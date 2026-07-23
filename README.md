@@ -1,7 +1,7 @@
 # AppOptR
 
 #### 介绍
-安卓应用 CPU 亲和性优化程序 - https://gitee.com/sutoliu/AppOpt Rust重构版
+安卓应用 CPU 亲和性优化程序 - https://gitee.com/sutoliu/AppOpt的Rust重构版
 
  **使用说明请参考** 
 
