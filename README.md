@@ -22,8 +22,5 @@ http://appopt.suto.top
 | `AppOpt-ebpf` | eBPF 内核态 |
 
 #### 请作者喝奶茶
- **请作者喝奶茶** 
-
-
 
 ![请作者喝奶茶](%E8%AF%B7%E4%BD%9C%E8%80%85%E6%9D%AF%E5%A5%B6%E8%8C%B6.png)
