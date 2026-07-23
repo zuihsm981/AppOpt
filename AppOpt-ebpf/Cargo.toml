@@ -1,0 +1,17 @@
+[package]
+name = "AppOpt-ebpf"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "AppOpt-ebpf"
+path = "src/main.rs"
+
+[dependencies]
+aya-ebpf = "0.1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+debug = false
+codegen-units = 1
