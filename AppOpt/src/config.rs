@@ -8,10 +8,10 @@ use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
 
 use crate::common::{
-    lock_ignore_poison, BASE_CPUSET, CONFIG_UPDATED, INOTIFY_FD, INOTIFY_SUPPORTED, INOTIFY_WD,
+    base_cpuset, lock_ignore_poison, CONFIG_UPDATED, INOTIFY_FD, INOTIFY_SUPPORTED, INOTIFY_WD,
     MAX_PKG_LEN, MAX_THREAD_LEN,
 };
-use crate::cpuset::{create_cpuset_dir, parse_cpu_ranges, CpuSet, CpuTopology};
+use crate::cpuset::{create_cpuset_dir, parse_cpu_spec, CpuSet, CpuTopology};
 
 pub struct AffinityRule {
     pub pkg: String,
@@ -29,13 +29,10 @@ pub struct AppConfig {
     pub config_file: String,
 }
 
-/// 当前生效配置的只读句柄，主循环与配置加载线程共享
-///
-/// 定义在此处而非 `common.rs`，是因为字段类型依赖 `AppConfig`，
-/// 依赖方向为 common ← config
+/// 当前生效配置，主循环与配置加载线程共享
 pub static CURRENT_CONFIG: Mutex<Option<Arc<AppConfig>>> = Mutex::new(None);
 
-/// 添加规则并创建对应的 cpuset 子目录
+/// 添加规则，包级规则创建 cpuset 子目录，线程规则目录由匹配时按合并集合创建
 fn add_rule(
     rules: &mut Vec<AffinityRule>,
     topo: &CpuTopology,
@@ -46,15 +43,18 @@ fn add_rule(
     if pkg.len() >= MAX_PKG_LEN || thread.len() >= MAX_THREAD_LEN {
         return false;
     }
-    let set = parse_cpu_ranges(cpus_spec, Some(&topo.present_cpus));
+    let set = parse_cpu_spec(cpus_spec, topo);
     if set.count() == 0 {
         return false;
     }
-    let dir_name = set.to_range_string();
-    let cpuset_dir = if topo.cpuset_enabled {
-        let path = format!("{}/{}", BASE_CPUSET, dir_name);
-        if create_cpuset_dir(&path, &dir_name, &topo.mems_str) {
-            dir_name
+    // 线程规则目录延迟到 thread_affinity 合并后创建，避免冗余空目录
+    let cpuset_dir = if thread.is_empty() {
+        let dir_name = set.to_range_string();
+        if topo.cpuset_enabled {
+            let path = format!("{}/{}", base_cpuset(), dir_name);
+            create_cpuset_dir(&path, &dir_name, &topo.mems_str)
+                .then_some(dir_name)
+                .unwrap_or_default()
         } else {
             String::new()
         }
@@ -159,7 +159,6 @@ pub fn load_config(
                     let cpus = rest[eq + 1..].trim();
                     let tail_br = cpus.find('{');
                     if let Some(tb) = tail_br {
-                        // pkg { thread } = cpus { ... }
                         let cpus_only = cpus[..tb].trim();
                         if !cpus_only.is_empty()
                             && !add_rule(&mut rules, topo, pkg, thread, cpus_only)
@@ -228,7 +227,9 @@ pub fn load_config(
         fail_cnt += 1;
     }
 
-    *last_mtime = mtime;
+    if fail_cnt == 0 {
+        *last_mtime = mtime;
+    }
 
     let pkgs: HashSet<String> = rules.iter().map(|r| r.pkg.clone()).collect();
     let has_thread_rules: HashSet<String> = rules
@@ -252,8 +253,8 @@ pub fn load_config(
     })
 }
 
-/// 配置加载线程：优先 inotify，失败降级为定时轮询
-pub fn config_loader_thread(interval: u64) {
+/// 配置加载线程，优先 inotify 失败降级为定时轮询
+pub fn config_loader(interval: u64) {
     let name = CString::new("ConfigLoader").unwrap();
     unsafe {
         libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
@@ -263,9 +264,9 @@ pub fn config_loader_thread(interval: u64) {
 
     loop {
         if INOTIFY_SUPPORTED.load(Ordering::Acquire) {
-            handle_inotify_events(interval, &mut last_mtime);
+            inotify_handle(interval, &mut last_mtime);
         } else {
-            try_reload_config(&mut last_mtime);
+            config_reload(&mut last_mtime);
             thread::sleep(Duration::from_secs(interval));
         }
     }
@@ -281,8 +282,8 @@ fn disable_inotify(inotify_fd: i32) {
     INOTIFY_WD.store(-1, Ordering::Release);
 }
 
-/// 重新加载配置；成功则更新 `CURRENT_CONFIG` 并置位 `CONFIG_UPDATED`
-fn try_reload_config(last_mtime: &mut i64) {
+/// 重新加载配置，成功则更新 CURRENT_CONFIG 并置位 CONFIG_UPDATED
+fn config_reload(last_mtime: &mut i64) {
     let Some(cfg) = lock_ignore_poison(&CURRENT_CONFIG).clone() else {
         return;
     };
@@ -296,9 +297,8 @@ fn try_reload_config(last_mtime: &mut i64) {
     CONFIG_UPDATED.store(true, Ordering::Release);
 }
 
-/// 处理 inotify 事件
-///
-fn handle_inotify_events(interval: u64, last_mtime: &mut i64) {
+/// 处理 inotify 事件，循环 read 直到 EAGAIN 避免事件丢失
+fn inotify_handle(interval: u64, last_mtime: &mut i64) {
     let inotify_fd = INOTIFY_FD.load(Ordering::Acquire);
 
     let mut pfd = libc::pollfd {
@@ -323,48 +323,62 @@ fn handle_inotify_events(interval: u64, last_mtime: &mut i64) {
     #[repr(align(8))]
     struct InotifyBuf([u8; 4096]);
     let mut buf = InotifyBuf([0u8; 4096]);
-    let len = unsafe {
-        libc::read(
-            inotify_fd,
-            buf.0.as_mut_ptr() as *mut libc::c_void,
-            buf.0.len(),
-        )
-    };
-    if len <= 0 {
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::EAGAIN) && err.raw_os_error() != Some(libc::EWOULDBLOCK)
-        {
-            disable_inotify(inotify_fd);
-        }
-        return;
-    }
-
     let mut reload_needed = false;
-    let mut offset = 0;
+    let mut needs_rewatch = false;
     let hdr = std::mem::size_of::<libc::inotify_event>();
-    while offset + hdr <= len as usize {
-        let event = unsafe { &*(buf.0.as_ptr().add(offset) as *const libc::inotify_event) };
-        if event.mask & (libc::IN_CLOSE_WRITE | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0 {
-            reload_needed = true;
-            *last_mtime = -1;
 
-            if event.mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0 {
-                thread::sleep(Duration::from_secs(interval));
-                if !reinstall_inotify_watch(inotify_fd) {
-                    break;
+    loop {
+        let len = unsafe {
+            libc::read(
+                inotify_fd,
+                buf.0.as_mut_ptr() as *mut libc::c_void,
+                buf.0.len(),
+            )
+        };
+        if len <= 0 {
+            let err = io::Error::last_os_error();
+            let errno = err.raw_os_error();
+            // EAGAIN 或 EINTR 退出循环
+            if errno == Some(libc::EAGAIN)
+                || errno == Some(libc::EWOULDBLOCK)
+                || errno == Some(libc::EINTR)
+            {
+                break;
+            }
+            disable_inotify(inotify_fd);
+            return;
+        }
+
+        let mut offset = 0;
+        while offset + hdr <= len as usize {
+            let event = unsafe { &*(buf.0.as_ptr().add(offset) as *const libc::inotify_event) };
+            if event.mask & (libc::IN_CLOSE_WRITE | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0
+            {
+                reload_needed = true;
+                *last_mtime = -1;
+                if event.mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0 {
+                    needs_rewatch = true;
                 }
             }
+            offset += hdr + event.len as usize;
         }
-        offset += hdr + event.len as usize;
+    }
+
+    // rewatch 在 read 循环结束后统一处理避免中途 sleep 丢事件
+    if needs_rewatch {
+        thread::sleep(Duration::from_secs(interval));
+        if !inotify_rewatch(inotify_fd) {
+            return;
+        }
     }
 
     if reload_needed {
-        try_reload_config(last_mtime);
+        config_reload(last_mtime);
     }
 }
 
 /// 重装 inotify 监听，失败则降级为轮询
-fn reinstall_inotify_watch(inotify_fd: i32) -> bool {
+fn inotify_rewatch(inotify_fd: i32) -> bool {
     let Some(cfg) = lock_ignore_poison(&CURRENT_CONFIG).clone() else {
         return false;
     };
