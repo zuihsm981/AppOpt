@@ -1,17 +1,20 @@
 ### v2.1.2更新日志
 - 主程序：支持在applist.conf中使用"语义核心"，可与范围核心随意混用
---   e-core 表示能效小核
---   p-core 表示性能中核
---   hp-core 为高性能大核
---   all-core 表示所有核心
+- e-core 表示能效小核
+- p-core 表示性能中核
+- hp-core 为高性能大核
+- all-core 表示所有核心
  也可以组合一起用（英文逗号）：
---   e-core,p-core  为小核与中核
---   p-core,hp-core 为中核与大核
+- e-core,p-core  为小核与中核
+- p-core,hp-core 为中核与大核
+
 - 主程序：支持使用-b参数自定义/dev/cpuset目录，防止被某些程序检测
---   使用方法：例如AppOpt -b MyAppOpt则目录会变成/dev/cpuset/MyAppOpt
+- 使用方法：例如AppOpt -b MyAppOpt则目录会变成/dev/cpuset/MyAppOpt
+
 - 主程序：修复了已知问题
 - 主程序：完善 eBPF 支持
 - 主程序：性能优化，内存与CPU占用更低
+
 
 ### v2.0.1更新日志
 - 主程序：使用Rust重构，性能大幅增强
