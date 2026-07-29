@@ -3,6 +3,7 @@
 compile_error!("AppOpt requires 64-bit target due to cpu_set_t binary layout assumptions");
 
 mod apply_affinity;
+mod cache;
 mod common;
 mod config;
 mod cpuset;
@@ -10,7 +11,6 @@ mod ebpf_mode;
 mod proc_mode;
 mod rule_match;
 
-use std::collections::HashSet;
 use std::env;
 use std::ffi::CString;
 use std::fs;
@@ -18,30 +18,47 @@ use std::process;
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::common::{
-    current_time_secs, lock_ignore_poison, CONFIG_UPDATED, DEAD_CLEANUP_INTERVAL, INOTIFY_FD,
+    lock_ignore_poison, set_base_cpuset, DEFAULT_CPUSET_NAME, CONFIG_UPDATED, INOTIFY_FD,
     INOTIFY_SUPPORTED, INOTIFY_WD,
 };
-use crate::config::{config_loader_thread, load_config, CURRENT_CONFIG};
+use crate::config::{config_loader, load_config, CURRENT_CONFIG};
 use crate::cpuset::init_cpu_topo;
 use crate::ebpf_mode::{
-    handle_ebpf_event, periodic_full_scan, refresh_cached_processes, setup_target_map,
-    try_init_ebpf, EbpfState,
+    affinity_check, full_scan, event_dispatch, comm_map_init,
+    ebpf_init, EbpfState,
 };
-use crate::proc_mode::{apply_affinity as proc_apply_affinity, update_cache, ProcCache};
+use crate::proc_mode::{cache_sync, ProcScanState};
 
 fn print_help(prog_name: &str) {
     println!("Usage: {} [OPTIONS]", prog_name);
     println!("Options:");
     println!("  -c <config_file>   指定配置文件 (默认: ./applist.conf)");
     println!("  -s <interval>      设置检查间隔(秒) (必须>=1, 默认: 2)");
+    println!("  -b <cpuset_name>   指定 BASE_CPUSET 目录名 (默认: AppOpt)");
     println!("  -v                 显示程序版本");
     println!("  -h                 显示帮助信息");
     println!();
     println!("示例:");
     println!("  {} -c /data/applist.conf -s 3", prog_name);
+    println!("  {} -b MyAppOpt", prog_name);
+    println!();
+    println!("规则格式:");
+    println!("  # 注释以 # 或 // 开头");
+    println!("  com.example=0-3           包级规则，绑定到 CPU 0-3");
+    println!("  com.example=e-core        语义核心，绑定到全部小核");
+    println!("  com.example=p-core        语义核心，绑定到全部中核");
+    println!("  com.example=hp-core       语义核心，绑定到全部大核");
+    println!();
+    println!("  块语法，包级规则 + 线程规则");
+    println!("  com.example {{");
+    println!("    RenderThread=6-7");
+    println!("    Thread-1=0-5");
+    println!("  }}");
+    println!("  线程 RenderThread 绑定到 CPU 6-7");
+    println!("  线程 Thread-1 绑定到 CPU 0-5");
 }
 
 fn init_inotify(config_file: &str) {
@@ -50,7 +67,7 @@ fn init_inotify(config_file: &str) {
         println!("inotify初始化失败，使用轮询模式");
         return;
     }
-    // 路径含 NUL 字节时无法构造 CString，直接降级到轮询模式
+    // 路径含 NUL 时无法构造 CString，降级到轮询模式
     let cfg_cstr = match CString::new(config_file) {
         Ok(c) => c,
         Err(_) => {
@@ -83,9 +100,9 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     let prog_name = &args[0];
 
-    let topo = init_cpu_topo();
     let mut config_file = String::from("./applist.conf");
     let mut sleep_interval: u64 = 2;
+    let mut cpuset_name = String::from(DEFAULT_CPUSET_NAME);
 
     let mut i = 1;
     while i < args.len() {
@@ -118,8 +135,23 @@ fn main() {
                     process::exit(1);
                 }
             }
+            "-b" => {
+                i += 1;
+                if i < args.len() {
+                    cpuset_name = args[i].clone();
+                    if cpuset_name.is_empty() || cpuset_name.contains('/') {
+                        eprintln!("无效的 cpuset 目录名: {}", args[i]);
+                        eprintln!("目录名不能为空或包含路径分隔符");
+                        process::exit(1);
+                    }
+                    println!("cpuset 目录名: {}", cpuset_name);
+                } else {
+                    eprintln!("错误: -b 需要指定 cpuset 目录名");
+                    process::exit(1);
+                }
+            }
             "-v" => {
-                if crate::ebpf_mode::check_ebpf_support() {
+                if crate::ebpf_mode::ebpf_probe() {
                     println!("AppOpt 版本 {} eBPF", env!("CARGO_PKG_VERSION"));
                 } else {
                     println!("AppOpt 版本 {}", env!("CARGO_PKG_VERSION"));
@@ -138,6 +170,10 @@ fn main() {
         }
         i += 1;
     }
+
+    // 先设置 cpuset 路径再初始化拓扑，init_cpu_topo 会创建 BASE_CPUSET 目录
+    set_base_cpuset(&cpuset_name);
+    let topo = init_cpu_topo();
 
     if fs::metadata(&config_file).is_err() {
         let initial_content = "# 规则编写与使用说明请参考 http://AppOpt.suto.top\n\n";
@@ -163,61 +199,55 @@ fn main() {
 
     init_inotify(&config_file);
 
+    // 守护进程模式，配置加载线程无 JoinHandle 进程退出时强制终止
     thread::spawn(move || {
-        config_loader_thread(sleep_interval);
+        config_loader(sleep_interval);
     });
 
-    let mut cache = ProcCache {
-        procs: Vec::new(),
-        last_proc_count: 0,
-        scan_all_proc: false,
-        tracked_pids: HashSet::new(),
-        last_proc_total: 0,
-    };
-    let mut affinity_counter: i32 = 0;
+    let mut cache = ProcScanState::new();
+    let mut affinity_deadline = Instant::now();
 
     println!("启动AppOpt服务 v{}", env!("CARGO_PKG_VERSION"));
 
-    let mut ebpf_state: Option<EbpfState> = try_init_ebpf();
-
-    let mut last_cfg_ptr: *const u8 = std::ptr::null();
+    let mut ebpf_state: Option<EbpfState> = ebpf_init();
 
     loop {
-        let config_updated = CONFIG_UPDATED.swap(false, Ordering::AcqRel);
+        // 先 swap CONFIG_UPDATED 再获取 cfg 防止漏更新
+        let config_changed = CONFIG_UPDATED.swap(false, Ordering::AcqRel);
         let Some(cfg) = lock_ignore_poison(&CURRENT_CONFIG).clone() else {
             thread::sleep(Duration::from_millis(100));
             continue;
         };
-        let cfg_ptr = Arc::as_ptr(&cfg) as *const u8;
-        let config_changed = config_updated || cfg_ptr != last_cfg_ptr;
-        last_cfg_ptr = cfg_ptr;
 
         let mut ebpf_dead = false;
+        let mut need_ebpf_reload = false;
         match &mut ebpf_state {
-            Some(ref mut es) => {
+            Some(es) => {
                 if config_changed {
-                    setup_target_map(&mut es.bpf, &cfg.pkgs);
-                    periodic_full_scan(&cfg, &mut es.runtime);
+                    need_ebpf_reload = comm_map_init(&mut es.bpf, &cfg.pkgs, &mut es.comm_capacity);
+                    if !need_ebpf_reload {
+                        full_scan(&cfg, es);
+                    }
                 }
 
-                match es.event_rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(event) => {
-                        handle_ebpf_event(&event, &cfg, &mut es.runtime, sleep_interval);
-                        while let Ok(event) = es.event_rx.try_recv() {
-                            handle_ebpf_event(&event, &cfg, &mut es.runtime, sleep_interval);
+                if !need_ebpf_reload {
+                    match es.event_rx.recv_timeout(Duration::from_secs(1)) {
+                        Ok(event) => {
+                            event_dispatch(&event, &cfg, es);
+                            while let Ok(event) = es.event_rx.try_recv() {
+                                event_dispatch(&event, &cfg, es);
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            ebpf_dead = true;
                         }
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        ebpf_dead = true;
-                    }
-                }
 
-                // 周期性清理死进程、重应用亲和性
-                if !ebpf_dead {
-                    let now = current_time_secs();
-                    if now - es.runtime.last_dead_cleanup_time >= DEAD_CLEANUP_INTERVAL {
-                        refresh_cached_processes(&cfg, &mut es.runtime);
+                    // 每 3*sleep_interval 秒定期纠正，纯事件驱动零 /proc 读
+                    if affinity_deadline.elapsed() >= Duration::from_secs(3 * sleep_interval) {
+                        affinity_check(es, &cfg);
+                        affinity_deadline = Instant::now();
                     }
                 }
             }
@@ -227,11 +257,11 @@ fn main() {
                     cache.last_proc_count = 0;
                 }
 
-                update_cache(&mut cache, &cfg, &mut affinity_counter);
-                affinity_counter -= 1;
-                if affinity_counter < 1 {
-                    proc_apply_affinity(&mut cache, &cfg.topo);
-                    affinity_counter = 5;
+                cache_sync(&mut cache, &cfg);
+                if affinity_deadline.elapsed() >= Duration::from_secs(5 * sleep_interval) || cache.force_affinity {
+                    cache.cache.affinity_sync(&cfg.topo);
+                    affinity_deadline = Instant::now();
+                    cache.force_affinity = false;
                 }
 
                 thread::sleep(Duration::from_secs(sleep_interval));
@@ -241,10 +271,18 @@ fn main() {
         if ebpf_dead {
             eprintln!("eBPF: 事件通道断开，回退到 /proc 轮询");
             ebpf_state = None;
-            // 下轮 /proc 轮询立即全量扫描，避免空窗
             cache.scan_all_proc = true;
             cache.last_proc_count = 0;
-            affinity_counter = 0;
+            cache.force_affinity = true;
+            affinity_deadline = Instant::now();
+        }
+
+        // 容量不足先释放旧 BPF 程序再重载，置位 CONFIG_UPDATED 触发重建
+        if need_ebpf_reload {
+            ebpf_state.take();
+            ebpf_state = ebpf_init();
+            CONFIG_UPDATED.store(true, Ordering::Release);
+            affinity_deadline = Instant::now();
         }
     }
 }
