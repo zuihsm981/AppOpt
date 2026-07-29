@@ -1,167 +1,231 @@
 #![no_std]
 #![no_main]
 #![allow(linker_messages)]
+#![allow(dead_code)]
 
 use aya_ebpf::{
-    helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_ktime_get_ns},
+    helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid},
     macros::{map, tracepoint},
-    maps::{HashMap, LruHashMap, RingBuf},
+    maps::{Array, HashMap, LruHashMap, RingBuf},
     programs::TracePointContext,
 };
 
 const EVENT_FORK: u32 = 1;
 const EVENT_EXEC: u32 = 2;
+const EVENT_RENAME: u32 = 3;
+const EVENT_EXIT: u32 = 4;
 
-/// 进程事件（布局需与用户态 EbpfProcEvent 一致）
+/// 4 类 tracepoint 字段布局：fork 读 child_pid/child_comm，exec/exit 用 bpf_get_current_pid_tgid，rename 读 newcomm
+
+/// 用户态解析 format 文件注入的字段偏移，因内核版本设备而异禁止硬编码
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TracepointOffsets {
+    fork_child_pid: u32,
+    fork_child_comm: u32,
+    rename_newcomm: u32,
+}
+
+/// 进程事件，布局需与用户态 EbpfProcEvent 一致
 #[repr(C)]
 struct ProcEvent {
     pid: i32,
     tid: i32,
-    child_pid: i32,
     comm: [u8; 16],
     event_type: u32,
 }
 
-#[repr(C)]
-struct DedupEntry {
-    last_ns: u64,
-    count: u32,
-}
-
-/// 白名单默认容量（用户态通过 EbpfLoader::set_max_entries 动态覆盖）
 const MAP_CAPACITY: u32 = 16 << 5;
-const DEDUP_CAPACITY: u32 = 4096;
-/// 防抖时间窗口：0.1 秒（纳秒）
-const DEDUP_WINDOW_NS: u64 = 100_000_000;
-/// 窗口内最大事件数，超过则丢弃
-const DEDUP_MAX_COUNT: u32 = 2;
+const APPLIED_CAPACITY: u32 = 8192;
 
-/// FORK/EXEC 共用白名单：键为 8 字节匹配串（包名前 8 字节或末 8 字节）
+/// 白名单键为包名前 8 字节或末 8 字节
 #[map]
 static TARGET_COMM_MAP: HashMap<[u8; 8], u32> = HashMap::with_max_entries(MAP_CAPACITY, 0);
 
+/// 已应用亲和性表 tid 到 CPU mask，LruHashMap 配合 ESRCH 兜底
 #[map]
-static DEDUP_MAP: LruHashMap<u32, DedupEntry> = LruHashMap::with_max_entries(DEDUP_CAPACITY, 0);
+static APPLIED_MAP: LruHashMap<u32, u64> = LruHashMap::with_max_entries(APPLIED_CAPACITY, 0);
 
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
-#[inline(always)]
-fn should_dedup(pid: u32, now_ns: u64) -> bool {
-    let prev = unsafe { DEDUP_MAP.get(&pid) };
-    let (last_ns, count) = match prev {
-        Some(e) => (e.last_ns, e.count),
-        None => (0, 0),
-    };
+/// 用户态注入的 tracepoint 字段偏移单条 Array 索引 0
+#[map]
+static OFFSETS_MAP: Array<TracepointOffsets> = Array::with_max_entries(1, 0);
 
-    if now_ns - last_ns < DEDUP_WINDOW_NS {
-        let new_count = count + 1;
-        if new_count > DEDUP_MAX_COUNT {
+/// 读取偏移，fork_child_pid 为 0 视为未注入返回 None
+#[inline(always)]
+fn offsets_load() -> Option<TracepointOffsets> {
+    OFFSETS_MAP.get(0).and_then(|o| {
+        if o.fork_child_pid != 0 {
+            Some(*o)
+        } else {
+            None
+        }
+    })
+}
+
+/// 事件元信息
+struct EventMeta {
+    pid: i32,
+    tid: i32,
+    comm: [u8; 16],
+    parent_tid: u32,
+    parent_tgid: u32,
+}
+
+#[inline(always)]
+fn applied_lookup(key: u32) -> bool {
+    unsafe { APPLIED_MAP.get(&key) }.is_some()
+}
+
+/// 在 comm 16 字节上以 8 字节窗口滑动匹配白名单
+#[inline(always)]
+fn whitelist_matched(comm: &[u8; 16]) -> bool {
+    for pos in 0..=8usize {
+        let key: [u8; 8] = comm[pos..pos + 8].try_into().unwrap_or([0u8; 8]);
+        if unsafe { TARGET_COMM_MAP.get(&key) }.is_some() {
             return true;
         }
-        let _ = DEDUP_MAP.insert(
-            &pid,
-            &DedupEntry {
-                last_ns,
-                count: new_count,
-            },
-            0,
-        );
-    } else {
-        let _ = DEDUP_MAP.insert(
-            &pid,
-            &DedupEntry {
-                last_ns: now_ns,
-                count: 1,
-            },
-            0,
-        );
     }
     false
 }
 
 #[inline(always)]
-fn report_event(ctx: &TracePointContext, event_type: u32) -> u32 {
-    // sched_process_fork 格式：offset 8=parent_comm[16], 24=parent_pid, 28=child_comm[16], 44=child_pid
-    let (pid_for_dedup, child_pid) = if event_type == EVENT_FORK {
-        let pid = unsafe { ctx.read_at::<i32>(44).unwrap_or(0) };
-        (pid as u32, pid)
-    } else {
-        let pid_tgid = bpf_get_current_pid_tgid();
-        ((pid_tgid >> 32) as u32, 0)
-    };
-
-    // 防抖先于白名单匹配，避免高频非目标进程事件冲击用户态
-    let now_ns = unsafe { bpf_ktime_get_ns() };
-    if should_dedup(pid_for_dedup, now_ns) {
-        return 0;
-    }
-
-    let comm = if event_type == EVENT_FORK {
-        unsafe { ctx.read_at::<[u8; 16]>(28).unwrap_or([0u8; 16]) }
-    } else {
-        bpf_get_current_comm().unwrap_or_default()
-    };
-
-    let mut matched = false;
-    let mut pos: usize = 0;
-    while pos <= 8 {
-        let key: [u8; 8] = [
-            comm[pos],
-            comm[pos + 1],
-            comm[pos + 2],
-            comm[pos + 3],
-            comm[pos + 4],
-            comm[pos + 5],
-            comm[pos + 6],
-            comm[pos + 7],
-        ];
-        if unsafe { TARGET_COMM_MAP.get(&key) }.is_some() {
-            matched = true;
-            break;
-        }
-        pos += 1;
-    }
-    if !matched {
-        return 0;
-    }
-
-    let event = if event_type == EVENT_FORK {
-        ProcEvent {
-            pid: child_pid,
-            tid: child_pid,
-            child_pid,
-            comm,
-            event_type,
-        }
-    } else {
-        let pid_tgid = bpf_get_current_pid_tgid();
-        ProcEvent {
-            pid: (pid_tgid >> 32) as i32,
-            tid: pid_tgid as i32,
-            child_pid: 0,
-            comm,
-            event_type,
-        }
-    };
-
+fn submit_event(event: ProcEvent) {
     if let Some(mut entry) = EVENTS.reserve(0) {
         entry.write(event);
         entry.submit(0);
     }
+}
+
+/// 解析 fork 字段，统一用 parent_tgid 作为 pid 确保 clone 共享 TGID，tid 为 child_pid
+#[inline(always)]
+fn fork_parse(ctx: &TracePointContext, offsets: &TracepointOffsets) -> EventMeta {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let parent_tid = (pid_tgid & 0xFFFFFFFF) as u32;
+    let parent_tgid = (pid_tgid >> 32) as u32;
+    let child_pid = unsafe { ctx.read_at::<i32>(offsets.fork_child_pid as usize).unwrap_or(0) };
+    let child_comm =
+        unsafe { ctx.read_at::<[u8; 16]>(offsets.fork_child_comm as usize).unwrap_or([0u8; 16]) };
+    EventMeta {
+        pid: parent_tgid as i32,
+        tid: child_pid,
+        comm: child_comm,
+        parent_tid,
+        parent_tgid,
+    }
+}
+
+#[inline(always)]
+fn exec_parse() -> EventMeta {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    EventMeta {
+        pid: (pid_tgid >> 32) as i32,
+        tid: pid_tgid as i32,
+        comm: bpf_get_current_comm().unwrap_or_default(),
+        parent_tid: 0,
+        parent_tgid: 0,
+    }
+}
+
+/// FORK 检查已管理线程的父线程，EXEC 检查自身，均以白名单兜底
+/// FORK 通过时立即占位 APPLIED_MAP[child_tid]=0，防 RENAME 竞态过滤
+#[inline(always)]
+fn report_named_event(ctx: &TracePointContext, event_type: u32) -> u32 {
+    let meta = if event_type == EVENT_FORK {
+        let Some(offsets) = offsets_load() else {
+            return 0;
+        };
+        fork_parse(ctx, &offsets)
+    } else {
+        exec_parse()
+    };
+
+    let is_tracked = if event_type == EVENT_FORK {
+        applied_lookup(meta.parent_tid)
+    } else {
+        applied_lookup(meta.tid as u32)
+    };
+
+    if !is_tracked && !whitelist_matched(&meta.comm) {
+        return 0;
+    }
+
+    if event_type == EVENT_FORK && is_tracked {
+        let _ = APPLIED_MAP.insert(&(meta.tid as u32), &0, 0);
+    }
+
+    submit_event(ProcEvent {
+        pid: meta.pid,
+        tid: meta.tid,
+        comm: meta.comm,
+        event_type,
+    });
     0
 }
 
-/// 捕获进程 fork / 线程 clone 事件
 #[tracepoint(name = "sched_process_fork", category = "sched")]
 fn sched_process_fork(ctx: TracePointContext) -> u32 {
-    report_event(&ctx, EVENT_FORK)
+    report_named_event(&ctx, EVENT_FORK)
 }
 
-/// 捕获进程执行新程序
 #[tracepoint(name = "sched_process_exec", category = "sched")]
 fn sched_process_exec(ctx: TracePointContext) -> u32 {
-    report_event(&ctx, EVENT_EXEC)
+    report_named_event(&ctx, EVENT_EXEC)
+}
+
+/// 捕获线程改名，已管理线程直接放行否则白名单匹配
+#[tracepoint(name = "task_rename", category = "task")]
+fn task_rename(ctx: TracePointContext) -> u32 {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let tid = (pid_tgid & 0xFFFFFFFF) as u32;
+    if tid == 0 {
+        return 0;
+    }
+    let tgid = (pid_tgid >> 32) as u32;
+
+    let tracked = applied_lookup(tid);
+
+    let Some(offsets) = offsets_load() else {
+        return 0;
+    };
+    let new_comm =
+        unsafe { ctx.read_at::<[u8; 16]>(offsets.rename_newcomm as usize).unwrap_or([0u8; 16]) };
+
+    if !tracked && !whitelist_matched(&new_comm) {
+        return 0;
+    }
+
+    submit_event(ProcEvent {
+        pid: tgid as i32,
+        tid: tid as i32,
+        comm: new_comm,
+        event_type: EVENT_RENAME,
+    });
+    0
+}
+
+/// 捕获线程退出，已管理线程清理 APPLIED_MAP
+#[tracepoint(name = "sched_process_exit", category = "sched")]
+fn sched_process_exit(_ctx: TracePointContext) -> u32 {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let tid = (pid_tgid & 0xFFFFFFFF) as u32;
+    let tgid = (pid_tgid >> 32) as u32;
+
+    if !applied_lookup(tid) {
+        return 0;
+    }
+
+    let _ = APPLIED_MAP.remove(&tid);
+
+    submit_event(ProcEvent {
+        pid: tgid as i32,
+        tid: tid as i32,
+        comm: [0u8; 16],
+        event_type: EVENT_EXIT,
+    });
+    0
 }
 
 #[panic_handler]
