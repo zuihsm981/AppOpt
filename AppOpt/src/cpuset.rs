@@ -4,7 +4,7 @@ use std::fs;
 use std::io;
 use std::os::unix::io::RawFd;
 
-use crate::common::{BASE_CPUSET, CPU_SETSIZE, CPU_WORDS, CPU_WORD_BITS};
+use crate::common::{base_cpuset, CPU_SETSIZE, CPU_WORDS, CPU_WORD_BITS};
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -60,7 +60,7 @@ impl CpuSet {
                     if start.is_none() {
                         start = Some(cpu);
                         end = Some(cpu);
-                    } else if cpu == end.unwrap() + 1 {
+                    } else if end.is_some_and(|e| cpu == e + 1) {
                         end = Some(cpu);
                     } else {
                         push_range(&mut result, start, end, &mut first);
@@ -161,7 +161,34 @@ pub fn parse_cpu_ranges(spec: &str, present: Option<&CpuSet>) -> CpuSet {
     set
 }
 
-/// 在 cpuset 中创建目录并写入 cpus/mems
+/// 解析 CPU 规格，支持语义核心名(e-core/p-core/hp-core)与数字范围混合
+pub fn parse_cpu_spec(spec: &str, topo: &CpuTopology) -> CpuSet {
+    let mut set = CpuSet::new();
+    if spec.is_empty() {
+        return set;
+    }
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        // 语义名展开为对应核心层，其余按数字范围解析
+        let seg = match part {
+            "e-core" => &topo.e_core,
+            "p-core" => &topo.p_core,
+            "hp-core" => &topo.hp_core,
+            "all-core" => &topo.present_cpus,
+            _ => {
+                set.or(&parse_cpu_ranges(part, Some(&topo.present_cpus)));
+                continue;
+            }
+        };
+        set.or(seg);
+    }
+    set
+}
+
+/// 创建 cpuset 子目录并写入 cpus 与 mems
 pub(crate) fn create_cpuset_dir(path: &str, cpus: &str, mems: &str) -> bool {
     let c_path = CString::new(path).expect("cpuset path 受控输入，无 NUL");
     let ret = unsafe { libc::mkdir(c_path.as_ptr(), 0o755) };
@@ -185,17 +212,91 @@ pub(crate) fn create_cpuset_dir(path: &str, cpus: &str, mems: &str) -> bool {
     fs::write(&mems_path, mems).is_ok()
 }
 
+/// 按合并后的 CPU 集合确保 cpuset 子目录存在，返回目录名（cpuset 未启用或创建失败返回空串）
+pub fn ensure_cpuset_dir(cpus: &CpuSet, topo: &CpuTopology) -> String {
+    if !topo.cpuset_enabled {
+        return String::new();
+    }
+    let dir_name = cpus.to_range_string();
+    let path = format!("{}/{}", base_cpuset(), dir_name);
+    // create_cpuset_dir 已处理 EEXIST，重复调用幂等
+    if create_cpuset_dir(&path, &dir_name, &topo.mems_str) {
+        dir_name
+    } else {
+        String::new()
+    }
+}
+
 #[derive(Clone)]
 pub struct CpuTopology {
     pub present_cpus: CpuSet,
     pub present_str: String,
     pub mems_str: String,
     pub cpuset_enabled: bool,
-    /// 进程生命周期 fd，不主动关闭
     pub base_cpuset_fd: RawFd,
+    /// 语义核心分层：最低频为 e-core，最高频为 hp-core，中间为 p-core
+    pub e_core: CpuSet,
+    pub p_core: CpuSet,
+    pub hp_core: CpuSet,
 }
 
-/// 初始化 CPU 拓扑
+/// 按 cpufreq 策略检测核心分层，按最高频率升序分组：首组为 e-core，末组为 hp-core，中间为 p-core
+fn detect_core_types() -> (CpuSet, CpuSet, CpuSet) {
+    let mut groups: Vec<(u64, Vec<usize>)> = Vec::new();
+    // 读取每个 policy 的 related_cpus 与 cpuinfo_max_freq，按频率合并同组
+    if let Ok(entries) = fs::read_dir("/sys/devices/system/cpu/cpufreq") {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("policy"))
+            {
+                continue;
+            }
+            let freq: u64 = fs::read_to_string(path.join("cpuinfo_max_freq"))
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0);
+            if freq == 0 {
+                continue;
+            }
+            let cpus: Vec<usize> = fs::read_to_string(path.join("related_cpus"))
+                .ok()
+                .map(|s| s.split_whitespace().filter_map(|c| c.parse().ok()).collect())
+                .unwrap_or_default();
+            if cpus.is_empty() {
+                continue;
+            }
+            if let Some(g) = groups.iter_mut().find(|(f, _)| *f == freq) {
+                g.1.extend(cpus);
+            } else {
+                groups.push((freq, cpus));
+            }
+        }
+    }
+    groups.sort_by_key(|(f, _)| *f);
+    let mut e = CpuSet::new();
+    let mut p = CpuSet::new();
+    let mut h = CpuSet::new();
+    let n = groups.len();
+    for (i, (_, cpus)) in groups.iter().enumerate() {
+        // 首组入 e-core，末组入 hp-core，其余入 p-core
+        let target = if i == 0 {
+            &mut e
+        } else if i == n - 1 {
+            &mut h
+        } else {
+            &mut p
+        };
+        for &cpu in cpus {
+            target.set(cpu);
+        }
+    }
+    (e, p, h)
+}
+
+/// 初始化 CPU 拓扑，检测 cpuset 可用性并创建 BASE_CPUSET 目录
 pub fn init_cpu_topo() -> CpuTopology {
     let mut topo = CpuTopology {
         present_cpus: CpuSet::new(),
@@ -203,20 +304,27 @@ pub fn init_cpu_topo() -> CpuTopology {
         mems_str: String::new(),
         cpuset_enabled: false,
         base_cpuset_fd: -1,
+        e_core: CpuSet::new(),
+        p_core: CpuSet::new(),
+        hp_core: CpuSet::new(),
     };
 
     if let Ok(content) = fs::read_to_string("/sys/devices/system/cpu/present") {
         topo.present_str = content.trim().to_string();
     }
     topo.present_cpus = parse_cpu_ranges(&topo.present_str, None);
+    let (e, p, h) = detect_core_types();
+    topo.e_core = e;
+    topo.p_core = p;
+    topo.hp_core = h;
 
     let cpuset_path = CString::new("/dev/cpuset").expect("常量字符串无 NUL");
     if unsafe { libc::access(cpuset_path.as_ptr(), libc::F_OK) } != 0 {
         return topo;
     }
 
-    if create_cpuset_dir(BASE_CPUSET, &topo.present_str, "0") {
-        let base_path = CString::new(BASE_CPUSET).expect("常量字符串无 NUL");
+    if create_cpuset_dir(base_cpuset(), &topo.present_str, "0") {
+        let base_path = CString::new(base_cpuset()).expect("常量字符串无 NUL");
         topo.base_cpuset_fd =
             unsafe { libc::open(base_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
         if topo.base_cpuset_fd != -1 {
@@ -224,7 +332,7 @@ pub fn init_cpu_topo() -> CpuTopology {
         }
     }
 
-    let mems_path = format!("{}/mems", BASE_CPUSET);
+    let mems_path = format!("{}/mems", base_cpuset());
     if let Ok(mems) = fs::read_to_string(&mems_path) {
         topo.mems_str = mems.trim().to_string();
     } else {
