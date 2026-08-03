@@ -1,11 +1,8 @@
-use crate::common::fnmatch_c;
+use std::ffi::CString;
+
+use crate::MAX_THREAD_LEN;
 use crate::config::AppConfig;
 use crate::cpuset::{ensure_cpuset_dir, CpuSet};
-
-pub fn pkg_match(pkg: &str, cfg: &AppConfig) -> (bool, bool) {
-    let interested = cfg.pkgs.contains(pkg);
-    (interested, interested && cfg.has_thread_rules.contains(pkg))
-}
 
 /// 线程亲和性计算结果
 pub struct AffinityResult {
@@ -72,4 +69,34 @@ pub fn thread_affinity(
             is_thread_rule: matched,
         })
     }
+}
+
+/// POSIX fnmatch 封装，需预转换为 CString
+pub fn fnmatch_c(pattern: &CString, string: &str) -> bool {
+    if string.len() >= MAX_THREAD_LEN {
+        return false;
+    }
+    let mut buf = [0u8; MAX_THREAD_LEN];
+    buf[..string.len()].copy_from_slice(string.as_bytes());
+    unsafe { libc::fnmatch(pattern.as_ptr(), buf.as_ptr() as *const _, libc::FNM_NOESCAPE) == 0 }
+}
+
+/// 通过内核 comm 匹配配置包名
+pub fn comm_to_pkg(comm: &str, cfg: &AppConfig) -> Option<String> {
+    if cfg.pkgs.contains(comm) {
+        return Some(comm.to_string());
+    }
+    if comm.len() >= 15 {
+        for pkg in &cfg.pkgs {
+            if pkg.starts_with(comm) {
+                return Some(pkg.clone());
+            }
+        }
+        for pkg in &cfg.pkgs {
+            if pkg.ends_with(comm) {
+                return Some(pkg.clone());
+            }
+        }
+    }
+    None
 }
