@@ -4,7 +4,6 @@ compile_error!("AppOpt requires 64-bit target due to cpu_set_t binary layout ass
 
 mod apply_affinity;
 mod cache;
-mod common;
 mod config;
 mod cpuset;
 mod ebpf_mode;
@@ -12,25 +11,32 @@ mod proc_mode;
 mod rule_match;
 
 use std::env;
-use std::ffi::CString;
 use std::fs;
 use std::process;
-use std::sync::atomic::Ordering;
-use std::sync::{mpsc, Arc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::common::{
-    lock_ignore_poison, set_base_cpuset, DEFAULT_CPUSET_NAME, CONFIG_UPDATED, INOTIFY_FD,
-    INOTIFY_SUPPORTED, INOTIFY_WD,
-};
-use crate::config::{config_loader, load_config, CURRENT_CONFIG};
-use crate::cpuset::init_cpu_topo;
+use crate::config::{config_loader, init_inotify, load_config, CURRENT_CONFIG};
+use crate::cpuset::{init_cpu_topo, set_base_cpuset, DEFAULT_CPUSET_NAME};
 use crate::ebpf_mode::{
     affinity_check, full_scan, event_dispatch, comm_map_init,
     ebpf_init, EbpfState,
 };
 use crate::proc_mode::{cache_sync, ProcScanState};
+
+pub const MAX_PKG_LEN: usize = 128;
+pub const MAX_THREAD_LEN: usize = 32;
+
+pub static CONFIG_UPDATED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn lock_ignore_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| {
+        eprintln!("警告: 互斥锁中毒，尝试恢复...");
+        e.into_inner()
+    })
+}
 
 fn print_help(prog_name: &str) {
     println!("Usage: {} [OPTIONS]", prog_name);
@@ -59,41 +65,6 @@ fn print_help(prog_name: &str) {
     println!("  }}");
     println!("  线程 RenderThread 绑定到 CPU 6-7");
     println!("  线程 Thread-1 绑定到 CPU 0-5");
-}
-
-fn init_inotify(config_file: &str) {
-    let inotify_fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
-    if inotify_fd < 0 {
-        println!("inotify初始化失败，使用轮询模式");
-        return;
-    }
-    // 路径含 NUL 时无法构造 CString，降级到轮询模式
-    let cfg_cstr = match CString::new(config_file) {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("错误: 配置文件路径包含非法字符，使用轮询模式");
-            unsafe { libc::close(inotify_fd); }
-            return;
-        }
-    };
-    let wd = unsafe {
-        libc::inotify_add_watch(
-            inotify_fd,
-            cfg_cstr.as_ptr(),
-            libc::IN_CLOSE_WRITE | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF,
-        )
-    };
-    if wd >= 0 {
-        INOTIFY_SUPPORTED.store(true, Ordering::Release);
-        INOTIFY_FD.store(inotify_fd, Ordering::Release);
-        INOTIFY_WD.store(wd, Ordering::Release);
-        println!("启用inotify监控配置文件变更");
-    } else {
-        unsafe {
-            libc::close(inotify_fd);
-        }
-        println!("inotify初始化失败，使用轮询模式");
-    }
 }
 
 fn main() {
@@ -199,12 +170,12 @@ fn main() {
 
     init_inotify(&config_file);
 
-    // 守护进程模式，配置加载线程无 JoinHandle 进程退出时强制终止
-    thread::spawn(move || {
+    // 守护进程模式，保存 JoinHandle 用于 panic 恢复检测
+    let mut config_handle = thread::spawn(move || {
         config_loader(sleep_interval);
     });
 
-    let mut cache = ProcScanState::new();
+    let mut proc_state: Option<ProcScanState> = None;
     let mut affinity_deadline = Instant::now();
 
     println!("启动AppOpt服务 v{}", env!("CARGO_PKG_VERSION"));
@@ -219,69 +190,83 @@ fn main() {
             continue;
         };
 
+        // 配置加载线程 panic 恢复
+        if config_handle.is_finished() {
+            eprintln!("警告: 配置加载线程异常退出，尝试重启...");
+            config_handle = thread::spawn(move || {
+                config_loader(sleep_interval);
+            });
+        }
+
         let mut ebpf_dead = false;
-        let mut need_ebpf_reload = false;
-        match &mut ebpf_state {
-            Some(es) => {
-                if config_changed {
-                    need_ebpf_reload = comm_map_init(&mut es.bpf, &cfg.pkgs, &mut es.comm_capacity);
-                    if !need_ebpf_reload {
-                        full_scan(&cfg, es);
+
+        let need_reload = if let Some(es) = ebpf_state.as_mut() {
+            if config_changed {
+                let r = comm_map_init(&mut es.bpf, &cfg.pkgs, es.comm_capacity);
+                if !r {
+                    full_scan(&cfg, es);
+                }
+                r
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if need_reload {
+            ebpf_state = None;
+            if let Some(mut new_es) = ebpf_init() {
+                if comm_map_init(&mut new_es.bpf, &cfg.pkgs, new_es.comm_capacity) {
+                    eprintln!("eBPF: 重载后白名单容量仍不足，回退到 /proc 轮询");
+                    continue;
+                }
+                full_scan(&cfg, &mut new_es);
+                ebpf_state = Some(new_es);
+            }
+            continue;
+        }
+
+        if let Some(es) = ebpf_state.as_mut() {
+            match es.event_rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(event) => {
+                    event_dispatch(&event, &cfg, es);
+                    while let Ok(event) = es.event_rx.try_recv() {
+                        event_dispatch(&event, &cfg, es);
                     }
                 }
-
-                if !need_ebpf_reload {
-                    match es.event_rx.recv_timeout(Duration::from_secs(1)) {
-                        Ok(event) => {
-                            event_dispatch(&event, &cfg, es);
-                            while let Ok(event) = es.event_rx.try_recv() {
-                                event_dispatch(&event, &cfg, es);
-                            }
-                        }
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            ebpf_dead = true;
-                        }
-                    }
-
-                    // 每 3*sleep_interval 秒定期纠正，纯事件驱动零 /proc 读
-                    if affinity_deadline.elapsed() >= Duration::from_secs(3 * sleep_interval) {
-                        affinity_check(es, &cfg);
-                        affinity_deadline = Instant::now();
-                    }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    ebpf_dead = true;
                 }
             }
-            None => {
-                if config_changed {
-                    cache.scan_all_proc = true;
-                    cache.last_proc_count = 0;
-                }
 
-                cache_sync(&mut cache, &cfg);
-                if affinity_deadline.elapsed() >= Duration::from_secs(5 * sleep_interval) || cache.force_affinity {
-                    cache.cache.affinity_sync(&cfg.topo);
-                    affinity_deadline = Instant::now();
-                    cache.force_affinity = false;
-                }
-
-                thread::sleep(Duration::from_secs(sleep_interval));
+            if affinity_deadline.elapsed() >= Duration::from_secs(3 * sleep_interval) {
+                affinity_check(es, &cfg);
+                affinity_deadline = Instant::now();
             }
+        } else {
+            let cache = proc_state.get_or_insert_with(ProcScanState::new);
+            if config_changed {
+                cache.scan_all_proc = true;
+                cache.last_proc_count = 0;
+            }
+            cache_sync(cache, &cfg);
+            if affinity_deadline.elapsed() >= Duration::from_secs(5 * sleep_interval) || cache.force_affinity {
+                cache.cache.affinity_sync(&cfg.topo);
+                affinity_deadline = Instant::now();
+                cache.force_affinity = false;
+            }
+            thread::sleep(Duration::from_secs(sleep_interval));
         }
 
         if ebpf_dead {
             eprintln!("eBPF: 事件通道断开，回退到 /proc 轮询");
             ebpf_state = None;
+            let cache = proc_state.get_or_insert_with(ProcScanState::new);
             cache.scan_all_proc = true;
             cache.last_proc_count = 0;
             cache.force_affinity = true;
-            affinity_deadline = Instant::now();
-        }
-
-        // 容量不足先释放旧 BPF 程序再重载，置位 CONFIG_UPDATED 触发重建
-        if need_ebpf_reload {
-            ebpf_state.take();
-            ebpf_state = ebpf_init();
-            CONFIG_UPDATED.store(true, Ordering::Release);
             affinity_deadline = Instant::now();
         }
     }
