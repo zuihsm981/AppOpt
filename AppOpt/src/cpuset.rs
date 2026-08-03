@@ -2,14 +2,47 @@ use std::ffi::CString;
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
-use std::os::unix::io::RawFd;
 
-use crate::common::{base_cpuset, CPU_SETSIZE, CPU_WORDS, CPU_WORD_BITS};
+use std::sync::OnceLock;
+
+pub const CPU_SETSIZE: usize = 1024;
+pub const CPU_WORD_BITS: usize = 64;
+pub const CPU_WORDS: usize = CPU_SETSIZE / CPU_WORD_BITS;
+
+/// BASE_CPUSET 运行时路径，未设置时默认 /dev/cpuset/AppOpt
+static BASE_CPUSET_PATH: OnceLock<String> = OnceLock::new();
+
+pub const DEFAULT_CPUSET_NAME: &str = "AppOpt";
+
+/// 设置 BASE_CPUSET 目录名，name 为空或含 / 时使用默认值
+pub fn set_base_cpuset(name: &str) {
+    if name.is_empty() || name.contains('/') {
+        return;
+    }
+    let path = format!("/dev/cpuset/{}", name);
+    let _ = BASE_CPUSET_PATH.set(path);
+}
+
+/// 获取 BASE_CPUSET 路径，未设置返回默认值
+pub fn base_cpuset() -> &'static str {
+    BASE_CPUSET_PATH
+        .get()
+        .map(|s| s.as_str())
+        .unwrap_or("/dev/cpuset/AppOpt")
+}
+
+const _: () = assert!(std::mem::size_of::<CpuSet>() == std::mem::size_of::<libc::cpu_set_t>());
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct CpuSet {
     pub bits: [u64; CPU_WORDS],
+}
+
+impl std::fmt::Debug for CpuSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CpuSet({})", self.to_range_string())
+    }
 }
 
 impl CpuSet {
@@ -233,7 +266,6 @@ pub struct CpuTopology {
     pub present_str: String,
     pub mems_str: String,
     pub cpuset_enabled: bool,
-    pub base_cpuset_fd: RawFd,
     /// 语义核心分层：最低频为 e-core，最高频为 hp-core，中间为 p-core
     pub e_core: CpuSet,
     pub p_core: CpuSet,
@@ -303,7 +335,6 @@ pub fn init_cpu_topo() -> CpuTopology {
         present_str: String::new(),
         mems_str: String::new(),
         cpuset_enabled: false,
-        base_cpuset_fd: -1,
         e_core: CpuSet::new(),
         p_core: CpuSet::new(),
         hp_core: CpuSet::new(),
@@ -323,20 +354,17 @@ pub fn init_cpu_topo() -> CpuTopology {
         return topo;
     }
 
-    if create_cpuset_dir(base_cpuset(), &topo.present_str, "0") {
-        let base_path = CString::new(base_cpuset()).expect("常量字符串无 NUL");
-        topo.base_cpuset_fd =
-            unsafe { libc::open(base_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
-        if topo.base_cpuset_fd != -1 {
-            topo.cpuset_enabled = true;
-        }
-    }
+    let mems = fs::read_to_string("/dev/cpuset/mems")
+        .ok()
+        .and_then(|s| {
+            let t = s.trim().to_string();
+            if t.is_empty() { None } else { Some(t) }
+        })
+        .unwrap_or_else(|| "0".to_string());
+    topo.mems_str = mems;
 
-    let mems_path = format!("{}/mems", base_cpuset());
-    if let Ok(mems) = fs::read_to_string(&mems_path) {
-        topo.mems_str = mems.trim().to_string();
-    } else {
-        topo.mems_str = "0".to_string();
+    if create_cpuset_dir(base_cpuset(), &topo.present_str, &topo.mems_str) {
+        topo.cpuset_enabled = true;
     }
 
     topo
