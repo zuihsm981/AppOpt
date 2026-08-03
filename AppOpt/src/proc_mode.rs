@@ -1,10 +1,8 @@
 use std::collections::HashSet;
-use std::fs;
 
-use crate::apply_affinity::{read_cmdline, task_tids, tid_comm};
+use crate::apply_affinity::{proc_walk, task_tids, tid_comm};
 use crate::cache::ProcCache;
 use crate::config::AppConfig;
-use crate::rule_match::pkg_match;
 
 /// /proc 轮询扫描状态
 pub struct ProcScanState {
@@ -33,42 +31,13 @@ impl ProcScanState {
 pub fn proc_scan(cfg: &AppConfig, state: &mut ProcScanState) -> usize {
     state.cache.clear();
 
-    let proc_dir = match fs::read_dir("/proc") {
-        Ok(d) => d,
-        Err(_) => return 0,
-    };
-
-    let mut count: usize = 0;
-    let mut current_proc_total: i32 = 0;
-
-    for entry in proc_dir.flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        let Ok(pid) = name_str.parse::<i32>() else {
-            continue;
-        };
-        current_proc_total += 1;
-
-        if !state.scan_all_proc && !state.tracked_pids.contains(&pid) {
-            continue;
-        }
-
-        let Some(proc_name) = read_cmdline(pid) else {
-            continue;
-        };
-
-        let (interested, has_thread_rules) = pkg_match(&proc_name, cfg);
-        if !interested {
-            continue;
-        }
-
-        // 仅 task 插入成功才缓存 pkgs 避免 pid 复用脏缓存
-        let any_inserted = proc_tasks(pid, &proc_name, has_thread_rules, cfg, &mut state.cache);
-        if any_inserted {
-            state.cache.pkgs.insert(pid, (proc_name, has_thread_rules));
-            count += 1;
-        }
-    }
+    let (count, current_proc_total) = proc_walk(
+        cfg,
+        |pid| state.scan_all_proc || state.tracked_pids.contains(&pid),
+        |pid, pkg, has_thread_rules| {
+            proc_tasks(pid, pkg, has_thread_rules, cfg, &mut state.cache);
+        },
+    );
 
     state.scan_all_proc = current_proc_total > state.last_proc_total;
     state.last_proc_total = current_proc_total;
@@ -132,7 +101,7 @@ fn proc_tasks(
             String::new()
         };
 
-        let inserted = cache.task_apply(tid, pid, pkg, &thread_name, has_thread_rules, cfg, true, |_, _, _| false);
+        let inserted = cache.task_apply(tid, pid, pkg, &thread_name, has_thread_rules, cfg, |_, _, _| false);
         any_inserted |= inserted;
     }
     any_inserted
