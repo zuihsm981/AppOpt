@@ -8,11 +8,10 @@ use std::thread;
 use aya::maps::{Array as AyaArray, HashMap as AyaHashMap};
 use aya::{programs::TracePoint as AyaTracePoint, Ebpf, EbpfLoader, Pod};
 
-use crate::apply_affinity::{affinity_set, read_cmdline, task_tids, tid_comm};
-use crate::cache::{comm_str, ProcCache};
+use crate::apply_affinity::{affinity_set, proc_walk, task_tids, tid_comm};
+use crate::cache::ProcCache;
 use crate::config::{AppConfig, CURRENT_CONFIG};
 use crate::cpuset::CpuSet;
-use crate::rule_match::pkg_match;
 
 /// eBPF 进程事件，布局需与内核态 ProcEvent 一致
 #[repr(C)]
@@ -39,6 +38,12 @@ struct EbpfOffsets {
 }
 
 unsafe impl Pod for EbpfOffsets {}
+
+/// 将内核 comm 截断于首个 NUL 并 trim 尾部空白
+fn comm_str<'a>(comm: &'a [u8; 16]) -> &'a str {
+    let end = comm.iter().position(|&b| b == 0).unwrap_or(16);
+    std::str::from_utf8(&comm[..end]).unwrap_or("").trim()
+}
 
 pub struct EbpfState {
     pub event_rx: mpsc::Receiver<EbpfProcEvent>,
@@ -67,15 +72,9 @@ impl Drop for EbpfState {
     }
 }
 
-/// 检测 eBPF 支持，BTF 与 AppOpt-ebpf 二进制均存在才返回 true
+/// 仅检测 BTF 支持
 pub fn ebpf_probe() -> bool {
-    if fs::metadata("/sys/kernel/btf/vmlinux").is_err() {
-        return false;
-    }
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.join("AppOpt-ebpf")))
-        .is_some_and(|path| path.exists())
+    fs::metadata("/sys/kernel/btf/vmlinux").is_ok()
 }
 
 fn attach_tracepoint(bpf: &mut Ebpf, category: &str, name: &str, required: bool) -> bool {
@@ -132,11 +131,11 @@ fn comm_keys_build<'a, I: IntoIterator<Item = &'a String>>(pkgs: I) -> Vec<[u8; 
     entries
 }
 
-/// 初始化 TARGET_COMM_MAP，返回 true 表示容量不足需重载内核端
-pub fn comm_map_init(bpf: &mut Ebpf, pkgs: &HashSet<String>, comm_capacity: &mut u32) -> bool {
+/// 初始化 TARGET_COMM_MAP，返回 true 表示需重载
+pub fn comm_map_init(bpf: &mut Ebpf, pkgs: &HashSet<String>, comm_capacity: u32) -> bool {
     let entries = comm_keys_build(pkgs.iter());
 
-    if entries.len() > *comm_capacity as usize {
+    if entries.len() > comm_capacity as usize {
         eprintln!(
             "eBPF: 白名单容量不足（需 {} > 现 {}），触发内核端重载",
             entries.len(),
@@ -169,8 +168,17 @@ pub fn comm_map_init(bpf: &mut Ebpf, pkgs: &HashSet<String>, comm_capacity: &mut
         }
     }
 
+    if count < entries.len() {
+        eprintln!(
+            "eBPF: 白名单插入部分失败（{}/{}），触发重载",
+            count,
+            entries.len()
+        );
+        return true;
+    }
+
     println!(
-        "eBPF: FORK/EXEC 白名单已配置，{} 个包名 > {} 条匹配规则",
+        "eBPF: 白名单已配置，{} 个包名 > {} 条匹配规则",
         pkgs.len(),
         count
     );
@@ -201,13 +209,7 @@ fn tracepoint_parse(root: &str, category: &str, name: &str) -> Option<HashMap<St
         if parts.len() < 2 {
             continue;
         }
-        let field_name = parts[0]
-            .split_whitespace()
-            .last()
-            .unwrap_or("")
-            .split('[')
-            .next()
-            .unwrap_or("");
+        let field_name = parts[0].split_whitespace().last().unwrap_or("").split('[').next().unwrap_or("");
         if field_name.is_empty() {
             continue;
         }
@@ -306,15 +308,11 @@ pub fn ebpf_init() -> Option<EbpfState> {
         ebpf_data.len()
     );
 
-    // 按包名数动态设置容量，最小 512 覆盖常见场景，不足时重载自然倍增
-    let pkgs = crate::common::lock_ignore_poison(&CURRENT_CONFIG)
+    let pkgs_len = crate::lock_ignore_poison(&CURRENT_CONFIG)
         .as_ref()
-        .map(|cfg| cfg.pkgs.clone())
-        .unwrap_or_default();
-    let capacity = comm_keys_build(pkgs.iter())
-        .len()
-        .max(512)
-        .next_power_of_two() as u32;
+        .map(|cfg| cfg.pkgs.len())
+        .unwrap_or(0);
+    let capacity = (pkgs_len * 2).max(512).next_power_of_two() as u32;
 
     let mut loader = EbpfLoader::new();
     loader.map_max_entries("TARGET_COMM_MAP", capacity);
@@ -367,7 +365,7 @@ pub fn ebpf_init() -> Option<EbpfState> {
         ebpf_reader(ring_buf, tx, wakeup_fd);
     });
 
-    println!("eBPF: 初始化成功，使用纯事件驱动模式（启动后零 /proc 读）");
+    println!("eBPF: 初始化成功");
 
     Some(EbpfState {
         event_rx: rx,
@@ -452,14 +450,13 @@ fn ebpf_reader(
     unsafe { libc::close(epfd) };
 }
 
+fn applied_get(bpf: &mut Ebpf) -> Option<AyaHashMap<&mut aya::maps::MapData, u32, u64>> {
+    AyaHashMap::<_, u32, u64>::try_from(bpf.map_mut("APPLIED_MAP")?).ok()
+}
+
 /// 写入 APPLIED_MAP tid 到 CPU mask
 fn applied_set(bpf: &mut Ebpf, tid: i32, cpus: &CpuSet) {
-    let Some(map) = bpf.map_mut("APPLIED_MAP") else {
-        return;
-    };
-    let Ok(mut applied) = AyaHashMap::<_, u32, u64>::try_from(map) else {
-        return;
-    };
+    let Some(mut applied) = applied_get(bpf) else { return };
     if let Err(e) = applied.insert(&(tid as u32), cpus.bits[0], 0) {
         eprintln!("eBPF: APPLIED_MAP 插入失败 tid={} ({})，map 可能已满", tid, e);
     }
@@ -467,23 +464,13 @@ fn applied_set(bpf: &mut Ebpf, tid: i32, cpus: &CpuSet) {
 
 /// 从 APPLIED_MAP 删除 tid
 fn applied_del(bpf: &mut Ebpf, tid: i32) {
-    let Some(map) = bpf.map_mut("APPLIED_MAP") else {
-        return;
-    };
-    let Ok(mut applied) = AyaHashMap::<_, u32, u64>::try_from(map) else {
-        return;
-    };
+    let Some(mut applied) = applied_get(bpf) else { return };
     let _ = applied.remove(&(tid as u32));
 }
 
 /// 清空 APPLIED_MAP 所有条目
 fn applied_clear(bpf: &mut Ebpf) {
-    let Some(map) = bpf.map_mut("APPLIED_MAP") else {
-        return;
-    };
-    let Ok(mut m) = AyaHashMap::<_, u32, u64>::try_from(map) else {
-        return;
-    };
+    let Some(mut m) = applied_get(bpf) else { return };
     let keys: Vec<u32> = m.keys().filter_map(|r| r.ok()).collect();
     for k in &keys {
         let _ = m.remove(k);
@@ -513,28 +500,24 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
 
     match event.event_type {
         EBPF_EVENT_EXIT => {
-            if tid == pid {
-                state.cache.pkgs.remove(&pid);
-            }
             state.cache.task_del(tid);
             applied_del(&mut state.bpf, tid);
         }
 
         EBPF_EVENT_EXEC => {
-            state.cache.pkgs.remove(&pid);
-            if !event_apply(&mut state.cache, &mut state.bpf, tid, pid, &comm, cfg, true) {
+            if !event_apply(&mut state.cache, &mut state.bpf, tid, pid, comm, cfg) {
                 state.cache.task_del(tid);
                 applied_del(&mut state.bpf, tid);
             }
         }
 
         EBPF_EVENT_FORK => {
-            // FORK 子线程继承父 comm 不可信，主线程 tid==pid comm 为自身
-            event_apply(&mut state.cache, &mut state.bpf, tid, pid, &comm, cfg, tid == pid);
+            // 子线程继承父线程亲和性与 cpuset
+            // 内核态已插入 APPLIED_MAP 占位，RENAME 时触发完整处理
         }
 
         EBPF_EVENT_RENAME => {
-            event_apply(&mut state.cache, &mut state.bpf, tid, pid, &comm, cfg, true);
+            event_apply(&mut state.cache, &mut state.bpf, tid, pid, comm, cfg);
         }
 
         _ => {}
@@ -549,17 +532,14 @@ fn event_apply(
     pid: i32,
     comm: &str,
     cfg: &AppConfig,
-    trust_comm: bool,
 ) -> bool {
     let Some((pkg, has_thread_rules)) = cache.pkg_lookup_comm(pid, comm, cfg) else {
         return false;
     };
 
-    let _applied = cache.task_apply(tid, pid, &pkg, comm, has_thread_rules, cfg, trust_comm, |t, c, d| {
+    cache.task_apply(tid, pid, &pkg, comm, has_thread_rules, cfg, |t, c, d| {
         affinity_apply(t, c, d, cfg, bpf)
-    });
-
-    true
+    })
 }
 
 /// 定期纠正 affinity_sync 清死亡 tid
@@ -570,33 +550,13 @@ pub fn affinity_check(state: &mut EbpfState, cfg: &AppConfig) {
     }
 }
 
-/// 全量扫描 /proc 仅启动或配置更新时调用，日常零 /proc 读
+/// 启动或配置更新时全量扫描 /proc
 pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
     state.cache.clear();
     applied_clear(&mut state.bpf);
 
-    let proc_dir = match fs::read_dir("/proc") {
-        Ok(d) => d,
-        Err(_) => return,
-    };
-
-    let targets: Vec<(i32, String, bool)> = proc_dir
-        .flatten()
-        .filter_map(|entry| {
-            let pid = entry.file_name().to_string_lossy().parse::<i32>().ok()?;
-            let pkg = read_cmdline(pid).or_else(|| tid_comm(pid))?;
-            let (interested, has_thread_rules) = pkg_match(&pkg, cfg);
-            if !interested {
-                return None;
-            }
-            Some((pid, pkg, has_thread_rules))
-        })
-        .collect();
-
-    for (pid, pkg, has_thread_rules) in targets {
-        let Some(tids) = task_tids(pid) else {
-            continue;
-        };
+    proc_walk(cfg, |_| true, |pid, pkg, has_thread_rules| {
+        let Some(tids) = task_tids(pid) else { return };
         for tid in tids {
             let t_name = if has_thread_rules {
                 tid_comm(tid).unwrap_or_default()
@@ -604,19 +564,11 @@ pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
                 String::new()
             };
             state.cache.task_apply(
-                tid,
-                pid,
-                &pkg,
-                &t_name,
-                has_thread_rules,
-                cfg,
-                true,
+                tid, pid, pkg, &t_name, has_thread_rules, cfg,
                 |tid, cpus, cpuset_dir| {
                     affinity_apply(tid, cpus, cpuset_dir, cfg, &mut state.bpf)
                 },
             );
         }
-        // 缓存 pkg 信息
-        state.cache.pkgs.insert(pid, (pkg, has_thread_rules));
-    }
+    });
 }
