@@ -2,16 +2,17 @@ use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs;
 use std::io;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
 
-use crate::common::{
-    base_cpuset, lock_ignore_poison, CONFIG_UPDATED, INOTIFY_FD, INOTIFY_SUPPORTED, INOTIFY_WD,
-    MAX_PKG_LEN, MAX_THREAD_LEN,
-};
-use crate::cpuset::{create_cpuset_dir, parse_cpu_spec, CpuSet, CpuTopology};
+use crate::{lock_ignore_poison, CONFIG_UPDATED, MAX_PKG_LEN, MAX_THREAD_LEN};
+use crate::cpuset::{base_cpuset, create_cpuset_dir, parse_cpu_spec, CpuSet, CpuTopology};
+
+pub static INOTIFY_SUPPORTED: AtomicBool = AtomicBool::new(false);
+pub static INOTIFY_FD: AtomicI32 = AtomicI32::new(-1);
+pub static INOTIFY_WD: AtomicI32 = AtomicI32::new(-1);
 
 pub struct AffinityRule {
     pub pkg: String,
@@ -83,7 +84,7 @@ pub fn load_config(
         .ok()?
         .duration_since(UNIX_EPOCH)
         .ok()?
-        .as_nanos() as i64;
+        .as_secs() as i64;
 
     if *last_mtime == mtime && *last_mtime != -1 {
         return None;
@@ -269,6 +270,42 @@ pub fn config_loader(interval: u64) {
             config_reload(&mut last_mtime);
             thread::sleep(Duration::from_secs(interval));
         }
+    }
+}
+
+/// 初始化 inotify 监控配置文件变更
+pub fn init_inotify(config_file: &str) {
+    let inotify_fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+    if inotify_fd < 0 {
+        println!("inotify初始化失败，使用轮询模式");
+        return;
+    }
+    // 路径含 NUL 时无法构造 CString，降级到轮询模式
+    let cfg_cstr = match CString::new(config_file) {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("错误: 配置文件路径包含非法字符，使用轮询模式");
+            unsafe { libc::close(inotify_fd); }
+            return;
+        }
+    };
+    let wd = unsafe {
+        libc::inotify_add_watch(
+            inotify_fd,
+            cfg_cstr.as_ptr(),
+            libc::IN_CLOSE_WRITE | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF,
+        )
+    };
+    if wd >= 0 {
+        INOTIFY_SUPPORTED.store(true, Ordering::Release);
+        INOTIFY_FD.store(inotify_fd, Ordering::Release);
+        INOTIFY_WD.store(wd, Ordering::Release);
+        println!("启用inotify监控配置文件变更");
+    } else {
+        unsafe {
+            libc::close(inotify_fd);
+        }
+        println!("inotify初始化失败，使用轮询模式");
     }
 }
 
