@@ -338,8 +338,9 @@ pub fn ebpf_init() -> Option<EbpfState> {
     if !attach_tracepoint(&mut bpf, "sched", "sched_process_exit", true) {
         return None;
     }
-
-    attach_tracepoint(&mut bpf, "task", "task_rename", false);
+    if !attach_tracepoint(&mut bpf, "task", "task_rename", true) {
+        return None;
+    }
 
     let ring_buf = match bpf.take_map("EVENTS") {
         Some(map) => match aya::maps::RingBuf::try_from(map) {
