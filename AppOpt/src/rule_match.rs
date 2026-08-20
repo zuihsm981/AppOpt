@@ -56,7 +56,7 @@ pub fn thread_affinity(
     if cpus.count() == 0 {
         if cfg.has_thread_rules.contains(pkg) {
             return Some(AffinityResult {
-                cpus: cfg.topo.present_cpus.clone(),
+                cpus: cfg.topo.present_cpus,
                 cpuset_dir: String::new(),
                 is_thread_rule: false,
             });
@@ -72,7 +72,7 @@ pub fn thread_affinity(
 }
 
 /// POSIX fnmatch 封装，需预转换为 CString
-pub fn fnmatch_c(pattern: &CString, string: &str) -> bool {
+fn fnmatch_c(pattern: &CString, string: &str) -> bool {
     if string.len() >= MAX_THREAD_LEN {
         return false;
     }
