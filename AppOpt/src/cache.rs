@@ -5,7 +5,6 @@ use crate::config::AppConfig;
 use crate::cpuset::{CpuSet, CpuTopology};
 use crate::rule_match::{comm_to_pkg, thread_affinity};
 
-/// 线程条目
 pub struct TaskEntry {
     pub pid: i32,
     pub pkg: String,
@@ -35,11 +34,8 @@ impl ProcCache {
     }
 
     /// comm 匹配包名，线程名时回退主线程条目
-    pub fn pkg_lookup_comm(&self, pid: i32, comm: &str, cfg: &AppConfig) -> Option<(String, bool)> {
-        let pkg = comm_to_pkg(comm, cfg)
-            .or_else(|| self.tasks.get(&pid).map(|e| e.pkg.clone()))?;
-        let htr = cfg.has_thread_rules.contains(&pkg);
-        Some((pkg, htr))
+    pub fn pkg_lookup_comm(&self, pid: i32, comm: &str, cfg: &AppConfig) -> Option<String> {
+        comm_to_pkg(comm, cfg).or_else(|| self.tasks.get(&pid).map(|e| e.pkg.clone()))
     }
 
     /// 计算并应用线程亲和性，保护已有线程规则绑定防止降级
@@ -49,14 +45,13 @@ impl ProcCache {
         pid: i32,
         pkg: &str,
         comm: &str,
-        has_thread_rules: bool,
         cfg: &AppConfig,
         apply_fn: F,
     ) -> bool
     where
         F: FnOnce(i32, &CpuSet, &str) -> bool,
     {
-        let thread_name = if has_thread_rules { comm } else { "" };
+        let thread_name = if cfg.has_thread_rules.contains(pkg) { comm } else { "" };
         let Some(result) = thread_affinity(pkg, thread_name, cfg) else {
             return false;
         };
