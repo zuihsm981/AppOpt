@@ -4,7 +4,6 @@ use crate::apply_affinity::{proc_walk, task_tids, tid_comm};
 use crate::cache::ProcCache;
 use crate::config::AppConfig;
 
-/// /proc 轮询扫描状态
 pub struct ProcScanState {
     pub cache: ProcCache,
     pub last_proc_count: i32,
@@ -27,7 +26,6 @@ impl ProcScanState {
     }
 }
 
-/// 全量扫描 /proc 重建 ProcCache
 pub fn proc_scan(cfg: &AppConfig, state: &mut ProcScanState) -> usize {
     state.cache.clear();
 
@@ -101,7 +99,7 @@ fn proc_tasks(
             String::new()
         };
 
-        let inserted = cache.task_apply(tid, pid, pkg, &thread_name, has_thread_rules, cfg, |_, _, _| false);
+        let inserted = cache.task_apply(tid, pid, pkg, &thread_name, cfg, |_, _, _| false);
         any_inserted |= inserted;
     }
     any_inserted
