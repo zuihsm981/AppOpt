@@ -3,32 +3,31 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io;
 
-use std::sync::OnceLock;
+use std::sync::RwLock;
 
 pub const CPU_SETSIZE: usize = 1024;
 pub const CPU_WORD_BITS: usize = 64;
 pub const CPU_WORDS: usize = CPU_SETSIZE / CPU_WORD_BITS;
 
-/// BASE_CPUSET 运行时路径，未设置时默认 /dev/cpuset/AppOpt
-static BASE_CPUSET_PATH: OnceLock<String> = OnceLock::new();
+/// BASE_CPUSET 运行时路径，web 端可热更新，未设置时默认 /dev/cpuset/AppOpt
+static BASE_CPUSET_PATH: RwLock<Option<String>> = RwLock::new(None);
 
 pub const DEFAULT_CPUSET_NAME: &str = "AppOpt";
 
-/// 设置 BASE_CPUSET 目录名，name 为空或含 / 时使用默认值
+/// 设置 BASE_CPUSET 目录名，name 为空或含 / 时忽略
 pub fn set_base_cpuset(name: &str) {
     if name.is_empty() || name.contains('/') {
         return;
     }
-    let path = format!("/dev/cpuset/{}", name);
-    let _ = BASE_CPUSET_PATH.set(path);
+    *BASE_CPUSET_PATH.write().unwrap() = Some(format!("/dev/cpuset/{}", name));
 }
 
-/// 获取 BASE_CPUSET 路径，未设置返回默认值
-pub fn base_cpuset() -> &'static str {
+pub fn base_cpuset() -> String {
     BASE_CPUSET_PATH
-        .get()
-        .map(|s| s.as_str())
-        .unwrap_or("/dev/cpuset/AppOpt")
+        .read()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| "/dev/cpuset/AppOpt".to_string())
 }
 
 const _: () = assert!(std::mem::size_of::<CpuSet>() == std::mem::size_of::<libc::cpu_set_t>());
@@ -70,8 +69,7 @@ impl CpuSet {
         }
     }
 
-    /// 转换为范围字符串
-    pub fn to_range_string(&self) -> String {
+    pub fn to_range_string(self) -> String {
         let mut result = String::new();
         let mut start: Option<usize> = None;
         let mut end: Option<usize> = None;
@@ -153,7 +151,6 @@ fn push_range(s: &mut String, start: Option<usize>, end: Option<usize>, first: &
     }
 }
 
-/// 解析 CPU 范围字符串
 pub fn parse_cpu_ranges(spec: &str, present: Option<&CpuSet>) -> CpuSet {
     let mut set = CpuSet::new();
     if spec.is_empty() {
@@ -183,11 +180,10 @@ pub fn parse_cpu_ranges(spec: &str, present: Option<&CpuSet>) -> CpuSet {
             (a, a)
         };
         for i in lo..=hi.min(CPU_SETSIZE - 1) {
-            if let Some(present) = present {
-                if !present.is_set(i) {
+            if let Some(present) = present
+                && !present.is_set(i) {
                     continue;
                 }
-            }
             set.set(i);
         }
     }
@@ -266,7 +262,6 @@ pub struct CpuTopology {
     pub present_str: String,
     pub mems_str: String,
     pub cpuset_enabled: bool,
-    /// 语义核心分层：最低频为 e-core，最高频为 hp-core，中间为 p-core
     pub e_core: CpuSet,
     pub p_core: CpuSet,
     pub hp_core: CpuSet,
@@ -313,7 +308,6 @@ fn detect_core_types() -> (CpuSet, CpuSet, CpuSet) {
     let mut h = CpuSet::new();
     let n = groups.len();
     for (i, (_, cpus)) in groups.iter().enumerate() {
-        // 首组入 e-core，末组入 hp-core，其余入 p-core
         let target = if i == 0 {
             &mut e
         } else if i == n - 1 {
@@ -363,7 +357,7 @@ pub fn init_cpu_topo() -> CpuTopology {
         .unwrap_or_else(|| "0".to_string());
     topo.mems_str = mems;
 
-    if create_cpuset_dir(base_cpuset(), &topo.present_str, &topo.mems_str) {
+    if create_cpuset_dir(&base_cpuset(), &topo.present_str, &topo.mems_str) {
         topo.cpuset_enabled = true;
     }
 
