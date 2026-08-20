@@ -40,7 +40,7 @@ struct EbpfOffsets {
 unsafe impl Pod for EbpfOffsets {}
 
 /// 将内核 comm 截断于首个 NUL 并 trim 尾部空白
-fn comm_str<'a>(comm: &'a [u8; 16]) -> &'a str {
+fn comm_str(comm: &[u8; 16]) -> &str {
     let end = comm.iter().position(|&b| b == 0).unwrap_or(16);
     std::str::from_utf8(&comm[..end]).unwrap_or("").trim()
 }
@@ -72,7 +72,6 @@ impl Drop for EbpfState {
     }
 }
 
-/// 仅检测 BTF 支持
 pub fn ebpf_probe() -> bool {
     fs::metadata("/sys/kernel/btf/vmlinux").is_ok()
 }
@@ -214,12 +213,11 @@ fn tracepoint_parse(root: &str, category: &str, name: &str) -> Option<HashMap<St
             continue;
         }
         for part in &parts[1..] {
-            if let Some(off_str) = part.strip_prefix("offset:") {
-                if let Ok(off) = off_str.trim().parse::<u32>() {
+            if let Some(off_str) = part.strip_prefix("offset:")
+                && let Ok(off) = off_str.trim().parse::<u32>() {
                     offsets.insert(field_name.to_string(), off);
                     break;
                 }
-            }
         }
     }
     Some(offsets)
@@ -257,7 +255,7 @@ fn offsets_inject(bpf: &mut Ebpf) -> bool {
         eprintln!("eBPF: OFFSETS_MAP 类型转换失败，回退到 /proc 轮询");
         return false;
     };
-    if offsets_map.set(0, &offsets, 0).is_err() {
+    if offsets_map.set(0, offsets, 0).is_err() {
         eprintln!("eBPF: OFFSETS_MAP 注入失败，回退到 /proc 轮询");
         return false;
     }
@@ -425,14 +423,7 @@ fn ebpf_reader(
         }
 
         // wakeup 事件优先退出
-        let mut wakeup = false;
-        for i in 0..n as usize {
-            if events[i].u64 == 1 {
-                wakeup = true;
-                break;
-            }
-        }
-        if wakeup {
+        if events.iter().take(n as usize).any(|e| e.u64 == 1) {
             break;
         }
 
@@ -455,21 +446,18 @@ fn applied_get(bpf: &mut Ebpf) -> Option<AyaHashMap<&mut aya::maps::MapData, u32
     AyaHashMap::<_, u32, u64>::try_from(bpf.map_mut("APPLIED_MAP")?).ok()
 }
 
-/// 写入 APPLIED_MAP tid 到 CPU mask
 fn applied_set(bpf: &mut Ebpf, tid: i32, cpus: &CpuSet) {
     let Some(mut applied) = applied_get(bpf) else { return };
-    if let Err(e) = applied.insert(&(tid as u32), cpus.bits[0], 0) {
+    if let Err(e) = applied.insert(tid as u32, cpus.bits[0], 0) {
         eprintln!("eBPF: APPLIED_MAP 插入失败 tid={} ({})，map 可能已满", tid, e);
     }
 }
 
-/// 从 APPLIED_MAP 删除 tid
 fn applied_del(bpf: &mut Ebpf, tid: i32) {
     let Some(mut applied) = applied_get(bpf) else { return };
     let _ = applied.remove(&(tid as u32));
 }
 
-/// 清空 APPLIED_MAP 所有条目
 fn applied_clear(bpf: &mut Ebpf) {
     let Some(mut m) = applied_get(bpf) else { return };
     let keys: Vec<u32> = m.keys().filter_map(|r| r.ok()).collect();
@@ -505,12 +493,11 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
             applied_del(&mut state.bpf, tid);
         }
 
-        EBPF_EVENT_EXEC => {
-            if !event_apply(&mut state.cache, &mut state.bpf, tid, pid, comm, cfg) {
+        EBPF_EVENT_EXEC
+            if !event_apply(&mut state.cache, &mut state.bpf, tid, pid, comm, cfg) => {
                 state.cache.task_del(tid);
                 applied_del(&mut state.bpf, tid);
             }
-        }
 
         EBPF_EVENT_FORK => {
             // 子线程继承父线程亲和性与 cpuset
@@ -534,11 +521,11 @@ fn event_apply(
     comm: &str,
     cfg: &AppConfig,
 ) -> bool {
-    let Some((pkg, has_thread_rules)) = cache.pkg_lookup_comm(pid, comm, cfg) else {
+    let Some(pkg) = cache.pkg_lookup_comm(pid, comm, cfg) else {
         return false;
     };
 
-    cache.task_apply(tid, pid, &pkg, comm, has_thread_rules, cfg, |t, c, d| {
+    cache.task_apply(tid, pid, &pkg, comm, cfg, |t, c, d| {
         affinity_apply(t, c, d, cfg, bpf)
     })
 }
@@ -564,12 +551,9 @@ pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
             } else {
                 String::new()
             };
-            state.cache.task_apply(
-                tid, pid, pkg, &t_name, has_thread_rules, cfg,
-                |tid, cpus, cpuset_dir| {
-                    affinity_apply(tid, cpus, cpuset_dir, cfg, &mut state.bpf)
-                },
-            );
+            state.cache.task_apply(tid, pid, pkg, &t_name, cfg, |tid, cpus, cpuset_dir| {
+                affinity_apply(tid, cpus, cpuset_dir, cfg, &mut state.bpf)
+            });
         }
     });
 }
