@@ -42,7 +42,6 @@ pub(crate) fn tid_comm(tid: i32) -> Option<String> {
     Some(name.trim().to_string())
 }
 
-/// 读 /proc/{pid}/task 下全部 tid
 pub(crate) fn task_tids(pid: i32) -> Option<Vec<i32>> {
     let mut path_buf = [0u8; 32];
     let mut cur = std::io::Cursor::new(&mut path_buf[..]);
@@ -66,11 +65,10 @@ pub fn affinity_set(
     topo: &CpuTopology,
 ) -> bool {
     // sched_getaffinity 短路，已符合目标零开销返回
-    if let Some(curr) = CpuSet::get_affinity(tid) {
-        if curr == *cpus {
+    if let Some(curr) = CpuSet::get_affinity(tid)
+        && curr == *cpus {
             return false;
         }
-    }
     if topo.cpuset_enabled {
         let tasks_path = if cpuset_dir.is_empty() {
             format!("{}/tasks", base_cpuset())
