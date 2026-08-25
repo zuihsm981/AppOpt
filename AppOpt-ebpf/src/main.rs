@@ -4,7 +4,7 @@
 #![allow(dead_code)]
 
 use aya_ebpf::{
-    helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_ktime_get_ns},
+    helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read},
     macros::{kprobe, map, tracepoint},
     maps::{Array, HashMap, LruHashMap, RingBuf},
     programs::{ProbeContext, TracePointContext},
@@ -15,7 +15,7 @@ const EVENT_EXEC: u32 = 2;
 const EVENT_RENAME: u32 = 3;
 const EVENT_EXIT: u32 = 4;
 const EVENT_INPUT: u32 = 5;
-const EVENT_OOM_ADJ: u32 = 7;
+const EVENT_FG_CHANGE: u32 = 8;
 
 /// 4 类 tracepoint 字段布局：fork 读 child_pid/child_comm，exec/exit 用 bpf_get_current_pid_tgid，rename 读 newcomm
 
@@ -95,6 +95,12 @@ fn whitelist_matched(comm: &[u8; 16]) -> bool {
         }
     }
     false
+}
+
+/// comm 中是否含 '.'，用于判断是否为用户应用进程
+#[inline(always)]
+fn comm_has_dot(comm: &[u8; 16]) -> bool {
+    comm.iter().take(15).any(|&b| b == b'.')
 }
 
 #[inline(always)]
@@ -257,17 +263,32 @@ fn kprobe_input_event(_ctx: ProbeContext) -> u32 {
     0
 }
 
-/// 前台应用切换检测：kprobe oom_score_adj_write
-/// Android ActivityManagerService 切换前台时写 /proc/<pid>/oom_score_adj
-/// 此函数被调用，发射事件通知用户态扫描 /proc 确认前台应用
-#[kprobe(function = "oom_score_adj_write")]
-fn oom_adj_write(_ctx: ProbeContext) -> u32 {
+/// 前台应用切换检测：kprobe set_task_comm
+/// set_task_comm 在进程创建/改名时调用，2nd arg (buf) 是新进程名（包名）
+/// 直接从参数读取包名，无需扫描 /proc
+#[kprobe(function = "set_task_comm")]
+fn kprobe_set_task_comm(ctx: ProbeContext) -> u32 {
+    // arm64: 2nd arg (buf) 在 pt_regs offset 8 (x1)
+    let buf_ptr = ctx.read_at::<*const u8>(8).unwrap_or(core::ptr::null());
+    if buf_ptr.is_null() {
+        return 0;
+    }
+
+    // 从内核内存读取新进程名
+    let mut comm = [0u8; 16];
+    let _ = unsafe { bpf_probe_read(&mut comm as *mut _ as *mut _, 16, buf_ptr as *const _) };
+
+    // 仅用户应用（含 '.'）才发射事件
+    if !comm_has_dot(&comm) {
+        return 0;
+    }
+
     let pid_tgid = bpf_get_current_pid_tgid();
     submit_event(ProcEvent {
         pid: (pid_tgid >> 32) as i32,
         tid: pid_tgid as i32,
-        comm: bpf_get_current_comm().unwrap_or_default(),
-        event_type: EVENT_OOM_ADJ,
+        comm,
+        event_type: EVENT_FG_CHANGE,
     });
     0
 }
