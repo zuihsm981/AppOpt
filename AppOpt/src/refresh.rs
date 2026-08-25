@@ -13,11 +13,9 @@ const MODE_90: i32 = 2;
 
 const CONFIG_PATH: &str = "./refresh_config.conf";
 const APPS_CONFIG_PATH: &str = "./refresh_config_apps.conf";
-const OOM_ADJ_DEBOUNCE_MS: u64 = 100;
-const FG_ADJ_THRESHOLD: i32 = 200;
 
 pub const EVENT_INPUT: u32 = 5;
-pub const EVENT_OOM_ADJ: u32 = 7;
+pub const EVENT_FG_CHANGE: u32 = 8;
 
 static REFRESH_FORCE_RELOAD: AtomicBool = AtomicBool::new(false);
 static WAKE_FD: AtomicI32 = AtomicI32::new(-1);
@@ -38,7 +36,7 @@ pub struct RefreshStatus {
 
 enum RefreshEvent {
     Input,
-    OomAdj,
+    FgChange { comm: [u8; 16] },
 }
 
 struct AppRefreshConfig {
@@ -62,7 +60,6 @@ struct RefreshState {
     current_package: String,
     last_applied_pkg: String,
     last_apply_time: Option<Instant>,
-    last_fg_check_time: Option<Instant>,
     last_input_time: Option<Instant>,
     backlight_path: Option<String>,
     prev_backlight: bool,
@@ -102,21 +99,10 @@ fn read_backlight(path: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 从 /proc/<pid>/status 读取 UID，比 fs::metadata 更可靠
-fn read_proc_uid(pid: i32) -> u32 {
-    let content = match fs::read_to_string(format!("/proc/{}/status", pid)) {
-        Ok(c) => c,
-        Err(_) => return 0,
-    };
-    for line in content.lines() {
-        if line.starts_with("Uid:") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 {
-                return parts[1].parse::<u32>().unwrap_or(0);
-            }
-        }
-    }
-    0
+/// 从内核 comm 截断于首个 NUL 并 trim
+fn comm_str(comm: &[u8; 16]) -> String {
+    let end = comm.iter().position(|&b| b == 0).unwrap_or(16);
+    std::str::from_utf8(&comm[..end]).unwrap_or("").trim().to_string()
 }
 
 fn create_default_config() {
@@ -257,72 +243,15 @@ fn switch_to_idle(state: &mut RefreshState) {
     state.is_paused = true;
 }
 
-/// 扫描 /proc 找到前台应用：oom_score_adj 最低且 < 200 的用户应用
-/// Android oom_score_adj: 前台 0-100, 可见 100-200, 后台 900+
-fn find_foreground_package() -> Option<String> {
-    let entries = fs::read_dir("/proc").ok()?;
-    let mut best: Option<(String, i32)> = None;
-    for entry in entries.flatten() {
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else { continue };
-
-        let adj = fs::read_to_string(format!("/proc/{}/oom_score_adj", pid))
-            .ok()
-            .and_then(|s| s.trim().parse::<i32>().ok())
-            .unwrap_or(1000);
-        if adj >= FG_ADJ_THRESHOLD {
-            continue;
-        }
-
-        let cmdline = match fs::read(format!("/proc/{}/cmdline", pid)) {
-            Ok(data) => {
-                let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-                let s = std::str::from_utf8(&data[..end]).unwrap_or("");
-                let name = s.rsplit('/').next().unwrap_or(s);
-                name.trim().to_string()
-            }
-            Err(_) => continue,
-        };
-        if cmdline.is_empty() {
-            continue;
-        }
-        // 排除 SystemUI（始终可见，下拉通知栏时 adj=0 会干扰）
-        if cmdline.starts_with("com.android.systemui") {
-            continue;
-        }
-        // 用户应用 UID >= 10000，桌面 com.android.launcher3 特殊放行
-        // 从 /proc/<pid>/status 读取 UID（比 fs::metadata 更可靠，不受 SELinux stat 拦截）
-        let uid = read_proc_uid(pid);
-        let is_user_app = uid >= 10000;
-        let is_launcher = cmdline == "com.android.launcher3";
-        if !is_user_app && !is_launcher {
-            continue;
-        }
-
-        match &best {
-            None => best = Some((cmdline, adj)),
-            Some((_, b)) if adj < *b => best = Some((cmdline, adj)),
-            _ => {}
-        }
-    }
-    best.map(|(pkg, _)| pkg)
-}
-
-/// kprobe oom_score_adj_write 触发：前台应用可能变化
-/// 扫描 /proc 确认实际前台应用（oom_score_adj 最低），仅在变化时切换
-fn handle_oom_adj(state: &mut RefreshState) {
-    let now = Instant::now();
-    if let Some(last) = state.last_fg_check_time {
-        if now - last < std::time::Duration::from_millis(OOM_ADJ_DEBOUNCE_MS) {
-            return;
-        }
-    }
-    state.last_fg_check_time = Some(now);
-
-    let Some(pkg) = find_foreground_package() else { return };
-    if pkg == state.last_applied_pkg {
+/// kprobe set_task_comm 触发：直接从事件参数获取包名
+/// 纯事件驱动，不扫描 /proc
+fn handle_fg_change(state: &mut RefreshState, comm: &[u8; 16]) {
+    let pkg = comm_str(comm);
+    if pkg.is_empty() || pkg == state.last_applied_pkg {
         return;
     }
 
+    let now = Instant::now();
     state.current_package = pkg.clone();
     state.last_applied_pkg = pkg;
     state.last_apply_time = Some(now);
@@ -460,7 +389,6 @@ pub fn refresh_init() {
         current_package: String::new(),
         last_applied_pkg: String::new(),
         last_apply_time: None,
-        last_fg_check_time: None,
         last_input_time: None,
         backlight_path,
         prev_backlight: false,
@@ -469,14 +397,6 @@ pub fn refresh_init() {
 
     load_global_config(&mut state);
     load_app_configs(&mut state);
-
-    // 初始前台应用检测，确保 current_package 在线程启动前就绪
-    if let Some(pkg) = find_foreground_package() {
-        state.current_package = pkg.clone();
-        state.last_applied_pkg = pkg;
-        let current_pkg = state.current_package.clone();
-        apply_app_config(&mut state, &current_pkg);
-    }
 
     if let Some(path) = &state.backlight_path {
         state.prev_backlight = read_backlight(path);
@@ -528,7 +448,7 @@ pub fn refresh_init() {
                         while let Ok(event) = rx.try_recv() {
                             match event {
                                 RefreshEvent::Input => handle_input(&mut state),
-                                RefreshEvent::OomAdj => handle_oom_adj(&mut state),
+                                RefreshEvent::FgChange { comm } => handle_fg_change(&mut state, &comm),
                             }
                         }
                         check_config(&mut state);
@@ -556,12 +476,12 @@ pub fn refresh_init() {
     });
 }
 
-pub fn refresh_on_event(event_type: u32, _pid: i32) {
+pub fn refresh_on_event(event_type: u32, comm: &[u8; 16]) {
     let guard = REFRESH_TX.lock().unwrap();
     if let Some(tx) = guard.as_ref() {
         let event = match event_type {
             EVENT_INPUT => RefreshEvent::Input,
-            EVENT_OOM_ADJ => RefreshEvent::OomAdj,
+            EVENT_FG_CHANGE => RefreshEvent::FgChange { comm: *comm },
             _ => return,
         };
         let _ = tx.send(event);
