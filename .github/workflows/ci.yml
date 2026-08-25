@@ -2,9 +2,22 @@ name: Build AppOpt
 
 on:
   workflow_dispatch:
+    inputs:
+      build_ebpf:
+        description: '是否构建 eBPF 内核态程序 (AppOpt-ebpf)'
+        required: true
+        default: true
+        type: boolean
+      build_android:
+        description: '是否构建 Android ARM64 用户态程序 (AppOpt)'
+        required: true
+        default: true
+        type: boolean
 
 jobs:
   build-ebpf:
+    # 仅当用户在触发时勾选了 build_ebpf 时才运行此任务
+    if: ${{ inputs.build_ebpf }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,20 +30,20 @@ jobs:
         with:
           tool: bpf-linker
           
-      # 【自动修复】：强制将 Cargo.toml 中的 opt-level = "s" 替换为 2，彻底解决 bpf-linker 报错
       - name: Fix opt-level in Cargo.toml
         run: sed -i 's/opt-level = "s"/opt-level = 2/g' AppOpt-ebpf/Cargo.toml
           
       - name: Build eBPF
         run: cd AppOpt-ebpf && cargo +nightly build --release --target=bpfel-unknown-none -Z build-std=core
 
-      # 【修复 path 缺失】：确保 path 参数存在且缩进严格为 10 个空格
       - uses: actions/upload-artifact@v4
         with:
           name: AppOpt-ebpf
           path: AppOpt-ebpf/target/bpfel-unknown-none/release/AppOpt-ebpf
 
   build-android-arm64:
+    # 仅当用户在触发时勾选了 build_android 时才运行此任务
+    if: ${{ inputs.build_android }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -39,26 +52,21 @@ jobs:
         with:
           targets: aarch64-linux-android
           
-      # 【彻底替换 cross】：使用 cargo-ndk，这是目前 Rust 编译 Android 最标准的方案
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-ndk
           
-      # 【彻底解决 -lunwind 缺失】：安装最新版 NDK r26b
       - name: Install Android NDK
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r26b
           
-      # 【修复 web 目录缺失】：复制 web 文件夹到 AppOpt 内部
       - name: Copy web directory
         run: cp -r web AppOpt/web
         
       - name: Build for Android
-        # cargo ndk 会自动处理所有 sysroot 和链接器参数，无需手动配置 .cargo/config.toml
         run: cd AppOpt && cargo ndk -t arm64-v8a build --release
         
-      # 【修复 path 缺失】：确保 path 参数存在且缩进严格为 10 个空格
       - uses: actions/upload-artifact@v4
         with:
           name: AppOpt-android-arm64
