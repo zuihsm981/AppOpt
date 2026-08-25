@@ -234,10 +234,10 @@ fn sched_process_exit(_ctx: TracePointContext) -> u32 {
     0
 }
 
-/// 用户活动检测：kprobe 内核函数 input_event()
-/// 替代 tracepoint input:input_event（部分高通内核不存在此 tracepoint）
+/// 用户活动检测：kprobe 内核函数 input_handle_event()
+/// input_handle_event 是 input_event 的内部处理函数，每次触摸/按键都会调用
 /// 1 秒节流，避免触摸事件淹没 RingBuf
-#[kprobe(function = "input_event")]
+#[kprobe(function = "input_handle_event")]
 fn kprobe_input_event(_ctx: ProbeContext) -> u32 {
     let now = unsafe { bpf_ktime_get_ns() };
     if let Some(last) = LAST_INPUT_NS.get(0) {
