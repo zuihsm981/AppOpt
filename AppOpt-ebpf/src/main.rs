@@ -7,7 +7,7 @@ use aya_ebpf::{
     helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_ktime_get_ns},
     macros::{kprobe, map, tracepoint},
     maps::{Array, HashMap, LruHashMap, RingBuf},
-    programs::{KProbeContext, TracePointContext},
+    programs::{ProbeContext, TracePointContext},
 };
 
 const EVENT_FORK: u32 = 1;
@@ -238,7 +238,7 @@ fn sched_process_exit(_ctx: TracePointContext) -> u32 {
 /// 任何输入事件(触摸/按键) = 用户活动，通知用户态重置空闲定时器
 #[tracepoint(name = "input_event", category = "input")]
 fn input_event(_ctx: TracePointContext) -> u32 {
-    let now = bpf_ktime_get_ns();
+    let now = unsafe { bpf_ktime_get_ns() };
     if let Some(last) = LAST_INPUT_NS.get(0) {
         if now - *last < 1_000_000_000 {
             return 0;
@@ -260,7 +260,7 @@ fn input_event(_ctx: TracePointContext) -> u32 {
 /// Android ActivityManagerService 切换前台时写 /proc/<pid>/oom_score_adj
 /// 此函数被调用，发射事件通知用户态扫描 /proc 确认前台应用
 #[kprobe(function = "oom_score_adj_write")]
-fn oom_adj_write(_ctx: KProbeContext) -> u32 {
+fn oom_adj_write(_ctx: ProbeContext) -> u32 {
     let pid_tgid = bpf_get_current_pid_tgid();
     submit_event(ProcEvent {
         pid: (pid_tgid >> 32) as i32,
