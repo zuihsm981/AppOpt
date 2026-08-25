@@ -1,7 +1,33 @@
-name: Test Workflow
-on: [push]
+name: Build AppOpt
+
+on:
+  workflow_dispatch:
+
 jobs:
-  test:
+  build-ebpf:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "Hello GitHub Actions!"
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: bpfel-unknown-none
+          components: rust-src
+      - run: cargo install bpf-linker
+      - run: cd AppOpt-ebpf && cargo +nightly build --release --target=bpfel-unknown-none -Z build-std=core
+
+  build-android-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: aarch64-linux-android
+      - run: sudo apt-get update && sudo apt-get install -y lld
+      - run: mkdir -p .cargo
+      - run: echo '[target.aarch64-linux-android]' > .cargo/config.toml
+      - run: echo 'linker = "rust-lld"' >> .cargo/config.toml
+      - run: cd AppOpt && cargo +nightly build --release --target aarch64-linux-android
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AppOpt-arm64
+          path: AppOpt/target/aarch64-linux-android/release/AppOpt
