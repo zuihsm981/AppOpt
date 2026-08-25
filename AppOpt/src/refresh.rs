@@ -268,6 +268,10 @@ fn find_foreground_package() -> Option<String> {
         if cmdline.is_empty() {
             continue;
         }
+        // 排除 SystemUI（始终可见，下拉通知栏时 adj=0 会干扰）
+        if cmdline.starts_with("com.android.systemui") {
+            continue;
+        }
         // 用户应用 UID >= 10000，桌面 com.android.launcher3 特殊放行
         let uid = fs::metadata(format!("/proc/{}", pid))
             .map(|m| m.uid())
@@ -333,7 +337,11 @@ fn handle_backlight_change(state: &mut RefreshState) {
     let Some(path) = &state.backlight_path else { return };
     let brightness = read_backlight(path);
     if brightness && !state.prev_backlight {
-        // 0 → >0：启动定时器
+        // 0 → >0：切回活跃刷新率 + 启动定时器
+        if state.is_paused || state.current_applied_mode == state.current_idle {
+            set_refresh_rate(state, state.current_active);
+            state.is_paused = false;
+        }
         reset_timer(state, true);
     } else if !brightness && state.prev_backlight {
         // >0 → 0：关闭定时器
