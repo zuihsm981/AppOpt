@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
 
 jobs:
+  # 任务 1：构建 eBPF 内核态程序
   build-ebpf:
     runs-on: ubuntu-latest
     steps:
@@ -20,9 +21,16 @@ jobs:
       - name: Build eBPF
         run: cd AppOpt-ebpf && cargo +nightly build --release --target=bpfel-unknown-none -Z build-std=core
         env:
-          # 强制覆盖 Cargo.toml 中的 opt-level = "s"，解决 bpf-linker 报错
+          # 强制覆盖优化级别，防止 bpf-linker 报错
           RUSTFLAGS: "-C opt-level=2"
+          
+      # 【新增】：上传 eBPF 产物
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AppOpt-ebpf
+          path: AppOpt-ebpf/target/bpfel-unknown-none/release/AppOpt-ebpf
 
+  # 任务 2：构建 Android 用户态程序 (ARM64)
   build-android-arm64:
     runs-on: ubuntu-latest
     steps:
@@ -32,12 +40,10 @@ jobs:
         with:
           targets: aarch64-linux-android
           
-      # 使用预编译的 cargo-ndk，比 cross 更轻量且兼容性更好
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-ndk
           
-      # 安装最新版 Android NDK (r26b)，彻底解决旧版 NDK 缺少 libunwind 的问题
       - name: Install Android NDK
         uses: nttld/setup-ndk@v1
         with:
@@ -47,10 +53,7 @@ jobs:
         run: cp -r web AppOpt/web
         
       - name: Build for Android
-        # cargo ndk 会自动处理所有 sysroot 和链接器参数
         run: cd AppOpt && cargo ndk -t arm64-v8a build --release
         
+      # 上传 Android 产物
       - uses: actions/upload-artifact@v4
-        with:
-          name: AppOpt-arm64
-          path: AppOpt/target/aarch64-linux-android/release/AppOpt
