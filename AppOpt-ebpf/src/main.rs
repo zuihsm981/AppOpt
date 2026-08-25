@@ -4,16 +4,18 @@
 #![allow(dead_code)]
 
 use aya_ebpf::{
-    helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid},
-    macros::{map, tracepoint},
+    helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_ktime_get_ns},
+    macros::{kprobe, map, tracepoint},
     maps::{Array, HashMap, LruHashMap, RingBuf},
-    programs::TracePointContext,
+    programs::{KProbeContext, TracePointContext},
 };
 
 const EVENT_FORK: u32 = 1;
 const EVENT_EXEC: u32 = 2;
 const EVENT_RENAME: u32 = 3;
 const EVENT_EXIT: u32 = 4;
+const EVENT_INPUT: u32 = 5;
+const EVENT_OOM_ADJ: u32 = 7;
 
 /// 4 类 tracepoint 字段布局：fork 读 child_pid/child_comm，exec/exit 用 bpf_get_current_pid_tgid，rename 读 newcomm
 
@@ -52,6 +54,10 @@ static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 /// 用户态注入的 tracepoint 字段偏移单条 Array 索引 0
 #[map]
 static OFFSETS_MAP: Array<TracepointOffsets> = Array::with_max_entries(1, 0);
+
+/// input_event 节流：上次发射时间(ns)，1 秒内不重复发射
+#[map]
+static LAST_INPUT_NS: Array<u64> = Array::with_max_entries(1, 0);
 
 /// 读取偏移，fork_child_pid 为 0 视为未注入返回 None
 #[inline(always)]
@@ -224,6 +230,43 @@ fn sched_process_exit(_ctx: TracePointContext) -> u32 {
         tid: tid as i32,
         comm: [0u8; 16],
         event_type: EVENT_EXIT,
+    });
+    0
+}
+
+/// 用户活动检测：input_event tracepoint，1 秒节流
+/// 任何输入事件(触摸/按键) = 用户活动，通知用户态重置空闲定时器
+#[tracepoint(name = "input_event", category = "input")]
+fn input_event(_ctx: TracePointContext) -> u32 {
+    let now = bpf_ktime_get_ns();
+    if let Some(last) = LAST_INPUT_NS.get(0) {
+        if now - *last < 1_000_000_000 {
+            return 0;
+        }
+    }
+    let _ = LAST_INPUT_NS.set(0, now, 0);
+
+    let pid_tgid = bpf_get_current_pid_tgid();
+    submit_event(ProcEvent {
+        pid: (pid_tgid >> 32) as i32,
+        tid: pid_tgid as i32,
+        comm: bpf_get_current_comm().unwrap_or_default(),
+        event_type: EVENT_INPUT,
+    });
+    0
+}
+
+/// 前台应用切换检测：kprobe oom_score_adj_write
+/// Android ActivityManagerService 切换前台时写 /proc/<pid>/oom_score_adj
+/// 此函数被调用，发射事件通知用户态扫描 /proc 确认前台应用
+#[kprobe(function = "oom_score_adj_write")]
+fn oom_adj_write(_ctx: KProbeContext) -> u32 {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    submit_event(ProcEvent {
+        pid: (pid_tgid >> 32) as i32,
+        tid: pid_tgid as i32,
+        comm: bpf_get_current_comm().unwrap_or_default(),
+        event_type: EVENT_OOM_ADJ,
     });
     0
 }
