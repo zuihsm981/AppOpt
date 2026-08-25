@@ -268,15 +268,15 @@ fn kprobe_input_event(_ctx: ProbeContext) -> u32 {
 /// 直接从参数读取包名，无需扫描 /proc
 #[kprobe(function = "set_task_comm")]
 fn kprobe_set_task_comm(ctx: ProbeContext) -> u32 {
-    // arm64: 2nd arg (buf) 在 pt_regs offset 8 (x1)
-    let buf_ptr = ctx.read_at::<*const u8>(8).unwrap_or(core::ptr::null());
+    // arm64: pt_regs 起始是 u64 regs[31]，x1 (2nd arg) 在 offset 8
+    let regs = ctx.as_ptr() as *const u64;
+    let buf_ptr = unsafe { core::ptr::read_unaligned(regs.add(1)) } as *const u8;
     if buf_ptr.is_null() {
         return 0;
     }
 
-    // 从内核内存读取新进程名
-    let mut comm = [0u8; 16];
-    let _ = unsafe { bpf_probe_read(&mut comm as *mut _ as *mut _, 16, buf_ptr as *const _) };
+    // 从内核内存读取新进程名（aya-ebpf bpf_probe_read 签名: fn<T>(src) -> Result<T, i32>）
+    let comm = unsafe { bpf_probe_read(buf_ptr as *const [u8; 16]) }.unwrap_or([0u8; 16]);
 
     // 仅用户应用（含 '.'）才发射事件
     if !comm_has_dot(&comm) {
