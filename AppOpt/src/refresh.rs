@@ -64,6 +64,7 @@ struct RefreshState {
     last_applied_pkg: String,
     last_apply_time: Option<Instant>,
     last_fg_check_time: Option<Instant>,
+    last_input_time: Option<Instant>,
     backlight_path: Option<String>,
     prev_backlight: bool,
     timer_fd: i32,
@@ -319,9 +320,17 @@ fn handle_oom_adj(state: &mut RefreshState) {
     }
 }
 
-/// input_event 触发：用户活动
-/// 切回活跃刷新率 + 重置定时器（仅在定时器运行时）
+/// input 事件触发：用户活动
+/// 1 秒节流 + 切回活跃刷新率 + 重置定时器
 fn handle_input(state: &mut RefreshState) {
+    let now = Instant::now();
+    if let Some(last) = state.last_input_time {
+        if now - last < std::time::Duration::from_secs(1) {
+            return;
+        }
+    }
+    state.last_input_time = Some(now);
+
     if state.is_paused || state.current_applied_mode == state.current_idle {
         set_refresh_rate(state, state.current_active);
         state.is_paused = false;
@@ -437,6 +446,7 @@ pub fn refresh_init() {
         last_applied_pkg: String::new(),
         last_apply_time: None,
         last_fg_check_time: None,
+        last_input_time: None,
         backlight_path,
         prev_backlight: false,
         timer_fd,
