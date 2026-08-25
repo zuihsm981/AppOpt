@@ -234,10 +234,11 @@ fn sched_process_exit(_ctx: TracePointContext) -> u32 {
     0
 }
 
-/// 用户活动检测：input_event tracepoint，1 秒节流
-/// 任何输入事件(触摸/按键) = 用户活动，通知用户态重置空闲定时器
-#[tracepoint(name = "input_event", category = "input")]
-fn input_event(_ctx: TracePointContext) -> u32 {
+/// 用户活动检测：kprobe 内核函数 input_event()
+/// 替代 tracepoint input:input_event（部分高通内核不存在此 tracepoint）
+/// 1 秒节流，避免触摸事件淹没 RingBuf
+#[kprobe(function = "input_event")]
+fn kprobe_input_event(_ctx: ProbeContext) -> u32 {
     let now = unsafe { bpf_ktime_get_ns() };
     if let Some(last) = LAST_INPUT_NS.get(0) {
         if now - *last < 1_000_000_000 {
