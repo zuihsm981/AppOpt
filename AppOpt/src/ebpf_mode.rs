@@ -28,7 +28,7 @@ pub const EBPF_EVENT_EXEC: u32 = 2;
 pub const EBPF_EVENT_RENAME: u32 = 3;
 pub const EBPF_EVENT_EXIT: u32 = 4;
 pub const EBPF_EVENT_INPUT: u32 = 5;
-pub const EBPF_EVENT_OOM_ADJ: u32 = 7;
+pub const EBPF_EVENT_FG_CHANGE: u32 = 8;
 
 /// 用户态注入内核的 tracepoint 字段偏移，布局需与内核态 TracepointOffsets 一致
 #[repr(C)]
@@ -372,9 +372,10 @@ pub fn ebpf_init() -> Option<EbpfState> {
     }
     // kprobe input_event 用于刷新率模块的用户活动检测
     // 替代 tracepoint input:input_event（高通内核可能不存在此 tracepoint）
+    // kprobe input_handle_event 用于用户活动检测（触摸/按键）
     attach_kprobe(&mut bpf, "kprobe_input_event", "input_handle_event", false);
-    // kprobe oom_score_adj_write 用于刷新率模块的前台应用切换检测
-    attach_kprobe(&mut bpf, "oom_adj_write", "oom_score_adj_write", false);
+    // kprobe set_task_comm 用于前台应用切换检测（直接从参数读包名）
+    attach_kprobe(&mut bpf, "kprobe_set_task_comm", "set_task_comm", false);
 
     let ring_buf = match bpf.take_map("EVENTS") {
         Some(map) => match aya::maps::RingBuf::try_from(map) {
@@ -545,13 +546,11 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
         }
 
         EBPF_EVENT_INPUT => {
-            // 用户活动事件，转发给刷新率模块
-            crate::refresh::refresh_on_event(EBPF_EVENT_INPUT, 0);
+            crate::refresh::refresh_on_event(EBPF_EVENT_INPUT, &[0u8; 16]);
         }
 
-        EBPF_EVENT_OOM_ADJ => {
-            // oom_score_adj 写入 = 前台应用可能变化，转发给刷新率模块
-            crate::refresh::refresh_on_event(EBPF_EVENT_OOM_ADJ, 0);
+        EBPF_EVENT_FG_CHANGE => {
+            crate::refresh::refresh_on_event(EBPF_EVENT_FG_CHANGE, &event.comm);
         }
 
         _ => {}
