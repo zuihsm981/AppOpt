@@ -6,7 +6,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use aya::maps::{Array as AyaArray, HashMap as AyaHashMap};
-use aya::{programs::TracePoint as AyaTracePoint, Ebpf, EbpfLoader, Pod};
+use aya::{programs::{KProbe as AyaKProbe, TracePoint as AyaTracePoint}, Ebpf, EbpfLoader, Pod};
 
 use crate::apply_affinity::{affinity_set, proc_walk, task_tids, tid_comm};
 use crate::cache::ProcCache;
@@ -27,6 +27,8 @@ pub const EBPF_EVENT_FORK: u32 = 1;
 pub const EBPF_EVENT_EXEC: u32 = 2;
 pub const EBPF_EVENT_RENAME: u32 = 3;
 pub const EBPF_EVENT_EXIT: u32 = 4;
+pub const EBPF_EVENT_INPUT: u32 = 5;
+pub const EBPF_EVENT_OOM_ADJ: u32 = 7;
 
 /// 用户态注入内核的 tracepoint 字段偏移，布局需与内核态 TracepointOffsets 一致
 #[repr(C)]
@@ -96,6 +98,35 @@ fn attach_tracepoint(bpf: &mut Ebpf, category: &str, name: &str, required: bool)
         return false;
     }
     if let Err(e) = tp.attach(category, name) {
+        if required {
+            eprintln!("eBPF: {} 附加失败 ({})", name, e);
+        }
+        return false;
+    }
+    true
+}
+
+/// attach kprobe，required=false 时失败不阻断 eBPF 初始化
+fn attach_kprobe(bpf: &mut Ebpf, name: &str, function: &str, required: bool) -> bool {
+    let Some(prog) = bpf.program_mut(name) else {
+        if required {
+            eprintln!("eBPF: 未找到 {} 程序", name);
+        }
+        return false;
+    };
+    let Ok(kp): Result<&mut AyaKProbe, _> = prog.try_into() else {
+        if required {
+            eprintln!("eBPF: {} 类型转换失败", name);
+        }
+        return false;
+    };
+    if let Err(e) = kp.load() {
+        if required {
+            eprintln!("eBPF: {} 加载失败 ({})", name, e);
+        }
+        return false;
+    }
+    if let Err(e) = kp.attach(function, 0) {
         if required {
             eprintln!("eBPF: {} 附加失败 ({})", name, e);
         }
@@ -339,6 +370,10 @@ pub fn ebpf_init() -> Option<EbpfState> {
     if !attach_tracepoint(&mut bpf, "task", "task_rename", true) {
         return None;
     }
+    // input_event 用于刷新率模块的用户活动检测
+    attach_tracepoint(&mut bpf, "input", "input_event", false);
+    // kprobe oom_score_adj_write 用于刷新率模块的前台应用切换检测
+    attach_kprobe(&mut bpf, "oom_adj_write", "oom_score_adj_write", false);
 
     let ring_buf = match bpf.take_map("EVENTS") {
         Some(map) => match aya::maps::RingBuf::try_from(map) {
@@ -506,6 +541,16 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
 
         EBPF_EVENT_RENAME => {
             event_apply(&mut state.cache, &mut state.bpf, tid, pid, comm, cfg);
+        }
+
+        EBPF_EVENT_INPUT => {
+            // 用户活动事件，转发给刷新率模块
+            crate::refresh::refresh_on_event(EBPF_EVENT_INPUT, 0);
+        }
+
+        EBPF_EVENT_OOM_ADJ => {
+            // oom_score_adj 写入 = 前台应用可能变化，转发给刷新率模块
+            crate::refresh::refresh_on_event(EBPF_EVENT_OOM_ADJ, 0);
         }
 
         _ => {}
