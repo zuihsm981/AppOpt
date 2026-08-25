@@ -370,8 +370,9 @@ pub fn ebpf_init() -> Option<EbpfState> {
     if !attach_tracepoint(&mut bpf, "task", "task_rename", true) {
         return None;
     }
-    // input_event 用于刷新率模块的用户活动检测
-    attach_tracepoint(&mut bpf, "input", "input_event", false);
+    // kprobe input_event 用于刷新率模块的用户活动检测
+    // 替代 tracepoint input:input_event（高通内核可能不存在此 tracepoint）
+    attach_kprobe(&mut bpf, "kprobe_input_event", "input_event", false);
     // kprobe oom_score_adj_write 用于刷新率模块的前台应用切换检测
     attach_kprobe(&mut bpf, "oom_adj_write", "oom_score_adj_write", false);
 
