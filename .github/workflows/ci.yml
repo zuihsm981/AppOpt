@@ -13,12 +13,15 @@ jobs:
         with:
           components: rust-src
           
-      # 使用预编译的 bpf-linker，彻底解决 LLVM 依赖问题
       - uses: taiki-e/install-action@v2
         with:
           tool: bpf-linker
           
-      - run: cd AppOpt-ebpf && cargo +nightly build --release --target=bpfel-unknown-none -Z build-std=core
+      - name: Build eBPF
+        run: cd AppOpt-ebpf && cargo +nightly build --release --target=bpfel-unknown-none -Z build-std=core
+        env:
+          # 强制覆盖 Cargo.toml 中的 opt-level = "s"，解决 bpf-linker 报错
+          RUSTFLAGS: "-C opt-level=2"
 
   build-android-arm64:
     runs-on: ubuntu-latest
@@ -29,15 +32,24 @@ jobs:
         with:
           targets: aarch64-linux-android
           
-      # 安装 cross 交叉编译工具，它自带 Android NDK 环境
-      - uses: taiki-e/install-action@cross
-      
-      # 修复 web 目录路径问题
-      - run: cp -r web AppOpt/web
-      
-      # 使用 cross 代替 cargo 进行编译，自动处理所有 C 库链接
-      - run: cd AppOpt && cross build --release --target aarch64-linux-android
-      
+      # 使用预编译的 cargo-ndk，比 cross 更轻量且兼容性更好
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+          
+      # 安装最新版 Android NDK (r26b)，彻底解决旧版 NDK 缺少 libunwind 的问题
+      - name: Install Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26b
+          
+      - name: Copy web directory
+        run: cp -r web AppOpt/web
+        
+      - name: Build for Android
+        # cargo ndk 会自动处理所有 sysroot 和链接器参数
+        run: cd AppOpt && cargo ndk -t arm64-v8a build --release
+        
       - uses: actions/upload-artifact@v4
         with:
           name: AppOpt-arm64
