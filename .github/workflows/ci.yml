@@ -13,8 +13,11 @@ jobs:
         with:
           components: rust-src
           
-      - run: cargo install bpf-linker
-      
+      # 使用预编译的 bpf-linker，彻底解决 LLVM 依赖问题
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: bpf-linker
+          
       - run: cd AppOpt-ebpf && cargo +nightly build --release --target=bpfel-unknown-none -Z build-std=core
 
   build-android-arm64:
@@ -26,15 +29,14 @@ jobs:
         with:
           targets: aarch64-linux-android
           
-      - run: sudo apt-get update && sudo apt-get install -y lld
+      # 安装 cross 交叉编译工具，它自带 Android NDK 环境
+      - uses: taiki-e/install-action@cross
       
-      - run: mkdir -p .cargo
-      - run: echo '[target.aarch64-linux-android]' > .cargo/config.toml
-      - run: echo 'linker = "rust-lld"' >> .cargo/config.toml
-      
+      # 修复 web 目录路径问题
       - run: cp -r web AppOpt/web
       
-      - run: cd AppOpt && cargo +nightly build --release --target aarch64-linux-android
+      # 使用 cross 代替 cargo 进行编译，自动处理所有 C 库链接
+      - run: cd AppOpt && cross build --release --target aarch64-linux-android
       
       - uses: actions/upload-artifact@v4
         with:
