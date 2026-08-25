@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs;
-use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Mutex;
 use std::sync::mpsc;
@@ -101,6 +100,23 @@ fn read_backlight(path: &str) -> bool {
         .and_then(|s| s.trim().parse::<i32>().ok())
         .map(|v| v > 0)
         .unwrap_or(false)
+}
+
+/// 从 /proc/<pid>/status 读取 UID，比 fs::metadata 更可靠
+fn read_proc_uid(pid: i32) -> u32 {
+    let content = match fs::read_to_string(format!("/proc/{}/status", pid)) {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    for line in content.lines() {
+        if line.starts_with("Uid:") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                return parts[1].parse::<u32>().unwrap_or(0);
+            }
+        }
+    }
+    0
 }
 
 fn create_default_config() {
@@ -274,9 +290,8 @@ fn find_foreground_package() -> Option<String> {
             continue;
         }
         // 用户应用 UID >= 10000，桌面 com.android.launcher3 特殊放行
-        let uid = fs::metadata(format!("/proc/{}", pid))
-            .map(|m| m.uid())
-            .unwrap_or(0);
+        // 从 /proc/<pid>/status 读取 UID（比 fs::metadata 更可靠，不受 SELinux stat 拦截）
+        let uid = read_proc_uid(pid);
         let is_user_app = uid >= 10000;
         let is_launcher = cmdline == "com.android.launcher3";
         if !is_user_app && !is_launcher {
