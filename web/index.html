@@ -205,10 +205,38 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 
 </section>
 
+<section id="tab-refresh" class="panel" hidden>
+<div class="card">
+<div class="card-title">刷新率状态</div>
+<div class="row"><span class="label">当前刷新率</span><span class="value" id="rf-mode">-</span></div>
+<div class="row"><span class="label">空闲定时器</span><span class="value" id="rf-timer">-</span></div>
+<div class="row"><span class="label">前台应用</span><span class="value mono" id="rf-pkg">-</span></div>
+</div>
+<div class="card">
+<div class="card-title">全局配置</div>
+<div class="row"><span class="label">活跃刷新率</span>
+<select id="rf-active" style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:14px;font-family:inherit">
+<option value="120">120Hz</option><option value="90">90Hz</option><option value="60">60Hz</option>
+</select></div>
+<div class="row"><span class="label">空闲刷新率</span>
+<select id="rf-idle" style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:14px;font-family:inherit">
+<option value="120">120Hz</option><option value="90">90Hz</option><option value="60">60Hz</option>
+</select></div>
+<div class="row"><span class="label">空闲超时(秒)</span><input id="rf-timeout" type="number" min="1" max="3600" style="width:80px;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:14px;font-family:inherit"></div>
+<div style="margin-top:10px;text-align:right"><button class="btn" id="rf-save">保存全局配置</button></div>
+</div>
+<div class="card">
+<div class="card-title">按应用配置</div>
+<div id="rf-apps"></div>
+<div style="margin-top:10px"><button class="rule-add" id="rf-add" style="width:100%">＋ 添加应用刷新率规则</button></div>
+</div>
+</section>
+
 </main>
 <nav class="tabbar">
 <button class="tab active" data-tab="status"><svg viewBox="0 0 24 24"><path d="M4 16a8 8 0 0 1 16 0"/><path d="M12 16L16 12"/><circle cx="12" cy="16" r="1.2" fill="currentColor" stroke="none"/><path d="M6 20h12"/></svg>状态</button>
 <button class="tab" data-tab="rules"><svg viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13"/><circle cx="4" cy="6" r="1" fill="currentColor" stroke="none"/><circle cx="4" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="4" cy="18" r="1" fill="currentColor" stroke="none"/></svg>规则</button>
+<button class="tab" data-tab="refresh"><svg viewBox="0 0 24 24"><path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z"/></svg>刷新率</button>
 <button class="tab" data-tab="settings"><svg viewBox="0 0 24 24"><path d="M5 21V9M12 21V3M19 21v-8"/><circle cx="5" cy="6" r="2"/><circle cx="12" cy="9" r="2"/><circle cx="19" cy="10" r="2"/></svg>设置</button>
 </nav>
 
@@ -291,10 +319,11 @@ document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{
   if(t===activeTab)return;
   activeTab=t;
   document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x===b));
-  ['status','rules','settings'].forEach(n=>$('tab-'+n).hidden=n!==t);
+  ['status','rules','settings','refresh'].forEach(n=>$('tab-'+n).hidden=n!==t);
   if(t==='status')startStat();else stopStat();
   if(t==='rules')loadRules();
   if(t==='settings')loadCfg();
+  if(t==='refresh')loadRefresh();
 });
 
 function startStat(){stopStat();refreshStat();statTimer=setInterval(refreshStat,3000)}
@@ -656,6 +685,56 @@ $('c-about').onclick=async()=>{
   try{const d=await api('/api/status');$('a-ver').textContent='v'+d.version}catch(e){}
 };
 $('about-back').onclick=()=>$('page-about').classList.remove('show');
+
+// ===== 刷新率管理 =====
+let rfTimer=null;
+async function loadRefresh(){
+  if(rfTimer){clearInterval(rfTimer);rfTimer=null}
+  try{
+    const[st,cfg]=await Promise.all([api('/api/refresh/status'),api('/api/refresh/config')]);
+    $('rf-mode').textContent=st.mode_str||'-';
+    $('rf-timer').textContent=st.timer_enabled?(st.is_paused?'空闲中':(st.timer_running?'计时中':'未运行')):'未启用';
+    $('rf-pkg').textContent=st.current_package||'-';
+    $('rf-timeout').value=cfg.timeout;
+    $('rf-active').value=cfg.active;
+    $('rf-idle').value=cfg.idle;
+    loadRefreshApps();
+    rfTimer=setInterval(async()=>{
+      try{const s=await api('/api/refresh/status');
+        $('rf-mode').textContent=s.mode_str||'-';
+        $('rf-timer').textContent=s.timer_enabled?(s.is_paused?'空闲中':(s.timer_running?'计时中':'未运行')):'未启用';
+        $('rf-pkg').textContent=s.current_package||'-';
+      }catch(e){}
+    },3000);
+  }catch(e){toast(e.message)}
+}
+async function loadRefreshApps(){
+  try{
+    const d=await api('/api/refresh/apps');
+    const apps=d.apps||[],box=$('rf-apps');
+    if(!apps.length){box.innerHTML='<div class="empty">暂无按应用配置<br>使用全局配置</div>';return}
+    box.innerHTML=apps.map(a=>`<div class="rule-row"><span class="rule-name">${esc(a.pkg)}</span><span class="rule-sub">${a.timeout}s ${a.active}→${a.idle}</span><button class="icon-btn danger" data-rfdel="${esc(a.pkg)}" title="删除">${ICO_TRASH}</button></div>`).join('');
+  }catch(e){toast(e.message)}
+}
+$('rf-save').onclick=async()=>{
+  try{await api('/api/refresh/config',{timeout:Math.max(1,+$('rf-timeout').value||30),active:$('rf-active').value,idle:$('rf-idle').value});toast('已保存');loadRefresh()}
+  catch(e){toast(e.message)}
+};
+$('rf-add').onclick=async()=>{
+  const pkg=prompt('输入应用包名:');if(!pkg||!pkg.trim())return;
+  const to=prompt('空闲超时(秒):','10');if(!to)return;
+  const act=prompt('活跃刷新率(120/90/60):','120');if(!act)return;
+  const idl=prompt('空闲刷新率(120/90/60):','60');if(!idl)return;
+  try{await api('/api/refresh/app',{pkg:pkg.trim(),timeout:+to||10,active:act,idle:idl});toast('已添加');loadRefreshApps()}
+  catch(e){toast(e.message)}
+};
+$('rf-apps').addEventListener('click',e=>{
+  const del=e.target.closest('[data-rfdel]');if(!del)return;
+  const pkg=del.dataset.rfdel;
+  $('mc-msg').textContent='删除 '+pkg+' 的刷新率配置';
+  confirmCb=async()=>{try{await api('/api/refresh/app/del',{pkg});toast('已删除');loadRefreshApps()}catch(e){toast(e.message)}};
+  $('modal-confirm').hidden=false;
+});
 
 startStat();
 </script>
