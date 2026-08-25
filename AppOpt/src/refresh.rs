@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Mutex;
 use std::sync::mpsc;
@@ -267,9 +268,11 @@ fn find_foreground_package() -> Option<String> {
         if cmdline.is_empty() {
             continue;
         }
-        // 用户应用含 '.'，加上 com.android.launcher3 桌面
-        // 排除 com.android.systemui（始终可见，下拉通知栏时 adj=0 会干扰）
-        let is_user_app = cmdline.contains('.') && !cmdline.starts_with("com.android.systemui");
+        // 用户应用 UID >= 10000，桌面 com.android.launcher3 特殊放行
+        let uid = fs::metadata(format!("/proc/{}", pid))
+            .map(|m| m.uid())
+            .unwrap_or(0);
+        let is_user_app = uid >= 10000;
         let is_launcher = cmdline == "com.android.launcher3";
         if !is_user_app && !is_launcher {
             continue;
@@ -345,9 +348,8 @@ fn check_config(state: &mut RefreshState) {
         load_global_config(state);
         load_app_configs(state);
         let current_pkg = state.current_package.clone();
-        if !current_pkg.is_empty() {
-            apply_app_config(state, &current_pkg);
-        }
+        apply_app_config(state, &current_pkg);
+        set_refresh_rate(state, state.current_active);
         if state.last_reset_time.is_some() {
             reset_timer(state, true);
         }
