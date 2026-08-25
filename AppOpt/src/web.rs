@@ -206,6 +206,12 @@ fn dispatch(out: &mut TcpStream, req: &Request) {
         ("POST", "/api/rule/rename") => rule_rename_api(req),
         ("POST", "/api/config") => config_set_api(req),
         ("POST", "/api/suggest") => suggest_api(req),
+        ("GET", "/api/refresh/status") => (200, refresh_status_json()),
+        ("GET", "/api/refresh/config") => (200, refresh_config_json()),
+        ("POST", "/api/refresh/config") => refresh_config_set_api(req),
+        ("GET", "/api/refresh/apps") => (200, refresh_apps_json()),
+        ("POST", "/api/refresh/app") => refresh_app_add_api(req),
+        ("POST", "/api/refresh/app/del") => refresh_app_del_api(req),
         _ => err_json(404, "not found"),
     };
     resp_send(out, status, "application/json", body.as_bytes(), !req.keep_alive);
@@ -678,4 +684,105 @@ pub fn settings_save() {
         config_file: lock_ignore_poison(&CONFIG_FILE).clone(),
     }
     .save(SETTINGS_FILE);
+}
+
+// ===== 刷新率 Web API =====
+
+fn refresh_status_json() -> String {
+    match crate::refresh::refresh_get_status() {
+        Some(s) => json!({
+            "current_mode": s.current_mode,
+            "mode_str": match s.current_mode {
+                0 => "120Hz", 1 => "60Hz", 2 => "90Hz", _ => "未知"
+            },
+            "timer_running": s.timer_running,
+            "is_paused": s.is_paused,
+            "timer_enabled": s.timer_enabled,
+            "current_package": s.current_package,
+            "timeout": s.timeout,
+            "active_mode": s.active_mode,
+            "active_str": match s.active_mode {
+                0 => "120Hz", 1 => "60Hz", 2 => "90Hz", _ => "60Hz"
+            },
+            "idle_mode": s.idle_mode,
+            "idle_str": match s.idle_mode {
+                0 => "120Hz", 1 => "60Hz", 2 => "90Hz", _ => "60Hz"
+            },
+        }).to_string(),
+        None => json!({"error": "refresh module not initialized"}).to_string(),
+    }
+}
+
+fn refresh_config_json() -> String {
+    let (timeout, active, idle) = crate::refresh::refresh_get_config();
+    json!({
+        "timeout": timeout,
+        "active": active,
+        "idle": idle,
+    }).to_string()
+}
+
+fn refresh_config_set_api(req: &Request) -> (u16, String) {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
+        return err_json(400, "请求体不是合法 JSON");
+    };
+    let timeout = v["timeout"].as_u64().unwrap_or(30) as i32;
+    let active = v["active"].as_str().unwrap_or("120");
+    let idle = v["idle"].as_str().unwrap_or("60");
+    if timeout < 1 || timeout > 3600 {
+        return err_json(400, "超时时间需在 1-3600 秒之间");
+    }
+    if !matches!(active, "120" | "90" | "60") || !matches!(idle, "120" | "90" | "60") {
+        return err_json(400, "刷新率仅支持 120/90/60");
+    }
+    crate::refresh::refresh_set_config(timeout, active, idle);
+    (200, json!({"ok": true}).to_string())
+}
+
+fn refresh_apps_json() -> String {
+    let apps = crate::refresh::refresh_get_apps();
+    let arr: Vec<_> = apps.iter().map(|(pkg, timeout, active, idle)| {
+        json!({"pkg": pkg, "timeout": timeout, "active": active, "idle": idle})
+    }).collect();
+    json!({"apps": arr}).to_string()
+}
+
+fn refresh_app_add_api(req: &Request) -> (u16, String) {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
+        return err_json(400, "请求体不是合法 JSON");
+    };
+    let Some(pkg) = v["pkg"].as_str().map(str::trim) else {
+        return err_json(400, "缺少 pkg 字段");
+    };
+    if pkg.is_empty() || pkg.len() >= 128 || !pkg.bytes().all(|b| b >= 0x20 && b != 0x7f) {
+        return err_json(400, "无效的包名");
+    }
+    let timeout = v["timeout"].as_u64().unwrap_or(30) as i32;
+    let active = v["active"].as_str().unwrap_or("120");
+    let idle = v["idle"].as_str().unwrap_or("60");
+    if timeout < 1 || timeout > 3600 {
+        return err_json(400, "超时时间需在 1-3600 秒之间");
+    }
+    if !matches!(active, "120" | "90" | "60") || !matches!(idle, "120" | "90" | "60") {
+        return err_json(400, "刷新率仅支持 120/90/60");
+    }
+    crate::refresh::refresh_add_app(pkg, timeout, active, idle);
+    (200, json!({"ok": true}).to_string())
+}
+
+fn refresh_app_del_api(req: &Request) -> (u16, String) {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
+        return err_json(400, "请求体不是合法 JSON");
+    };
+    let Some(pkg) = v["pkg"].as_str().map(str::trim) else {
+        return err_json(400, "缺少 pkg 字段");
+    };
+    if pkg.is_empty() {
+        return err_json(400, "包名不能为空");
+    }
+    if crate::refresh::refresh_del_app(pkg) {
+        (200, json!({"ok": true}).to_string())
+    } else {
+        err_json(500, "删除失败")
+    }
 }
