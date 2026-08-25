@@ -304,7 +304,8 @@ fn handle_oom_adj(state: &mut RefreshState) {
     state.last_applied_pkg = pkg;
     state.last_apply_time = Some(now);
 
-    apply_app_config(state, &state.current_package);
+    let current_pkg = state.current_package.clone();
+    apply_app_config(state, &current_pkg);
     set_refresh_rate(state, state.current_active);
     if state.prev_backlight {
         reset_timer(state, true);
@@ -343,8 +344,9 @@ fn check_config(state: &mut RefreshState) {
     if REFRESH_FORCE_RELOAD.swap(false, Ordering::AcqRel) {
         load_global_config(state);
         load_app_configs(state);
-        if !state.current_package.is_empty() {
-            apply_app_config(state, &state.current_package);
+        let current_pkg = state.current_package.clone();
+        if !current_pkg.is_empty() {
+            apply_app_config(state, &current_pkg);
         }
         if state.last_reset_time.is_some() {
             reset_timer(state, true);
@@ -437,7 +439,8 @@ pub fn refresh_init() {
     if let Some(pkg) = find_foreground_package() {
         state.current_package = pkg.clone();
         state.last_applied_pkg = pkg;
-        apply_app_config(&mut state, &state.current_package);
+        let current_pkg = state.current_package.clone();
+        apply_app_config(&mut state, &current_pkg);
     }
 
     if let Some(path) = &state.backlight_path {
