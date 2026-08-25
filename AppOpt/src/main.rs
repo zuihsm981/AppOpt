@@ -8,6 +8,7 @@ mod config;
 mod cpuset;
 mod ebpf_mode;
 mod proc_mode;
+mod refresh;
 mod rule_edit;
 mod rule_match;
 mod web;
@@ -217,6 +218,9 @@ fn main() {
     let mut ebpf_retry_at = Instant::now()
         .checked_sub(Duration::from_secs(60))
         .unwrap_or_else(Instant::now);
+
+    // 刷新率控制模块，独立线程运行，通过 eBPF 事件驱动
+    refresh::refresh_init();
 
     println!("启动AppOpt服务 v{}", env!("CARGO_PKG_VERSION"));
 
