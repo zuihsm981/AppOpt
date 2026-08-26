@@ -14,6 +14,27 @@ use std::sync::{LazyLock, Mutex, OnceLock};
 use std::sync::atomic::{AtomicI32, Ordering};
 use libc::{c_char, c_int, dlopen, dlsym, RTLD_LAZY};
 
+// ── Android log（liblog.so 已由 NDK 自动链接 -llog）──
+extern "C" {
+    fn __android_log_write(prio: c_int, tag: *const c_char, text: *const c_char) -> c_int;
+}
+
+const LOG_TAG: &[u8] = b"AppOpt\0";
+const LOG_DEBUG: c_int = 3;
+const LOG_ERROR: c_int = 6;
+
+fn log(msg: &str) {
+    let mut buf = vec![0u8; msg.len() + 1];
+    buf[..msg.len()].copy_from_slice(msg.as_bytes());
+    unsafe {
+        __android_log_write(LOG_DEBUG, LOG_TAG.as_ptr() as *const c_char, buf.as_ptr() as *const c_char);
+    }
+}
+
+macro_rules! alog {
+    ($($arg:tt)*) => { log(&format!($($arg)*)) };
+}
+
 // ── 硬编码事务码 ──
 const TX_REGISTER_PROCESS_OBSERVER: u32 = 0x0d;
 const TX_ON_PROCESS_STARTED: u32 = 0x01;
@@ -67,13 +88,13 @@ static BINDER_NDK: OnceLock<Option<BinderNdk>> = OnceLock::new();
 
 fn ndk() -> Option<&'static BinderNdk> {
     BINDER_NDK.get_or_init(|| unsafe {
-        eprintln!("刷新率dbg: dlopen libbinder_ndk.so ...");
+        alog!("dlopen libbinder_ndk.so ...");
         let lib = dlopen(b"libbinder_ndk.so\0".as_ptr() as *const c_char, RTLD_LAZY);
         if lib.is_null() {
-            eprintln!("刷新率dbg: dlopen 失败");
+            alog!("dlopen 失败");
             return None;
         }
-        eprintln!("刷新率dbg: dlopen 成功, 开始 dlsym");
+        alog!("dlopen 成功, 开始 dlsym");
 
         let sym = |name: &[u8]| -> *mut c_void {
             let mut buf = [0u8; 64];
@@ -96,13 +117,13 @@ fn ndk() -> Option<&'static BinderNdk> {
         let p_read_string = sym(b"AParcel_readString");
         let p_join = sym(b"ABinder_joinThreadPool");
 
-        eprintln!(
-            "刷新率dbg: dlsym 结果 get_service={} class_new={} binder_new={} prepare={} transact={} delete={} wtoken={} wbinder={} ri32={} rbool={} rstr={} join={}",
-            p_get_service.is_null(), p_class_new.is_null(), p_binder_new.is_null(),
-            p_prepare_tx.is_null(), p_transact.is_null(), p_parcel_delete.is_null(),
-            p_write_token.is_null(), p_write_binder.is_null(),
-            p_read_i32.is_null(), p_read_bool.is_null(), p_read_string.is_null(),
-            p_join.is_null()
+        alog!(
+            "dlsym: getService={} classNew={} binderNew={} prepare={} transact={} delete={} wToken={} wBinder={} rI32={} rBool={} rStr={} join={}",
+            !p_get_service.is_null(), !p_class_new.is_null(), !p_binder_new.is_null(),
+            !p_prepare_tx.is_null(), !p_transact.is_null(), !p_parcel_delete.is_null(),
+            !p_write_token.is_null(), !p_write_binder.is_null(),
+            !p_read_i32.is_null(), !p_read_bool.is_null(), !p_read_string.is_null(),
+            !p_join.is_null()
         );
 
         if p_get_service.is_null() || p_class_new.is_null() || p_binder_new.is_null()
@@ -111,11 +132,11 @@ fn ndk() -> Option<&'static BinderNdk> {
             || p_read_i32.is_null() || p_read_bool.is_null() || p_read_string.is_null()
             || p_join.is_null()
         {
-            eprintln!("刷新率dbg: 部分 dlsym 为 null, 放弃");
+            alog!("部分 dlsym 为 null, 放弃");
             return None;
         }
 
-        eprintln!("刷新率dbg: 所有 dlsym 成功");
+        alog!("所有 dlsym 成功");
         Some(BinderNdk {
             get_service: std::mem::transmute(p_get_service),
             class_new: std::mem::transmute(p_class_new),
@@ -152,12 +173,12 @@ extern "C" fn on_transact(
     in_parcel: *const AParcel,
     _out: *mut AParcel,
 ) -> c_int {
-    eprintln!("刷新率dbg: on_transact 收到 code=0x{:04x}", code);
+    alog!("on_transact 收到 code=0x{:04x}", code);
 
     let ndk = match ndk() {
         Some(n) => n,
         None => {
-            eprintln!("刷新率dbg: on_transact ndk()=None");
+            alog!("on_transact: ndk()=None");
             return STATUS_UNKNOWN_TRANSACTION;
         }
     };
@@ -167,38 +188,38 @@ extern "C" fn on_transact(
     let s1 = unsafe { (ndk.read_i32)(in_parcel, &mut tmp) };
     let s2 = unsafe { (ndk.read_i32)(in_parcel, &mut tmp) };
     let s3 = read_string(in_parcel);
-    eprintln!("刷新率dbg: interface token 读取 i32={} i32={} str={:?}", s1, s2, s3.as_deref().unwrap_or("(null)"));
+    alog!("token: i32={} i32={} str={:?}", s1, s2, s3.as_deref().unwrap_or("(null)"));
 
     match code {
         TX_ON_PROCESS_STARTED => {
-            eprintln!("刷新率dbg: 匹配 onProcessStarted");
+            alog!("匹配 onProcessStarted");
             let mut pid = 0i32;
             let mut process_uid = 0i32;
             let mut package_uid = 0i32;
             if unsafe { (ndk.read_i32)(in_parcel, &mut pid) } != STATUS_OK {
-                eprintln!("刷新率dbg: onProcessStarted read pid 失败");
+                alog!("onProcessStarted: read pid 失败");
                 return STATUS_UNKNOWN_TRANSACTION;
             }
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut process_uid) };
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut package_uid) };
             let package_name = read_string(in_parcel).unwrap_or_default();
             let process_name = read_string(in_parcel).unwrap_or_default();
-            eprintln!("刷新率dbg: onProcessStarted pid={} pkg={} proc={}", pid, package_name, process_name);
+            alog!("onProcessStarted: pid={} pkg={} proc={}", pid, package_name, process_name);
             PID_CACHE.lock().unwrap().insert(pid, package_name);
             STATUS_OK
         }
         TX_ON_FG_ACTIVITIES_CHANGED => {
-            eprintln!("刷新率dbg: 匹配 onForegroundActivitiesChanged");
+            alog!("匹配 onForegroundActivitiesChanged");
             let mut pid = 0i32;
             let mut uid = 0i32;
             let mut fg = false;
             let r1 = unsafe { (ndk.read_i32)(in_parcel, &mut pid) };
             let r2 = unsafe { (ndk.read_i32)(in_parcel, &mut uid) };
             let r3 = unsafe { (ndk.read_bool)(in_parcel, &mut fg) };
-            eprintln!("刷新率dbg: onFGChanged pid={} uid={} fg={} (r={} {} {})", pid, uid, fg, r1, r2, r3);
+            alog!("onFGChanged: pid={} uid={} fg={} (r={} {} {})", pid, uid, fg, r1, r2, r3);
             if fg {
                 let fd = FG_EVENTFD.load(Ordering::Acquire);
-                eprintln!("刷新率dbg: fg=true, eventfd={}, 写入 pid={}", fd, pid);
+                alog!("fg=true, eventfd={}, 写入 pid={}", fd, pid);
                 if fd >= 0 {
                     let val: u64 = pid as u64;
                     unsafe { libc::write(fd, &val as *const u64 as *const _, 8); }
@@ -207,7 +228,7 @@ extern "C" fn on_transact(
             STATUS_OK
         }
         TX_ON_FG_SERVICES_CHANGED => {
-            eprintln!("刷新率dbg: 匹配 onForegroundServicesChanged");
+            alog!("匹配 onForegroundServicesChanged");
             let mut _pid = 0i32;
             let mut _uid = 0i32;
             let mut _st = 0i32;
@@ -217,17 +238,17 @@ extern "C" fn on_transact(
             STATUS_OK
         }
         TX_ON_PROCESS_DIED => {
-            eprintln!("刷新率dbg: 匹配 onProcessDied");
+            alog!("匹配 onProcessDied");
             let mut pid = 0i32;
             let mut _uid = 0i32;
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut pid) };
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _uid) };
-            eprintln!("刷新率dbg: onProcessDied pid={}", pid);
+            alog!("onProcessDied: pid={}", pid);
             PID_CACHE.lock().unwrap().remove(&pid);
             STATUS_OK
         }
         _ => {
-            eprintln!("刷新率dbg: 未知 code=0x{:04x}, 返回 UNKNOWN_TRANSACTION", code);
+            alog!("未知 code=0x{:04x} -> UNKNOWN_TRANSACTION", code);
             STATUS_UNKNOWN_TRANSACTION
         }
     }
@@ -258,7 +279,7 @@ fn get_observer_class() -> *mut AIBinderClass {
         None => return std::ptr::null_mut(),
     };
     OBSERVER_CLASS.get_or_init(|| {
-        eprintln!("刷新率dbg: AIBinder_Class_new ...");
+        alog!("AIBinder_Class_new ...");
         let class = unsafe {
             (ndk.class_new)(
                 b"android.app.IProcessObserver\0".as_ptr() as *const c_char,
@@ -267,59 +288,59 @@ fn get_observer_class() -> *mut AIBinderClass {
                 Some(on_transact),
             )
         };
-        eprintln!("刷新率dbg: AIBinder_Class_new 返回 {}", if class.is_null() { "null" } else { "ok" });
+        alog!("AIBinder_Class_new = {}", if class.is_null() { "null" } else { "ok" });
         SendClass(class)
     }).0
 }
 
 pub fn init_observer(eventfd: i32) -> bool {
-    eprintln!("刷新率dbg: init_observer 开始, eventfd={}", eventfd);
+    alog!("init_observer 开始, eventfd={}", eventfd);
     FG_EVENTFD.store(eventfd, Ordering::Release);
 
     let ndk = match ndk() {
         Some(n) => n,
         None => {
-            eprintln!("刷新率dbg: ndk()=None, 无法加载 libbinder_ndk.so");
+            alog!("ndk()=None, 无法加载 libbinder_ndk.so");
             return false;
         }
     };
 
     let class = get_observer_class();
     if class.is_null() {
-        eprintln!("刷新率dbg: class=null, 放弃");
+        alog!("class=null, 放弃");
         return false;
     }
-    eprintln!("刷新率dbg: class=ok, 创建 AIBinder ...");
+    alog!("class=ok, 创建 AIBinder ...");
     let observer = unsafe { (ndk.binder_new)(class, std::ptr::null_mut()) };
     if observer.is_null() {
-        eprintln!("刷新率dbg: AIBinder_new 返回 null");
+        alog!("AIBinder_new = null");
         return false;
     }
-    eprintln!("刷新率dbg: observer=ok, 获取 activity 服务 ...");
+    alog!("observer=ok, 获取 activity 服务 ...");
 
     let am = unsafe { (ndk.get_service)(b"activity\0".as_ptr() as *const c_char) };
     if am.is_null() {
-        eprintln!("刷新率dbg: AServiceManager_getService(activity) 返回 null");
+        alog!("getService(activity) = null");
         return false;
     }
-    eprintln!("刷新率dbg: activity 服务=ok, 构造事务 ...");
+    alog!("activity=ok, 构造事务 ...");
 
     let mut in_parcel: *mut AParcel = std::ptr::null_mut();
     let status = unsafe { (ndk.prepare_tx)(am, &mut in_parcel) };
-    eprintln!("刷新率dbg: prepareTx status={} parcel_null={}", status, in_parcel.is_null());
+    alog!("prepareTx: status={} parcel_null={}", status, in_parcel.is_null());
     if status != STATUS_OK || in_parcel.is_null() {
         return false;
     }
 
     let r1 = unsafe { (ndk.write_token)(in_parcel, b"android.app.IActivityManager\0".as_ptr() as *const c_char) };
     let r2 = unsafe { (ndk.write_binder)(in_parcel, observer) };
-    eprintln!("刷新率dbg: writeToken={} writeBinder={}", r1, r2);
+    alog!("writeToken={} writeBinder={}", r1, r2);
 
     let code = TX_REGISTER_PROCESS_OBSERVER;
     let mut out_parcel: *mut AParcel = std::ptr::null_mut();
-    eprintln!("刷新率dbg: transact code=0x{:04x} ...", code);
+    alog!("transact code=0x{:04x} ...", code);
     let status = unsafe { (ndk.transact)(am, code, in_parcel, &mut out_parcel, 0) };
-    eprintln!("刷新率dbg: transact status={}", status);
+    alog!("transact: status={}", status);
 
     unsafe { (ndk.parcel_delete)(in_parcel) };
     if !out_parcel.is_null() {
@@ -327,23 +348,23 @@ pub fn init_observer(eventfd: i32) -> bool {
     }
 
     if status == STATUS_OK {
-        eprintln!("刷新率dbg: 注册成功, 启动 binder 线程池 ...");
+        alog!("注册成功, 启动 binder 线程池 ...");
         let join_fn = ndk.join_thread_pool;
         std::thread::spawn(move || {
-            eprintln!("刷新率dbg: binder 线程池线程启动, 调用 ABinder_joinThreadPool");
+            alog!("binder 线程池线程启动, 调用 ABinder_joinThreadPool");
             unsafe { join_fn(); }
-            eprintln!("刷新率dbg: ABinder_joinThreadPool 返回 (不应发生)");
+            alog!("ABinder_joinThreadPool 返回 (不应发生)");
         });
-        eprintln!("刷新率dbg: init_observer 完成");
+        alog!("init_observer 完成");
         true
     } else {
-        eprintln!("刷新率dbg: registerProcessObserver 失败 status={}", status);
+        alog!("registerProcessObserver 失败 status={}", status);
         true
     }
 }
 
 pub fn get_package_name(pid: i32) -> Option<String> {
     let r = PID_CACHE.lock().unwrap().get(&pid).cloned();
-    eprintln!("刷新率dbg: get_package_name({}) = {:?}", pid, r);
+    alog!("get_package_name({}) = {:?}", pid, r);
     r
 }
