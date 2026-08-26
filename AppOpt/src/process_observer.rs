@@ -72,29 +72,39 @@ fn ndk() -> Option<&'static BinderNdk> {
             dlsym(lib, buf.as_ptr() as *const c_char)
         };
 
-        let get_service: FnGetService = std::mem::transmute(sym(b"AServiceManager_getService"));
-        let class_new: FnClassNew = std::mem::transmute(sym(b"AIBinder_Class_new"));
-        let binder_new: FnBinderNew = std::mem::transmute(sym(b"AIBinder_new"));
-        let prepare_tx: FnPrepareTx = std::mem::transmute(sym(b"ABinder_prepareTransaction"));
-        let transact: FnTransact = std::mem::transmute(sym(b"ABinder_transact"));
-        let parcel_delete: FnParcelDelete = std::mem::transmute(sym(b"AParcel_delete"));
-        let write_token: FnWriteToken = std::mem::transmute(sym(b"AParcel_writeInterfaceToken"));
-        let write_binder: FnWriteBinder = std::mem::transmute(sym(b"AParcel_writeStrongBinder"));
-        let read_i32: FnReadI32 = std::mem::transmute(sym(b"AParcel_readInt32"));
-        let read_bool: FnReadBool = std::mem::transmute(sym(b"AParcel_readBool"));
-        let read_string: FnReadString = std::mem::transmute(sym(b"AParcel_readString"));
+        // 先获取原始指针，检查 null 后再 transmute 为函数指针
+        let p_get_service = sym(b"AServiceManager_getService");
+        let p_class_new = sym(b"AIBinder_Class_new");
+        let p_binder_new = sym(b"AIBinder_new");
+        let p_prepare_tx = sym(b"ABinder_prepareTransaction");
+        let p_transact = sym(b"ABinder_transact");
+        let p_parcel_delete = sym(b"AParcel_delete");
+        let p_write_token = sym(b"AParcel_writeInterfaceToken");
+        let p_write_binder = sym(b"AParcel_writeStrongBinder");
+        let p_read_i32 = sym(b"AParcel_readInt32");
+        let p_read_bool = sym(b"AParcel_readBool");
+        let p_read_string = sym(b"AParcel_readString");
 
-        if get_service.is_null() || class_new.is_null() || binder_new.is_null()
-            || prepare_tx.is_null() || transact.is_null() || parcel_delete.is_null()
-            || write_token.is_null() || write_binder.is_null()
-            || read_i32.is_null() || read_bool.is_null() || read_string.is_null()
+        if p_get_service.is_null() || p_class_new.is_null() || p_binder_new.is_null()
+            || p_prepare_tx.is_null() || p_transact.is_null() || p_parcel_delete.is_null()
+            || p_write_token.is_null() || p_write_binder.is_null()
+            || p_read_i32.is_null() || p_read_bool.is_null() || p_read_string.is_null()
         {
             return None;
         }
 
         Some(BinderNdk {
-            get_service, class_new, binder_new, prepare_tx, transact,
-            parcel_delete, write_token, write_binder, read_i32, read_bool, read_string,
+            get_service: std::mem::transmute(p_get_service),
+            class_new: std::mem::transmute(p_class_new),
+            binder_new: std::mem::transmute(p_binder_new),
+            prepare_tx: std::mem::transmute(p_prepare_tx),
+            transact: std::mem::transmute(p_transact),
+            parcel_delete: std::mem::transmute(p_parcel_delete),
+            write_token: std::mem::transmute(p_write_token),
+            write_binder: std::mem::transmute(p_write_binder),
+            read_i32: std::mem::transmute(p_read_i32),
+            read_bool: std::mem::transmute(p_read_bool),
+            read_string: std::mem::transmute(p_read_string),
         })
     }).as_ref()
 }
