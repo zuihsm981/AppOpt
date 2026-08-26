@@ -303,8 +303,9 @@ pub fn init_observer(eventfd: i32) -> bool {
     alog!("writeString(len={})={} writeBinder={}", iface_len, r1, r2);
 
     let code = TX_REGISTER_PROCESS_OBSERVER;
-    let mut out_parcel: *mut c_void = std::ptr::null_mut();
-    alog!("transact code=0x{:04x}", code);
+    // 预分配 reply parcel（某些设备要求 *out 非 null）
+    let mut out_parcel = unsafe { (ndk.parcel_create)() };
+    alog!("transact code=0x{:04x} out_null={}", code, out_parcel.is_null());
     let status = unsafe { (ndk.transact)(am, code, in_parcel, &mut out_parcel, 0) };
     alog!("transact: status={}", status);
 
