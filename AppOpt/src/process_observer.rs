@@ -146,6 +146,7 @@ extern "C" fn on_transact(
 
     // 【核心修复 2】：正确读取 Interface Token (1个 i32 Strict Mode + 1个 String)
     // 如果只读 String，会导致后续 pid/uid 读取错位 4 字节！    let mut strict_mode = 0i32;
+    let mut strict_mode = 0i32; //
     let _ = unsafe { (ndk.read_i32)(in_parcel, &mut strict_mode) };
     let _token = read_string(in_parcel).unwrap_or_default();
 
