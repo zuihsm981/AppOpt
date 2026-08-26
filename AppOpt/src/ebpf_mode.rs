@@ -28,7 +28,6 @@ pub const EBPF_EVENT_EXEC: u32 = 2;
 pub const EBPF_EVENT_RENAME: u32 = 3;
 pub const EBPF_EVENT_EXIT: u32 = 4;
 pub const EBPF_EVENT_INPUT: u32 = 5;
-pub const EBPF_EVENT_FG_CHANGE: u32 = 8;
 
 /// 用户态注入内核的 tracepoint 字段偏移，布局需与内核态 TracepointOffsets 一致
 #[repr(C)]
@@ -545,10 +544,6 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
 
         EBPF_EVENT_INPUT => {
             crate::refresh::refresh_on_event(EBPF_EVENT_INPUT, 0);
-        }
-
-        EBPF_EVENT_FG_CHANGE => {
-            crate::refresh::refresh_on_event(EBPF_EVENT_FG_CHANGE, event.pid);
         }
 
         _ => {}
