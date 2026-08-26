@@ -8,6 +8,7 @@ mod config;
 mod cpuset;
 mod ebpf_mode;
 mod proc_mode;
+mod process_observer;
 mod refresh;
 mod rule_edit;
 mod rule_match;
