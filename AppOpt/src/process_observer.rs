@@ -54,8 +54,6 @@ type FnReadString = unsafe extern "C" fn(
     Option<extern "C" fn(*mut c_void, *const c_char, i32) -> c_int>,
 ) -> c_int;
 type FnJoinThreadPool = unsafe extern "C" fn() -> c_int;
-// 【修正】：AIBinder_associateClass 返回 void
-type FnAssociateClass = unsafe extern "C" fn(*mut c_void, *const c_void);
 
 struct BinderNdk {
     get_service: FnGetService,
@@ -71,7 +69,6 @@ struct BinderNdk {
     read_bool: FnReadBool,
     read_string: FnReadString,
     join_thread_pool: FnJoinThreadPool,
-    associate_class: FnAssociateClass,
 }
 
 static BINDER_NDK: OnceLock<Option<BinderNdk>> = OnceLock::new();
@@ -96,23 +93,21 @@ fn ndk() -> Option<&'static BinderNdk> {
         let p_write_string = sym("AParcel_writeString");
         let p_write_binder = sym("AParcel_writeStrongBinder");
         let p_write_i32 = sym("AParcel_writeInt32");
-        let p_read_i32 = sym("AParcel_readInt32");        let p_read_bool = sym("AParcel_readBool");
+        let p_read_i32 = sym("AParcel_readInt32");
+        let p_read_bool = sym("AParcel_readBool");
         let p_read_string = sym("AParcel_readString");
         let p_join = sym("ABinderProcess_joinThreadPool");
-        let p_associate = sym("AIBinder_associateClass");
-
-        alog!("dlsym: getService={} classDefine={} binderNew={} prepare={} transact={} delete={} wStr={} wBinder={} wI32={} rI32={} rBool={} rStr={} join={} associate={}",
+        alog!("dlsym: getService={} classDefine={} binderNew={} prepare={} transact={} delete={} wStr={} wBinder={} wI32={} rI32={} rBool={} rStr={} join={}",
             !p_get_service.is_null(), !p_class_define.is_null(), !p_binder_new.is_null(),
             !p_prepare_tx.is_null(), !p_transact.is_null(), !p_parcel_delete.is_null(),
             !p_write_string.is_null(), !p_write_binder.is_null(), !p_write_i32.is_null(),
-            !p_read_i32.is_null(), !p_read_bool.is_null(), !p_read_string.is_null(), !p_join.is_null(),
-            !p_associate.is_null());
+            !p_read_i32.is_null(), !p_read_bool.is_null(), !p_read_string.is_null(), !p_join.is_null());
 
         if p_get_service.is_null() || p_class_define.is_null() || p_binder_new.is_null()
             || p_prepare_tx.is_null() || p_transact.is_null() || p_parcel_delete.is_null()
             || p_write_string.is_null() || p_write_binder.is_null() || p_write_i32.is_null()
             || p_read_i32.is_null() || p_read_bool.is_null() || p_read_string.is_null()
-            || p_join.is_null() || p_associate.is_null()
+            || p_join.is_null()
         { alog!("部分 dlsym 为 null"); return None; }
         
         alog!("所有 dlsym 成功");
@@ -130,7 +125,6 @@ fn ndk() -> Option<&'static BinderNdk> {
             read_bool: std::mem::transmute(p_read_bool),
             read_string: std::mem::transmute(p_read_string),
             join_thread_pool: std::mem::transmute(p_join),
-            associate_class: std::mem::transmute(p_associate),
         })
     }).as_ref()
 }
@@ -146,11 +140,11 @@ struct SendClass(*mut c_void);
 unsafe impl Send for SendClass {}
 unsafe impl Sync for SendClass {}
 static OBSERVER_CLASS: OnceLock<SendClass> = OnceLock::new();
+
 /// onCreate 回调（dummy）
 extern "C" fn on_create(_args: *mut c_void) -> *mut c_void {
     std::ptr::null_mut()
 }
-
 /// onDestroy 回调（dummy）
 extern "C" fn on_destroy(_user_data: *mut c_void) {}
 
@@ -167,11 +161,10 @@ extern "C" fn on_transact(
         None => return STATUS_UNKNOWN_TRANSACTION,
     };
 
-    // 【修正】：正确读取 Interface Token (1个 i32 strict mode + 1个 string16 token)
+    // 【正确做法】：读取并丢弃 AIDL 标准 Header (1个 i32 strict mode + 1个 string token)
     let mut strict_mode = 0i32;
     let _ = unsafe { (ndk.read_i32)(in_parcel, &mut strict_mode) };
     let _token = read_string(in_parcel).unwrap_or_default();
-    alog!("on_transact token: strict_mode={} str={}", strict_mode, _token);
 
     match code {
         TX_ON_PROCESS_STARTED => {
@@ -194,14 +187,14 @@ extern "C" fn on_transact(
             let mut uid = 0i32;
             let mut fg_val = 0i32; // 使用 i32 读取 boolean 兼容性更好
             
-            let r1 = unsafe { (ndk.read_i32)(in_parcel, &mut pid) };            let r2 = unsafe { (ndk.read_i32)(in_parcel, &mut uid) };
+            let r1 = unsafe { (ndk.read_i32)(in_parcel, &mut pid) };
+            let r2 = unsafe { (ndk.read_i32)(in_parcel, &mut uid) };
             let r3 = unsafe { (ndk.read_i32)(in_parcel, &mut fg_val) };
             
             let fg = fg_val != 0;
             alog!("onFGChanged: pid={} uid={} fg={} (r={} {} {})", pid, uid, fg, r1, r2, r3);
             
-            if fg {
-                let fd = FG_EVENTFD.load(Ordering::Acquire);
+            if fg {                let fd = FG_EVENTFD.load(Ordering::Acquire);
                 if fd >= 0 {
                     let val: u64 = pid as u64;
                     unsafe { libc::write(fd, &val as *const u64 as *const _, 8); }
@@ -243,13 +236,13 @@ fn read_string(parcel: *mut c_void) -> Option<String> {
             *result = None;
         } else {
             let bytes = unsafe { std::slice::from_raw_parts(buffer as *const u8, length as usize) };
-            *result = Some(String::from_utf8_lossy(bytes).into_owned());        }
+            *result = Some(String::from_utf8_lossy(bytes).into_owned());
+        }
         0
     }
     let _ = unsafe { (ndk.read_string)(parcel, &mut result as *mut _ as *mut c_void, Some(allocator)) };
     result
 }
-
 fn get_observer_class() -> *mut c_void {
     let ndk = match ndk() { Some(n) => n, None => return std::ptr::null_mut() };
     OBSERVER_CLASS.get_or_init(|| {
@@ -276,34 +269,34 @@ pub fn init_observer(eventfd: i32) -> bool {
     let class = get_observer_class();
     if class.is_null() { alog!("class=null"); return false; }
     
+    // 创建本地 Binder，它已经自动关联了上面的 class，无需手动 associate
     let observer = unsafe { (ndk.binder_new)(class, std::ptr::null_mut()) };
     if observer.is_null() { alog!("AIBinder_new=null"); return false; }
     alog!("observer=ok");
     
+    // 获取远程系统服务 Binder
     let am = unsafe { (ndk.get_service)(b"activity\0".as_ptr() as *const c_char) };
     if am.is_null() { alog!("getService(activity)=null"); return false; }
     alog!("activity=ok");
 
-    // 【核心修复】：必须将获取到的远程 binder (am) 与我们定义的 class 关联
-    // 否则 NDK 会拒绝 prepareTransaction，报错 "Class must be defined..."
-    unsafe { (ndk.associate_class)(am, class) };
-    alog!("associateClass=ok");
-    
+    // 【关键修正】：绝对不要对远程 Binder (am) 调用 associate_class！
+    // 这会污染其内部状态并导致后续的 prepareTransaction 失败。
+
+    // 准备向远程 Binder 发送事务
     let mut in_parcel: *mut c_void = std::ptr::null_mut();
     let prep_status = unsafe { (ndk.prepare_tx)(am, &mut in_parcel) };
     if prep_status != STATUS_OK || in_parcel.is_null() {
-        alog!("prepareTransaction 失败: status={}", prep_status);        return false;
+        alog!("prepareTransaction 失败: status={}", prep_status);
+        return false;
     }
     alog!("prepareTransaction=ok, in_parcel={:p}", in_parcel);
     
-    // 写入 Interface Token (strict mode policy x2 + interface descriptor)
-    let iface = b"android.app.IActivityManager\0";
-    let iface_len = (iface.len() - 1) as i32;
+    // 写入标准的 AIDL Interface Token: strict mode policy (0) + interface descriptor
+    let iface = b"android.app.IActivityManager\0";    let iface_len = (iface.len() - 1) as i32;
     let r1 = unsafe { (ndk.write_i32)(in_parcel, 0) };
-    let r2 = unsafe { (ndk.write_i32)(in_parcel, 0) };
-    let r3 = unsafe { (ndk.write_string)(in_parcel, iface.as_ptr() as *const c_char, iface_len) };
-    let r4 = unsafe { (ndk.write_binder)(in_parcel, observer) };
-    alog!("writeI32={} {} writeString={} writeBinder={}", r1, r2, r3, r4);
+    let r2 = unsafe { (ndk.write_string)(in_parcel, iface.as_ptr() as *const c_char, iface_len) };
+    let r3 = unsafe { (ndk.write_binder)(in_parcel, observer) };
+    alog!("writeI32={} writeString={} writeBinder={}", r1, r2, r3);
     
     let mut out_parcel: *mut c_void = std::ptr::null_mut();
     let status = unsafe { (ndk.transact)(am, TX_REGISTER_PROCESS_OBSERVER, in_parcel, &mut out_parcel, 0) };
