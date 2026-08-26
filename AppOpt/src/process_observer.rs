@@ -46,6 +46,7 @@ type FnTransact = unsafe extern "C" fn(
 type FnParcelDelete = unsafe extern "C" fn(*mut c_void);
 type FnWriteString = unsafe extern "C" fn(*mut c_void, *const c_char, i32) -> c_int;
 type FnWriteBinder = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
+type FnWriteI32 = unsafe extern "C" fn(*mut c_void, i32) -> c_int;
 type FnReadI32 = unsafe extern "C" fn(*mut c_void, *mut i32) -> c_int;
 type FnReadBool = unsafe extern "C" fn(*mut c_void, *mut bool) -> c_int;
 type FnReadString = unsafe extern "C" fn(
@@ -66,6 +67,7 @@ struct BinderNdk {
     parcel_delete: FnParcelDelete,
     write_string: FnWriteString,
     write_binder: FnWriteBinder,
+    write_i32: FnWriteI32,
     read_i32: FnReadI32,
     read_bool: FnReadBool,
     read_string: FnReadString,
@@ -95,6 +97,7 @@ fn ndk() -> Option<&'static BinderNdk> {
         let p_parcel_delete = sym("AParcel_delete");
         let p_write_string = sym("AParcel_writeString");
         let p_write_binder = sym("AParcel_writeStrongBinder");
+        let p_write_i32 = sym("AParcel_writeInt32");
         let p_read_i32 = sym("AParcel_readInt32");
         let p_read_bool = sym("AParcel_readBool");
         let p_read_string = sym("AParcel_readString");
@@ -102,16 +105,16 @@ fn ndk() -> Option<&'static BinderNdk> {
         let p_associate = sym("AIBinder_associateClass");
         let p_parcel_create = sym("AParcel_create");
 
-        alog!("dlsym: getService={} classDefine={} binderNew={} prepare={} transact={} delete={} wStr={} wBinder={} rI32={} rBool={} rStr={} join={} associate={} parcelCreate={}",
+        alog!("dlsym: getService={} classDefine={} binderNew={} prepare={} transact={} delete={} wStr={} wBinder={} wI32={} rI32={} rBool={} rStr={} join={} associate={} parcelCreate={}",
             !p_get_service.is_null(), !p_class_define.is_null(), !p_binder_new.is_null(),
             !p_prepare_tx.is_null(), !p_transact.is_null(), !p_parcel_delete.is_null(),
-            !p_write_string.is_null(), !p_write_binder.is_null(),
+            !p_write_string.is_null(), !p_write_binder.is_null(), !p_write_i32.is_null(),
             !p_read_i32.is_null(), !p_read_bool.is_null(), !p_read_string.is_null(), !p_join.is_null(),
             !p_associate.is_null(), !p_parcel_create.is_null());
 
         if p_get_service.is_null() || p_class_define.is_null() || p_binder_new.is_null()
             || p_prepare_tx.is_null() || p_transact.is_null() || p_parcel_delete.is_null()
-            || p_write_string.is_null() || p_write_binder.is_null()
+            || p_write_string.is_null() || p_write_binder.is_null() || p_write_i32.is_null()
             || p_read_i32.is_null() || p_read_bool.is_null() || p_read_string.is_null()
             || p_join.is_null() || p_associate.is_null() || p_parcel_create.is_null()
         { alog!("部分 dlsym 为 null"); return None; }
@@ -126,6 +129,7 @@ fn ndk() -> Option<&'static BinderNdk> {
             parcel_delete: std::mem::transmute(p_parcel_delete),
             write_string: std::mem::transmute(p_write_string),
             write_binder: std::mem::transmute(p_write_binder),
+            write_i32: std::mem::transmute(p_write_i32),
             read_i32: std::mem::transmute(p_read_i32),
             read_bool: std::mem::transmute(p_read_bool),
             read_string: std::mem::transmute(p_read_string),
@@ -285,16 +289,19 @@ pub fn init_observer(eventfd: i32) -> bool {
     if am.is_null() { alog!("getService(activity)=null"); return false; }
     alog!("activity=ok");
 
-    let mut in_parcel = std::ptr::null_mut();
-    let status = unsafe { (ndk.prepare_tx)(am, &mut in_parcel) };
-    if status != STATUS_OK || in_parcel.is_null() {
-        alog!("prepareTx 失败 status={}", status);
-        return false;
-    }
+    // 用 AParcel_create 手动创建 parcel（不关联 binder，绕过 transact 的 binder 检查）
+    let in_parcel = unsafe { (ndk.parcel_create)() };
+    alog!("parcelCreate: null={}", in_parcel.is_null());
+    if in_parcel.is_null() { return false; }
 
-    // 只写入 observer 参数（registerProcessObserver 仅需要这一个参数）
-    let r = unsafe { (ndk.write_binder)(in_parcel, observer) };
-    alog!("writeBinder={}", r);
+    // 模仿 writeInterfaceToken 格式：int32(0), int32(0), string(interface descriptor)
+    let iface = b"android.app.IActivityManager\0";
+    let iface_len = (iface.len() - 1) as i32;
+    let r1 = unsafe { (ndk.write_i32)(in_parcel, 0) };
+    let r2 = unsafe { (ndk.write_i32)(in_parcel, 0) };
+    let r3 = unsafe { (ndk.write_string)(in_parcel, iface.as_ptr() as *const c_char, iface_len) };
+    let r4 = unsafe { (ndk.write_binder)(in_parcel, observer) };
+    alog!("writeI32={} {} writeString={} writeBinder={}", r1, r2, r3, r4);
 
     let mut out_parcel = std::ptr::null_mut();
     let status = unsafe { (ndk.transact)(am, TX_REGISTER_PROCESS_OBSERVER, in_parcel, &mut out_parcel, 0) };
