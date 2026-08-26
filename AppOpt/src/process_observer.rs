@@ -32,18 +32,24 @@ type FnClassDefine = unsafe extern "C" fn(
     *const c_char,
     Option<extern "C" fn(*mut c_void) -> *mut c_void>,
     Option<extern "C" fn(*mut c_void)>,
-    Option<extern "C" fn(*mut c_void, u32, *const c_void, *mut c_void) -> c_int>,
+    Option<extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void) -> c_int>,
 ) -> *mut c_void;
 type FnBinderNew = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
 type FnPrepareTx = unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> c_int;
-type FnTransact = unsafe extern "C" fn(*mut c_void, u32, *const c_void, *mut *mut c_void, u32) -> c_int;
+type FnTransact = unsafe extern "C" fn(
+    *mut c_void,       // binder
+    u32,               // code
+    *mut c_void,       // in parcel
+    *mut *mut c_void,  // out parcel
+    u32,               // flags
+) -> c_int;
 type FnParcelDelete = unsafe extern "C" fn(*mut c_void);
 type FnWriteString = unsafe extern "C" fn(*mut c_void, *const c_char, i32) -> c_int;
 type FnWriteBinder = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
-type FnReadI32 = unsafe extern "C" fn(*const c_void, *mut i32) -> c_int;
-type FnReadBool = unsafe extern "C" fn(*const c_void, *mut bool) -> c_int;
+type FnReadI32 = unsafe extern "C" fn(*mut c_void, *mut i32) -> c_int;
+type FnReadBool = unsafe extern "C" fn(*mut c_void, *mut bool) -> c_int;
 type FnReadString = unsafe extern "C" fn(
-    *const c_void,
+    *mut c_void,
     *mut c_void,
     Option<extern "C" fn(*mut c_void, *const c_char, i32) -> c_int>,
 ) -> c_int;
@@ -156,7 +162,7 @@ extern "C" fn on_destroy(_user_data: *mut c_void) {
 extern "C" fn on_transact(
     _binder: *mut c_void,
     code: u32,
-    in_parcel: *const c_void,
+    in_parcel: *mut c_void,
     _out: *mut c_void,
 ) -> c_int {
     alog!("on_transact code=0x{:04x}", code);
@@ -228,7 +234,7 @@ extern "C" fn on_transact(
     }
 }
 
-fn read_string(parcel: *const c_void) -> Option<String> {
+fn read_string(parcel: *mut c_void) -> Option<String> {
     let ndk = ndk()?;
     let mut result: Option<String> = None;
     extern "C" fn allocator(context: *mut c_void, buffer: *const c_char, length: i32) -> c_int {
@@ -303,14 +309,12 @@ pub fn init_observer(eventfd: i32) -> bool {
     alog!("writeString(len={})={} writeBinder={}", iface_len, r1, r2);
 
     let code = TX_REGISTER_PROCESS_OBSERVER;
-    // 预分配 reply parcel（某些设备要求 *out 非 null）
-    let mut out_parcel = unsafe { (ndk.parcel_create)() };
-    alog!("transact code=0x{:04x} out_null={}", code, out_parcel.is_null());
-    let status = unsafe { (ndk.transact)(am, code, in_parcel, &mut out_parcel, 0) };
+    alog!("transact code=0x{:04x}", code);
+    // 注册操作无需返回数据，out 直接传 null
+    let status = unsafe { (ndk.transact)(am, code, in_parcel, std::ptr::null_mut(), 0) };
     alog!("transact: status={}", status);
 
     unsafe { (ndk.parcel_delete)(in_parcel) };
-    if !out_parcel.is_null() { unsafe { (ndk.parcel_delete)(out_parcel) }; }
 
     if status == STATUS_OK {
         alog!("注册成功, 启动 binder 线程池");
