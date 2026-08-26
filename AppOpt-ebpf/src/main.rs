@@ -4,7 +4,7 @@
 #![allow(dead_code)]
 
 use aya_ebpf::{
-    helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read},
+    helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_ktime_get_ns},
     macros::{kprobe, map, tracepoint},
     maps::{Array, HashMap, LruHashMap, RingBuf},
     programs::{ProbeContext, TracePointContext},
@@ -189,6 +189,7 @@ fn sched_process_exec(ctx: TracePointContext) -> u32 {
 }
 
 /// 捕获线程改名，已管理线程直接放行否则白名单匹配
+/// 非白名单用户应用（comm 含 '.'）发射 EVENT_FG_CHANGE 供刷新率模块
 #[tracepoint(name = "task_rename", category = "task")]
 fn task_rename(ctx: TracePointContext) -> u32 {
     let pid_tgid = bpf_get_current_pid_tgid();
@@ -207,6 +208,15 @@ fn task_rename(ctx: TracePointContext) -> u32 {
         unsafe { ctx.read_at::<[u8; 16]>(offsets.rename_newcomm as usize).unwrap_or([0u8; 16]) };
 
     if !tracked && !whitelist_matched(&new_comm) {
+        // 非白名单用户应用：发射 EVENT_FG_CHANGE 供刷新率模块
+        if comm_has_dot(&new_comm) {
+            submit_event(ProcEvent {
+                pid: tgid as i32,
+                tid: tid as i32,
+                comm: new_comm,
+                event_type: EVENT_FG_CHANGE,
+            });
+        }
         return 0;
     }
 
@@ -260,36 +270,6 @@ fn kprobe_input_event(_ctx: ProbeContext) -> u32 {
         tid: pid_tgid as i32,
         comm: bpf_get_current_comm().unwrap_or_default(),
         event_type: EVENT_INPUT,
-    });
-    0
-}
-
-/// 前台应用切换检测：kprobe set_task_comm
-/// set_task_comm 在进程创建/改名时调用，2nd arg (buf) 是新进程名（包名）
-/// 直接从参数读取包名，无需扫描 /proc
-#[kprobe(function = "set_task_comm")]
-fn kprobe_set_task_comm(ctx: ProbeContext) -> u32 {
-    // arm64: pt_regs 起始是 u64 regs[31]，x1 (2nd arg) 在 offset 8
-    let regs = ctx.as_ptr() as *const u64;
-    let buf_ptr = unsafe { core::ptr::read_unaligned(regs.add(1)) } as *const u8;
-    if buf_ptr.is_null() {
-        return 0;
-    }
-
-    // 从内核内存读取新进程名（aya-ebpf bpf_probe_read 签名: fn<T>(src) -> Result<T, i32>）
-    let comm = unsafe { bpf_probe_read(buf_ptr as *const [u8; 16]) }.unwrap_or([0u8; 16]);
-
-    // 仅用户应用（含 '.'）才发射事件
-    if !comm_has_dot(&comm) {
-        return 0;
-    }
-
-    let pid_tgid = bpf_get_current_pid_tgid();
-    submit_event(ProcEvent {
-        pid: (pid_tgid >> 32) as i32,
-        tid: pid_tgid as i32,
-        comm,
-        event_type: EVENT_FG_CHANGE,
     });
     0
 }
