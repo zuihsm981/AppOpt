@@ -96,7 +96,7 @@ fn ndk() -> Option<&'static BinderNdk> {
         let p_associate = sym("AIBinder_associateClass");
         let p_parcel_create = sym("AParcel_create");
 
-        alog!("dlsym: getService={} classDefine={} binderNew={} prepare={} transact={} delete={} wStr={} wBinder={} rI32={} rBool={} rStr={} join={} associate={}",
+        alog!("dlsym: getService={} classDefine={} binderNew={} prepare={} transact={} delete={} wStr={} wBinder={} rI32={} rBool={} rStr={} join={} associate={} parcelCreate={}",
             !p_get_service.is_null(), !p_class_define.is_null(), !p_binder_new.is_null(),
             !p_prepare_tx.is_null(), !p_transact.is_null(), !p_parcel_delete.is_null(),
             !p_write_string.is_null(), !p_write_binder.is_null(),
