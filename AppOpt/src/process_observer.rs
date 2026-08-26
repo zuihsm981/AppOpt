@@ -293,9 +293,10 @@ pub fn init_observer(eventfd: i32) -> bool {
 
     // 写入 interface token: 仅一个 string
     let iface = b"android.app.IActivityManager\0";
-    let r1 = unsafe { (ndk.write_string)(in_parcel, iface.as_ptr() as *const c_char, -1) };
+    let iface_len = (iface.len() - 1) as i32; // 去掉 \0
+    let r1 = unsafe { (ndk.write_string)(in_parcel, iface.as_ptr() as *const c_char, iface_len) };
     let r2 = unsafe { (ndk.write_binder)(in_parcel, observer) };
-    alog!("writeString={} writeBinder={}", r1, r2);
+    alog!("writeString(len={})={} writeBinder={}", iface_len, r1, r2);
 
     let code = TX_REGISTER_PROCESS_OBSERVER;
     let mut out_parcel: *mut c_void = std::ptr::null_mut();
