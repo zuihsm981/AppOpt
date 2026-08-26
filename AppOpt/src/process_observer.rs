@@ -48,6 +48,7 @@ type FnReadString = unsafe extern "C" fn(
     Option<extern "C" fn(*mut c_void, *const c_char, i32) -> c_int>,
 ) -> c_int;
 type FnJoinThreadPool = unsafe extern "C" fn() -> c_int;
+type FnAssociateClass = unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool;
 
 struct BinderNdk {
     get_service: FnGetService,
@@ -62,6 +63,7 @@ struct BinderNdk {
     read_bool: FnReadBool,
     read_string: FnReadString,
     join_thread_pool: FnJoinThreadPool,
+    associate_class: FnAssociateClass,
 }
 
 static BINDER_NDK: OnceLock<Option<BinderNdk>> = OnceLock::new();
@@ -89,18 +91,20 @@ fn ndk() -> Option<&'static BinderNdk> {
         let p_read_bool = sym("AParcel_readBool");
         let p_read_string = sym("AParcel_readString");
         let p_join = sym("ABinderProcess_joinThreadPool");
+        let p_associate = sym("AIBinder_associateClass");
 
         alog!("dlsym: getService={} classDefine={} binderNew={} prepare={} transact={} delete={} wStr={} wBinder={} rI32={} rBool={} rStr={} join={}",
             !p_get_service.is_null(), !p_class_define.is_null(), !p_binder_new.is_null(),
             !p_prepare_tx.is_null(), !p_transact.is_null(), !p_parcel_delete.is_null(),
             !p_write_string.is_null(), !p_write_binder.is_null(),
-            !p_read_i32.is_null(), !p_read_bool.is_null(), !p_read_string.is_null(), !p_join.is_null());
+            !p_read_i32.is_null(), !p_read_bool.is_null(), !p_read_string.is_null(), !p_join.is_null(),
+            !p_associate.is_null());
 
         if p_get_service.is_null() || p_class_define.is_null() || p_binder_new.is_null()
             || p_prepare_tx.is_null() || p_transact.is_null() || p_parcel_delete.is_null()
             || p_write_string.is_null() || p_write_binder.is_null()
             || p_read_i32.is_null() || p_read_bool.is_null() || p_read_string.is_null()
-            || p_join.is_null()
+            || p_join.is_null() || p_associate.is_null()
         { alog!("部分 dlsym 为 null"); return None; }
 
         alog!("所有 dlsym 成功");
@@ -117,6 +121,7 @@ fn ndk() -> Option<&'static BinderNdk> {
             read_bool: std::mem::transmute(p_read_bool),
             read_string: std::mem::transmute(p_read_string),
             join_thread_pool: std::mem::transmute(p_join),
+            associate_class: std::mem::transmute(p_associate),
         })
     }).as_ref()
 }
@@ -269,6 +274,17 @@ pub fn init_observer(eventfd: i32) -> bool {
     let am = unsafe { (ndk.get_service)(b"activity\0".as_ptr() as *const c_char) };
     if am.is_null() { alog!("getService(activity)=null"); return false; }
     alog!("activity=ok");
+
+    // 为 remote binder 关联 IActivityManager class（AIBinder_prepareTransaction 要求）
+    let am_class = unsafe {
+        (ndk.class_define)(
+            b"android.app.IActivityManager\0".as_ptr() as *const c_char,
+            Some(on_create), Some(on_destroy), Some(on_transact),
+        )
+    };
+    if am_class.is_null() { alog!("am class=null"); return false; }
+    let ok = unsafe { (ndk.associate_class)(am, am_class) };
+    alog!("associateClass(am) = {}", ok);
 
     let mut in_parcel: *mut c_void = std::ptr::null_mut();
     let status = unsafe { (ndk.prepare_tx)(am, &mut in_parcel) };
