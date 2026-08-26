@@ -88,34 +88,43 @@ static BINDER_NDK: OnceLock<Option<BinderNdk>> = OnceLock::new();
 
 fn ndk() -> Option<&'static BinderNdk> {
     BINDER_NDK.get_or_init(|| unsafe {
-        alog!("dlopen libbinder_ndk.so ...");
-        let lib = dlopen(b"libbinder_ndk.so\0".as_ptr() as *const c_char, RTLD_LAZY);
+        alog!("dlopen libbinder_ndk.so (RTLD_LAZY|RTLD_GLOBAL) ...");
+        let lib = dlopen(
+            b"libbinder_ndk.so\0".as_ptr() as *const c_char,
+            RTLD_LAZY | libc::RTLD_GLOBAL,
+        );
         if lib.is_null() {
-            alog!("dlopen 失败");
-            return None;
+            alog!("dlopen 失败, 尝试 RTLD_DEFAULT 搜索 ...");
+        } else {
+            alog!("dlopen 成功, 开始 dlsym");
         }
-        alog!("dlopen 成功, 开始 dlsym");
 
-        let sym = |name: &[u8]| -> *mut c_void {
-            let mut buf = [0u8; 64];
-            let n = name.len().min(63);
-            buf[..n].copy_from_slice(&name[..n]);
-            buf[n] = 0;
-            dlsym(lib, buf.as_ptr() as *const c_char)
+        // 搜索策略：先搜 libbinder_ndk.so，再搜 RTLD_DEFAULT（全部已加载库）
+        let sym = |name: &str| -> *mut c_void {
+            let c_name = std::ffi::CString::new(name).unwrap();
+            // 1. 搜 libbinder_ndk.so
+            if !lib.is_null() {
+                let p = dlsym(lib, c_name.as_ptr());
+                if !p.is_null() {
+                    return p;
+                }
+            }
+            // 2. 搜全部已加载库（RTLD_DEFAULT = null）
+            dlsym(std::ptr::null_mut(), c_name.as_ptr())
         };
 
-        let p_get_service = sym(b"AServiceManager_getService");
-        let p_class_new = sym(b"AIBinder_Class_new");
-        let p_binder_new = sym(b"AIBinder_new");
-        let p_prepare_tx = sym(b"ABinder_prepareTransaction");
-        let p_transact = sym(b"ABinder_transact");
-        let p_parcel_delete = sym(b"AParcel_delete");
-        let p_write_token = sym(b"AParcel_writeInterfaceToken");
-        let p_write_binder = sym(b"AParcel_writeStrongBinder");
-        let p_read_i32 = sym(b"AParcel_readInt32");
-        let p_read_bool = sym(b"AParcel_readBool");
-        let p_read_string = sym(b"AParcel_readString");
-        let p_join = sym(b"ABinder_joinThreadPool");
+        let p_get_service = sym("AServiceManager_getService");
+        let p_class_new = sym("AIBinder_Class_new");
+        let p_binder_new = sym("AIBinder_new");
+        let p_prepare_tx = sym("ABinder_prepareTransaction");
+        let p_transact = sym("ABinder_transact");
+        let p_parcel_delete = sym("AParcel_delete");
+        let p_write_token = sym("AParcel_writeInterfaceToken");
+        let p_write_binder = sym("AParcel_writeStrongBinder");
+        let p_read_i32 = sym("AParcel_readInt32");
+        let p_read_bool = sym("AParcel_readBool");
+        let p_read_string = sym("AParcel_readString");
+        let p_join = sym("ABinder_joinThreadPool");
 
         alog!(
             "dlsym: getService={} classNew={} binderNew={} prepare={} transact={} delete={} wToken={} wBinder={} rI32={} rBool={} rStr={} join={}",
