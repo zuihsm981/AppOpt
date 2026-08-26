@@ -15,7 +15,6 @@ const CONFIG_PATH: &str = "./refresh_config.conf";
 const APPS_CONFIG_PATH: &str = "./refresh_config_apps.conf";
 
 pub const EVENT_INPUT: u32 = 5;
-pub const EVENT_FG_CHANGE: u32 = 8;
 
 static REFRESH_FORCE_RELOAD: AtomicBool = AtomicBool::new(false);
 static WAKE_FD: AtomicI32 = AtomicI32::new(-1);
@@ -36,7 +35,6 @@ pub struct RefreshStatus {
 
 enum RefreshEvent {
     Input,
-    FgChange { pid: i32 },
 }
 
 struct AppRefreshConfig {
@@ -237,26 +235,19 @@ fn switch_to_idle(state: &mut RefreshState) {
     state.is_paused = true;
 }
 
-/// task_rename 触发：eBPF 转发 pid，用户态读 /proc/<pid>/cmdline 获取完整包名
-/// eBPF 不做任何过滤，所有决策在用户态完成
+/// IProcessObserver 回调触发：通过 eventfd 收到 pid
+/// 从 process_observer 的 PID_CACHE 获取包名
 fn handle_fg_change(state: &mut RefreshState, pid: i32) {
-    // 读取 /proc/<pid>/cmdline 获取完整包名（不受 15 字符截断限制）
-    let cmdline_path = format!("/proc/{}/cmdline", pid);
-    let pkg = match fs::read(&cmdline_path) {
-        Ok(data) => {
-            let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-            let s = std::str::from_utf8(&data[..end]).unwrap_or("");
-            let name = s.rsplit('/').next().unwrap_or(s);
-            name.trim().to_string()
-        }
-        Err(_) => return, // 进程可能已退出
+    let pkg = match crate::process_observer::get_package_name(pid) {
+        Some(p) => p,
+        None => return,
     };
 
     if pkg.is_empty() || pkg == state.last_applied_pkg {
         return;
     }
 
-    // 过滤系统进程（用户态决策，完整包名匹配，无截断问题）
+    // 过滤系统进程
     if pkg.starts_with("com.android.systemui")
         || pkg.starts_with("com.android.phone")
         || pkg.starts_with("com.qti.")
@@ -363,6 +354,14 @@ pub fn refresh_init() {
     }
     WAKE_FD.store(wake_fd, Ordering::Release);
 
+    // IProcessObserver 用的 eventfd
+    let fg_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if fg_fd < 0 {
+        eprintln!("刷新率: fg eventfd 创建失败");
+        unsafe { libc::close(wake_fd); }
+        return;
+    }
+
     let timer_fd = unsafe {
         libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC | libc::TFD_NONBLOCK)
     };
@@ -419,6 +418,9 @@ pub fn refresh_init() {
         }
     }
 
+    // 注册 IProcessObserver 回调
+    crate::process_observer::init_observer(fg_fd);
+
     let name = CString::new("RefreshRate").unwrap();
     thread::spawn(move || {
         unsafe { libc::pthread_setname_np(libc::pthread_self(), name.as_ptr()); }
@@ -443,10 +445,15 @@ pub fn refresh_init() {
             unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, backlight_fd, &mut ev); }
         }
 
-        let mut events: [libc::epoll_event; 3] = unsafe { std::mem::zeroed() };
+        // fg_eventfd: IProcessObserver 回调通知 (u64=3)
+        ev.events = libc::EPOLLIN as u32;
+        ev.u64 = 3;
+        unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fg_fd, &mut ev); }
+
+        let mut events: [libc::epoll_event; 4] = unsafe { std::mem::zeroed() };
 
         loop {
-            let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 3, -1) };
+            let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 4, -1) };
             if n <= 0 {
                 if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                     continue;
@@ -462,7 +469,6 @@ pub fn refresh_init() {
                         while let Ok(event) = rx.try_recv() {
                             match event {
                                 RefreshEvent::Input => handle_input(&mut state),
-                                RefreshEvent::FgChange { pid } => handle_fg_change(&mut state, pid),
                             }
                         }
                         check_config(&mut state);
@@ -475,6 +481,12 @@ pub fn refresh_init() {
                     2 => {
                         handle_backlight_change(&mut state);
                     }
+                    3 => {
+                        // IProcessObserver 回调: 读取 pid，查缓存获取包名
+                        let mut val: u64 = 0;
+                        unsafe { libc::read(fg_fd, &mut val as *mut _ as *mut _, 8); }
+                        handle_fg_change(&mut state, val as i32);
+                    }
                     _ => {}
                 }
             }
@@ -485,17 +497,17 @@ pub fn refresh_init() {
             libc::close(epfd);
             libc::close(wake_fd);
             libc::close(timer_fd);
+            libc::close(fg_fd);
             if backlight_fd >= 0 { libc::close(backlight_fd); }
         }
     });
 }
 
-pub fn refresh_on_event(event_type: u32, pid: i32) {
+pub fn refresh_on_event(event_type: u32, _pid: i32) {
     let guard = REFRESH_TX.lock().unwrap();
     if let Some(tx) = guard.as_ref() {
         let event = match event_type {
             EVENT_INPUT => RefreshEvent::Input,
-            EVENT_FG_CHANGE => RefreshEvent::FgChange { pid },
             _ => return,
         };
         let _ = tx.send(event);
