@@ -310,11 +310,16 @@ pub fn init_observer(eventfd: i32) -> bool {
 
     let code = TX_REGISTER_PROCESS_OBSERVER;
     alog!("transact code=0x{:04x}", code);
-    // 注册操作无需返回数据，out 直接传 null
-    let status = unsafe { (ndk.transact)(am, code, in_parcel, std::ptr::null_mut(), 0) };
+    // 在栈上分配一个变量，用于接收 out parcel 指针
+    let mut out_parcel: *mut c_void = std::ptr::null_mut();
+    let status = unsafe { (ndk.transact)(am, code, in_parcel, &mut out_parcel, 0) };
     alog!("transact: status={}", status);
 
     unsafe { (ndk.parcel_delete)(in_parcel) };
+    // 如果返回了 out parcel，需要删除它（通常注册操作不会返回数据，但安全起见）
+    if !out_parcel.is_null() {
+        unsafe { (ndk.parcel_delete)(out_parcel) };
+    }
 
     if status == STATUS_OK {
         alog!("注册成功, 启动 binder 线程池");
