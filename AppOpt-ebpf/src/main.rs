@@ -98,25 +98,6 @@ fn whitelist_matched(comm: &[u8; 16]) -> bool {
     false
 }
 
-/// 检查 comm 是否为有效的包名
-/// 1. 以字母开头（过滤 .zip 等垃圾）
-/// 2. 含 '.'（过滤 Thread-123, onSettings 等）
-/// 3. 不含 ':'（过滤 app.in:download 等子进程名）
-#[inline(always)]
-fn is_valid_package_name(comm: &[u8; 16]) -> bool {
-    let first = comm[0];
-    if !((first >= b'a' && first <= b'z') || (first >= b'A' && first <= b'Z')) {
-        return false;
-    }
-    let mut has_dot = false;
-    for &b in comm.iter().take(15) {
-        if b == 0 { break; }
-        if b == b':' { return false; }
-        if b == b'.' { has_dot = true; }
-    }
-    has_dot
-}
-
 #[inline(always)]
 fn submit_event(event: ProcEvent) {
     if let Some(mut entry) = EVENTS.reserve(0) {
@@ -201,8 +182,10 @@ fn sched_process_exec(ctx: TracePointContext) -> u32 {
     report_named_event(&ctx, EVENT_EXEC)
 }
 
-/// 捕获线程改名，已管理线程直接放行否则白名单匹配
-/// 非白名单用户应用（comm 含 '.'）发射 EVENT_FG_CHANGE 供刷新率模块
+/// 捕获线程改名
+/// 已跟踪/白名单 → EVENT_RENAME (亲和性)
+/// 非白名单 → EVENT_FG_CHANGE，只转发 pid，comm 填零
+/// 用户态通过 /proc/<pid>/cmdline 获取完整包名并决策
 #[tracepoint(name = "task_rename", category = "task")]
 fn task_rename(ctx: TracePointContext) -> u32 {
     let pid_tgid = bpf_get_current_pid_tgid();
@@ -221,15 +204,13 @@ fn task_rename(ctx: TracePointContext) -> u32 {
         unsafe { ctx.read_at::<[u8; 16]>(offsets.rename_newcomm as usize).unwrap_or([0u8; 16]) };
 
     if !tracked && !whitelist_matched(&new_comm) {
-        // 非白名单用户应用：发射 EVENT_FG_CHANGE 供刷新率模块
-        if is_valid_package_name(&new_comm) {
-            submit_event(ProcEvent {
-                pid: tgid as i32,
-                tid: tid as i32,
-                comm: new_comm,
-                event_type: EVENT_FG_CHANGE,
-            });
-        }
+        // 非白名单：只转发 pid，不传 comm，用户态读 /proc/<pid>/cmdline
+        submit_event(ProcEvent {
+            pid: tgid as i32,
+            tid: 0,
+            comm: [0u8; 16],
+            event_type: EVENT_FG_CHANGE,
+        });
         return 0;
     }
 
