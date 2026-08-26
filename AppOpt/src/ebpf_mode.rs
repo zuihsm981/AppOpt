@@ -1,604 +1,678 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::Mutex;
 use std::sync::mpsc;
 use std::thread;
+use std::time::Instant;
 
-use aya::maps::{Array as AyaArray, HashMap as AyaHashMap};
-use aya::{programs::{KProbe as AyaKProbe, TracePoint as AyaTracePoint}, Ebpf, EbpfLoader, Pod};
+const MODE_120: i32 = 0;
+const MODE_60: i32 = 1;
+const MODE_90: i32 = 2;
 
-use crate::apply_affinity::{affinity_set, proc_walk, task_tids, tid_comm};
-use crate::cache::ProcCache;
-use crate::config::{AppConfig, CURRENT_CONFIG};
-use crate::cpuset::CpuSet;
+const CONFIG_PATH: &str = "./refresh_config.conf";
+const APPS_CONFIG_PATH: &str = "./refresh_config_apps.conf";
+const OOM_ADJ_DEBOUNCE_MS: u64 = 100;
+const FG_ADJ_THRESHOLD: i32 = 200;
 
-/// eBPF 进程事件，布局需与内核态 ProcEvent 一致
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct EbpfProcEvent {
-    pub pid: i32,
-    pub tid: i32,
-    pub comm: [u8; 16],
-    pub event_type: u32,
+pub const EVENT_INPUT: u32 = 5;
+pub const EVENT_OOM_ADJ: u32 = 7;
+
+static REFRESH_FORCE_RELOAD: AtomicBool = AtomicBool::new(false);
+static WAKE_FD: AtomicI32 = AtomicI32::new(-1);
+static REFRESH_STATUS: Mutex<Option<RefreshStatus>> = Mutex::new(None);
+static REFRESH_TX: Mutex<Option<mpsc::Sender<RefreshEvent>>> = Mutex::new(None);
+
+#[derive(Clone)]
+pub struct RefreshStatus {
+    pub current_mode: i32,
+    pub is_paused: bool,
+    pub timer_enabled: bool,
+    pub timer_running: bool,
+    pub current_package: String,
+    pub timeout: i32,
+    pub active_mode: i32,
+    pub idle_mode: i32,
 }
 
-pub const EBPF_EVENT_FORK: u32 = 1;
-pub const EBPF_EVENT_EXEC: u32 = 2;
-pub const EBPF_EVENT_RENAME: u32 = 3;
-pub const EBPF_EVENT_EXIT: u32 = 4;
-pub const EBPF_EVENT_INPUT: u32 = 5;
-pub const EBPF_EVENT_FG_CHANGE: u32 = 8;
-
-/// 用户态注入内核的 tracepoint 字段偏移，布局需与内核态 TracepointOffsets 一致
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct EbpfOffsets {
-    fork_child_pid: u32,
-    fork_child_comm: u32,
-    rename_newcomm: u32,
+enum RefreshEvent {
+    Input,
+    OomAdj,
 }
 
-unsafe impl Pod for EbpfOffsets {}
-
-/// 将内核 comm 截断于首个 NUL 并 trim 尾部空白
-fn comm_str(comm: &[u8; 16]) -> &str {
-    let end = comm.iter().position(|&b| b == 0).unwrap_or(16);
-    std::str::from_utf8(&comm[..end]).unwrap_or("").trim()
+struct AppRefreshConfig {
+    timeout: i32,
+    active_mode: i32,
+    idle_mode: i32,
 }
 
-pub struct EbpfState {
-    pub event_rx: mpsc::Receiver<EbpfProcEvent>,
-    pub reader_thread: Option<thread::JoinHandle<()>>,
-    pub bpf: Ebpf,
-    pub cache: ProcCache,
-    pub wakeup_fd: RawFd,
-    pub comm_capacity: u32,
+struct RefreshState {
+    timeout_seconds: i32,
+    active_mode: i32,
+    idle_mode: i32,
+    app_configs: HashMap<String, AppRefreshConfig>,
+    current_active: i32,
+    current_idle: i32,
+    current_timeout: i32,
+    current_applied_mode: i32,
+    is_paused: bool,
+    timer_enabled: bool,
+    last_reset_time: Option<Instant>,
+    current_package: String,
+    last_applied_pkg: String,
+    last_apply_time: Option<Instant>,
+    last_fg_check_time: Option<Instant>,
+    last_input_time: Option<Instant>,
+    backlight_path: Option<String>,
+    prev_backlight: bool,
+    timer_fd: i32,
 }
 
-impl Drop for EbpfState {
-    fn drop(&mut self) {
-        // 写 eventfd 唤醒 reader 线程的 epoll_wait 后 join 等待退出
-        if self.wakeup_fd >= 0 {
-            let val: u64 = 1;
-            unsafe {
-                libc::write(self.wakeup_fd, &val as *const u64 as *const _, 8);
+fn parse_mode(s: &str) -> i32 {
+    match s.trim() {
+        "120" => MODE_120,
+        "90" => MODE_90,
+        "60" => MODE_60,
+        _ => MODE_60,
+    }
+}
+
+fn find_backlight_path() -> Option<String> {
+    let path = "/sys/class/leds/lcd-backlight/brightness";
+    if std::path::Path::new(path).exists() {
+        return Some(path.to_string());
+    }
+    if let Ok(entries) = fs::read_dir("/sys/class/backlight") {
+        for entry in entries.flatten() {
+            let brightness = entry.path().join("brightness");
+            if brightness.exists() {
+                return Some(brightness.to_string_lossy().into_owned());
             }
         }
-        if let Some(handle) = self.reader_thread.take() {
-            let _ = handle.join();
-        }
-        if self.wakeup_fd >= 0 {
-            unsafe { libc::close(self.wakeup_fd); }
-        }
-    }
-}
-
-pub fn ebpf_probe() -> bool {
-    fs::metadata("/sys/kernel/btf/vmlinux").is_ok()
-}
-
-fn attach_tracepoint(bpf: &mut Ebpf, category: &str, name: &str, required: bool) -> bool {
-    let Some(prog) = bpf.program_mut(name) else {
-        if required {
-            eprintln!("eBPF: 未找到 {} 程序", name);
-        }
-        return false;
-    };
-    let Ok(tp): Result<&mut AyaTracePoint, _> = prog.try_into() else {
-        if required {
-            eprintln!("eBPF: {} 类型转换失败", name);
-        }
-        return false;
-    };
-    if let Err(e) = tp.load() {
-        if required {
-            eprintln!("eBPF: {} 加载失败 ({})", name, e);
-        }
-        return false;
-    }
-    if let Err(e) = tp.attach(category, name) {
-        if required {
-            eprintln!("eBPF: {} 附加失败 ({})", name, e);
-        }
-        return false;
-    }
-    true
-}
-
-/// attach kprobe，required=false 时失败不阻断 eBPF 初始化
-fn attach_kprobe(bpf: &mut Ebpf, name: &str, function: &str, required: bool) -> bool {
-    let Some(prog) = bpf.program_mut(name) else {
-        if required {
-            eprintln!("eBPF: 未找到 {} 程序", name);
-        }
-        return false;
-    };
-    let Ok(kp): Result<&mut AyaKProbe, _> = prog.try_into() else {
-        if required {
-            eprintln!("eBPF: {} 类型转换失败", name);
-        }
-        return false;
-    };
-    if let Err(e) = kp.load() {
-        if required {
-            eprintln!("eBPF: {} 加载失败 ({})", name, e);
-        }
-        return false;
-    }
-    if let Err(e) = kp.attach(function, 0) {
-        if required {
-            eprintln!("eBPF: {} 附加失败 ({})", name, e);
-        }
-        return false;
-    }
-    true
-}
-
-/// 构建白名单键，每个包名生成前 8 字节与末 8 字节键
-fn comm_keys_build<'a, I: IntoIterator<Item = &'a String>>(pkgs: I) -> Vec<[u8; 8]> {
-    let mut entries: Vec<[u8; 8]> = Vec::new();
-    for pkg in pkgs {
-        let bytes = pkg.as_bytes();
-        if bytes.is_empty() {
-            continue;
-        }
-
-        let mut prefix_key = [0u8; 8];
-        let prefix_len = bytes.len().min(8);
-        prefix_key[..prefix_len].copy_from_slice(&bytes[..prefix_len]);
-        entries.push(prefix_key);
-
-        if bytes.len() > 8 {
-            let mut suffix_key = [0u8; 8];
-            let start = bytes.len() - 8;
-            suffix_key.copy_from_slice(&bytes[start..]);
-            entries.push(suffix_key);
-        }
-    }
-    entries.sort();
-    entries.dedup();
-    entries
-}
-
-/// 初始化 TARGET_COMM_MAP，返回 true 表示需重载
-pub fn comm_map_init(bpf: &mut Ebpf, pkgs: &HashSet<String>, comm_capacity: u32) -> bool {
-    let entries = comm_keys_build(pkgs.iter());
-
-    if entries.len() > comm_capacity as usize {
-        eprintln!(
-            "eBPF: 白名单容量不足（需 {} > 现 {}），触发内核端重载",
-            entries.len(),
-            comm_capacity
-        );
-        return true;
-    }
-
-    let Some(map) = bpf.map_mut("TARGET_COMM_MAP") else {
-        eprintln!("eBPF: 未找到 TARGET_COMM_MAP");
-        return false;
-    };
-    let mut target_map = match AyaHashMap::<_, [u8; 8], u32>::try_from(map) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("eBPF: TARGET_COMM_MAP 类型转换失败 ({})", e);
-            return false;
-        }
-    };
-
-    let old_keys: Vec<[u8; 8]> = target_map.keys().filter_map(|r| r.ok()).collect();
-    for key in &old_keys {
-        let _ = target_map.remove(key);
-    }
-
-    let mut count = 0;
-    for key in &entries {
-        if target_map.insert(key, 1, 0).is_ok() {
-            count += 1;
-        }
-    }
-
-    if count < entries.len() {
-        eprintln!(
-            "eBPF: 白名单插入部分失败（{}/{}），触发重载",
-            count,
-            entries.len()
-        );
-        return true;
-    }
-
-    println!(
-        "eBPF: 白名单已配置，{} 个包名 > {} 条匹配规则",
-        pkgs.len(),
-        count
-    );
-    false
-}
-
-/// 检测 tracefs 根路径，现代内核优先 tracing 旧内核回退 debug/tracing
-fn tracefs_root() -> Option<&'static str> {
-    if fs::metadata("/sys/kernel/tracing").is_ok() {
-        return Some("/sys/kernel/tracing");
-    }
-    if fs::metadata("/sys/kernel/debug/tracing").is_ok() {
-        return Some("/sys/kernel/debug/tracing");
     }
     None
 }
 
-/// 解析 tracepoint format 文件提取字段名到偏移映射，字段名剥离数组下标
-fn tracepoint_parse(root: &str, category: &str, name: &str) -> Option<HashMap<String, u32>> {
-    let path = format!("{}/events/{}/{}/format", root, category, name);
-    let content = fs::read_to_string(&path).ok()?;
-    let mut offsets = HashMap::new();
-    for line in content.lines() {
-        let Some(rest) = line.trim().strip_prefix("field:") else {
-            continue;
-        };
-        let parts: Vec<&str> = rest.split(';').map(|s| s.trim()).collect();
-        if parts.len() < 2 {
-            continue;
-        }
-        let field_name = parts[0].split_whitespace().last().unwrap_or("").split('[').next().unwrap_or("");
-        if field_name.is_empty() {
-            continue;
-        }
-        for part in &parts[1..] {
-            if let Some(off_str) = part.strip_prefix("offset:")
-                && let Ok(off) = off_str.trim().parse::<u32>() {
-                    offsets.insert(field_name.to_string(), off);
-                    break;
-                }
-        }
-    }
-    Some(offsets)
+fn read_backlight(path: &str) -> bool {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .map(|v| v > 0)
+        .unwrap_or(false)
 }
 
-/// 解析本机 format 文件并注入 OFFSETS_MAP 索引 0，失败返回 false 由调用方回退 /proc
-fn offsets_inject(bpf: &mut Ebpf) -> bool {
-    let Some(root) = tracefs_root() else {
-        eprintln!("eBPF: tracefs 不可用，回退到 /proc 轮询");
-        return false;
+/// 从 /proc/<pid>/status 读取 UID，比 fs::metadata 更可靠
+fn read_proc_uid(pid: i32) -> u32 {
+    let content = match fs::read_to_string(format!("/proc/{}/status", pid)) {
+        Ok(c) => c,
+        Err(_) => return 0,
     };
+    for line in content.lines() {
+        if line.starts_with("Uid:") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                return parts[1].parse::<u32>().unwrap_or(0);
+            }
+        }
+    }
+    0
+}
 
-    let offsets = (|| {
-        let fork_fields = tracepoint_parse(root, "sched", "sched_process_fork")?;
-        let rename_fields = tracepoint_parse(root, "task", "task_rename")?;
-        Some(EbpfOffsets {
-            fork_child_pid: *fork_fields.get("child_pid")?,
-            fork_child_comm: *fork_fields.get("child_comm")?,
-            rename_newcomm: *rename_fields.get("newcomm")?,
-        })
-    })();
-    let Some(offsets) = offsets else {
-        eprintln!(
-            "eBPF: tracepoint format 解析失败 [{}]，回退到 /proc 轮询",
-            root
+fn create_default_config() {
+    if !std::path::Path::new(CONFIG_PATH).exists() {
+        let _ = fs::write(CONFIG_PATH, "timeout=30\nactive=120\nidle=60\n");
+    }
+    if !std::path::Path::new(APPS_CONFIG_PATH).exists() {
+        let _ = fs::write(APPS_CONFIG_PATH, "# packageName,timeout,activeMode,idleMode\n");
+    }
+}
+
+fn load_global_config(state: &mut RefreshState) {
+    let content = match fs::read_to_string(CONFIG_PATH) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            match k.trim() {
+                "timeout" => {
+                    if let Ok(t) = v.trim().parse::<i32>() {
+                        if t > 0 {
+                            state.timeout_seconds = t;
+                        }
+                    }
+                }
+                "active" => state.active_mode = parse_mode(v),
+                "idle" => state.idle_mode = parse_mode(v),
+                _ => {}
+            }
+        }
+    }
+    state.current_active = state.active_mode;
+    state.current_idle = state.idle_mode;
+    state.current_timeout = state.timeout_seconds;
+    state.timer_enabled = state.current_idle != state.current_active;
+}
+
+fn load_app_configs(state: &mut RefreshState) {
+    state.app_configs.clear();
+    let content = match fs::read_to_string(APPS_CONFIG_PATH) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = line.split(',').collect();
+        if parts.len() != 4 {
+            continue;
+        }
+        state.app_configs.insert(
+            parts[0].trim().to_string(),
+            AppRefreshConfig {
+                timeout: parts[1].trim().parse::<i32>().unwrap_or(30),
+                active_mode: parse_mode(parts[2].trim()),
+                idle_mode: parse_mode(parts[3].trim()),
+            },
         );
-        return false;
-    };
+    }
+}
 
-    let Some(map) = bpf.map_mut("OFFSETS_MAP") else {
-        eprintln!("eBPF: 未找到 OFFSETS_MAP，回退到 /proc 轮询");
-        return false;
+fn set_refresh_rate(state: &mut RefreshState, mode: i32) {
+    if mode == state.current_applied_mode {
+        return;
+    }
+    let _ = std::process::Command::new("service")
+        .args(["call", "SurfaceFlinger", "1035", "i32", &mode.to_string()])
+        .output();
+    state.current_applied_mode = mode;
+}
+
+fn apply_app_config(state: &mut RefreshState, pkg: &str) {
+    if let Some(cfg) = state.app_configs.get(pkg) {
+        state.current_timeout = cfg.timeout;
+        state.current_active = cfg.active_mode;
+        state.current_idle = cfg.idle_mode;
+    } else {
+        state.current_timeout = state.timeout_seconds;
+        state.current_active = state.active_mode;
+        state.current_idle = state.idle_mode;
+    }
+    state.timer_enabled = state.current_idle != state.current_active;
+}
+
+fn timerfd_set(fd: i32, seconds: i32) {
+    let its = libc::itimerspec {
+        it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
+        it_value: libc::timespec { tv_sec: seconds as i64, tv_nsec: 0 },
     };
-    let Ok(mut offsets_map) = AyaArray::<_, EbpfOffsets>::try_from(map) else {
-        eprintln!("eBPF: OFFSETS_MAP 类型转换失败，回退到 /proc 轮询");
-        return false;
+    unsafe { libc::timerfd_settime(fd, 0, &its, std::ptr::null_mut()); }
+}
+
+fn timerfd_cancel(fd: i32) {
+    let its = libc::itimerspec {
+        it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
+        it_value: libc::timespec { tv_sec: 0, tv_nsec: 0 },
     };
-    if offsets_map.set(0, offsets, 0).is_err() {
-        eprintln!("eBPF: OFFSETS_MAP 注入失败，回退到 /proc 轮询");
-        return false;
+    unsafe { libc::timerfd_settime(fd, 0, &its, std::ptr::null_mut()); }
+}
+
+fn reset_timer(state: &mut RefreshState, force: bool) {
+    if !state.timer_enabled {
+        timerfd_cancel(state.timer_fd);
+        state.last_reset_time = None;
+        return;
+    }
+    if state.is_paused {
+        state.is_paused = false;
+    }
+    let now = Instant::now();
+    if !force
+        && state.current_applied_mode == state.current_active
+        && state.current_active != state.current_idle
+    {
+        let debounce = std::time::Duration::from_secs((state.current_timeout - 10).max(0) as u64);
+        if let Some(last) = state.last_reset_time {
+            if now - last < debounce {
+                return;
+            }
+        }
+    }
+    timerfd_set(state.timer_fd, state.current_timeout);
+    state.last_reset_time = Some(now);
+}
+
+fn switch_to_idle(state: &mut RefreshState) {
+    if !state.timer_enabled {
+        return;
+    }
+    set_refresh_rate(state, state.current_idle);
+    state.is_paused = true;
+}
+
+/// 扫描 /proc 找到前台应用：oom_score_adj 最低且 < 200 的用户应用
+/// Android oom_score_adj: 前台 0-100, 可见 100-200, 后台 900+
+fn find_foreground_package() -> Option<String> {
+    let entries = fs::read_dir("/proc").ok()?;
+    let mut best: Option<(String, i32)> = None;
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else { continue };
+
+        let adj = fs::read_to_string(format!("/proc/{}/oom_score_adj", pid))
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .unwrap_or(1000);
+        if adj >= FG_ADJ_THRESHOLD {
+            continue;
+        }
+
+        let cmdline = match fs::read(format!("/proc/{}/cmdline", pid)) {
+            Ok(data) => {
+                let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+                let s = std::str::from_utf8(&data[..end]).unwrap_or("");
+                let name = s.rsplit('/').next().unwrap_or(s);
+                name.trim().to_string()
+            }
+            Err(_) => continue,
+        };
+        if cmdline.is_empty() {
+            continue;
+        }
+        // 排除 SystemUI（始终可见，下拉通知栏时 adj=0 会干扰）
+        if cmdline.starts_with("com.android.systemui") {
+            continue;
+        }
+        // 用户应用 UID >= 10000，桌面 com.android.launcher3 特殊放行
+        // 从 /proc/<pid>/status 读取 UID（比 fs::metadata 更可靠，不受 SELinux stat 拦截）
+        let uid = read_proc_uid(pid);
+        let is_user_app = uid >= 10000;
+        let is_launcher = cmdline == "com.android.launcher3";
+        if !is_user_app && !is_launcher {
+            continue;
+        }
+
+        match &best {
+            None => best = Some((cmdline, adj)),
+            Some((_, b)) if adj < *b => best = Some((cmdline, adj)),
+            _ => {}
+        }
+    }
+    best.map(|(pkg, _)| pkg)
+}
+
+/// kprobe oom_score_adj_write 触发：前台应用可能变化
+/// 扫描 /proc 确认实际前台应用（oom_score_adj 最低），仅在变化时切换
+fn handle_oom_adj(state: &mut RefreshState) {
+    let now = Instant::now();
+    if let Some(last) = state.last_fg_check_time {
+        if now - last < std::time::Duration::from_millis(OOM_ADJ_DEBOUNCE_MS) {
+            return;
+        }
+    }
+    state.last_fg_check_time = Some(now);
+
+    let Some(pkg) = find_foreground_package() else { return };
+    if pkg == state.last_applied_pkg {
+        return;
     }
 
-    println!(
-        "eBPF: tracepoint 偏移注入 [{}] fork[child_pid={}, child_comm={}] rename[newcomm={}]",
-        root, offsets.fork_child_pid, offsets.fork_child_comm, offsets.rename_newcomm
-    );
+    state.current_package = pkg.clone();
+    state.last_applied_pkg = pkg;
+    state.last_apply_time = Some(now);
+
+    let current_pkg = state.current_package.clone();
+    apply_app_config(state, &current_pkg);
+    set_refresh_rate(state, state.current_active);
+    if state.prev_backlight {
+        reset_timer(state, true);
+    }
+}
+
+/// input 事件触发：用户活动
+/// 1 秒节流 + 切回活跃刷新率 + 重置定时器
+fn handle_input(state: &mut RefreshState) {
+    let now = Instant::now();
+    if let Some(last) = state.last_input_time {
+        if now - last < std::time::Duration::from_secs(1) {
+            return;
+        }
+    }
+    state.last_input_time = Some(now);
+
+    if state.is_paused || state.current_applied_mode == state.current_idle {
+        set_refresh_rate(state, state.current_active);
+        state.is_paused = false;
+    }
+    if state.last_reset_time.is_some() {
+        reset_timer(state, false);
+    }
+}
+
+/// sysfs 背光 EPOLLPRI 触发：仅 0 边界穿越时操作
+/// 0→>0 启动定时器，>0→0 关闭定时器，1~254 微调丢弃
+fn handle_backlight_change(state: &mut RefreshState) {
+    let Some(path) = &state.backlight_path else { return };
+    let brightness = read_backlight(path);
+    if brightness && !state.prev_backlight {
+        // 0 → >0：切回活跃刷新率 + 启动定时器
+        if state.is_paused || state.current_applied_mode == state.current_idle {
+            set_refresh_rate(state, state.current_active);
+            state.is_paused = false;
+        }
+        reset_timer(state, true);
+    } else if !brightness && state.prev_backlight {
+        // >0 → 0：关闭定时器
+        timerfd_cancel(state.timer_fd);
+        state.last_reset_time = None;
+    }
+    state.prev_backlight = brightness;
+}
+
+fn check_config(state: &mut RefreshState) {
+    if REFRESH_FORCE_RELOAD.swap(false, Ordering::AcqRel) {
+        load_global_config(state);
+        load_app_configs(state);
+        let current_pkg = state.current_package.clone();
+        apply_app_config(state, &current_pkg);
+        set_refresh_rate(state, state.current_active);
+        if state.last_reset_time.is_some() {
+            reset_timer(state, true);
+        }
+    }
+}
+
+fn update_status(state: &RefreshState) {
+    let status = RefreshStatus {
+        current_mode: state.current_applied_mode,
+        is_paused: state.is_paused,
+        timer_enabled: state.timer_enabled,
+        timer_running: state.last_reset_time.is_some(),
+        current_package: state.current_package.clone(),
+        timeout: state.current_timeout,
+        active_mode: state.current_active,
+        idle_mode: state.current_idle,
+    };
+    *REFRESH_STATUS.lock().unwrap() = Some(status);
+}
+
+fn wake() {
+    let fd = WAKE_FD.load(Ordering::Acquire);
+    if fd >= 0 {
+        let val: u64 = 1;
+        unsafe { libc::write(fd, &val as *const u64 as *const _, 8); }
+    }
+}
+
+pub fn refresh_init() {
+    create_default_config();
+
+    let wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if wake_fd < 0 {
+        eprintln!("刷新率: eventfd 创建失败");
+        return;
+    }
+    WAKE_FD.store(wake_fd, Ordering::Release);
+
+    let timer_fd = unsafe {
+        libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC | libc::TFD_NONBLOCK)
+    };
+    if timer_fd < 0 {
+        eprintln!("刷新率: timerfd 创建失败");
+        unsafe { libc::close(wake_fd); }
+        return;
+    }
+
+    let (tx, rx) = mpsc::channel::<RefreshEvent>();
+    *REFRESH_TX.lock().unwrap() = Some(tx);
+
+    let backlight_path = find_backlight_path();
+    let backlight_fd = if let Some(path) = &backlight_path {
+        let c_path = CString::new(path.as_str()).unwrap();
+        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+        if fd < 0 {
+            eprintln!("刷新率: 无法打开背光文件 {}", path);
+        }
+        fd
+    } else {
+        eprintln!("刷新率: 未找到背光路径，灭屏检测依赖 input 事件");
+        -1
+    };
+
+    let mut state = RefreshState {
+        timeout_seconds: 30,
+        active_mode: MODE_120,
+        idle_mode: MODE_60,
+        app_configs: HashMap::new(),
+        current_active: MODE_120,
+        current_idle: MODE_60,
+        current_timeout: 30,
+        current_applied_mode: -1,
+        is_paused: false,
+        timer_enabled: true,
+        last_reset_time: None,
+        current_package: String::new(),
+        last_applied_pkg: String::new(),
+        last_apply_time: None,
+        last_fg_check_time: None,
+        last_input_time: None,
+        backlight_path,
+        prev_backlight: false,
+        timer_fd,
+    };
+
+    load_global_config(&mut state);
+    load_app_configs(&mut state);
+
+    // 初始前台应用检测，确保 current_package 在线程启动前就绪
+    if let Some(pkg) = find_foreground_package() {
+        state.current_package = pkg.clone();
+        state.last_applied_pkg = pkg;
+        let current_pkg = state.current_package.clone();
+        apply_app_config(&mut state, &current_pkg);
+    }
+
+    if let Some(path) = &state.backlight_path {
+        state.prev_backlight = read_backlight(path);
+        if state.prev_backlight {
+            reset_timer(&mut state, true);
+        }
+    }
+
+    let name = CString::new("RefreshRate").unwrap();
+    thread::spawn(move || {
+        unsafe { libc::pthread_setname_np(libc::pthread_self(), name.as_ptr()); }
+
+        let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if epfd < 0 {
+            eprintln!("刷新率: epoll_create1 失败");
+            return;
+        }
+
+        let mut ev: libc::epoll_event = unsafe { std::mem::zeroed() };
+        ev.events = libc::EPOLLIN as u32;
+        ev.u64 = 0;
+        unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, wake_fd, &mut ev); }
+
+        ev.u64 = 1;
+        unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, timer_fd, &mut ev); }
+
+        if backlight_fd >= 0 {
+            ev.events = (libc::EPOLLPRI | libc::EPOLLET) as u32;
+            ev.u64 = 2;
+            unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, backlight_fd, &mut ev); }
+        }
+
+        let mut events: [libc::epoll_event; 3] = unsafe { std::mem::zeroed() };
+
+        loop {
+            let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 3, -1) };
+            if n <= 0 {
+                if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break;
+            }
+
+            for i in 0..n as usize {
+                match events[i].u64 {
+                    0 => {
+                        let mut val: u64 = 0;
+                        unsafe { libc::read(wake_fd, &mut val as *mut _ as *mut _, 8); }
+                        while let Ok(event) = rx.try_recv() {
+                            match event {
+                                RefreshEvent::Input => handle_input(&mut state),
+                                RefreshEvent::OomAdj => handle_oom_adj(&mut state),
+                            }
+                        }
+                        check_config(&mut state);
+                    }
+                    1 => {
+                        let mut val: u64 = 0;
+                        unsafe { libc::read(timer_fd, &mut val as *mut _ as *mut _, 8); }
+                        switch_to_idle(&mut state);
+                    }
+                    2 => {
+                        handle_backlight_change(&mut state);
+                    }
+                    _ => {}
+                }
+            }
+            update_status(&state);
+        }
+
+        unsafe {
+            libc::close(epfd);
+            libc::close(wake_fd);
+            libc::close(timer_fd);
+            if backlight_fd >= 0 { libc::close(backlight_fd); }
+        }
+    });
+}
+
+pub fn refresh_on_event(event_type: u32, _pid: i32) {
+    let guard = REFRESH_TX.lock().unwrap();
+    if let Some(tx) = guard.as_ref() {
+        let event = match event_type {
+            EVENT_INPUT => RefreshEvent::Input,
+            EVENT_OOM_ADJ => RefreshEvent::OomAdj,
+            _ => return,
+        };
+        let _ = tx.send(event);
+        wake();
+    }
+}
+
+// ===== Web API =====
+
+pub fn refresh_get_config() -> (i32, String, String) {
+    let content = fs::read_to_string(CONFIG_PATH).unwrap_or_default();
+    let mut timeout = 30;
+    let mut active = "120".to_string();
+    let mut idle = "60".to_string();
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some((k, v)) = line.split_once('=') {
+            match k.trim() {
+                "timeout" => {
+                    if let Ok(t) = v.trim().parse::<i32>() {
+                        if t > 0 {
+                            timeout = t;
+                        }
+                    }
+                }
+                "active" => active = v.trim().to_string(),
+                "idle" => idle = v.trim().to_string(),
+                _ => {}
+            }
+        }
+    }
+    (timeout, active, idle)
+}
+
+pub fn refresh_set_config(timeout: i32, active: &str, idle: &str) {
+    let content = format!("timeout={}\nactive={}\nidle={}\n", timeout, active, idle);
+    let _ = fs::write(CONFIG_PATH, content);
+    REFRESH_FORCE_RELOAD.store(true, Ordering::Release);
+    wake();
+}
+
+pub fn refresh_get_apps() -> Vec<(String, i32, String, String)> {
+    let content = match fs::read_to_string(APPS_CONFIG_PATH) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let mut apps = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = line.split(',').collect();
+        if parts.len() != 4 {
+            continue;
+        }
+        apps.push((
+            parts[0].trim().to_string(),
+            parts[1].trim().parse::<i32>().unwrap_or(30),
+            parts[2].trim().to_string(),
+            parts[3].trim().to_string(),
+        ));
+    }
+    apps
+}
+
+pub fn refresh_add_app(pkg: &str, timeout: i32, active: &str, idle: &str) {
+    let content = fs::read_to_string(APPS_CONFIG_PATH).unwrap_or_default();
+    let mut lines: Vec<String> = content.lines().map(String::from).collect();
+    let new_line = format!("{},{},{},{}", pkg, timeout, active, idle);
+    let mut found = false;
+    for line in lines.iter_mut() {
+        if line.trim().starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        if line.split(',').next().map(|s| s.trim() == pkg).unwrap_or(false) {
+            *line = new_line.clone();
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        lines.push(new_line);
+    }
+    let _ = fs::write(APPS_CONFIG_PATH, lines.join("\n") + "\n");
+    REFRESH_FORCE_RELOAD.store(true, Ordering::Release);
+    wake();
+}
+
+pub fn refresh_del_app(pkg: &str) -> bool {
+    let content = match fs::read_to_string(APPS_CONFIG_PATH) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let lines: Vec<String> = content
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return true;
+            }
+            line.split(',').next().map(|s| s.trim() != pkg).unwrap_or(true)
+        })
+        .map(String::from)
+        .collect();
+    let _ = fs::write(APPS_CONFIG_PATH, lines.join("\n") + "\n");
+    REFRESH_FORCE_RELOAD.store(true, Ordering::Release);
+    wake();
     true
 }
 
-/// 初始化 eBPF，加载程序 attach tracepoint 创建 RingBuf 线程，失败回退 /proc
-pub fn ebpf_init() -> Option<EbpfState> {
-    if !ebpf_probe() {
-        eprintln!("eBPF: 内核不支持（缺少 BTF），回退到 /proc 轮询");
-        return None;
-    }
-
-    let ebpf_path = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.join("AppOpt-ebpf")))?;
-
-    if !ebpf_path.exists() {
-        eprintln!("eBPF: 未找到 {}，回退到 /proc 轮询", ebpf_path.display());
-        return None;
-    }
-
-    let ebpf_data = match fs::read(&ebpf_path) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!(
-                "eBPF: 读取 {} 失败 ({})，回退到 /proc 轮询",
-                ebpf_path.display(),
-                e
-            );
-            return None;
-        }
-    };
-
-    if ebpf_data.is_empty() {
-        eprintln!("eBPF: {} 文件为空，回退到 /proc 轮询", ebpf_path.display());
-        return None;
-    }
-
-    println!(
-        "eBPF: 从 {} 加载程序 ({} bytes)",
-        ebpf_path.display(),
-        ebpf_data.len()
-    );
-
-    let pkgs_len = crate::lock_ignore_poison(&CURRENT_CONFIG)
-        .as_ref()
-        .map(|cfg| cfg.pkgs.len())
-        .unwrap_or(0);
-    let capacity = (pkgs_len * 2).max(512).next_power_of_two() as u32;
-
-    let mut loader = EbpfLoader::new();
-    loader.map_max_entries("TARGET_COMM_MAP", capacity);
-    let mut bpf = match loader.load(&ebpf_data) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("eBPF: 加载失败 ({})，回退到 /proc 轮询", e);
-            return None;
-        }
-    };
-
-    // attach 前注入偏移避免首批事件读到空 map
-    if !offsets_inject(&mut bpf) {
-        return None;
-    }
-
-    if !attach_tracepoint(&mut bpf, "sched", "sched_process_fork", true) {
-        return None;
-    }
-    if !attach_tracepoint(&mut bpf, "sched", "sched_process_exec", true) {
-        return None;
-    }
-    if !attach_tracepoint(&mut bpf, "sched", "sched_process_exit", true) {
-        return None;
-    }
-    if !attach_tracepoint(&mut bpf, "task", "task_rename", true) {
-        return None;
-    }
-    // kprobe input_event 用于刷新率模块的用户活动检测
-    // 替代 tracepoint input:input_event（高通内核可能不存在此 tracepoint）
-    // kprobe input_handle_event 用于用户活动检测（触摸/按键）
-    attach_kprobe(&mut bpf, "kprobe_input_event", "input_handle_event", false);
-    // kprobe set_task_comm 用于前台应用切换检测（直接从参数读包名）
-    attach_kprobe(&mut bpf, "kprobe_set_task_comm", "set_task_comm", false);
-
-    let ring_buf = match bpf.take_map("EVENTS") {
-        Some(map) => match aya::maps::RingBuf::try_from(map) {
-            Ok(rb) => rb,
-            Err(e) => {
-                eprintln!("eBPF: EVENTS map 类型转换失败 ({})，回退到 /proc 轮询", e);
-                return None;
-            }
-        },
-        None => {
-            eprintln!("eBPF: 未找到 EVENTS map，回退到 /proc 轮询");
-            return None;
-        }
-    };
-
-    let (tx, rx) = mpsc::channel::<EbpfProcEvent>();
-    let wakeup_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-    if wakeup_fd < 0 {
-        eprintln!("eBPF: eventfd 创建失败，回退到 /proc 轮询");
-        return None;
-    }
-    let reader_thread = thread::spawn(move || {
-        ebpf_reader(ring_buf, tx, wakeup_fd);
-    });
-
-    println!("eBPF: 初始化成功");
-
-    Some(EbpfState {
-        event_rx: rx,
-        reader_thread: Some(reader_thread),
-        bpf,
-        cache: ProcCache::new(),
-        wakeup_fd,
-        comm_capacity: capacity,
-    })
-}
-
-/// RingBuf 读取线程，epoll 阻塞等待事件 wakeup_fd 用于 Drop 唤醒退出
-fn ebpf_reader(
-    mut ring_buf: aya::maps::RingBuf<aya::maps::MapData>,
-    tx: mpsc::Sender<EbpfProcEvent>,
-    wakeup_fd: RawFd,
-) {
-    let name = CString::new("EbpfReader").unwrap();
-    unsafe {
-        libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
-    }
-
-    let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-    if epfd < 0 {
-        eprintln!("eBPF: epoll_create1 失败");
-        return;
-    }
-
-    let ring_fd = ring_buf.as_raw_fd();
-    let mut ring_ev: libc::epoll_event = unsafe { std::mem::zeroed() };
-    ring_ev.events = libc::EPOLLIN as u32;
-    ring_ev.u64 = 0;
-    if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, ring_fd, &mut ring_ev) } < 0 {
-        eprintln!("eBPF: epoll_ctl ADD ring_fd 失败");
-        unsafe { libc::close(epfd) };
-        return;
-    }
-
-    let mut wake_ev: libc::epoll_event = unsafe { std::mem::zeroed() };
-    wake_ev.events = libc::EPOLLIN as u32;
-    wake_ev.u64 = 1;
-    if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, wakeup_fd, &mut wake_ev) } < 0 {
-        eprintln!("eBPF: epoll_ctl ADD wakeup_fd 失败");
-        unsafe { libc::close(epfd) };
-        return;
-    }
-
-    let mut events: [libc::epoll_event; 2] = unsafe { std::mem::zeroed() };
-    loop {
-        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 2, -1) };
-        if n <= 0 {
-            if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            break;
-        }
-
-        // wakeup 事件优先退出
-        if events.iter().take(n as usize).any(|e| e.u64 == 1) {
-            break;
-        }
-
-        while let Some(item) = ring_buf.next() {
-            let bytes: &[u8] = &item;
-            if bytes.len() >= std::mem::size_of::<EbpfProcEvent>() {
-                let event: EbpfProcEvent =
-                    unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const EbpfProcEvent) };
-                if tx.send(event).is_err() {
-                    unsafe { libc::close(epfd) };
-                    return;
-                }
-            }
-        }
-    }
-    unsafe { libc::close(epfd) };
-}
-
-fn applied_get(bpf: &mut Ebpf) -> Option<AyaHashMap<&mut aya::maps::MapData, u32, u64>> {
-    AyaHashMap::<_, u32, u64>::try_from(bpf.map_mut("APPLIED_MAP")?).ok()
-}
-
-fn applied_set(bpf: &mut Ebpf, tid: i32, cpus: &CpuSet) {
-    let Some(mut applied) = applied_get(bpf) else { return };
-    if let Err(e) = applied.insert(tid as u32, cpus.bits[0], 0) {
-        eprintln!("eBPF: APPLIED_MAP 插入失败 tid={} ({})，map 可能已满", tid, e);
-    }
-}
-
-fn applied_del(bpf: &mut Ebpf, tid: i32) {
-    let Some(mut applied) = applied_get(bpf) else { return };
-    let _ = applied.remove(&(tid as u32));
-}
-
-fn applied_clear(bpf: &mut Ebpf) {
-    let Some(mut m) = applied_get(bpf) else { return };
-    let keys: Vec<u32> = m.keys().filter_map(|r| r.ok()).collect();
-    for k in &keys {
-        let _ = m.remove(k);
-    }
-}
-
-/// 应用亲和性并写 APPLIED_MAP，返回 true 表示 tid 已退出
-fn affinity_apply(
-    tid: i32,
-    cpus: &CpuSet,
-    cpuset_dir: &str,
-    cfg: &AppConfig,
-    bpf: &mut Ebpf,
-) -> bool {
-    let dead = affinity_set(tid, cpus, cpuset_dir, &cfg.topo);
-    if !dead {
-        applied_set(bpf, tid, cpus);
-    }
-    dead
-}
-
-/// 事件派发，按 event_type 增量处理 FORK/RENAME/EXEC/EXIT
-pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfState) {
-    let tid = event.tid;
-    let pid = event.pid;
-    let comm = comm_str(&event.comm);
-
-    match event.event_type {
-        EBPF_EVENT_EXIT => {
-            state.cache.task_del(tid);
-            applied_del(&mut state.bpf, tid);
-        }
-
-        EBPF_EVENT_EXEC
-            if !event_apply(&mut state.cache, &mut state.bpf, tid, pid, comm, cfg) => {
-                state.cache.task_del(tid);
-                applied_del(&mut state.bpf, tid);
-            }
-
-        EBPF_EVENT_FORK => {
-            // 子线程继承父线程亲和性与 cpuset
-            // 内核态已插入 APPLIED_MAP 占位，RENAME 时触发完整处理
-        }
-
-        EBPF_EVENT_RENAME => {
-            event_apply(&mut state.cache, &mut state.bpf, tid, pid, comm, cfg);
-        }
-
-        EBPF_EVENT_INPUT => {
-            crate::refresh::refresh_on_event(EBPF_EVENT_INPUT, &[0u8; 16]);
-        }
-
-        EBPF_EVENT_FG_CHANGE => {
-            crate::refresh::refresh_on_event(EBPF_EVENT_FG_CHANGE, &event.comm);
-        }
-
-        _ => {}
-    }
-}
-
-/// 统一事件处理 pkg_lookup_comm 到 task_apply
-fn event_apply(
-    cache: &mut ProcCache,
-    bpf: &mut Ebpf,
-    tid: i32,
-    pid: i32,
-    comm: &str,
-    cfg: &AppConfig,
-) -> bool {
-    let Some(pkg) = cache.pkg_lookup_comm(pid, comm, cfg) else {
-        return false;
-    };
-
-    cache.task_apply(tid, pid, &pkg, comm, cfg, |t, c, d| {
-        affinity_apply(t, c, d, cfg, bpf)
-    })
-}
-
-/// 定期纠正 affinity_sync 清死亡 tid
-pub fn affinity_check(state: &mut EbpfState, cfg: &AppConfig) {
-    let dead_tids = state.cache.affinity_sync(&cfg.topo);
-    for tid in dead_tids {
-        applied_del(&mut state.bpf, tid);
-    }
-}
-
-/// 启动或配置更新时全量扫描 /proc
-pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
-    state.cache.clear();
-    applied_clear(&mut state.bpf);
-
-    proc_walk(cfg, |_| true, |pid, pkg, has_thread_rules| {
-        let Some(tids) = task_tids(pid) else { return };
-        for tid in tids {
-            let t_name = if has_thread_rules {
-                tid_comm(tid).unwrap_or_default()
-            } else {
-                String::new()
-            };
-            state.cache.task_apply(tid, pid, pkg, &t_name, cfg, |tid, cpus, cpuset_dir| {
-                affinity_apply(tid, cpus, cpuset_dir, cfg, &mut state.bpf)
-            });
-        }
-    });
+pub fn refresh_get_status() -> Option<RefreshStatus> {
+    REFRESH_STATUS.lock().unwrap().clone()
 }
