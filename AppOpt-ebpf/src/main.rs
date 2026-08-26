@@ -16,7 +16,6 @@ const EVENT_EXEC: u32 = 2;
 const EVENT_RENAME: u32 = 3;
 const EVENT_EXIT: u32 = 4;
 const EVENT_INPUT: u32 = 5;
-const EVENT_FG_CHANGE: u32 = 8;
 
 /// 4 类 tracepoint 字段布局：fork 读 child_pid/child_comm，exec/exit 用 bpf_get_current_pid_tgid，rename 读 newcomm
 
@@ -182,10 +181,8 @@ fn sched_process_exec(ctx: TracePointContext) -> u32 {
     report_named_event(&ctx, EVENT_EXEC)
 }
 
-/// 捕获线程改名
-/// 已跟踪/白名单 → EVENT_RENAME (亲和性)
-/// 非白名单 → EVENT_FG_CHANGE，只转发 pid，comm 填零
-/// 用户态通过 /proc/<pid>/cmdline 获取完整包名并决策
+/// 捕获线程改名，已管理线程直接放行否则白名单匹配
+/// 仅处理线程亲和性
 #[tracepoint(name = "task_rename", category = "task")]
 fn task_rename(ctx: TracePointContext) -> u32 {
     let pid_tgid = bpf_get_current_pid_tgid();
@@ -204,13 +201,6 @@ fn task_rename(ctx: TracePointContext) -> u32 {
         unsafe { ctx.read_at::<[u8; 16]>(offsets.rename_newcomm as usize).unwrap_or([0u8; 16]) };
 
     if !tracked && !whitelist_matched(&new_comm) {
-        // 非白名单：只转发 pid，不传 comm，用户态读 /proc/<pid>/cmdline
-        submit_event(ProcEvent {
-            pid: tgid as i32,
-            tid: 0,
-            comm: [0u8; 16],
-            event_type: EVENT_FG_CHANGE,
-        });
         return 0;
     }
 
@@ -246,7 +236,6 @@ fn sched_process_exit(_ctx: TracePointContext) -> u32 {
 }
 
 /// 用户活动检测：kprobe 内核函数 input_handle_event()
-/// input_handle_event 是 input_event 的内部处理函数，每次触摸/按键都会调用
 /// 1 秒节流，避免触摸事件淹没 RingBuf
 #[kprobe(function = "input_handle_event")]
 fn kprobe_input_event(_ctx: ProbeContext) -> u32 {
