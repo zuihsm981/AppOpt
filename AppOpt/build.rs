@@ -32,7 +32,7 @@ fn main() {
     let target_arg = format!("--target={}29", target);
 
     let status = Command::new(&cc)
-        .args([&target_arg, "-shared", "-o", so_path.to_str().unwrap(), stub_c.to_str().unwrap()])
+        .args([&target_arg, "-nostdlib", "-shared", "-o", so_path.to_str().unwrap(), stub_c.to_str().unwrap()])
         .status();
 
     match status {
