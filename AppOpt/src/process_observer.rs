@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use libc::{c_char, c_int};
@@ -22,7 +22,7 @@ type AParcel = c_void;
 
 // ── libbinder_ndk.so 函数声明 ──
 #[link(name = "binder_ndk")]
-extern "C" {
+unsafe extern "C" {
     fn AServiceManager_getService(instance: *const c_char) -> *mut AIBinder;
     fn AIBinder_Class_new(
         interfaceDescriptor: *const c_char,
@@ -55,7 +55,8 @@ const STATUS_OK: c_int = 0;
 const STATUS_UNKNOWN_TRANSACTION: c_int = -29;
 
 // ── 状态 ──
-static PID_CACHE: Mutex<HashMap<i32, String>> = Mutex::new(HashMap::new());
+static PID_CACHE: LazyLock<Mutex<HashMap<i32, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 static FG_EVENTFD: AtomicI32 = AtomicI32::new(-1);
 
 // ── AIBinder_Class 单例（线程安全 OnceLock）──
@@ -161,7 +162,7 @@ fn read_string(parcel: *const AParcel) -> Option<String> {
 
 /// 获取或创建 IProcessObserver 的 AIBinder_Class 单例
 fn get_observer_class() -> *mut AIBinderClass {
-    *OBSERVER_CLASS.get_or_init(|| {
+    OBSERVER_CLASS.get_or_init(|| {
         let class = unsafe {
             AIBinder_Class_new(
                 b"android.app.IProcessObserver\0".as_ptr() as *const c_char,
