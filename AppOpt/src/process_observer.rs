@@ -89,18 +89,18 @@ static BINDER_NDK: OnceLock<Option<BinderNdk>> = OnceLock::new();
 fn ndk() -> Option<&'static BinderNdk> {
     BINDER_NDK.get_or_init(|| unsafe {
         // 加载多个可能包含 binder NDK 符号的库
-        let libs = [
+        let libs: &[&[u8]] = &[
             b"libbinder_ndk.so\0",
             b"libbinder.so\0",
             b"libutils.so\0",
         ];
-        let mut handles: [*mut c_void; 3] = [std::ptr::null_mut(); 3];
-        for (i, lib_name) in libs.iter().enumerate() {
+        let mut handles: Vec<*mut c_void> = Vec::new();
+        for lib_name in libs {
             let h = dlopen(lib_name.as_ptr() as *const c_char, RTLD_LAZY | libc::RTLD_GLOBAL);
-            alog!("dlopen {} = {}", 
+            alog!("dlopen {} = {}",
                 std::str::from_utf8(&lib_name[..lib_name.len()-1]).unwrap_or("?"),
                 if h.is_null() { "null" } else { "ok" });
-            handles[i] = h;
+            handles.push(h);
         }
 
         // 搜索策略：依次搜每个库，最后搜 RTLD_DEFAULT
