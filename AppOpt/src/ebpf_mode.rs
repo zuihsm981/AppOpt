@@ -544,11 +544,11 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
         }
 
         EBPF_EVENT_INPUT => {
-            crate::refresh::refresh_on_event(EBPF_EVENT_INPUT, &[0u8; 16]);
+            crate::refresh::refresh_on_event(EBPF_EVENT_INPUT, 0);
         }
 
         EBPF_EVENT_FG_CHANGE => {
-            crate::refresh::refresh_on_event(EBPF_EVENT_FG_CHANGE, &event.comm);
+            crate::refresh::refresh_on_event(EBPF_EVENT_FG_CHANGE, event.pid);
         }
 
         _ => {}
