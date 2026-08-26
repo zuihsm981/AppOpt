@@ -8,6 +8,7 @@ use aya_ebpf::{
     macros::{kprobe, map, tracepoint},
     maps::{Array, HashMap, LruHashMap, RingBuf},
     programs::{ProbeContext, TracePointContext},
+    EbpfContext,
 };
 
 const EVENT_FORK: u32 = 1;
