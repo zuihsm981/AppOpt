@@ -15,9 +15,7 @@ const LOG_TAG: &[u8] = b"AppOpt\0";
 fn log(msg: &str) {
     let mut buf = vec![0u8; msg.len() + 1];
     buf[..msg.len()].copy_from_slice(msg.as_bytes());
-    unsafe { 
-        __android_log_write(3, LOG_TAG.as_ptr() as *const c_char, buf.as_ptr() as *const c_char); 
-    }
+    unsafe { __android_log_write(3, LOG_TAG.as_ptr() as *const c_char, buf.as_ptr() as *const c_char); }
 }
 macro_rules! alog { ($($a:tt)*) => { log(&format!($($a)*)) } }
 
@@ -47,16 +45,15 @@ type FnTransact = unsafe extern "C" fn(
 ) -> c_int;
 type FnParcelDelete = unsafe extern "C" fn(*mut c_void);
 type FnWriteString = unsafe extern "C" fn(*mut c_void, *const c_char, i32) -> c_int;
-type FnWriteBinder = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;type FnWriteI32 = unsafe extern "C" fn(*mut c_void, i32) -> c_int;
-type FnReadI32 = unsafe extern "C" fn(*mut c_void, *mut i32) -> c_int;
-type FnReadString = unsafe extern "C" fn(
+type FnWriteBinder = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
+type FnWriteI32 = unsafe extern "C" fn(*mut c_void, i32) -> c_int;
+type FnReadI32 = unsafe extern "C" fn(*mut c_void, *mut i32) -> c_int;type FnReadString = unsafe extern "C" fn(
     *mut c_void,
     *mut c_void,
     Option<extern "C" fn(*mut c_void, *const c_char, i32) -> c_int>,
 ) -> c_int;
 type FnJoinThreadPool = unsafe extern "C" fn() -> c_int;
-// 【修正】：AIBinder_associateClass 返回 void
-type FnAssociateClass = unsafe extern "C" fn(*mut c_void, *const c_void);
+type FnAssociateClass = unsafe extern "C" fn(*mut c_void, *mut c_void); // 返回 void
 
 struct BinderNdk {
     get_service: FnGetService,
@@ -96,16 +93,10 @@ fn ndk() -> Option<&'static BinderNdk> {
         let p_write_string = sym("AParcel_writeString");
         let p_write_binder = sym("AParcel_writeStrongBinder");
         let p_write_i32 = sym("AParcel_writeInt32");
-        let p_read_i32 = sym("AParcel_readInt32");        let p_read_string = sym("AParcel_readString");
+        let p_read_i32 = sym("AParcel_readInt32");
+        let p_read_string = sym("AParcel_readString");
         let p_join = sym("ABinderProcess_joinThreadPool");
         let p_associate = sym("AIBinder_associateClass");
-
-        alog!("dlsym: getService={} classDefine={} binderNew={} prepare={} transact={} delete={} wStr={} wBinder={} wI32={} rI32={} rStr={} join={} associate={}",
-            !p_get_service.is_null(), !p_class_define.is_null(), !p_binder_new.is_null(),
-            !p_prepare_tx.is_null(), !p_transact.is_null(), !p_parcel_delete.is_null(),
-            !p_write_string.is_null(), !p_write_binder.is_null(), !p_write_i32.is_null(),
-            !p_read_i32.is_null(), !p_read_string.is_null(), !p_join.is_null(), !p_associate.is_null());
-
         if p_get_service.is_null() || p_class_define.is_null() || p_binder_new.is_null()
             || p_prepare_tx.is_null() || p_transact.is_null() || p_parcel_delete.is_null()
             || p_write_string.is_null() || p_write_binder.is_null() || p_write_i32.is_null()
@@ -134,8 +125,7 @@ fn ndk() -> Option<&'static BinderNdk> {
 const STATUS_OK: c_int = 0;
 const STATUS_UNKNOWN_TRANSACTION: c_int = -29;
 
-static PID_CACHE: LazyLock<Mutex<HashMap<i32, String>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static PID_CACHE: LazyLock<Mutex<HashMap<i32, String>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static FG_EVENTFD: AtomicI32 = AtomicI32::new(-1);
 
 struct SendClass(*mut c_void);
@@ -144,30 +134,21 @@ unsafe impl Sync for SendClass {}
 static OBSERVER_CLASS: OnceLock<SendClass> = OnceLock::new();
 static AM_CLASS: OnceLock<SendClass> = OnceLock::new();
 
-// ── Observer 回调 ──
-extern "C" fn on_create(_args: *mut c_void) -> *mut c_void { std::ptr::null_mut() }extern "C" fn on_destroy(_user_data: *mut c_void) {}
+extern "C" fn on_create(_args: *mut c_void) -> *mut c_void { std::ptr::null_mut() }
+extern "C" fn on_destroy(_user_data: *mut c_void) {}
+extern "C" fn am_dummy_on_transact(_b: *mut c_void, _c: u32, _i: *mut c_void, _o: *mut c_void) -> c_int { STATUS_UNKNOWN_TRANSACTION }
 
-// ── AM Dummy 回调 (用于绕过 prepareTransaction 的 Class 检查) ──
-extern "C" fn am_dummy_on_create(_args: *mut c_void) -> *mut c_void { std::ptr::null_mut() }
-extern "C" fn am_dummy_on_destroy(_user_data: *mut c_void) {}
-extern "C" fn am_dummy_on_transact(_b: *mut c_void, _c: u32, _i: *mut c_void, _o: *mut c_void) -> c_int {
-    STATUS_UNKNOWN_TRANSACTION
-}
-
-/// onTransact 回调 (处理 IProcessObserver 的事件)
+/// onTransact 回调
 extern "C" fn on_transact(
     _binder: *mut c_void,
     code: u32,
     in_parcel: *mut c_void,
     _out: *mut c_void,
 ) -> c_int {
-    alog!("on_transact code=0x{:04x}", code);
-    let ndk = match ndk() {
-        Some(n) => n,
-        None => return STATUS_UNKNOWN_TRANSACTION,
-    };
+    alog!("on_transact code=0x{:04x}", code);    let ndk = match ndk() { Some(n) => n, None => return STATUS_UNKNOWN_TRANSACTION };
 
-    // 【核心修复】：正确读取 AIDL Interface Token (1个 i32 strict mode + 1个 string)
+    // 【核心修复 1】：正确读取 AIDL Interface Token (1个 i32 strict mode + 1个 string)
+    // 之前只读 string 会导致后续 pid/uid 读取错位 4 字节！
     let mut strict_mode = 0i32;
     let _ = unsafe { (ndk.read_i32)(in_parcel, &mut strict_mode) };
     let _token = read_string(in_parcel).unwrap_or_default();
@@ -177,14 +158,11 @@ extern "C" fn on_transact(
             let mut pid = 0i32;
             let mut process_uid = 0i32;
             let mut package_uid = 0i32;
-            if unsafe { (ndk.read_i32)(in_parcel, &mut pid) } != STATUS_OK {
-                return STATUS_UNKNOWN_TRANSACTION;
-            }
+            if unsafe { (ndk.read_i32)(in_parcel, &mut pid) } != STATUS_OK { return STATUS_UNKNOWN_TRANSACTION; }
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut process_uid) };
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut package_uid) };
             let package_name = read_string(in_parcel).unwrap_or_default();
             let _process_name = read_string(in_parcel).unwrap_or_default();
-            
             alog!("onProcessStarted: pid={} pkg={}", pid, package_name);
             PID_CACHE.lock().unwrap().insert(pid, package_name);
             STATUS_OK
@@ -194,7 +172,8 @@ extern "C" fn on_transact(
             let mut uid = 0i32;
             let mut fg_val = 0i32; // 使用 i32 读取 boolean 兼容性更好
             
-            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut pid) };            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut uid) };
+            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut pid) };
+            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut uid) };
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut fg_val) };
             
             let fg = fg_val != 0;
@@ -210,27 +189,20 @@ extern "C" fn on_transact(
             STATUS_OK
         }
         TX_ON_FG_SERVICES_CHANGED => {
-            let mut _pid = 0i32;
-            let mut _uid = 0i32;
-            let mut _st = 0i32;
+            let mut _pid = 0i32; let mut _uid = 0i32; let mut _st = 0i32;
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _pid) };
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _uid) };
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _st) };
             STATUS_OK
-        }
-        TX_ON_PROCESS_DIED => {
-            let mut pid = 0i32;
-            let mut _uid = 0i32;
+        }        TX_ON_PROCESS_DIED => {
+            let mut pid = 0i32; let mut _uid = 0i32;
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut pid) };
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _uid) };
             alog!("onProcessDied: pid={}", pid);
             PID_CACHE.lock().unwrap().remove(&pid);
             STATUS_OK
         }
-        _ => {
-            alog!("未知 code=0x{:04x}", code);
-            STATUS_UNKNOWN_TRANSACTION
-        }
+        _ => { alog!("未知 code=0x{:04x}", code); STATUS_UNKNOWN_TRANSACTION }
     }
 }
 
@@ -239,11 +211,11 @@ fn read_string(parcel: *mut c_void) -> Option<String> {
     let mut result: Option<String> = None;
     extern "C" fn allocator(context: *mut c_void, buffer: *const c_char, length: i32) -> c_int {
         let result = unsafe { &mut *(context as *mut Option<String>) };
-        if buffer.is_null() || length < 0 {
-            *result = None;
-        } else {
+        if buffer.is_null() || length < 0 { *result = None; } 
+        else {
             let bytes = unsafe { std::slice::from_raw_parts(buffer as *const u8, length as usize) };
-            *result = Some(String::from_utf8_lossy(bytes).into_owned());        }
+            *result = Some(String::from_utf8_lossy(bytes).into_owned());
+        }
         0
     }
     let _ = unsafe { (ndk.read_string)(parcel, &mut result as *mut _ as *mut c_void, Some(allocator)) };
@@ -256,9 +228,7 @@ fn get_observer_class() -> *mut c_void {
         let class = unsafe {
             (ndk.class_define)(
                 b"android.app.IProcessObserver\0".as_ptr() as *const c_char,
-                Some(on_create),
-                Some(on_destroy),
-                Some(on_transact),
+                Some(on_create), Some(on_destroy), Some(on_transact),
             )
         };
         SendClass(class)
@@ -271,12 +241,9 @@ fn get_am_class() -> *mut c_void {
         let class = unsafe {
             (ndk.class_define)(
                 b"android.app.IActivityManager\0".as_ptr() as *const c_char,
-                Some(am_dummy_on_create),
-                Some(am_dummy_on_destroy),
-                Some(am_dummy_on_transact),
+                Some(on_create), Some(on_destroy), Some(am_dummy_on_transact),
             )
-        };
-        SendClass(class)
+        };        SendClass(class)
     }).0
 }
 
@@ -284,25 +251,25 @@ pub fn init_observer(eventfd: i32) -> bool {
     alog!("init_observer 开始, eventfd={}", eventfd);
     FG_EVENTFD.store(eventfd, Ordering::Release);
     
-    let ndk = match ndk() { Some(n) => n, None => { alog!("ndk()=None"); return false; } };
-    
+    let ndk = match ndk() { Some(n) => n, None => return false };
     let class = get_observer_class();
-    if class.is_null() { alog!("class=null"); return false; }
+    if class.is_null() { return false; }
     
     let observer = unsafe { (ndk.binder_new)(class, std::ptr::null_mut()) };
-    if observer.is_null() { alog!("AIBinder_new=null"); return false; }
+    if observer.is_null() { return false; }
     alog!("observer=ok");
-        let am = unsafe { (ndk.get_service)(b"activity\0".as_ptr() as *const c_char) };
-    if am.is_null() { alog!("getService(activity)=null"); return false; }
+    
+    let am = unsafe { (ndk.get_service)(b"activity\0".as_ptr() as *const c_char) };
+    if am.is_null() { return false; }
     alog!("activity=ok");
 
-    // 【核心修复】：获取 AM 的 dummy class 并关联，绕过 prepareTransaction 的检查
     let am_class = get_am_class();
-    if am_class.is_null() { alog!("am_class=null"); return false; }
+    if am_class.is_null() { return false; }
     unsafe { (ndk.associate_class)(am, am_class) };
     alog!("associateClass for AM = ok");
     
-    // 使用 prepare_tx 获取与 am 关联的 in_parcel
+    // 【核心修复 2】：彻底删除 AParcel_create！
+    // 让 prepare_tx 自动创建并正确关联 binder，避免 parcel is associated with binder object 报错
     let mut in_parcel: *mut c_void = std::ptr::null_mut();
     let prep_status = unsafe { (ndk.prepare_tx)(am, &mut in_parcel) };
     if prep_status != STATUS_OK || in_parcel.is_null() {
@@ -311,7 +278,7 @@ pub fn init_observer(eventfd: i32) -> bool {
     }
     alog!("prepareTransaction=ok");
     
-    // 写入 AIDL Interface Token: strict mode policy (0) + interface descriptor
+    // 写入 Interface Token
     let iface = b"android.app.IActivityManager\0";
     let iface_len = (iface.len() - 1) as i32;
     let _ = unsafe { (ndk.write_i32)(in_parcel, 0) };
@@ -323,17 +290,13 @@ pub fn init_observer(eventfd: i32) -> bool {
     alog!("transact: status={}", status);
     
     unsafe { (ndk.parcel_delete)(in_parcel) };
-    if !out_parcel.is_null() {
-        unsafe { (ndk.parcel_delete)(out_parcel) };
-    }
+    if !out_parcel.is_null() { unsafe { (ndk.parcel_delete)(out_parcel) }; }
     
-    if status == STATUS_OK {
-        alog!("注册成功, 启动 binder 线程池");
+    if status == STATUS_OK {        alog!("注册成功, 启动 binder 线程池");
         let join_fn = ndk.join_thread_pool;
         std::thread::spawn(move || {
             alog!("binder 线程池启动");
             unsafe { join_fn(); }
-            alog!("joinThreadPool 返回 (不应发生)");
         });
         alog!("init_observer 完成");
         true
@@ -342,6 +305,7 @@ pub fn init_observer(eventfd: i32) -> bool {
         false
     }
 }
+
 pub fn get_package_name(pid: i32) -> Option<String> {
     PID_CACHE.lock().unwrap().get(&pid).cloned()
 }
