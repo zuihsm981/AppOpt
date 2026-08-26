@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 libc = "0.2"
-binder = "0.1"
+binder = "0.0.1"
 aya = "0.14"
 serde_json = "1"
 
