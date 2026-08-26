@@ -133,6 +133,16 @@ unsafe impl Send for SendClass {}
 unsafe impl Sync for SendClass {}
 static OBSERVER_CLASS: OnceLock<SendClass> = OnceLock::new();
 
+/// onCreate 回调（dummy）
+extern "C" fn on_create(_args: *mut c_void) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+/// onDestroy 回调（dummy）
+extern "C" fn on_destroy(_user_data: *mut c_void) {
+    // nothing
+}
+
 /// onTransact 回调
 extern "C" fn on_transact(
     _binder: *mut c_void,
@@ -233,7 +243,9 @@ fn get_observer_class() -> *mut c_void {
         let class = unsafe {
             (ndk.class_define)(
                 b"android.app.IProcessObserver\0".as_ptr() as *const c_char,
-                None, None, Some(on_transact),
+                Some(on_create),
+                Some(on_destroy),
+                Some(on_transact),
             )
         };
         alog!("AIBinder_Class_define = {}", if class.is_null() { "null" } else { "ok" });
