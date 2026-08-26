@@ -98,10 +98,23 @@ fn whitelist_matched(comm: &[u8; 16]) -> bool {
     false
 }
 
-/// comm 中是否含 '.'，用于判断是否为用户应用进程
+/// 检查 comm 是否为有效的包名
+/// 1. 以字母开头（过滤 .zip 等垃圾）
+/// 2. 含 '.'（过滤 Thread-123, onSettings 等）
+/// 3. 不含 ':'（过滤 app.in:download 等子进程名）
 #[inline(always)]
-fn comm_has_dot(comm: &[u8; 16]) -> bool {
-    comm.iter().take(15).any(|&b| b == b'.')
+fn is_valid_package_name(comm: &[u8; 16]) -> bool {
+    let first = comm[0];
+    if !((first >= b'a' && first <= b'z') || (first >= b'A' && first <= b'Z')) {
+        return false;
+    }
+    let mut has_dot = false;
+    for &b in comm.iter().take(15) {
+        if b == 0 { break; }
+        if b == b':' { return false; }
+        if b == b'.' { has_dot = true; }
+    }
+    has_dot
 }
 
 #[inline(always)]
@@ -209,7 +222,7 @@ fn task_rename(ctx: TracePointContext) -> u32 {
 
     if !tracked && !whitelist_matched(&new_comm) {
         // 非白名单用户应用：发射 EVENT_FG_CHANGE 供刷新率模块
-        if comm_has_dot(&new_comm) {
+        if is_valid_package_name(&new_comm) {
             submit_event(ProcEvent {
                 pid: tgid as i32,
                 tid: tid as i32,
