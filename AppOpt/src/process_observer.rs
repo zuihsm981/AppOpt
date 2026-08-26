@@ -54,7 +54,8 @@ type FnReadString = unsafe extern "C" fn(
     Option<extern "C" fn(*mut c_void, *const c_char, i32) -> c_int>,
 ) -> c_int;
 type FnJoinThreadPool = unsafe extern "C" fn() -> c_int;
-type FnAssociateClass = unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool;
+// 【修正】：AIBinder_associateClass 返回 void
+type FnAssociateClass = unsafe extern "C" fn(*mut c_void, *const c_void);
 
 struct BinderNdk {
     get_service: FnGetService,
@@ -95,8 +96,8 @@ fn ndk() -> Option<&'static BinderNdk> {
         let p_write_string = sym("AParcel_writeString");
         let p_write_binder = sym("AParcel_writeStrongBinder");
         let p_write_i32 = sym("AParcel_writeInt32");
-        let p_read_i32 = sym("AParcel_readInt32");
-        let p_read_bool = sym("AParcel_readBool");        let p_read_string = sym("AParcel_readString");
+        let p_read_i32 = sym("AParcel_readInt32");        let p_read_bool = sym("AParcel_readBool");
+        let p_read_string = sym("AParcel_readString");
         let p_join = sym("ABinderProcess_joinThreadPool");
         let p_associate = sym("AIBinder_associateClass");
 
@@ -166,14 +167,11 @@ extern "C" fn on_transact(
         None => return STATUS_UNKNOWN_TRANSACTION,
     };
 
-    // 【核心修复 1】：正确读取 Interface Token (2个 i32 + 1个 string)
-    // 如果只读 string，会导致后续 pid/uid 读取错位
-    let mut strict_mode_1 = 0i32;
-    let mut strict_mode_2 = 0i32;
-    let _ = unsafe { (ndk.read_i32)(in_parcel, &mut strict_mode_1) };
-    let _ = unsafe { (ndk.read_i32)(in_parcel, &mut strict_mode_2) };
+    // 【修正】：正确读取 Interface Token (1个 i32 strict mode + 1个 string16 token)
+    let mut strict_mode = 0i32;
+    let _ = unsafe { (ndk.read_i32)(in_parcel, &mut strict_mode) };
     let _token = read_string(in_parcel).unwrap_or_default();
-    alog!("token: i32={} {} str={}", strict_mode_1, strict_mode_2, _token);
+    alog!("on_transact token: strict_mode={} str={}", strict_mode, _token);
 
     match code {
         TX_ON_PROCESS_STARTED => {
@@ -194,9 +192,9 @@ extern "C" fn on_transact(
         TX_ON_FG_ACTIVITIES_CHANGED => {
             let mut pid = 0i32;
             let mut uid = 0i32;
-            let mut fg_val = 0i32; // 【核心修复 2】：使用 i32 读取 boolean 兼容性更好            
-            let r1 = unsafe { (ndk.read_i32)(in_parcel, &mut pid) };
-            let r2 = unsafe { (ndk.read_i32)(in_parcel, &mut uid) };
+            let mut fg_val = 0i32; // 使用 i32 读取 boolean 兼容性更好
+            
+            let r1 = unsafe { (ndk.read_i32)(in_parcel, &mut pid) };            let r2 = unsafe { (ndk.read_i32)(in_parcel, &mut uid) };
             let r3 = unsafe { (ndk.read_i32)(in_parcel, &mut fg_val) };
             
             let fg = fg_val != 0;
@@ -243,9 +241,9 @@ fn read_string(parcel: *mut c_void) -> Option<String> {
         let result = unsafe { &mut *(context as *mut Option<String>) };
         if buffer.is_null() || length < 0 {
             *result = None;
-        } else {            let bytes = unsafe { std::slice::from_raw_parts(buffer as *const u8, length as usize) };
-            *result = Some(String::from_utf8_lossy(bytes).into_owned());
-        }
+        } else {
+            let bytes = unsafe { std::slice::from_raw_parts(buffer as *const u8, length as usize) };
+            *result = Some(String::from_utf8_lossy(bytes).into_owned());        }
         0
     }
     let _ = unsafe { (ndk.read_string)(parcel, &mut result as *mut _ as *mut c_void, Some(allocator)) };
@@ -285,17 +283,20 @@ pub fn init_observer(eventfd: i32) -> bool {
     let am = unsafe { (ndk.get_service)(b"activity\0".as_ptr() as *const c_char) };
     if am.is_null() { alog!("getService(activity)=null"); return false; }
     alog!("activity=ok");
+
+    // 【核心修复】：必须将获取到的远程 binder (am) 与我们定义的 class 关联
+    // 否则 NDK 会拒绝 prepareTransaction，报错 "Class must be defined..."
+    unsafe { (ndk.associate_class)(am, class) };
+    alog!("associateClass=ok");
     
-    // 【核心修复 3】：必须使用 AIBinder_prepareTransaction 获取与 am 关联的 in_parcel
-    // 手动使用 parcel_create 创建的 parcel 缺少 binder 关联信息，会导致 transact 被 NDK 拒绝
     let mut in_parcel: *mut c_void = std::ptr::null_mut();
     let prep_status = unsafe { (ndk.prepare_tx)(am, &mut in_parcel) };
     if prep_status != STATUS_OK || in_parcel.is_null() {
-        alog!("prepareTransaction 失败: status={}", prep_status);
-        return false;    }
+        alog!("prepareTransaction 失败: status={}", prep_status);        return false;
+    }
     alog!("prepareTransaction=ok, in_parcel={:p}", in_parcel);
     
-    // 写入 Interface Token (严格模式策略 0, 严格模式策略 0, 接口描述符)
+    // 写入 Interface Token (strict mode policy x2 + interface descriptor)
     let iface = b"android.app.IActivityManager\0";
     let iface_len = (iface.len() - 1) as i32;
     let r1 = unsafe { (ndk.write_i32)(in_parcel, 0) };
@@ -305,7 +306,6 @@ pub fn init_observer(eventfd: i32) -> bool {
     alog!("writeI32={} {} writeString={} writeBinder={}", r1, r2, r3, r4);
     
     let mut out_parcel: *mut c_void = std::ptr::null_mut();
-    // 传递 &mut out_parcel 确保 out 参数本身非 null，满足 NDK 的参数检查要求
     let status = unsafe { (ndk.transact)(am, TX_REGISTER_PROCESS_OBSERVER, in_parcel, &mut out_parcel, 0) };
     alog!("transact: status={}", status);
     
