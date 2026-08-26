@@ -38,6 +38,7 @@ type FnReadString = unsafe extern "C" fn(
     *mut c_void,
     Option<extern "C" fn(*mut c_void, *const c_char, i32) -> c_int>,
 ) -> c_int;
+type FnJoinThreadPool = unsafe extern "C" fn() -> c_int;
 
 /// dlopen 加载的 libbinder_ndk 函数指针集合
 struct BinderNdk {
@@ -52,6 +53,7 @@ struct BinderNdk {
     read_i32: FnReadI32,
     read_bool: FnReadBool,
     read_string: FnReadString,
+    join_thread_pool: FnJoinThreadPool,
 }
 
 static BINDER_NDK: OnceLock<Option<BinderNdk>> = OnceLock::new();
@@ -84,11 +86,13 @@ fn ndk() -> Option<&'static BinderNdk> {
         let p_read_i32 = sym(b"AParcel_readInt32");
         let p_read_bool = sym(b"AParcel_readBool");
         let p_read_string = sym(b"AParcel_readString");
+        let p_join = sym(b"ABinder_joinThreadPool");
 
         if p_get_service.is_null() || p_class_new.is_null() || p_binder_new.is_null()
             || p_prepare_tx.is_null() || p_transact.is_null() || p_parcel_delete.is_null()
             || p_write_token.is_null() || p_write_binder.is_null()
             || p_read_i32.is_null() || p_read_bool.is_null() || p_read_string.is_null()
+            || p_join.is_null()
         {
             return None;
         }
@@ -105,6 +109,7 @@ fn ndk() -> Option<&'static BinderNdk> {
             read_i32: std::mem::transmute(p_read_i32),
             read_bool: std::mem::transmute(p_read_bool),
             read_string: std::mem::transmute(p_read_string),
+            join_thread_pool: std::mem::transmute(p_join),
         })
     }).as_ref()
 }
@@ -277,6 +282,14 @@ pub fn init_observer(eventfd: i32) -> bool {
 
     if status == STATUS_OK {
         eprintln!("刷新率: IProcessObserver 已注册 (事务码 0x{:04x})", code);
+
+        // 启动 binder 线程池，否则 on_transact 回调永远不会被调用
+        // ABinder_joinThreadPool 会阻塞当前线程，所以放在独立线程中运行
+        let join_fn = ndk.join_thread_pool;
+        std::thread::spawn(move || {
+            unsafe { join_fn(); }
+        });
+
         true
     } else {
         eprintln!("刷新率: registerProcessObserver 失败 ({})", status);
