@@ -1,8 +1,11 @@
-#![allow(dead_code, non_snake_case, non_upper_case_globals)]
+#![allow(dead_code)]
 //! IProcessObserver binder 回调实现（dlopen 运行时加载 libbinder_ndk.so）
 //!
-//! libbinder_ndk.so 是 Android 系统库，NDK sysroot 中无链接用 stub，
-//! 因此用 dlopen/dlsym 运行时加载，避免链接期 -lbinder_ndk 找不到的错误。
+//! 事务码硬编码，不依赖 AIDL 文件或 build.rs 生成：
+//!   registerProcessObserver          = 0x0d
+//!   onForegroundActivitiesChanged   = 0x02
+//!   onForegroundServicesChanged      = 0x03
+//!   onProcessDied                   = 0x04
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -10,14 +13,18 @@ use std::sync::{LazyLock, Mutex, OnceLock};
 use std::sync::atomic::{AtomicI32, Ordering};
 use libc::{c_char, c_int, dlopen, dlsym, RTLD_LAZY};
 
-include!(concat!(env!("OUT_DIR"), "/aidl_transactions.rs"));
+// ── 硬编码事务码 ──
+const TX_REGISTER_PROCESS_OBSERVER: u32 = 0x0d;
+const TX_ON_PROCESS_STARTED: u32 = 0x01;
+const TX_ON_FG_ACTIVITIES_CHANGED: u32 = 0x02;
+const TX_ON_FG_SERVICES_CHANGED: u32 = 0x03;
+const TX_ON_PROCESS_DIED: u32 = 0x04;
 
 // ── FFI 类型 ──
 type AIBinder = c_void;
 type AIBinderClass = c_void;
 type AParcel = c_void;
 
-// ── 函数指针类型 ──
 type FnGetService = unsafe extern "C" fn(*const c_char) -> *mut AIBinder;
 type FnClassNew = unsafe extern "C" fn(
     *const c_char,
@@ -40,7 +47,6 @@ type FnReadString = unsafe extern "C" fn(
 ) -> c_int;
 type FnJoinThreadPool = unsafe extern "C" fn() -> c_int;
 
-/// dlopen 加载的 libbinder_ndk 函数指针集合
 struct BinderNdk {
     get_service: FnGetService,
     class_new: FnClassNew,
@@ -58,7 +64,6 @@ struct BinderNdk {
 
 static BINDER_NDK: OnceLock<Option<BinderNdk>> = OnceLock::new();
 
-/// 加载 libbinder_ndk.so，返回函数指针集合的引用
 fn ndk() -> Option<&'static BinderNdk> {
     BINDER_NDK.get_or_init(|| unsafe {
         let lib = dlopen(b"libbinder_ndk.so\0".as_ptr() as *const c_char, RTLD_LAZY);
@@ -74,7 +79,6 @@ fn ndk() -> Option<&'static BinderNdk> {
             dlsym(lib, buf.as_ptr() as *const c_char)
         };
 
-        // 先获取原始指针，检查 null 后再 transmute 为函数指针
         let p_get_service = sym(b"AServiceManager_getService");
         let p_class_new = sym(b"AIBinder_Class_new");
         let p_binder_new = sym(b"AIBinder_new");
@@ -138,14 +142,16 @@ extern "C" fn on_transact(
         None => return STATUS_UNKNOWN_TRANSACTION,
     };
 
-    // 读取并丢弃 interface token
+    // 读取并丢弃 interface token (strict policy + work source + descriptor string)
     let mut tmp = 0i32;
     let _ = unsafe { (ndk.read_i32)(in_parcel, &mut tmp) };
     let _ = unsafe { (ndk.read_i32)(in_parcel, &mut tmp) };
     let _ = read_string(in_parcel);
 
     match code {
-        c if c == aidl::IProcessObserver::TRANSACTION_onProcessStarted => {
+        TX_ON_PROCESS_STARTED => {
+            // onProcessStarted(int pid, int processUid, int packageUid,
+            //                  String packageName, String processName)
             let mut pid = 0i32;
             let mut process_uid = 0i32;
             let mut package_uid = 0i32;
@@ -159,7 +165,7 @@ extern "C" fn on_transact(
             PID_CACHE.lock().unwrap().insert(pid, package_name);
             STATUS_OK
         }
-        c if c == aidl::IProcessObserver::TRANSACTION_onForegroundActivitiesChanged => {
+        TX_ON_FG_ACTIVITIES_CHANGED => {
             let mut pid = 0i32;
             let mut uid = 0i32;
             let mut fg = false;
@@ -175,7 +181,7 @@ extern "C" fn on_transact(
             }
             STATUS_OK
         }
-        c if c == aidl::IProcessObserver::TRANSACTION_onForegroundServicesChanged => {
+        TX_ON_FG_SERVICES_CHANGED => {
             let mut _pid = 0i32;
             let mut _uid = 0i32;
             let mut _st = 0i32;
@@ -184,7 +190,7 @@ extern "C" fn on_transact(
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _st) };
             STATUS_OK
         }
-        c if c == aidl::IProcessObserver::TRANSACTION_onProcessDied => {
+        TX_ON_PROCESS_DIED => {
             let mut pid = 0i32;
             let mut _uid = 0i32;
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut pid) };
@@ -271,7 +277,7 @@ pub fn init_observer(eventfd: i32) -> bool {
     let _ = unsafe { (ndk.write_token)(in_parcel, b"android.app.IActivityManager\0".as_ptr() as *const c_char) };
     let _ = unsafe { (ndk.write_binder)(in_parcel, observer) };
 
-    let code = aidl::IActivityManager::TRANSACTION_registerProcessObserver;
+    let code = TX_REGISTER_PROCESS_OBSERVER;
     let mut out_parcel: *mut AParcel = std::ptr::null_mut();
     let status = unsafe { (ndk.transact)(am, code, in_parcel, &mut out_parcel, 0) };
 
@@ -284,7 +290,6 @@ pub fn init_observer(eventfd: i32) -> bool {
         eprintln!("刷新率: IProcessObserver 已注册 (事务码 0x{:04x})", code);
 
         // 启动 binder 线程池，否则 on_transact 回调永远不会被调用
-        // ABinder_joinThreadPool 会阻塞当前线程，所以放在独立线程中运行
         let join_fn = ndk.join_thread_pool;
         std::thread::spawn(move || {
             unsafe { join_fn(); }
