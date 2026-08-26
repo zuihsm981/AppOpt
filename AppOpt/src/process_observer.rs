@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use libc::{c_char, c_int, dlopen, dlsym, RTLD_LAZY};
 
 // ── Android log（liblog.so 已由 NDK 自动链接 -llog）──
-extern "C" {
+unsafe extern "C" {
     fn __android_log_write(prio: c_int, tag: *const c_char, text: *const c_char) -> c_int;
 }
 
