@@ -88,28 +88,33 @@ static BINDER_NDK: OnceLock<Option<BinderNdk>> = OnceLock::new();
 
 fn ndk() -> Option<&'static BinderNdk> {
     BINDER_NDK.get_or_init(|| unsafe {
-        alog!("dlopen libbinder_ndk.so (RTLD_LAZY|RTLD_GLOBAL) ...");
-        let lib = dlopen(
-            b"libbinder_ndk.so\0".as_ptr() as *const c_char,
-            RTLD_LAZY | libc::RTLD_GLOBAL,
-        );
-        if lib.is_null() {
-            alog!("dlopen 失败, 尝试 RTLD_DEFAULT 搜索 ...");
-        } else {
-            alog!("dlopen 成功, 开始 dlsym");
+        // 加载多个可能包含 binder NDK 符号的库
+        let libs = [
+            b"libbinder_ndk.so\0",
+            b"libbinder.so\0",
+            b"libutils.so\0",
+        ];
+        let mut handles: [*mut c_void; 3] = [std::ptr::null_mut(); 3];
+        for (i, lib_name) in libs.iter().enumerate() {
+            let h = dlopen(lib_name.as_ptr() as *const c_char, RTLD_LAZY | libc::RTLD_GLOBAL);
+            alog!("dlopen {} = {}", 
+                std::str::from_utf8(&lib_name[..lib_name.len()-1]).unwrap_or("?"),
+                if h.is_null() { "null" } else { "ok" });
+            handles[i] = h;
         }
 
-        // 搜索策略：先搜 libbinder_ndk.so，再搜 RTLD_DEFAULT（全部已加载库）
+        // 搜索策略：依次搜每个库，最后搜 RTLD_DEFAULT
         let sym = |name: &str| -> *mut c_void {
             let c_name = std::ffi::CString::new(name).unwrap();
-            // 1. 搜 libbinder_ndk.so
-            if !lib.is_null() {
-                let p = dlsym(lib, c_name.as_ptr());
-                if !p.is_null() {
-                    return p;
+            for &h in &handles {
+                if !h.is_null() {
+                    let p = dlsym(h, c_name.as_ptr());
+                    if !p.is_null() {
+                        return p;
+                    }
                 }
             }
-            // 2. 搜全部已加载库（RTLD_DEFAULT = null）
+            // 搜全部已加载库
             dlsym(std::ptr::null_mut(), c_name.as_ptr())
         };
 
