@@ -10,7 +10,7 @@
 
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -35,6 +35,8 @@ fn main() {
     output.push_str("//        method_index 按 AIDL 接口体内方法声明顺序从 0 开始计数\n");
     output.push_str("//        这与 AOSP aidl 编译器 (frameworks/base/tools/aidl/) 的编号规则一致\n");
     output.push_str("// ================================================= ========================\n\n");
+    // 包裹在 aidl 父模块中，避免 IProcessObserver 模块名与 trait 名冲突 (E0428)
+    output.push_str("pub mod aidl {\n");
 
     for (aidl_name, module_name) in aidl_files {
         let aidl_path = aidl_dir.join(aidl_name);
@@ -86,6 +88,9 @@ fn main() {
 
         println!("cargo:rerun-if-changed={}", aidl_path.display());
     }
+
+    // 关闭 aidl 父模块
+    output.push_str("}\n");
 
     fs::write(&dest, output).unwrap();
     println!("cargo:rerun-if-changed=build.rs");
