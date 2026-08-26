@@ -285,34 +285,19 @@ pub fn init_observer(eventfd: i32) -> bool {
     if am.is_null() { alog!("getService(activity)=null"); return false; }
     alog!("activity=ok");
 
-    // 为 remote binder 关联 IActivityManager class（AIBinder_prepareTransaction 要求）
-    let am_class = unsafe {
-        (ndk.class_define)(
-            b"android.app.IActivityManager\0".as_ptr() as *const c_char,
-            Some(on_create), Some(on_destroy), Some(on_transact),
-        )
-    };
-    if am_class.is_null() { alog!("am class=null"); return false; }
-    let ok = unsafe { (ndk.associate_class)(am, am_class) };
-    alog!("associateClass(am) = {}", ok);
+    let mut in_parcel = std::ptr::null_mut();
+    let status = unsafe { (ndk.prepare_tx)(am, &mut in_parcel) };
+    if status != STATUS_OK || in_parcel.is_null() {
+        alog!("prepareTx 失败 status={}", status);
+        return false;
+    }
 
-    // 用 AParcel_create 手动创建 parcel（不关联 binder，绕过 transact 的 binder 检查）
-    let in_parcel = unsafe { (ndk.parcel_create)() };
-    alog!("parcelCreate: null={}", in_parcel.is_null());
-    if in_parcel.is_null() { return false; }
+    // 只写入 observer 参数（registerProcessObserver 仅需要这一个参数）
+    let r = unsafe { (ndk.write_binder)(in_parcel, observer) };
+    alog!("writeBinder={}", r);
 
-    // 写入 interface token: 仅一个 string
-    let iface = b"android.app.IActivityManager\0";
-    let iface_len = (iface.len() - 1) as i32; // 去掉 \0
-    let r1 = unsafe { (ndk.write_string)(in_parcel, iface.as_ptr() as *const c_char, iface_len) };
-    let r2 = unsafe { (ndk.write_binder)(in_parcel, observer) };
-    alog!("writeString(len={})={} writeBinder={}", iface_len, r1, r2);
-
-    let code = TX_REGISTER_PROCESS_OBSERVER;
-    alog!("transact code=0x{:04x}", code);
-    // 在栈上分配一个变量，用于接收 out parcel 指针
-    let mut out_parcel: *mut c_void = std::ptr::null_mut();
-    let status = unsafe { (ndk.transact)(am, code, in_parcel, &mut out_parcel, 0) };
+    let mut out_parcel = std::ptr::null_mut();
+    let status = unsafe { (ndk.transact)(am, TX_REGISTER_PROCESS_OBSERVER, in_parcel, &mut out_parcel, 0) };
     alog!("transact: status={}", status);
 
     unsafe { (ndk.parcel_delete)(in_parcel) };
