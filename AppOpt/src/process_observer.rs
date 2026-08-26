@@ -49,6 +49,7 @@ type FnReadString = unsafe extern "C" fn(
 ) -> c_int;
 type FnJoinThreadPool = unsafe extern "C" fn() -> c_int;
 type FnAssociateClass = unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool;
+type FnParcelCreate = unsafe extern "C" fn() -> *mut c_void;
 
 struct BinderNdk {
     get_service: FnGetService,
@@ -64,6 +65,7 @@ struct BinderNdk {
     read_string: FnReadString,
     join_thread_pool: FnJoinThreadPool,
     associate_class: FnAssociateClass,
+    parcel_create: FnParcelCreate,
 }
 
 static BINDER_NDK: OnceLock<Option<BinderNdk>> = OnceLock::new();
@@ -92,19 +94,20 @@ fn ndk() -> Option<&'static BinderNdk> {
         let p_read_string = sym("AParcel_readString");
         let p_join = sym("ABinderProcess_joinThreadPool");
         let p_associate = sym("AIBinder_associateClass");
+        let p_parcel_create = sym("AParcel_create");
 
         alog!("dlsym: getService={} classDefine={} binderNew={} prepare={} transact={} delete={} wStr={} wBinder={} rI32={} rBool={} rStr={} join={} associate={}",
             !p_get_service.is_null(), !p_class_define.is_null(), !p_binder_new.is_null(),
             !p_prepare_tx.is_null(), !p_transact.is_null(), !p_parcel_delete.is_null(),
             !p_write_string.is_null(), !p_write_binder.is_null(),
             !p_read_i32.is_null(), !p_read_bool.is_null(), !p_read_string.is_null(), !p_join.is_null(),
-            !p_associate.is_null());
+            !p_associate.is_null(), !p_parcel_create.is_null());
 
         if p_get_service.is_null() || p_class_define.is_null() || p_binder_new.is_null()
             || p_prepare_tx.is_null() || p_transact.is_null() || p_parcel_delete.is_null()
             || p_write_string.is_null() || p_write_binder.is_null()
             || p_read_i32.is_null() || p_read_bool.is_null() || p_read_string.is_null()
-            || p_join.is_null() || p_associate.is_null()
+            || p_join.is_null() || p_associate.is_null() || p_parcel_create.is_null()
         { alog!("部分 dlsym 为 null"); return None; }
 
         alog!("所有 dlsym 成功");
@@ -122,6 +125,7 @@ fn ndk() -> Option<&'static BinderNdk> {
             read_string: std::mem::transmute(p_read_string),
             join_thread_pool: std::mem::transmute(p_join),
             associate_class: std::mem::transmute(p_associate),
+            parcel_create: std::mem::transmute(p_parcel_create),
         })
     }).as_ref()
 }
@@ -286,10 +290,10 @@ pub fn init_observer(eventfd: i32) -> bool {
     let ok = unsafe { (ndk.associate_class)(am, am_class) };
     alog!("associateClass(am) = {}", ok);
 
-    let mut in_parcel: *mut c_void = std::ptr::null_mut();
-    let status = unsafe { (ndk.prepare_tx)(am, &mut in_parcel) };
-    alog!("prepareTx: status={} null={}", status, in_parcel.is_null());
-    if status != STATUS_OK || in_parcel.is_null() { return false; }
+    // 用 AParcel_create 手动创建 parcel（不关联 binder，绕过 transact 的 binder 检查）
+    let in_parcel = unsafe { (ndk.parcel_create)() };
+    alog!("parcelCreate: null={}", in_parcel.is_null());
+    if in_parcel.is_null() { return false; }
 
     // 写入 interface token: 仅一个 string
     let iface = b"android.app.IActivityManager\0";
