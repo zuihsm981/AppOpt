@@ -21,10 +21,8 @@ macro_rules! alog { ($($a:tt)*) => { log(&format!($($a)*)) } }
 
 // ── 硬编码事务码 ──
 const TX_REGISTER_PROCESS_OBSERVER: u32 = 0x0d;
-const TX_ON_PROCESS_STARTED: u32 = 0x01;
 const TX_ON_FG_ACTIVITIES_CHANGED: u32 = 0x02;
 const TX_ON_FG_SERVICES_CHANGED: u32 = 0x03;
-const TX_ON_PROCESS_DIED: u32 = 0x04;
 
 // ── FFI 函数指针类型 ──
 type FnGetService = unsafe extern "C" fn(*const c_char) -> *mut c_void;
@@ -44,15 +42,8 @@ type FnTransact = unsafe extern "C" fn(
     u32,               // flags
 ) -> c_int;
 type FnParcelDelete = unsafe extern "C" fn(*mut c_void);
-type FnWriteString = unsafe extern "C" fn(*mut c_void, *const c_char, i32) -> c_int;
 type FnWriteBinder = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
-type FnWriteI32 = unsafe extern "C" fn(*mut c_void, i32) -> c_int;
 type FnReadI32 = unsafe extern "C" fn(*mut c_void, *mut i32) -> c_int;
-type FnReadString = unsafe extern "C" fn(
-    *mut c_void,
-    *mut c_void,
-    Option<extern "C" fn(*mut c_void, *mut *mut c_char, i32) -> bool>,
-) -> c_int;
 type FnJoinThreadPool = unsafe extern "C" fn();
 type FnStartThreadPool = unsafe extern "C" fn();
 type FnAssociateClass = unsafe extern "C" fn(*mut c_void, *const c_void) -> bool;
@@ -64,11 +55,8 @@ struct BinderNdk {
     prepare_tx: FnPrepareTx,
     transact: FnTransact,
     parcel_delete: FnParcelDelete,
-    write_string: FnWriteString,
     write_binder: FnWriteBinder,
-    write_i32: FnWriteI32,
     read_i32: FnReadI32,
-    read_string: FnReadString,
     join_thread_pool: FnJoinThreadPool,
     start_thread_pool: FnStartThreadPool,
     associate_class: FnAssociateClass,
@@ -93,18 +81,15 @@ fn ndk() -> Option<&'static BinderNdk> {
         let p_prepare_tx = sym("AIBinder_prepareTransaction");
         let p_transact = sym("AIBinder_transact");
         let p_parcel_delete = sym("AParcel_delete");
-        let p_write_string = sym("AParcel_writeString");
         let p_write_binder = sym("AParcel_writeStrongBinder");
-        let p_write_i32 = sym("AParcel_writeInt32");
         let p_read_i32 = sym("AParcel_readInt32");
-        let p_read_string = sym("AParcel_readString");
         let p_join = sym("ABinderProcess_joinThreadPool");
         let p_start = sym("ABinderProcess_startThreadPool");
         let p_associate = sym("AIBinder_associateClass");
         if p_get_service.is_null() || p_class_define.is_null() || p_binder_new.is_null()
             || p_prepare_tx.is_null() || p_transact.is_null() || p_parcel_delete.is_null()
-            || p_write_string.is_null() || p_write_binder.is_null() || p_write_i32.is_null()
-            || p_read_i32.is_null() || p_read_string.is_null() || p_join.is_null() || p_start.is_null() || p_associate.is_null()
+            || p_write_binder.is_null()
+            || p_read_i32.is_null() || p_join.is_null() || p_start.is_null() || p_associate.is_null()
         { alog!("部分 dlsym 为 null"); return None; }
         
         alog!("所有 dlsym 成功");
@@ -115,11 +100,8 @@ fn ndk() -> Option<&'static BinderNdk> {
             prepare_tx: std::mem::transmute(p_prepare_tx),
             transact: std::mem::transmute(p_transact),
             parcel_delete: std::mem::transmute(p_parcel_delete),
-            write_string: std::mem::transmute(p_write_string),
             write_binder: std::mem::transmute(p_write_binder),
-            write_i32: std::mem::transmute(p_write_i32),
             read_i32: std::mem::transmute(p_read_i32),
-            read_string: std::mem::transmute(p_read_string),
             join_thread_pool: std::mem::transmute(p_join),
             start_thread_pool: std::mem::transmute(p_start),
             associate_class: std::mem::transmute(p_associate),
@@ -130,8 +112,61 @@ fn ndk() -> Option<&'static BinderNdk> {
 const STATUS_OK: c_int = 0;
 const STATUS_UNKNOWN_TRANSACTION: c_int = -29;
 
-static PID_CACHE: LazyLock<Mutex<HashMap<i32, String>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static FG_EVENTFD: AtomicI32 = AtomicI32::new(-1);
+
+// ── UID → 包名映射表（从 /data/system/packages.list 加载）──
+struct UidMap {
+    map: HashMap<i32, String>,
+    last_mtime: i64,
+}
+
+static UID_MAP: LazyLock<Mutex<UidMap>> = LazyLock::new(|| {
+    Mutex::new(UidMap {
+        map: HashMap::new(),
+        last_mtime: -1,
+    })
+});
+
+const PACKAGES_LIST: &str = "/data/system/packages.list";
+
+/// 检查 mtime，变化时重新加载 packages.list
+fn reload_if_mtime_changed() {
+    let current_mtime = std::fs::metadata(PACKAGES_LIST)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(-1);
+
+    {
+        let guard = UID_MAP.lock().unwrap();
+        if guard.last_mtime == current_mtime {
+            return;
+        }
+    }
+
+    match std::fs::read_to_string(PACKAGES_LIST) {
+        Ok(content) => {
+            let mut new_map = HashMap::new();
+            for line in content.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let Ok(uid) = parts[1].parse::<i32>() {
+                        new_map.insert(uid, parts[0].to_string());
+                    }
+                }
+            }
+            let count = new_map.len();
+            let mut guard = UID_MAP.lock().unwrap();
+            guard.map = new_map;
+            guard.last_mtime = current_mtime;
+            alog!("UID 映射表加载完成: {} 条 (mtime={})", count, current_mtime);
+        }
+        Err(e) => {
+            alog!("无法读取 {}: {}", PACKAGES_LIST, e);
+        }
+    }
+}
 
 struct SendClass(*mut c_void);
 unsafe impl Send for SendClass {}
@@ -158,19 +193,6 @@ extern "C" fn on_transact(
     // 因此这里直接从事务数据开始读取，不再重复读 token
 
     match code {
-        TX_ON_PROCESS_STARTED => {
-            let mut pid = 0i32;
-            let mut process_uid = 0i32;
-            let mut package_uid = 0i32;
-            if unsafe { (ndk.read_i32)(in_parcel, &mut pid) } != STATUS_OK { return STATUS_UNKNOWN_TRANSACTION; }
-            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut process_uid) };
-            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut package_uid) };
-            let package_name = read_string(in_parcel).unwrap_or_default();
-            let _process_name = read_string(in_parcel).unwrap_or_default();
-            alog!("onProcessStarted: pid={} pkg={} proc={}", pid, package_name, _process_name);
-            PID_CACHE.lock().unwrap().insert(pid, package_name);
-            STATUS_OK
-        }
         TX_ON_FG_ACTIVITIES_CHANGED => {
             let mut pid = 0i32;
             let mut uid = 0i32;
@@ -185,9 +207,10 @@ extern "C" fn on_transact(
 
             if fg {
                 let fd = FG_EVENTFD.load(Ordering::Acquire);
-                alog!("  notifying eventfd={} pid={}", fd, pid);
+                alog!("  notifying eventfd={} pid={} uid={}", fd, pid, uid);
                 if fd >= 0 {
-                    let val: u64 = pid as u64;
+                    // 打包 uid (高32位) + pid (低32位) 到 eventfd
+                    let val: u64 = ((uid as u32 as u64) << 32) | (pid as u32 as u64);
                     unsafe { libc::write(fd, &val as *const u64 as *const _, 8); }
                 }
             }
@@ -200,70 +223,8 @@ extern "C" fn on_transact(
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _st) };
             STATUS_OK
         }
-        TX_ON_PROCESS_DIED => {
-            let mut pid = 0i32; let mut _uid = 0i32;
-            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut pid) };
-            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _uid) };
-            alog!("onProcessDied: pid={}", pid);
-            PID_CACHE.lock().unwrap().remove(&pid);
-            STATUS_OK
-        }
         _ => { alog!("未知 code=0x{:04x}", code); STATUS_UNKNOWN_TRANSACTION }
     }
-}
-
-fn read_string(parcel: *mut c_void) -> Option<String> {
-    let ndk = ndk()?;
-
-    // 上下文：保存 allocator 分配的缓冲区指针和长度
-    // AParcel_readString 流程：先调 allocator 分配 buffer → 再把字符串数据写入 buffer → 返回
-    // allocator 返回 true=成功, false=失败(NDK 会返回 NO_MEMORY)
-    struct StrCtx {
-        buffer: *mut u8,
-        length: i32,
-    }
-
-    extern "C" fn allocator(context: *mut c_void, buffer: *mut *mut c_char, length: i32) -> bool {
-        let ctx = unsafe { &mut *(context as *mut StrCtx) };
-        ctx.length = length;
-        if length <= 0 {
-            // 空字符串或 null，不需要分配
-            return true;
-        }
-        // 分配 length + 1 字节（NDK 可能写入 null terminator）
-        let buf = unsafe { libc::malloc((length as usize).saturating_add(1)) };
-        if buf.is_null() {
-            return false;
-        }
-        unsafe { *buffer = buf as *mut c_char; }
-        ctx.buffer = buf as *mut u8;
-        true
-    }
-
-    let mut ctx = StrCtx {
-        buffer: std::ptr::null_mut(),
-        length: 0,
-    };
-    let status = unsafe {
-        (ndk.read_string)(parcel, &mut ctx as *mut _ as *mut c_void, Some(allocator))
-    };
-    alog!("  read_string: status={} length={} buf_null={}", status, ctx.length, ctx.buffer.is_null());
-
-    let result = if status != STATUS_OK {
-        None
-    } else if ctx.length <= 0 || ctx.buffer.is_null() {
-        Some(String::new())
-    } else {
-        let bytes =
-            unsafe { std::slice::from_raw_parts(ctx.buffer, ctx.length as usize) };
-        Some(String::from_utf8_lossy(bytes).into_owned())
-    };
-
-    if !ctx.buffer.is_null() {
-        unsafe { libc::free(ctx.buffer as *mut libc::c_void) };
-    }
-
-    result
 }
 
 fn get_observer_class() -> *mut c_void {
@@ -367,21 +328,27 @@ pub fn init_observer(eventfd: i32) -> bool {
     }
 }
 
-pub fn get_package_name(pid: i32) -> Option<String> {
-    // 1. 先查 PID_CACHE（onProcessStarted 回调填充）
-    if let Some(pkg) = PID_CACHE.lock().unwrap().get(&pid).cloned() {
-        if !pkg.is_empty() {
-            return Some(pkg);
+pub fn get_package_name(uid: i32, pid: i32) -> Option<String> {
+    // 每次调用前检查 mtime，变化时重载
+    reload_if_mtime_changed();
+
+    // 1. 优先用 uid 查映射表
+    {
+        let guard = UID_MAP.lock().unwrap();
+        if let Some(pkg) = guard.map.get(&uid).cloned() {
+            if !pkg.is_empty() {
+                return Some(pkg);
+            }
         }
     }
-    // 2. 回退：读 /proc/<pid>/cmdline（进程在 observer 注册前已启动的情况）
+
+    // 2. 回退：读 /proc/<pid>/cmdline
     let path = format!("/proc/{}/cmdline", pid);
     if let Ok(data) = std::fs::read(&path) {
-        // cmdline 用 \0 分隔，第一个字段是进程名（通常等于包名）
         if let Some(name) = data.split(|&b| b == 0).next() {
             if !name.is_empty() {
                 let pkg = String::from_utf8_lossy(name).into_owned();
-                alog!("get_package_name: pid={} 从 cmdline 获取 pkg={}", pid, pkg);
+                alog!("get_package_name: uid={} pid={} 从 cmdline 获取 pkg={}", uid, pid, pkg);
                 return Some(pkg);
             }
         }
