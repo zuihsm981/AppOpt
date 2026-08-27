@@ -24,7 +24,6 @@ const MODE_60: i32 = 1;
 const MODE_90: i32 = 2;
 
 const CONFIG_PATH: &str = "./refresh_config.conf";
-const APPS_CONFIG_PATH: &str = "./refresh_config_apps.conf";
 
 pub const EVENT_INPUT: u32 = 5;
 
@@ -71,8 +70,6 @@ struct RefreshState {
     last_applied_pkg: String,
     last_apply_time: Option<Instant>,
     last_input_time: Option<Instant>,
-    backlight_path: Option<String>,
-    prev_backlight: bool,
     timer_fd: i32,
 }
 
@@ -85,36 +82,9 @@ fn parse_mode(s: &str) -> i32 {
     }
 }
 
-fn find_backlight_path() -> Option<String> {
-    let path = "/sys/class/leds/lcd-backlight/brightness";
-    if std::path::Path::new(path).exists() {
-        return Some(path.to_string());
-    }
-    if let Ok(entries) = fs::read_dir("/sys/class/backlight") {
-        for entry in entries.flatten() {
-            let brightness = entry.path().join("brightness");
-            if brightness.exists() {
-                return Some(brightness.to_string_lossy().into_owned());
-            }
-        }
-    }
-    None
-}
-
-fn read_backlight(path: &str) -> bool {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|s| s.trim().parse::<i32>().ok())
-        .map(|v| v > 0)
-        .unwrap_or(false)
-}
-
 fn create_default_config() {
     if !std::path::Path::new(CONFIG_PATH).exists() {
-        let _ = fs::write(CONFIG_PATH, "timeout=30\nactive=120\nidle=60\n");
-    }
-    if !std::path::Path::new(APPS_CONFIG_PATH).exists() {
-        let _ = fs::write(APPS_CONFIG_PATH, "# packageName,timeout,activeMode,idleMode\n");
+        let _ = fs::write(CONFIG_PATH, "timeout=30\nactive=120\nidle=60\n# packageName,timeout,activeMode,idleMode\n");
     }
 }
 
@@ -151,7 +121,7 @@ fn load_global_config(state: &mut RefreshState) {
 
 fn load_app_configs(state: &mut RefreshState) {
     state.app_configs.clear();
-    let content = match fs::read_to_string(APPS_CONFIG_PATH) {
+    let content = match fs::read_to_string(CONFIG_PATH) {
         Ok(s) => s,
         Err(_) => return,
     };
@@ -249,16 +219,15 @@ fn switch_to_idle(state: &mut RefreshState) {
     state.last_reset_time = None;
 }
 
-/// IProcessObserver 回调触发：通过 eventfd 收到打包的 uid+pid
-/// 用 uid 查 packages.list 映射表获取包名，回退读 /proc/<pid>/cmdline
-fn handle_fg_change(state: &mut RefreshState, packed: u64) {
-    let uid = (packed >> 32) as i32;
-    let pid = (packed & 0xFFFFFFFF) as i32;
-    ralog!("handle_fg_change: pid={} uid={}", pid, uid);
-    let pkg = match crate::process_observer::get_package_name(uid, pid) {
+/// IProcessObserver 回调触发：通过 eventfd 收到 uid
+/// 用 uid 查 packages.list 映射表获取包名
+fn handle_fg_change(state: &mut RefreshState, val: u64) {
+    let uid = val as i32;
+    ralog!("handle_fg_change: uid={}", uid);
+    let pkg = match crate::process_observer::get_package_name(uid) {
         Some(p) => p,
         None => {
-            ralog!("  package not found for uid={} pid={}", uid, pid);
+            ralog!("  package not found for uid={}", uid);
             return;
         }
     };
@@ -287,13 +256,11 @@ fn handle_fg_change(state: &mut RefreshState, packed: u64) {
     let current_pkg = state.current_package.clone();
     apply_app_config(state, &current_pkg);
     set_refresh_rate(state, state.current_active);
-    if state.prev_backlight {
-        reset_timer(state, true);
-    }
+    reset_timer(state, true);
 }
 
 /// input 事件触发：用户活动
-/// 1 秒节流 + 切回活跃刷新率 + 重置定时器
+/// 1 秒节流 + 计时器停止时切回活跃刷新率并重启计时器
 fn handle_input(state: &mut RefreshState) {
     let now = Instant::now();
     if let Some(last) = state.last_input_time {
@@ -303,35 +270,15 @@ fn handle_input(state: &mut RefreshState) {
     }
     state.last_input_time = Some(now);
 
-    if state.is_paused || state.current_applied_mode == state.current_idle {
+    if state.last_reset_time.is_none() {
+        // 计时器已停止（空闲状态）：切回活跃刷新率 + 重启计时器
         set_refresh_rate(state, state.current_active);
         state.is_paused = false;
-    }
-    if state.last_reset_time.is_some() {
+        reset_timer(state, true);
+    } else {
+        // 计时器运行中：带防抖重置
         reset_timer(state, false);
     }
-}
-
-/// sysfs 背光 EPOLLPRI 触发：仅 0 边界穿越时操作
-/// 0→>0 启动定时器，>0→0 关闭定时器，1~254 微调丢弃
-fn handle_backlight_change(state: &mut RefreshState) {
-    let Some(path) = &state.backlight_path else { return };
-    let brightness = read_backlight(path);
-    if brightness && !state.prev_backlight {
-        // 0 → >0：亮屏
-        ralog!("亮屏: 切回活跃刷新率 + 启动定时器");
-        if state.is_paused || state.current_applied_mode == state.current_idle {
-            set_refresh_rate(state, state.current_active);
-            state.is_paused = false;
-        }
-        reset_timer(state, true);
-    } else if !brightness && state.prev_backlight {
-        // >0 → 0：灭屏
-        ralog!("灭屏: 关闭定时器");
-        timerfd_cancel(state.timer_fd);
-        state.last_reset_time = None;
-    }
-    state.prev_backlight = brightness;
 }
 
 fn check_config(state: &mut RefreshState) {
@@ -399,19 +346,6 @@ pub fn refresh_init() {
     let (tx, rx) = mpsc::channel::<RefreshEvent>();
     *REFRESH_TX.lock().unwrap() = Some(tx);
 
-    let backlight_path = find_backlight_path();
-    let backlight_fd = if let Some(path) = &backlight_path {
-        let c_path = CString::new(path.as_str()).unwrap();
-        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
-        if fd < 0 {
-            eprintln!("刷新率: 无法打开背光文件 {}", path);
-        }
-        fd
-    } else {
-        eprintln!("刷新率: 未找到背光路径，灭屏检测依赖 input 事件");
-        -1
-    };
-
     let mut state = RefreshState {
         timeout_seconds: 30,
         active_mode: MODE_120,
@@ -428,20 +362,11 @@ pub fn refresh_init() {
         last_applied_pkg: String::new(),
         last_apply_time: None,
         last_input_time: None,
-        backlight_path,
-        prev_backlight: false,
         timer_fd,
     };
 
     load_global_config(&mut state);
     load_app_configs(&mut state);
-
-    if let Some(path) = &state.backlight_path {
-        state.prev_backlight = read_backlight(path);
-        if state.prev_backlight {
-            reset_timer(&mut state, true);
-        }
-    }
 
     // 加载 UID → 包名映射表
     crate::process_observer::init_uid_map();
@@ -468,18 +393,12 @@ pub fn refresh_init() {
         ev.u64 = 1;
         unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, timer_fd, &mut ev); }
 
-        if backlight_fd >= 0 {
-            ev.events = (libc::EPOLLPRI | libc::EPOLLET) as u32;
-            ev.u64 = 2;
-            unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, backlight_fd, &mut ev); }
-        }
-
         // fg_eventfd: IProcessObserver 回调通知 (u64=3)
         ev.events = libc::EPOLLIN as u32;
         ev.u64 = 3;
         unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fg_fd, &mut ev); }
 
-        let mut events: [libc::epoll_event; 4] = unsafe { std::mem::zeroed() };
+        let mut events: [libc::epoll_event; 3] = unsafe { std::mem::zeroed() };
 
         loop {
             let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 4, -1) };
@@ -507,11 +426,8 @@ pub fn refresh_init() {
                         unsafe { libc::read(timer_fd, &mut val as *mut _ as *mut _, 8); }
                         switch_to_idle(&mut state);
                     }
-                    2 => {
-                        handle_backlight_change(&mut state);
-                    }
                     3 => {
-                        // IProcessObserver 回调: 读取打包的 uid+pid
+                        // IProcessObserver 回调: 读取 uid
                         let mut val: u64 = 0;
                         unsafe { libc::read(fg_fd, &mut val as *mut _ as *mut _, 8); }
                         ralog!("epoll: fg eventfd triggered, val={}", val);
@@ -528,7 +444,6 @@ pub fn refresh_init() {
             libc::close(wake_fd);
             libc::close(timer_fd);
             libc::close(fg_fd);
-            if backlight_fd >= 0 { libc::close(backlight_fd); }
         }
     });
 }
@@ -580,7 +495,7 @@ pub fn refresh_set_config(timeout: i32, active: &str, idle: &str) {
 }
 
 pub fn refresh_get_apps() -> Vec<(String, i32, String, String)> {
-    let content = match fs::read_to_string(APPS_CONFIG_PATH) {
+    let content = match fs::read_to_string(CONFIG_PATH) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
@@ -605,7 +520,7 @@ pub fn refresh_get_apps() -> Vec<(String, i32, String, String)> {
 }
 
 pub fn refresh_add_app(pkg: &str, timeout: i32, active: &str, idle: &str) {
-    let content = fs::read_to_string(APPS_CONFIG_PATH).unwrap_or_default();
+    let content = fs::read_to_string(CONFIG_PATH).unwrap_or_default();
     let mut lines: Vec<String> = content.lines().map(String::from).collect();
     let new_line = format!("{},{},{},{}", pkg, timeout, active, idle);
     let mut found = false;
@@ -622,13 +537,13 @@ pub fn refresh_add_app(pkg: &str, timeout: i32, active: &str, idle: &str) {
     if !found {
         lines.push(new_line);
     }
-    let _ = fs::write(APPS_CONFIG_PATH, lines.join("\n") + "\n");
+    let _ = fs::write(CONFIG_PATH, lines.join("\n") + "\n");
     REFRESH_FORCE_RELOAD.store(true, Ordering::Release);
     wake();
 }
 
 pub fn refresh_del_app(pkg: &str) -> bool {
-    let content = match fs::read_to_string(APPS_CONFIG_PATH) {
+    let content = match fs::read_to_string(CONFIG_PATH) {
         Ok(s) => s,
         Err(_) => return false,
     };
@@ -643,7 +558,7 @@ pub fn refresh_del_app(pkg: &str) -> bool {
         })
         .map(String::from)
         .collect();
-    let _ = fs::write(APPS_CONFIG_PATH, lines.join("\n") + "\n");
+    let _ = fs::write(CONFIG_PATH, lines.join("\n") + "\n");
     REFRESH_FORCE_RELOAD.store(true, Ordering::Release);
     wake();
     true
