@@ -131,7 +131,53 @@ static UID_MAP: LazyLock<Mutex<UidMap>> = LazyLock::new(|| {
 
 const PACKAGES_LIST: &str = "/data/system/packages.list";
 
-/// 检查 mtime，变化时重新加载 packages.list
+/// 读取 packages.list 并更新映射表（含 @system 过滤）
+fn load_packages_list() {
+    let content = match std::fs::read_to_string(PACKAGES_LIST) {
+        Ok(c) => c,
+        Err(e) => {
+            alog!("无法读取 {}: {}", PACKAGES_LIST, e);
+            return;
+        }
+    };
+
+    let mut map = HashMap::new();
+    for line in content.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let pkg = parts[0];
+        let last = parts.last().unwrap();
+        // 过滤：末尾 @system 且非 com.android.launcher3
+        if *last == "@system" && pkg != "com.android.launcher3" {
+            continue;
+        }
+        if let Ok(uid) = parts[1].parse::<i32>() {
+            map.insert(uid, pkg.to_string());
+        }
+    }
+
+    let current_mtime = std::fs::metadata(PACKAGES_LIST)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(-1);
+
+    let count = map.len();
+    let mut guard = UID_MAP.lock().unwrap();
+    guard.map = map;
+    guard.last_mtime = current_mtime;
+    alog!("UID 映射表加载完成: {} 条 (mtime={})", count, current_mtime);
+}
+
+/// 初始化阶段加载 packages.list
+pub fn init_uid_map() {
+    load_packages_list();
+}
+
+/// 检查 mtime，变化时重新加载
 fn reload_if_mtime_changed() {
     let current_mtime = std::fs::metadata(PACKAGES_LIST)
         .ok()
@@ -147,27 +193,7 @@ fn reload_if_mtime_changed() {
         }
     }
 
-    match std::fs::read_to_string(PACKAGES_LIST) {
-        Ok(content) => {
-            let mut new_map = HashMap::new();
-            for line in content.lines() {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    if let Ok(uid) = parts[1].parse::<i32>() {
-                        new_map.insert(uid, parts[0].to_string());
-                    }
-                }
-            }
-            let count = new_map.len();
-            let mut guard = UID_MAP.lock().unwrap();
-            guard.map = new_map;
-            guard.last_mtime = current_mtime;
-            alog!("UID 映射表加载完成: {} 条 (mtime={})", count, current_mtime);
-        }
-        Err(e) => {
-            alog!("无法读取 {}: {}", PACKAGES_LIST, e);
-        }
-    }
+    load_packages_list();
 }
 
 struct SendClass(*mut c_void);
@@ -340,30 +366,10 @@ pub fn init_observer(eventfd: i32) -> bool {
     }
 }
 
-pub fn get_package_name(uid: i32, pid: i32) -> Option<String> {
+pub fn get_package_name(uid: i32, _pid: i32) -> Option<String> {
     // 每次调用前检查 mtime，变化时重载
     reload_if_mtime_changed();
 
-    // 1. 优先用 uid 查映射表
-    {
-        let guard = UID_MAP.lock().unwrap();
-        if let Some(pkg) = guard.map.get(&uid).cloned() {
-            if !pkg.is_empty() {
-                return Some(pkg);
-            }
-        }
-    }
-
-    // 2. 回退：读 /proc/<pid>/cmdline
-    let path = format!("/proc/{}/cmdline", pid);
-    if let Ok(data) = std::fs::read(&path) {
-        if let Some(name) = data.split(|&b| b == 0).next() {
-            if !name.is_empty() {
-                let pkg = String::from_utf8_lossy(name).into_owned();
-                alog!("get_package_name: uid={} pid={} 从 cmdline 获取 pkg={}", uid, pid, pkg);
-                return Some(pkg);
-            }
-        }
-    }
-    None
+    let guard = UID_MAP.lock().unwrap();
+    guard.map.get(&uid).cloned().filter(|s| !s.is_empty())
 }
