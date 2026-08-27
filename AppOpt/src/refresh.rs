@@ -368,7 +368,8 @@ pub fn refresh_init() {
 
     // 初始化完成后应用一次全局配置的活跃刷新率
     // （之后的前台切换判定见 handle_fg_change：未配置→未配置不再重复应用全局活跃刷新率）
-    set_refresh_rate(&mut state, state.current_active);
+    let active = state.current_active;
+    set_refresh_rate(&mut state, active);
 
     // 加载 UID → 包名映射表
     crate::process_observer::init_uid_map();
