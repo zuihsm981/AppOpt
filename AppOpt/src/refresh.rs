@@ -488,8 +488,45 @@ pub fn refresh_get_config() -> (i32, String, String) {
 }
 
 pub fn refresh_set_config(timeout: i32, active: &str, idle: &str) {
-    let content = format!("timeout={}\nactive={}\nidle={}\n", timeout, active, idle);
-    let _ = fs::write(CONFIG_PATH, content);
+    // 原地编辑而非覆盖整个文件：只替换 timeout/active/idle 三个全局配置键的值，
+    // 保留原有行顺序、注释、空行与应用配置行（不做 trim、不丢弃空行、不重排），
+    // 缺失的键追加到文件末尾。
+    let content = fs::read_to_string(CONFIG_PATH).unwrap_or_default();
+    let mut found_timeout = false;
+    let mut found_active = false;
+    let mut found_idle = false;
+
+    let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+    for line in lines.iter_mut() {
+        let trimmed = line.trim();
+        let Some((k, _v)) = trimmed.split_once('=') else { continue };
+        match k.trim() {
+            "timeout" => {
+                *line = format!("timeout={}", timeout);
+                found_timeout = true;
+            }
+            "active" => {
+                *line = format!("active={}", active);
+                found_active = true;
+            }
+            "idle" => {
+                *line = format!("idle={}", idle);
+                found_idle = true;
+            }
+            _ => {}
+        }
+    }
+    if !found_timeout {
+        lines.push(format!("timeout={}", timeout));
+    }
+    if !found_active {
+        lines.push(format!("active={}", active));
+    }
+    if !found_idle {
+        lines.push(format!("idle={}", idle));
+    }
+
+    let _ = fs::write(CONFIG_PATH, lines.join("\n") + "\n");
     REFRESH_FORCE_RELOAD.store(true, Ordering::Release);
     wake();
 }
