@@ -39,21 +39,22 @@ type FnPrepareTx = unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> c_int;
 type FnTransact = unsafe extern "C" fn(
     *mut c_void,       // binder
     u32,               // code
-    *mut c_void,       // in parcel
-    *mut *mut c_void,  // out parcel
+    *mut *mut c_void,  // in parcel (AParcel** — transact 会消费并置 null)
+    *mut *mut c_void,  // out parcel (AParcel**)
     u32,               // flags
 ) -> c_int;
 type FnParcelDelete = unsafe extern "C" fn(*mut c_void);
 type FnWriteString = unsafe extern "C" fn(*mut c_void, *const c_char, i32) -> c_int;
 type FnWriteBinder = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
 type FnWriteI32 = unsafe extern "C" fn(*mut c_void, i32) -> c_int;
-type FnReadI32 = unsafe extern "C" fn(*mut c_void, *mut i32) -> c_int;type FnReadString = unsafe extern "C" fn(
+type FnReadI32 = unsafe extern "C" fn(*mut c_void, *mut i32) -> c_int;
+type FnReadString = unsafe extern "C" fn(
     *mut c_void,
     *mut c_void,
-    Option<extern "C" fn(*mut c_void, *const c_char, i32) -> c_int>,
+    Option<extern "C" fn(*mut c_void, *mut *mut c_char, i32) -> bool>,
 ) -> c_int;
-type FnJoinThreadPool = unsafe extern "C" fn() -> c_int;
-type FnAssociateClass = unsafe extern "C" fn(*mut c_void, *mut c_void); // 返回 void
+type FnJoinThreadPool = unsafe extern "C" fn();
+type FnAssociateClass = unsafe extern "C" fn(*mut c_void, *const c_void) -> bool;
 
 struct BinderNdk {
     get_service: FnGetService,
@@ -145,7 +146,8 @@ extern "C" fn on_transact(
     in_parcel: *mut c_void,
     _out: *mut c_void,
 ) -> c_int {
-    alog!("on_transact code=0x{:04x}", code);    let ndk = match ndk() { Some(n) => n, None => return STATUS_UNKNOWN_TRANSACTION };
+    alog!("on_transact code=0x{:04x}", code);
+    let ndk = match ndk() { Some(n) => n, None => return STATUS_UNKNOWN_TRANSACTION };
 
     // 【核心修复 1】：正确读取 AIDL Interface Token (1个 i32 strict mode + 1个 string)
     // 之前只读 string 会导致后续 pid/uid 读取错位 4 字节！
@@ -194,7 +196,8 @@ extern "C" fn on_transact(
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _uid) };
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _st) };
             STATUS_OK
-        }        TX_ON_PROCESS_DIED => {
+        }
+        TX_ON_PROCESS_DIED => {
             let mut pid = 0i32; let mut _uid = 0i32;
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut pid) };
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _uid) };
@@ -208,17 +211,54 @@ extern "C" fn on_transact(
 
 fn read_string(parcel: *mut c_void) -> Option<String> {
     let ndk = ndk()?;
-    let mut result: Option<String> = None;
-    extern "C" fn allocator(context: *mut c_void, buffer: *const c_char, length: i32) -> c_int {
-        let result = unsafe { &mut *(context as *mut Option<String>) };
-        if buffer.is_null() || length < 0 { *result = None; } 
-        else {
-            let bytes = unsafe { std::slice::from_raw_parts(buffer as *const u8, length as usize) };
-            *result = Some(String::from_utf8_lossy(bytes).into_owned());
-        }
-        0
+
+    // 上下文：保存 allocator 分配的缓冲区指针和长度
+    // AParcel_readString 流程：先调 allocator 分配 buffer → 再把字符串数据写入 buffer → 返回
+    // allocator 返回 true=成功, false=失败(NDK 会返回 NO_MEMORY)
+    struct StrCtx {
+        buffer: *mut u8,
+        length: i32,
     }
-    let _ = unsafe { (ndk.read_string)(parcel, &mut result as *mut _ as *mut c_void, Some(allocator)) };
+
+    extern "C" fn allocator(context: *mut c_void, buffer: *mut *mut c_char, length: i32) -> bool {
+        let ctx = unsafe { &mut *(context as *mut StrCtx) };
+        ctx.length = length;
+        if length <= 0 {
+            // 空字符串或 null，不需要分配
+            return true;
+        }
+        // 分配 length + 1 字节（NDK 可能写入 null terminator）
+        let buf = unsafe { libc::malloc((length as usize).saturating_add(1)) };
+        if buf.is_null() {
+            return false;
+        }
+        unsafe { *buffer = buf as *mut c_char; }
+        ctx.buffer = buf as *mut u8;
+        true
+    }
+
+    let mut ctx = StrCtx {
+        buffer: std::ptr::null_mut(),
+        length: 0,
+    };
+    let status = unsafe {
+        (ndk.read_string)(parcel, &mut ctx as *mut _ as *mut c_void, Some(allocator))
+    };
+
+    let result = if status != STATUS_OK {
+        None
+    } else if ctx.length <= 0 || ctx.buffer.is_null() {
+        Some(String::new())
+    } else {
+        let bytes =
+            unsafe { std::slice::from_raw_parts(ctx.buffer, ctx.length as usize) };
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    };
+
+    if !ctx.buffer.is_null() {
+        unsafe { libc::free(ctx.buffer as *mut libc::c_void) };
+    }
+
     result
 }
 
@@ -243,7 +283,8 @@ fn get_am_class() -> *mut c_void {
                 b"android.app.IActivityManager\0".as_ptr() as *const c_char,
                 Some(on_create), Some(on_destroy), Some(am_dummy_on_transact),
             )
-        };        SendClass(class)
+        };
+        SendClass(class)
     }).0
 }
 
@@ -265,7 +306,11 @@ pub fn init_observer(eventfd: i32) -> bool {
 
     let am_class = get_am_class();
     if am_class.is_null() { return false; }
-    unsafe { (ndk.associate_class)(am, am_class) };
+    let associated = unsafe { (ndk.associate_class)(am, am_class as *const c_void) };
+    if !associated {
+        alog!("associateClass for AM 失败");
+        return false;
+    }
     alog!("associateClass for AM = ok");
     
     // 【核心修复 2】：彻底删除 AParcel_create！
@@ -286,13 +331,14 @@ pub fn init_observer(eventfd: i32) -> bool {
     let _ = unsafe { (ndk.write_binder)(in_parcel, observer) };
     
     let mut out_parcel: *mut c_void = std::ptr::null_mut();
-    let status = unsafe { (ndk.transact)(am, TX_REGISTER_PROCESS_OBSERVER, in_parcel, &mut out_parcel, 0) };
+    let status = unsafe { (ndk.transact)(am, TX_REGISTER_PROCESS_OBSERVER, &mut in_parcel, &mut out_parcel, 0) };
     alog!("transact: status={}", status);
     
     unsafe { (ndk.parcel_delete)(in_parcel) };
     if !out_parcel.is_null() { unsafe { (ndk.parcel_delete)(out_parcel) }; }
     
-    if status == STATUS_OK {        alog!("注册成功, 启动 binder 线程池");
+    if status == STATUS_OK {
+        alog!("注册成功, 启动 binder 线程池");
         let join_fn = ndk.join_thread_pool;
         std::thread::spawn(move || {
             alog!("binder 线程池启动");
