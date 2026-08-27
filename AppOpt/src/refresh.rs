@@ -1,645 +1,390 @@
-use std::collections::HashMap;
-use std::ffi::CString;
-use std::fs;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::Mutex;
-use std::sync::mpsc;
-use std::thread;
-use std::time::Instant;
+#![allow(dead_code)]
+//! IProcessObserver binder 回调实现（dlopen 运行时加载 libbinder_ndk.so）
 
-// ── Android log (调试用) ──
+use std::collections::HashMap;
+use std::ffi::c_void;
+use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::atomic::{AtomicI32, Ordering};
+use libc::{c_char, c_int, dlopen, dlsym, RTLD_LAZY};
+
+// ── Android log ──
 unsafe extern "C" {
-    fn __android_log_write(prio: std::os::raw::c_int, tag: *const std::os::raw::c_char, text: *const std::os::raw::c_char) -> std::os::raw::c_int;
+    fn __android_log_write(prio: c_int, tag: *const c_char, text: *const c_char) -> c_int;
 }
-const RLOG_TAG: &[u8] = b"AppOpt\0";
-fn rlog(msg: &str) {
+const LOG_TAG: &[u8] = b"AppOpt\0";
+fn log(msg: &str) {
     let mut buf = vec![0u8; msg.len() + 1];
     buf[..msg.len()].copy_from_slice(msg.as_bytes());
-    unsafe { __android_log_write(3, RLOG_TAG.as_ptr() as *const std::os::raw::c_char, buf.as_ptr() as *const std::os::raw::c_char); }
+    unsafe { __android_log_write(3, LOG_TAG.as_ptr() as *const c_char, buf.as_ptr() as *const c_char); }
 }
-macro_rules! ralog { ($($a:tt)*) => { rlog(&format!($($a)*)) } }
+macro_rules! alog { ($($a:tt)*) => { log(&format!($($a)*)) } }
 
-const MODE_120: i32 = 0;
-const MODE_60: i32 = 1;
-const MODE_90: i32 = 2;
+// ── 硬编码事务码 ──
+const TX_REGISTER_PROCESS_OBSERVER: u32 = 0x0d;
+const TX_ON_PROCESS_STARTED: u32 = 0x01;
+const TX_ON_FG_ACTIVITIES_CHANGED: u32 = 0x02;
+const TX_ON_FG_SERVICES_CHANGED: u32 = 0x03;
+const TX_ON_PROCESS_DIED: u32 = 0x04;
 
-const CONFIG_PATH: &str = "./refresh_config.conf";
-const APPS_CONFIG_PATH: &str = "./refresh_config_apps.conf";
+// ── FFI 函数指针类型 ──
+type FnGetService = unsafe extern "C" fn(*const c_char) -> *mut c_void;
+type FnClassDefine = unsafe extern "C" fn(
+    *const c_char,
+    Option<extern "C" fn(*mut c_void) -> *mut c_void>,
+    Option<extern "C" fn(*mut c_void)>,
+    Option<extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void) -> c_int>,
+) -> *mut c_void;
+type FnBinderNew = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+type FnPrepareTx = unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> c_int;
+type FnTransact = unsafe extern "C" fn(
+    *mut c_void,       // binder
+    u32,               // code
+    *mut *mut c_void,  // in parcel (AParcel** — transact 会消费并置 null)
+    *mut *mut c_void,  // out parcel (AParcel**)
+    u32,               // flags
+) -> c_int;
+type FnParcelDelete = unsafe extern "C" fn(*mut c_void);
+type FnWriteString = unsafe extern "C" fn(*mut c_void, *const c_char, i32) -> c_int;
+type FnWriteBinder = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
+type FnWriteI32 = unsafe extern "C" fn(*mut c_void, i32) -> c_int;
+type FnReadI32 = unsafe extern "C" fn(*mut c_void, *mut i32) -> c_int;
+type FnReadString = unsafe extern "C" fn(
+    *mut c_void,
+    *mut c_void,
+    Option<extern "C" fn(*mut c_void, *mut *mut c_char, i32) -> bool>,
+) -> c_int;
+type FnJoinThreadPool = unsafe extern "C" fn();
+type FnStartThreadPool = unsafe extern "C" fn();
+type FnAssociateClass = unsafe extern "C" fn(*mut c_void, *const c_void) -> bool;
 
-pub const EVENT_INPUT: u32 = 5;
-
-static REFRESH_FORCE_RELOAD: AtomicBool = AtomicBool::new(false);
-static WAKE_FD: AtomicI32 = AtomicI32::new(-1);
-static REFRESH_STATUS: Mutex<Option<RefreshStatus>> = Mutex::new(None);
-static REFRESH_TX: Mutex<Option<mpsc::Sender<RefreshEvent>>> = Mutex::new(None);
-
-#[derive(Clone)]
-pub struct RefreshStatus {
-    pub current_mode: i32,
-    pub is_paused: bool,
-    pub timer_enabled: bool,
-    pub timer_running: bool,
-    pub current_package: String,
-    pub timeout: i32,
-    pub active_mode: i32,
-    pub idle_mode: i32,
-}
-
-enum RefreshEvent {
-    Input,
-}
-
-struct AppRefreshConfig {
-    timeout: i32,
-    active_mode: i32,
-    idle_mode: i32,
-}
-
-struct RefreshState {
-    timeout_seconds: i32,
-    active_mode: i32,
-    idle_mode: i32,
-    app_configs: HashMap<String, AppRefreshConfig>,
-    current_active: i32,
-    current_idle: i32,
-    current_timeout: i32,
-    current_applied_mode: i32,
-    is_paused: bool,
-    timer_enabled: bool,
-    last_reset_time: Option<Instant>,
-    current_package: String,
-    last_applied_pkg: String,
-    last_apply_time: Option<Instant>,
-    last_input_time: Option<Instant>,
-    backlight_path: Option<String>,
-    prev_backlight: bool,
-    timer_fd: i32,
+struct BinderNdk {
+    get_service: FnGetService,
+    class_define: FnClassDefine,
+    binder_new: FnBinderNew,
+    prepare_tx: FnPrepareTx,
+    transact: FnTransact,
+    parcel_delete: FnParcelDelete,
+    write_string: FnWriteString,
+    write_binder: FnWriteBinder,
+    write_i32: FnWriteI32,
+    read_i32: FnReadI32,
+    read_string: FnReadString,
+    join_thread_pool: FnJoinThreadPool,
+    start_thread_pool: FnStartThreadPool,
+    associate_class: FnAssociateClass,
 }
 
-fn parse_mode(s: &str) -> i32 {
-    match s.trim() {
-        "120" => MODE_120,
-        "90" => MODE_90,
-        "60" => MODE_60,
-        _ => MODE_60,
+static BINDER_NDK: OnceLock<Option<BinderNdk>> = OnceLock::new();
+
+fn ndk() -> Option<&'static BinderNdk> {
+    BINDER_NDK.get_or_init(|| unsafe {
+        let lib = dlopen(b"libbinder_ndk.so\0".as_ptr() as *const c_char, RTLD_LAZY | libc::RTLD_GLOBAL);
+        if lib.is_null() { alog!("dlopen 失败"); return None; }
+        alog!("dlopen 成功");
+
+        let sym = |name: &str| -> *mut c_void {
+            let c = std::ffi::CString::new(name).unwrap();
+            dlsym(lib, c.as_ptr())
+        };
+
+        let p_get_service = sym("AServiceManager_getService");
+        let p_class_define = sym("AIBinder_Class_define");
+        let p_binder_new = sym("AIBinder_new");
+        let p_prepare_tx = sym("AIBinder_prepareTransaction");
+        let p_transact = sym("AIBinder_transact");
+        let p_parcel_delete = sym("AParcel_delete");
+        let p_write_string = sym("AParcel_writeString");
+        let p_write_binder = sym("AParcel_writeStrongBinder");
+        let p_write_i32 = sym("AParcel_writeInt32");
+        let p_read_i32 = sym("AParcel_readInt32");
+        let p_read_string = sym("AParcel_readString");
+        let p_join = sym("ABinderProcess_joinThreadPool");
+        let p_start = sym("ABinderProcess_startThreadPool");
+        let p_associate = sym("AIBinder_associateClass");
+        if p_get_service.is_null() || p_class_define.is_null() || p_binder_new.is_null()
+            || p_prepare_tx.is_null() || p_transact.is_null() || p_parcel_delete.is_null()
+            || p_write_string.is_null() || p_write_binder.is_null() || p_write_i32.is_null()
+            || p_read_i32.is_null() || p_read_string.is_null() || p_join.is_null() || p_start.is_null() || p_associate.is_null()
+        { alog!("部分 dlsym 为 null"); return None; }
+        
+        alog!("所有 dlsym 成功");
+        Some(BinderNdk {
+            get_service: std::mem::transmute(p_get_service),
+            class_define: std::mem::transmute(p_class_define),
+            binder_new: std::mem::transmute(p_binder_new),
+            prepare_tx: std::mem::transmute(p_prepare_tx),
+            transact: std::mem::transmute(p_transact),
+            parcel_delete: std::mem::transmute(p_parcel_delete),
+            write_string: std::mem::transmute(p_write_string),
+            write_binder: std::mem::transmute(p_write_binder),
+            write_i32: std::mem::transmute(p_write_i32),
+            read_i32: std::mem::transmute(p_read_i32),
+            read_string: std::mem::transmute(p_read_string),
+            join_thread_pool: std::mem::transmute(p_join),
+            start_thread_pool: std::mem::transmute(p_start),
+            associate_class: std::mem::transmute(p_associate),
+        })
+    }).as_ref()
+}
+
+const STATUS_OK: c_int = 0;
+const STATUS_UNKNOWN_TRANSACTION: c_int = -29;
+
+static PID_CACHE: LazyLock<Mutex<HashMap<i32, String>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static FG_EVENTFD: AtomicI32 = AtomicI32::new(-1);
+
+struct SendClass(*mut c_void);
+unsafe impl Send for SendClass {}
+unsafe impl Sync for SendClass {}
+static OBSERVER_CLASS: OnceLock<SendClass> = OnceLock::new();
+static AM_CLASS: OnceLock<SendClass> = OnceLock::new();
+
+extern "C" fn on_create(_args: *mut c_void) -> *mut c_void { std::ptr::null_mut() }
+extern "C" fn on_destroy(_user_data: *mut c_void) {}
+extern "C" fn am_dummy_on_transact(_b: *mut c_void, _c: u32, _i: *mut c_void, _o: *mut c_void) -> c_int { STATUS_UNKNOWN_TRANSACTION }
+
+/// onTransact 回调
+extern "C" fn on_transact(
+    _binder: *mut c_void,
+    code: u32,
+    in_parcel: *mut c_void,
+    _out: *mut c_void,
+) -> c_int {
+    alog!("on_transact code=0x{:04x}", code);
+    let ndk = match ndk() { Some(n) => n, None => return STATUS_UNKNOWN_TRANSACTION };
+
+    // NDK 的 AIBinder_onTransact 内部已通过 checkInterface() 读取了 Interface Token
+    // (strict_mode i32 + UTF-16 descriptor)，且不重置 parcel 位置
+    // 因此这里直接从事务数据开始读取，不再重复读 token
+
+    match code {
+        TX_ON_PROCESS_STARTED => {
+            let mut pid = 0i32;
+            let mut process_uid = 0i32;
+            let mut package_uid = 0i32;
+            if unsafe { (ndk.read_i32)(in_parcel, &mut pid) } != STATUS_OK { return STATUS_UNKNOWN_TRANSACTION; }
+            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut process_uid) };
+            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut package_uid) };
+            let package_name = read_string(in_parcel).unwrap_or_default();
+            let _process_name = read_string(in_parcel).unwrap_or_default();
+            alog!("onProcessStarted: pid={} pkg={} proc={}", pid, package_name, _process_name);
+            PID_CACHE.lock().unwrap().insert(pid, package_name);
+            STATUS_OK
+        }
+        TX_ON_FG_ACTIVITIES_CHANGED => {
+            let mut pid = 0i32;
+            let mut uid = 0i32;
+            let mut fg_val = 0i32;
+
+            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut pid) };
+            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut uid) };
+            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut fg_val) };
+
+            let fg = fg_val != 0;
+            alog!("onFGChanged: pid={} uid={} fg={}", pid, uid, fg);
+
+            if fg {
+                let fd = FG_EVENTFD.load(Ordering::Acquire);
+                alog!("  notifying eventfd={} pid={}", fd, pid);
+                if fd >= 0 {
+                    let val: u64 = pid as u64;
+                    unsafe { libc::write(fd, &val as *const u64 as *const _, 8); }
+                }
+            }
+            STATUS_OK
+        }
+        TX_ON_FG_SERVICES_CHANGED => {
+            let mut _pid = 0i32; let mut _uid = 0i32; let mut _st = 0i32;
+            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _pid) };
+            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _uid) };
+            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _st) };
+            STATUS_OK
+        }
+        TX_ON_PROCESS_DIED => {
+            let mut pid = 0i32; let mut _uid = 0i32;
+            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut pid) };
+            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _uid) };
+            alog!("onProcessDied: pid={}", pid);
+            PID_CACHE.lock().unwrap().remove(&pid);
+            STATUS_OK
+        }
+        _ => { alog!("未知 code=0x{:04x}", code); STATUS_UNKNOWN_TRANSACTION }
     }
 }
 
-fn find_backlight_path() -> Option<String> {
-    let path = "/sys/class/leds/lcd-backlight/brightness";
-    if std::path::Path::new(path).exists() {
-        return Some(path.to_string());
+fn read_string(parcel: *mut c_void) -> Option<String> {
+    let ndk = ndk()?;
+
+    // 上下文：保存 allocator 分配的缓冲区指针和长度
+    // AParcel_readString 流程：先调 allocator 分配 buffer → 再把字符串数据写入 buffer → 返回
+    // allocator 返回 true=成功, false=失败(NDK 会返回 NO_MEMORY)
+    struct StrCtx {
+        buffer: *mut u8,
+        length: i32,
     }
-    if let Ok(entries) = fs::read_dir("/sys/class/backlight") {
-        for entry in entries.flatten() {
-            let brightness = entry.path().join("brightness");
-            if brightness.exists() {
-                return Some(brightness.to_string_lossy().into_owned());
+
+    extern "C" fn allocator(context: *mut c_void, buffer: *mut *mut c_char, length: i32) -> bool {
+        let ctx = unsafe { &mut *(context as *mut StrCtx) };
+        ctx.length = length;
+        if length <= 0 {
+            // 空字符串或 null，不需要分配
+            return true;
+        }
+        // 分配 length + 1 字节（NDK 可能写入 null terminator）
+        let buf = unsafe { libc::malloc((length as usize).saturating_add(1)) };
+        if buf.is_null() {
+            return false;
+        }
+        unsafe { *buffer = buf as *mut c_char; }
+        ctx.buffer = buf as *mut u8;
+        true
+    }
+
+    let mut ctx = StrCtx {
+        buffer: std::ptr::null_mut(),
+        length: 0,
+    };
+    let status = unsafe {
+        (ndk.read_string)(parcel, &mut ctx as *mut _ as *mut c_void, Some(allocator))
+    };
+    alog!("  read_string: status={} length={} buf_null={}", status, ctx.length, ctx.buffer.is_null());
+
+    let result = if status != STATUS_OK {
+        None
+    } else if ctx.length <= 0 || ctx.buffer.is_null() {
+        Some(String::new())
+    } else {
+        let bytes =
+            unsafe { std::slice::from_raw_parts(ctx.buffer, ctx.length as usize) };
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    };
+
+    if !ctx.buffer.is_null() {
+        unsafe { libc::free(ctx.buffer as *mut libc::c_void) };
+    }
+
+    result
+}
+
+fn get_observer_class() -> *mut c_void {
+    let ndk = match ndk() { Some(n) => n, None => return std::ptr::null_mut() };
+    OBSERVER_CLASS.get_or_init(|| {
+        let class = unsafe {
+            (ndk.class_define)(
+                b"android.app.IProcessObserver\0".as_ptr() as *const c_char,
+                Some(on_create), Some(on_destroy), Some(on_transact),
+            )
+        };
+        SendClass(class)
+    }).0
+}
+
+fn get_am_class() -> *mut c_void {
+    let ndk = match ndk() { Some(n) => n, None => return std::ptr::null_mut() };
+    AM_CLASS.get_or_init(|| {
+        let class = unsafe {
+            (ndk.class_define)(
+                b"android.app.IActivityManager\0".as_ptr() as *const c_char,
+                Some(on_create), Some(on_destroy), Some(am_dummy_on_transact),
+            )
+        };
+        SendClass(class)
+    }).0
+}
+
+pub fn init_observer(eventfd: i32) -> bool {
+    alog!("init_observer 开始, eventfd={}", eventfd);
+    FG_EVENTFD.store(eventfd, Ordering::Release);
+    
+    let ndk = match ndk() { Some(n) => n, None => return false };
+    let class = get_observer_class();
+    if class.is_null() { return false; }
+    
+    let observer = unsafe { (ndk.binder_new)(class, std::ptr::null_mut()) };
+    if observer.is_null() { return false; }
+    alog!("observer=ok");
+    
+    let am = unsafe { (ndk.get_service)(b"activity\0".as_ptr() as *const c_char) };
+    if am.is_null() { return false; }
+    alog!("activity=ok");
+
+    let am_class = get_am_class();
+    if am_class.is_null() { return false; }
+    let associated = unsafe { (ndk.associate_class)(am, am_class as *const c_void) };
+    if !associated {
+        alog!("associateClass for AM 失败");
+        return false;
+    }
+    alog!("associateClass for AM = ok");
+    
+    // 【核心修复 2】：彻底删除 AParcel_create！
+    // 让 prepare_tx 自动创建并正确关联 binder，避免 parcel is associated with binder object 报错
+    let mut in_parcel: *mut c_void = std::ptr::null_mut();
+    let prep_status = unsafe { (ndk.prepare_tx)(am, &mut in_parcel) };
+    if prep_status != STATUS_OK || in_parcel.is_null() {
+        alog!("prepareTransaction 失败: status={}", prep_status);
+        return false;
+    }
+    alog!("prepareTransaction=ok");
+    
+    // NDK 的 prepareTransaction 已自动写入 Interface Token (UTF-16, 与 Java 端 enforceInterface 兼容)
+    // 手动再写一次会导致双重 token → Java 端 readStrongBinder 读到第二个 token 而非 observer → 静默失败
+    // 只需写入 observer binder 参数
+    let _ = unsafe { (ndk.write_binder)(in_parcel, observer) };
+    
+    let mut out_parcel: *mut c_void = std::ptr::null_mut();
+    let status = unsafe { (ndk.transact)(am, TX_REGISTER_PROCESS_OBSERVER, &mut in_parcel, &mut out_parcel, 0) };
+    alog!("transact: status={}", status);
+    
+    // 检查 reply 中的异常码 (Java 端 enforceInterface/readStrongBinder 失败会返回异常)
+    if status == STATUS_OK && !out_parcel.is_null() {
+        let mut exception_code = 0i32;
+        let _ = unsafe { (ndk.read_i32)(out_parcel, &mut exception_code) };
+        alog!("reply exception_code={}", exception_code);
+        if exception_code != 0 {
+            alog!("服务端异常! 注册可能未生效");
+        }
+    }
+    
+    unsafe { (ndk.parcel_delete)(in_parcel) };
+    if !out_parcel.is_null() { unsafe { (ndk.parcel_delete)(out_parcel) }; }
+    
+    if status == STATUS_OK {
+        alog!("注册成功, 启动 binder 线程池");
+        let start_fn = ndk.start_thread_pool;
+        let join_fn = ndk.join_thread_pool;
+        std::thread::spawn(move || {
+            alog!("startThreadPool");
+            unsafe { start_fn(); }
+            alog!("joinThreadPool (阻塞)");
+            unsafe { join_fn(); }
+        });
+        alog!("init_observer 完成");
+        true
+    } else {
+        alog!("registerProcessObserver 失败 status={}", status);
+        false
+    }
+}
+
+pub fn get_package_name(pid: i32) -> Option<String> {
+    // 1. 先查 PID_CACHE（onProcessStarted 回调填充）
+    if let Some(pkg) = PID_CACHE.lock().unwrap().get(&pid).cloned() {
+        if !pkg.is_empty() {
+            return Some(pkg);
+        }
+    }
+    // 2. 回退：读 /proc/<pid>/cmdline（进程在 observer 注册前已启动的情况）
+    let path = format!("/proc/{}/cmdline", pid);
+    if let Ok(data) = std::fs::read(&path) {
+        // cmdline 用 \0 分隔，第一个字段是进程名（通常等于包名）
+        if let Some(name) = data.split(|&b| b == 0).next() {
+            if !name.is_empty() {
+                let pkg = String::from_utf8_lossy(name).into_owned();
+                alog!("get_package_name: pid={} 从 cmdline 获取 pkg={}", pid, pkg);
+                return Some(pkg);
             }
         }
     }
     None
-}
-
-fn read_backlight(path: &str) -> bool {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|s| s.trim().parse::<i32>().ok())
-        .map(|v| v > 0)
-        .unwrap_or(false)
-}
-
-fn create_default_config() {
-    if !std::path::Path::new(CONFIG_PATH).exists() {
-        let _ = fs::write(CONFIG_PATH, "timeout=30\nactive=120\nidle=60\n");
-    }
-    if !std::path::Path::new(APPS_CONFIG_PATH).exists() {
-        let _ = fs::write(APPS_CONFIG_PATH, "# packageName,timeout,activeMode,idleMode\n");
-    }
-}
-
-fn load_global_config(state: &mut RefreshState) {
-    let content = match fs::read_to_string(CONFIG_PATH) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((k, v)) = line.split_once('=') {
-            match k.trim() {
-                "timeout" => {
-                    if let Ok(t) = v.trim().parse::<i32>() {
-                        if t > 0 {
-                            state.timeout_seconds = t;
-                        }
-                    }
-                }
-                "active" => state.active_mode = parse_mode(v),
-                "idle" => state.idle_mode = parse_mode(v),
-                _ => {}
-            }
-        }
-    }
-    state.current_active = state.active_mode;
-    state.current_idle = state.idle_mode;
-    state.current_timeout = state.timeout_seconds;
-    state.timer_enabled = state.current_idle != state.current_active;
-}
-
-fn load_app_configs(state: &mut RefreshState) {
-    state.app_configs.clear();
-    let content = match fs::read_to_string(APPS_CONFIG_PATH) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let parts: Vec<&str> = line.split(',').collect();
-        if parts.len() != 4 {
-            continue;
-        }
-        state.app_configs.insert(
-            parts[0].trim().to_string(),
-            AppRefreshConfig {
-                timeout: parts[1].trim().parse::<i32>().unwrap_or(30),
-                active_mode: parse_mode(parts[2].trim()),
-                idle_mode: parse_mode(parts[3].trim()),
-            },
-        );
-    }
-}
-
-fn set_refresh_rate(state: &mut RefreshState, mode: i32) {
-    if mode == state.current_applied_mode {
-        return;
-    }
-    let _ = std::process::Command::new("service")
-        .args(["call", "SurfaceFlinger", "1035", "i32", &mode.to_string()])
-        .output();
-    state.current_applied_mode = mode;
-}
-
-fn apply_app_config(state: &mut RefreshState, pkg: &str) {
-    if let Some(cfg) = state.app_configs.get(pkg) {
-        state.current_timeout = cfg.timeout;
-        state.current_active = cfg.active_mode;
-        state.current_idle = cfg.idle_mode;
-    } else {
-        state.current_timeout = state.timeout_seconds;
-        state.current_active = state.active_mode;
-        state.current_idle = state.idle_mode;
-    }
-    state.timer_enabled = state.current_idle != state.current_active;
-}
-
-fn timerfd_set(fd: i32, seconds: i32) {
-    let its = libc::itimerspec {
-        it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
-        it_value: libc::timespec { tv_sec: seconds as i64, tv_nsec: 0 },
-    };
-    unsafe { libc::timerfd_settime(fd, 0, &its, std::ptr::null_mut()); }
-}
-
-fn timerfd_cancel(fd: i32) {
-    let its = libc::itimerspec {
-        it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
-        it_value: libc::timespec { tv_sec: 0, tv_nsec: 0 },
-    };
-    unsafe { libc::timerfd_settime(fd, 0, &its, std::ptr::null_mut()); }
-}
-
-fn reset_timer(state: &mut RefreshState, force: bool) {
-    if !state.timer_enabled {
-        timerfd_cancel(state.timer_fd);
-        state.last_reset_time = None;
-        return;
-    }
-    if state.is_paused {
-        state.is_paused = false;
-    }
-    let now = Instant::now();
-    if !force
-        && state.current_applied_mode == state.current_active
-        && state.current_active != state.current_idle
-    {
-        let debounce = std::time::Duration::from_secs((state.current_timeout - 10).max(0) as u64);
-        if let Some(last) = state.last_reset_time {
-            if now - last < debounce {
-                return;
-            }
-        }
-    }
-    timerfd_set(state.timer_fd, state.current_timeout);
-    state.last_reset_time = Some(now);
-}
-
-fn switch_to_idle(state: &mut RefreshState) {
-    if !state.timer_enabled {
-        return;
-    }
-    set_refresh_rate(state, state.current_idle);
-    state.is_paused = true;
-}
-
-/// IProcessObserver 回调触发：通过 eventfd 收到 pid
-/// 从 process_observer 的 PID_CACHE 获取包名
-fn handle_fg_change(state: &mut RefreshState, pid: i32) {
-    ralog!("handle_fg_change: pid={}", pid);
-    let pkg = match crate::process_observer::get_package_name(pid) {
-        Some(p) => p,
-        None => {
-            ralog!("  package not found in PID_CACHE for pid={}", pid);
-            return;
-        }
-    };
-
-    ralog!("  package={}", pkg);
-
-    if pkg.is_empty() || pkg == state.last_applied_pkg {
-        ralog!("  skip: empty or same as last_applied_pkg={}", state.last_applied_pkg);
-        return;
-    }
-
-    // 过滤系统进程
-    if pkg.starts_with("com.android.systemui")
-        || pkg.starts_with("com.android.phone")
-        || pkg.starts_with("com.qti.")
-        || pkg.starts_with("android.")
-    {
-        return;
-    }
-
-    let now = Instant::now();
-    state.current_package = pkg.clone();
-    state.last_applied_pkg = pkg;
-    state.last_apply_time = Some(now);
-
-    let current_pkg = state.current_package.clone();
-    apply_app_config(state, &current_pkg);
-    set_refresh_rate(state, state.current_active);
-    if state.prev_backlight {
-        reset_timer(state, true);
-    }
-}
-
-/// input 事件触发：用户活动
-/// 1 秒节流 + 切回活跃刷新率 + 重置定时器
-fn handle_input(state: &mut RefreshState) {
-    let now = Instant::now();
-    if let Some(last) = state.last_input_time {
-        if now - last < std::time::Duration::from_secs(1) {
-            return;
-        }
-    }
-    state.last_input_time = Some(now);
-
-    if state.is_paused || state.current_applied_mode == state.current_idle {
-        set_refresh_rate(state, state.current_active);
-        state.is_paused = false;
-    }
-    if state.last_reset_time.is_some() {
-        reset_timer(state, false);
-    }
-}
-
-/// sysfs 背光 EPOLLPRI 触发：仅 0 边界穿越时操作
-/// 0→>0 启动定时器，>0→0 关闭定时器，1~254 微调丢弃
-fn handle_backlight_change(state: &mut RefreshState) {
-    let Some(path) = &state.backlight_path else { return };
-    let brightness = read_backlight(path);
-    if brightness && !state.prev_backlight {
-        // 0 → >0：切回活跃刷新率 + 启动定时器
-        if state.is_paused || state.current_applied_mode == state.current_idle {
-            set_refresh_rate(state, state.current_active);
-            state.is_paused = false;
-        }
-        reset_timer(state, true);
-    } else if !brightness && state.prev_backlight {
-        // >0 → 0：关闭定时器
-        timerfd_cancel(state.timer_fd);
-        state.last_reset_time = None;
-    }
-    state.prev_backlight = brightness;
-}
-
-fn check_config(state: &mut RefreshState) {
-    if REFRESH_FORCE_RELOAD.swap(false, Ordering::AcqRel) {
-        load_global_config(state);
-        load_app_configs(state);
-        let current_pkg = state.current_package.clone();
-        apply_app_config(state, &current_pkg);
-        set_refresh_rate(state, state.current_active);
-        if state.last_reset_time.is_some() {
-            reset_timer(state, true);
-        }
-    }
-}
-
-fn update_status(state: &RefreshState) {
-    let status = RefreshStatus {
-        current_mode: state.current_applied_mode,
-        is_paused: state.is_paused,
-        timer_enabled: state.timer_enabled,
-        timer_running: state.last_reset_time.is_some(),
-        current_package: state.current_package.clone(),
-        timeout: state.current_timeout,
-        active_mode: state.current_active,
-        idle_mode: state.current_idle,
-    };
-    *REFRESH_STATUS.lock().unwrap() = Some(status);
-}
-
-fn wake() {
-    let fd = WAKE_FD.load(Ordering::Acquire);
-    if fd >= 0 {
-        let val: u64 = 1;
-        unsafe { libc::write(fd, &val as *const u64 as *const _, 8); }
-    }
-}
-
-pub fn refresh_init() {
-    create_default_config();
-
-    let wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-    if wake_fd < 0 {
-        eprintln!("刷新率: eventfd 创建失败");
-        return;
-    }
-    WAKE_FD.store(wake_fd, Ordering::Release);
-
-    // IProcessObserver 用的 eventfd
-    let fg_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-    if fg_fd < 0 {
-        eprintln!("刷新率: fg eventfd 创建失败");
-        unsafe { libc::close(wake_fd); }
-        return;
-    }
-
-    let timer_fd = unsafe {
-        libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC | libc::TFD_NONBLOCK)
-    };
-    if timer_fd < 0 {
-        eprintln!("刷新率: timerfd 创建失败");
-        unsafe { libc::close(wake_fd); }
-        return;
-    }
-
-    let (tx, rx) = mpsc::channel::<RefreshEvent>();
-    *REFRESH_TX.lock().unwrap() = Some(tx);
-
-    let backlight_path = find_backlight_path();
-    let backlight_fd = if let Some(path) = &backlight_path {
-        let c_path = CString::new(path.as_str()).unwrap();
-        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
-        if fd < 0 {
-            eprintln!("刷新率: 无法打开背光文件 {}", path);
-        }
-        fd
-    } else {
-        eprintln!("刷新率: 未找到背光路径，灭屏检测依赖 input 事件");
-        -1
-    };
-
-    let mut state = RefreshState {
-        timeout_seconds: 30,
-        active_mode: MODE_120,
-        idle_mode: MODE_60,
-        app_configs: HashMap::new(),
-        current_active: MODE_120,
-        current_idle: MODE_60,
-        current_timeout: 30,
-        current_applied_mode: -1,
-        is_paused: false,
-        timer_enabled: true,
-        last_reset_time: None,
-        current_package: String::new(),
-        last_applied_pkg: String::new(),
-        last_apply_time: None,
-        last_input_time: None,
-        backlight_path,
-        prev_backlight: false,
-        timer_fd,
-    };
-
-    load_global_config(&mut state);
-    load_app_configs(&mut state);
-
-    if let Some(path) = &state.backlight_path {
-        state.prev_backlight = read_backlight(path);
-        if state.prev_backlight {
-            reset_timer(&mut state, true);
-        }
-    }
-
-    // 注册 IProcessObserver 回调
-    let observer_ok = crate::process_observer::init_observer(fg_fd);
-    ralog!("init_observer result={}", observer_ok);
-
-    let name = CString::new("RefreshRate").unwrap();
-    thread::spawn(move || {
-        unsafe { libc::pthread_setname_np(libc::pthread_self(), name.as_ptr()); }
-
-        let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-        if epfd < 0 {
-            eprintln!("刷新率: epoll_create1 失败");
-            return;
-        }
-
-        let mut ev: libc::epoll_event = unsafe { std::mem::zeroed() };
-        ev.events = libc::EPOLLIN as u32;
-        ev.u64 = 0;
-        unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, wake_fd, &mut ev); }
-
-        ev.u64 = 1;
-        unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, timer_fd, &mut ev); }
-
-        if backlight_fd >= 0 {
-            ev.events = (libc::EPOLLPRI | libc::EPOLLET) as u32;
-            ev.u64 = 2;
-            unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, backlight_fd, &mut ev); }
-        }
-
-        // fg_eventfd: IProcessObserver 回调通知 (u64=3)
-        ev.events = libc::EPOLLIN as u32;
-        ev.u64 = 3;
-        unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fg_fd, &mut ev); }
-
-        let mut events: [libc::epoll_event; 4] = unsafe { std::mem::zeroed() };
-
-        loop {
-            let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 4, -1) };
-            if n <= 0 {
-                if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                    continue;
-                }
-                break;
-            }
-
-            for i in 0..n as usize {
-                match events[i].u64 {
-                    0 => {
-                        let mut val: u64 = 0;
-                        unsafe { libc::read(wake_fd, &mut val as *mut _ as *mut _, 8); }
-                        while let Ok(event) = rx.try_recv() {
-                            match event {
-                                RefreshEvent::Input => handle_input(&mut state),
-                            }
-                        }
-                        check_config(&mut state);
-                    }
-                    1 => {
-                        let mut val: u64 = 0;
-                        unsafe { libc::read(timer_fd, &mut val as *mut _ as *mut _, 8); }
-                        switch_to_idle(&mut state);
-                    }
-                    2 => {
-                        handle_backlight_change(&mut state);
-                    }
-                    3 => {
-                        // IProcessObserver 回调: 读取 pid，查缓存获取包名
-                        let mut val: u64 = 0;
-                        unsafe { libc::read(fg_fd, &mut val as *mut _ as *mut _, 8); }
-                        ralog!("epoll: fg eventfd triggered, pid={}", val);
-                        handle_fg_change(&mut state, val as i32);
-                    }
-                    _ => {}
-                }
-            }
-            update_status(&state);
-        }
-
-        unsafe {
-            libc::close(epfd);
-            libc::close(wake_fd);
-            libc::close(timer_fd);
-            libc::close(fg_fd);
-            if backlight_fd >= 0 { libc::close(backlight_fd); }
-        }
-    });
-}
-
-pub fn refresh_on_event(event_type: u32, _pid: i32) {
-    let guard = REFRESH_TX.lock().unwrap();
-    if let Some(tx) = guard.as_ref() {
-        let event = match event_type {
-            EVENT_INPUT => RefreshEvent::Input,
-            _ => return,
-        };
-        let _ = tx.send(event);
-        wake();
-    }
-}
-
-// ===== Web API =====
-
-pub fn refresh_get_config() -> (i32, String, String) {
-    let content = fs::read_to_string(CONFIG_PATH).unwrap_or_default();
-    let mut timeout = 30;
-    let mut active = "120".to_string();
-    let mut idle = "60".to_string();
-    for line in content.lines() {
-        let line = line.trim();
-        if let Some((k, v)) = line.split_once('=') {
-            match k.trim() {
-                "timeout" => {
-                    if let Ok(t) = v.trim().parse::<i32>() {
-                        if t > 0 {
-                            timeout = t;
-                        }
-                    }
-                }
-                "active" => active = v.trim().to_string(),
-                "idle" => idle = v.trim().to_string(),
-                _ => {}
-            }
-        }
-    }
-    (timeout, active, idle)
-}
-
-pub fn refresh_set_config(timeout: i32, active: &str, idle: &str) {
-    let content = format!("timeout={}\nactive={}\nidle={}\n", timeout, active, idle);
-    let _ = fs::write(CONFIG_PATH, content);
-    REFRESH_FORCE_RELOAD.store(true, Ordering::Release);
-    wake();
-}
-
-pub fn refresh_get_apps() -> Vec<(String, i32, String, String)> {
-    let content = match fs::read_to_string(APPS_CONFIG_PATH) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    let mut apps = Vec::new();
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let parts: Vec<&str> = line.split(',').collect();
-        if parts.len() != 4 {
-            continue;
-        }
-        apps.push((
-            parts[0].trim().to_string(),
-            parts[1].trim().parse::<i32>().unwrap_or(30),
-            parts[2].trim().to_string(),
-            parts[3].trim().to_string(),
-        ));
-    }
-    apps
-}
-
-pub fn refresh_add_app(pkg: &str, timeout: i32, active: &str, idle: &str) {
-    let content = fs::read_to_string(APPS_CONFIG_PATH).unwrap_or_default();
-    let mut lines: Vec<String> = content.lines().map(String::from).collect();
-    let new_line = format!("{},{},{},{}", pkg, timeout, active, idle);
-    let mut found = false;
-    for line in lines.iter_mut() {
-        if line.trim().starts_with('#') || line.trim().is_empty() {
-            continue;
-        }
-        if line.split(',').next().map(|s| s.trim() == pkg).unwrap_or(false) {
-            *line = new_line.clone();
-            found = true;
-            break;
-        }
-    }
-    if !found {
-        lines.push(new_line);
-    }
-    let _ = fs::write(APPS_CONFIG_PATH, lines.join("\n") + "\n");
-    REFRESH_FORCE_RELOAD.store(true, Ordering::Release);
-    wake();
-}
-
-pub fn refresh_del_app(pkg: &str) -> bool {
-    let content = match fs::read_to_string(APPS_CONFIG_PATH) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    let lines: Vec<String> = content
-        .lines()
-        .filter(|line| {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                return true;
-            }
-            line.split(',').next().map(|s| s.trim() != pkg).unwrap_or(true)
-        })
-        .map(String::from)
-        .collect();
-    let _ = fs::write(APPS_CONFIG_PATH, lines.join("\n") + "\n");
-    REFRESH_FORCE_RELOAD.store(true, Ordering::Release);
-    wake();
-    true
-}
-
-pub fn refresh_get_status() -> Option<RefreshStatus> {
-    REFRESH_STATUS.lock().unwrap().clone()
 }
