@@ -7,6 +7,18 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Instant;
 
+// ── Android log (调试用) ──
+unsafe extern "C" {
+    fn __android_log_write(prio: std::os::raw::c_int, tag: *const std::os::raw::c_char, text: *const std::os::raw::c_char) -> std::os::raw::c_int;
+}
+const RLOG_TAG: &[u8] = b"AppOpt\0";
+fn rlog(msg: &str) {
+    let mut buf = vec![0u8; msg.len() + 1];
+    buf[..msg.len()].copy_from_slice(msg.as_bytes());
+    unsafe { __android_log_write(3, RLOG_TAG.as_ptr() as *const std::os::raw::c_char, buf.as_ptr() as *const std::os::raw::c_char); }
+}
+macro_rules! ralog { ($($a:tt)*) => { rlog(&format!($($a)*)) } }
+
 const MODE_120: i32 = 0;
 const MODE_60: i32 = 1;
 const MODE_90: i32 = 2;
@@ -238,12 +250,19 @@ fn switch_to_idle(state: &mut RefreshState) {
 /// IProcessObserver 回调触发：通过 eventfd 收到 pid
 /// 从 process_observer 的 PID_CACHE 获取包名
 fn handle_fg_change(state: &mut RefreshState, pid: i32) {
+    ralog!("handle_fg_change: pid={}", pid);
     let pkg = match crate::process_observer::get_package_name(pid) {
         Some(p) => p,
-        None => return,
+        None => {
+            ralog!("  package not found in PID_CACHE for pid={}", pid);
+            return;
+        }
     };
 
+    ralog!("  package={}", pkg);
+
     if pkg.is_empty() || pkg == state.last_applied_pkg {
+        ralog!("  skip: empty or same as last_applied_pkg={}", state.last_applied_pkg);
         return;
     }
 
@@ -419,7 +438,8 @@ pub fn refresh_init() {
     }
 
     // 注册 IProcessObserver 回调
-    crate::process_observer::init_observer(fg_fd);
+    let observer_ok = crate::process_observer::init_observer(fg_fd);
+    ralog!("init_observer result={}", observer_ok);
 
     let name = CString::new("RefreshRate").unwrap();
     thread::spawn(move || {
@@ -485,6 +505,7 @@ pub fn refresh_init() {
                         // IProcessObserver 回调: 读取 pid，查缓存获取包名
                         let mut val: u64 = 0;
                         unsafe { libc::read(fg_fd, &mut val as *mut _ as *mut _, 8); }
+                        ralog!("epoll: fg eventfd triggered, pid={}", val);
                         handle_fg_change(&mut state, val as i32);
                     }
                     _ => {}
