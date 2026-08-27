@@ -219,43 +219,31 @@ fn switch_to_idle(state: &mut RefreshState) {
     state.last_reset_time = None;
 }
 
-/// IProcessObserver 回调触发：通过 eventfd 收到 uid
-/// 用 uid 查 packages.list 映射表获取包名
-fn handle_fg_change(state: &mut RefreshState, val: u64) {
-    let uid = val as i32;
-    ralog!("handle_fg_change: uid={}", uid);
-    let pkg = match crate::process_observer::get_package_name(uid) {
-        Some(p) => p,
-        None => {
-            ralog!("  package not found for uid={}", uid);
-            return;
-        }
-    };
-
-    ralog!("  package={}", pkg);
+/// IProcessObserver 回调触发：直接收到包名（socketpair 传递，系统过滤已在 UID 映射表完成）
+fn handle_fg_change(state: &mut RefreshState, pkg: &str) {
+    ralog!("handle_fg_change: pkg={}", pkg);
 
     if pkg.is_empty() || pkg == state.last_applied_pkg {
         ralog!("  skip: empty or same as last_applied_pkg={}", state.last_applied_pkg);
         return;
     }
 
-    // 过滤系统进程
-    if pkg.starts_with("com.android.systemui")
-        || pkg.starts_with("com.android.phone")
-        || pkg.starts_with("com.qti.")
-        || pkg.starts_with("android.")
-    {
-        return;
-    }
+    // 判断切换前/后的应用是否已配置（决定是否应用全局活跃刷新率）
+    // 注意：last_applied_pkg 为空串时不可能是已配置 uid，故无需单独判断是否有上一应用
+    let prev_configured = state.app_configs.contains_key(&state.last_applied_pkg);
+    let cur_configured = state.app_configs.contains_key(pkg);
 
     let now = Instant::now();
-    state.current_package = pkg.clone();
-    state.last_applied_pkg = pkg;
+    state.current_package = pkg.to_string();
+    state.last_applied_pkg = pkg.to_string();
     state.last_apply_time = Some(now);
 
-    let current_pkg = state.current_package.clone();
-    apply_app_config(state, &current_pkg);
-    set_refresh_rate(state, state.current_active);
+    apply_app_config(state, pkg);
+    // 未配置 uid 之间切换时不重新应用全局活跃刷新率；
+    // 仅当从已配置 uid 切换到未配置 uid（或切到已配置 uid）时才应用活跃刷新率
+    if prev_configured || cur_configured {
+        set_refresh_rate(state, state.current_active);
+    }
     reset_timer(state, true);
 }
 
@@ -326,13 +314,23 @@ pub fn refresh_init() {
     }
     WAKE_FD.store(wake_fd, Ordering::Release);
 
-    // IProcessObserver 用的 eventfd
-    let fg_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-    if fg_fd < 0 {
-        eprintln!("刷新率: fg eventfd 创建失败");
+    // IProcessObserver 回调用 socketpair(SOCK_DGRAM) 传递包名（字符串），不再传 uid
+    let mut fg_sv: [libc::c_int; 2] = [0, 0];
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+            fg_sv.as_mut_ptr(),
+        )
+    } != 0
+    {
+        eprintln!("刷新率: fg socketpair 创建失败");
         unsafe { libc::close(wake_fd); }
         return;
     }
+    let fg_recv_fd = fg_sv[0];
+    let fg_send_fd = fg_sv[1];
 
     let timer_fd = unsafe {
         libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC | libc::TFD_NONBLOCK)
@@ -368,11 +366,15 @@ pub fn refresh_init() {
     load_global_config(&mut state);
     load_app_configs(&mut state);
 
+    // 初始化完成后应用一次全局配置的活跃刷新率
+    // （之后的前台切换判定见 handle_fg_change：未配置→未配置不再重复应用全局活跃刷新率）
+    set_refresh_rate(&mut state, state.current_active);
+
     // 加载 UID → 包名映射表
     crate::process_observer::init_uid_map();
 
     // 注册 IProcessObserver 回调
-    let observer_ok = crate::process_observer::init_observer(fg_fd);
+    let observer_ok = crate::process_observer::init_observer(fg_send_fd);
     ralog!("init_observer result={}", observer_ok);
 
     let name = CString::new("RefreshRate").unwrap();
@@ -393,10 +395,10 @@ pub fn refresh_init() {
         ev.u64 = 1;
         unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, timer_fd, &mut ev); }
 
-        // fg_eventfd: IProcessObserver 回调通知 (u64=3)
+        // fg socketpair 读端: IProcessObserver 回调通知 (u64=3)
         ev.events = libc::EPOLLIN as u32;
         ev.u64 = 3;
-        unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fg_fd, &mut ev); }
+        unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fg_recv_fd, &mut ev); }
 
         let mut events: [libc::epoll_event; 3] = unsafe { std::mem::zeroed() };
 
@@ -427,11 +429,16 @@ pub fn refresh_init() {
                         switch_to_idle(&mut state);
                     }
                     3 => {
-                        // IProcessObserver 回调: 读取 uid
-                        let mut val: u64 = 0;
-                        unsafe { libc::read(fg_fd, &mut val as *mut _ as *mut _, 8); }
-                        ralog!("epoll: fg eventfd triggered, val={}", val);
-                        handle_fg_change(&mut state, val);
+                        // IProcessObserver 回调: 读取包名（socketpair datagram，无需再查表）
+                        let mut buf = [0u8; 512];
+                        let n = unsafe {
+                            libc::recv(fg_recv_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
+                        };
+                        if n > 0 {
+                            let pkg = String::from_utf8_lossy(&buf[..n as usize]).into_owned();
+                            ralog!("epoll: fg pkg={}", pkg);
+                            handle_fg_change(&mut state, &pkg);
+                        }
                     }
                     _ => {}
                 }
@@ -443,7 +450,8 @@ pub fn refresh_init() {
             libc::close(epfd);
             libc::close(wake_fd);
             libc::close(timer_fd);
-            libc::close(fg_fd);
+            libc::close(fg_recv_fd);
+            libc::close(fg_send_fd);
         }
     });
 }
