@@ -21,8 +21,10 @@ macro_rules! alog { ($($a:tt)*) => { log(&format!($($a)*)) } }
 
 // ── 硬编码事务码 ──
 const TX_REGISTER_PROCESS_OBSERVER: u32 = 0x0d;
+const TX_ON_PROCESS_STARTED: u32 = 0x01;
 const TX_ON_FG_ACTIVITIES_CHANGED: u32 = 0x02;
 const TX_ON_FG_SERVICES_CHANGED: u32 = 0x03;
+const TX_ON_PROCESS_DIED: u32 = 0x04;
 
 // ── FFI 函数指针类型 ──
 type FnGetService = unsafe extern "C" fn(*const c_char) -> *mut c_void;
@@ -193,6 +195,11 @@ extern "C" fn on_transact(
     // 因此这里直接从事务数据开始读取，不再重复读 token
 
     match code {
+        TX_ON_PROCESS_STARTED => {
+            // oneway 事务，无需读取数据，直接返回 OK 避免 NDK 警告
+            alog!("onProcessStarted (已忽略)");
+            STATUS_OK
+        }
         TX_ON_FG_ACTIVITIES_CHANGED => {
             let mut pid = 0i32;
             let mut uid = 0i32;
@@ -217,10 +224,15 @@ extern "C" fn on_transact(
             STATUS_OK
         }
         TX_ON_FG_SERVICES_CHANGED => {
+            alog!("onFGServicesChanged (已忽略)");
             let mut _pid = 0i32; let mut _uid = 0i32; let mut _st = 0i32;
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _pid) };
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _uid) };
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _st) };
+            STATUS_OK
+        }
+        TX_ON_PROCESS_DIED => {
+            alog!("onProcessDied (已忽略)");
             STATUS_OK
         }
         _ => { alog!("未知 code=0x{:04x}", code); STATUS_UNKNOWN_TRANSACTION }
