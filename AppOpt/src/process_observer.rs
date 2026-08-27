@@ -153,11 +153,9 @@ extern "C" fn on_transact(
     alog!("on_transact code=0x{:04x}", code);
     let ndk = match ndk() { Some(n) => n, None => return STATUS_UNKNOWN_TRANSACTION };
 
-    // 读取 AIDL Interface Token (i32 strict mode + string descriptor)
-    let mut strict_mode = 0i32;
-    let sm_status = unsafe { (ndk.read_i32)(in_parcel, &mut strict_mode) };
-    let token = read_string(in_parcel);
-    alog!("  token: sm_status={} strict={} desc={:?}", sm_status, strict_mode, token);
+    // NDK 的 AIBinder_onTransact 内部已通过 checkInterface() 读取了 Interface Token
+    // (strict_mode i32 + UTF-16 descriptor)，且不重置 parcel 位置
+    // 因此这里直接从事务数据开始读取，不再重复读 token
 
     match code {
         TX_ON_PROCESS_STARTED => {
@@ -370,5 +368,23 @@ pub fn init_observer(eventfd: i32) -> bool {
 }
 
 pub fn get_package_name(pid: i32) -> Option<String> {
-    PID_CACHE.lock().unwrap().get(&pid).cloned()
+    // 1. 先查 PID_CACHE（onProcessStarted 回调填充）
+    if let Some(pkg) = PID_CACHE.lock().unwrap().get(&pid).cloned() {
+        if !pkg.is_empty() {
+            return Some(pkg);
+        }
+    }
+    // 2. 回退：读 /proc/<pid>/cmdline（进程在 observer 注册前已启动的情况）
+    let path = format!("/proc/{}/cmdline", pid);
+    if let Ok(data) = std::fs::read(&path) {
+        // cmdline 用 \0 分隔，第一个字段是进程名（通常等于包名）
+        if let Some(name) = data.split(|&b| b == 0).next() {
+            if !name.is_empty() {
+                let pkg = String::from_utf8_lossy(name).into_owned();
+                alog!("get_package_name: pid={} 从 cmdline 获取 pkg={}", pid, pkg);
+                return Some(pkg);
+            }
+        }
+    }
+    None
 }
