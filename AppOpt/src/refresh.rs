@@ -2,28 +2,27 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::Mutex;
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
 use std::time::Instant;
-
-// ── Android log (调试用) ──
-unsafe extern "C" {
-    fn __android_log_write(prio: std::os::raw::c_int, tag: *const std::os::raw::c_char, text: *const std::os::raw::c_char) -> std::os::raw::c_int;
-}
-const RLOG_TAG: &[u8] = b"AppOpt\0";
-fn rlog(msg: &str) {
-    let mut buf = vec![0u8; msg.len() + 1];
-    buf[..msg.len()].copy_from_slice(msg.as_bytes());
-    unsafe { __android_log_write(3, RLOG_TAG.as_ptr() as *const std::os::raw::c_char, buf.as_ptr() as *const std::os::raw::c_char); }
-}
-macro_rules! ralog { ($($a:tt)*) => { rlog(&format!($($a)*)) } }
 
 const MODE_120: i32 = 0;
 const MODE_60: i32 = 1;
 const MODE_90: i32 = 2;
 
-const CONFIG_PATH: &str = "./refresh_config.conf";
+/// 配置文件绝对路径：以可执行文件所在目录为基准，
+/// 避免重启后工作目录（cwd）变化导致找不到/重建配置（应用配置被清空）
+fn config_path() -> &'static str {
+    static PATH: OnceLock<String> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let mut p = std::env::current_exe()
+            .or_else(|_| std::env::current_dir())
+            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+        p.pop(); // 去掉可执行文件名，得到模块目录
+        p.push("refresh_config.conf");
+        p.to_string_lossy().into_owned()
+    })
+}
 
 pub const EVENT_INPUT: u32 = 5;
 
@@ -83,13 +82,13 @@ fn parse_mode(s: &str) -> i32 {
 }
 
 fn create_default_config() {
-    if !std::path::Path::new(CONFIG_PATH).exists() {
-        let _ = fs::write(CONFIG_PATH, "timeout=30\nactive=120\nidle=60\n# packageName,timeout,activeMode,idleMode\n");
+    if !std::path::Path::new(config_path()).exists() {
+        let _ = fs::write(config_path(), "timeout=30\nactive=120\nidle=60\n# packageName,timeout,activeMode,idleMode\n");
     }
 }
 
 fn load_global_config(state: &mut RefreshState) {
-    let content = match fs::read_to_string(CONFIG_PATH) {
+    let content = match fs::read_to_string(config_path()) {
         Ok(s) => s,
         Err(_) => return,
     };
@@ -121,7 +120,7 @@ fn load_global_config(state: &mut RefreshState) {
 
 fn load_app_configs(state: &mut RefreshState) {
     state.app_configs.clear();
-    let content = match fs::read_to_string(CONFIG_PATH) {
+    let content = match fs::read_to_string(config_path()) {
         Ok(s) => s,
         Err(_) => return,
     };
@@ -149,9 +148,8 @@ fn set_refresh_rate(state: &mut RefreshState, mode: i32) {
     if mode == state.current_applied_mode {
         return;
     }
-    let _ = std::process::Command::new("service")
-        .args(["call", "SurfaceFlinger", "1035", "i32", &mode.to_string()])
-        .output();
+    // 只走 binder 直连 SurfaceFlinger，不再回退到 service 子进程
+    crate::process_observer::set_refresh_rate_binder(mode);
     state.current_applied_mode = mode;
 }
 
@@ -221,10 +219,7 @@ fn switch_to_idle(state: &mut RefreshState) {
 
 /// IProcessObserver 回调触发：直接收到包名（socketpair 传递，系统过滤已在 UID 映射表完成）
 fn handle_fg_change(state: &mut RefreshState, pkg: &str) {
-    ralog!("handle_fg_change: pkg={}", pkg);
-
     if pkg.is_empty() || pkg == state.last_applied_pkg {
-        ralog!("  skip: empty or same as last_applied_pkg={}", state.last_applied_pkg);
         return;
     }
 
@@ -309,7 +304,6 @@ pub fn refresh_init() {
 
     let wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     if wake_fd < 0 {
-        eprintln!("刷新率: eventfd 创建失败");
         return;
     }
     WAKE_FD.store(wake_fd, Ordering::Release);
@@ -325,18 +319,28 @@ pub fn refresh_init() {
         )
     } != 0
     {
-        eprintln!("刷新率: fg socketpair 创建失败");
         unsafe { libc::close(wake_fd); }
         return;
     }
     let fg_recv_fd = fg_sv[0];
     let fg_send_fd = fg_sv[1];
 
+    // 增大 socketpair 接收缓冲（默认可能只有几十 KB），减少 fg 事件堆积溢出
+    let rcvbuf: libc::c_int = 256 * 1024;
+    unsafe {
+        libc::setsockopt(
+            fg_recv_fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &rcvbuf as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+
     let timer_fd = unsafe {
         libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC | libc::TFD_NONBLOCK)
     };
     if timer_fd < 0 {
-        eprintln!("刷新率: timerfd 创建失败");
         unsafe { libc::close(wake_fd); }
         return;
     }
@@ -375,8 +379,7 @@ pub fn refresh_init() {
     crate::process_observer::init_uid_map();
 
     // 注册 IProcessObserver 回调
-    let observer_ok = crate::process_observer::init_observer(fg_send_fd);
-    ralog!("init_observer result={}", observer_ok);
+    let _ = crate::process_observer::init_observer(fg_send_fd);
 
     let name = CString::new("RefreshRate").unwrap();
     thread::spawn(move || {
@@ -384,7 +387,6 @@ pub fn refresh_init() {
 
         let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         if epfd < 0 {
-            eprintln!("刷新率: epoll_create1 失败");
             return;
         }
 
@@ -402,9 +404,12 @@ pub fn refresh_init() {
         unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fg_recv_fd, &mut ev); }
 
         let mut events: [libc::epoll_event; 3] = unsafe { std::mem::zeroed() };
+        // 复用固定缓冲：from_utf8 直接借用，读取路径零堆分配（包名均为合法 UTF-8）
+        let mut fg_buf = [0u8; 512];
 
         loop {
-            let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 4, -1) };
+            // maxevents 与 events 缓冲大小一致（3 个已注册 fd，最多返回 3 个事件）
+            let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 3, -1) };
             if n <= 0 {
                 if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                     continue;
@@ -431,14 +436,19 @@ pub fn refresh_init() {
                     }
                     3 => {
                         // IProcessObserver 回调: 读取包名（socketpair datagram，无需再查表）
-                        let mut buf = [0u8; 512];
+                        // 复用 fg_buf，from_utf8 直接借用 &str，不产生堆分配
                         let n = unsafe {
-                            libc::recv(fg_recv_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
+                            libc::recv(
+                                fg_recv_fd,
+                                fg_buf.as_mut_ptr() as *mut libc::c_void,
+                                fg_buf.len(),
+                                0,
+                            )
                         };
                         if n > 0 {
-                            let pkg = String::from_utf8_lossy(&buf[..n as usize]).into_owned();
-                            ralog!("epoll: fg pkg={}", pkg);
-                            handle_fg_change(&mut state, &pkg);
+                            if let Ok(pkg) = std::str::from_utf8(&fg_buf[..n as usize]) {
+                                handle_fg_change(&mut state, pkg);
+                            }
                         }
                     }
                     _ => {}
@@ -472,7 +482,7 @@ pub fn refresh_on_event(event_type: u32, _pid: i32) {
 // ===== Web API =====
 
 pub fn refresh_get_config() -> (i32, String, String) {
-    let content = fs::read_to_string(CONFIG_PATH).unwrap_or_default();
+    let content = fs::read_to_string(config_path()).unwrap_or_default();
     let mut timeout = 30;
     let mut active = "120".to_string();
     let mut idle = "60".to_string();
@@ -500,7 +510,7 @@ pub fn refresh_set_config(timeout: i32, active: &str, idle: &str) {
     // 原地编辑而非覆盖整个文件：只替换 timeout/active/idle 三个全局配置键的值，
     // 保留原有行顺序、注释、空行与应用配置行（不做 trim、不丢弃空行、不重排），
     // 缺失的键追加到文件末尾。
-    let content = fs::read_to_string(CONFIG_PATH).unwrap_or_default();
+    let content = fs::read_to_string(config_path()).unwrap_or_default();
     let mut found_timeout = false;
     let mut found_active = false;
     let mut found_idle = false;
@@ -535,13 +545,13 @@ pub fn refresh_set_config(timeout: i32, active: &str, idle: &str) {
         lines.push(format!("idle={}", idle));
     }
 
-    let _ = fs::write(CONFIG_PATH, lines.join("\n") + "\n");
+    let _ = fs::write(config_path(), lines.join("\n") + "\n");
     REFRESH_FORCE_RELOAD.store(true, Ordering::Release);
     wake();
 }
 
 pub fn refresh_get_apps() -> Vec<(String, i32, String, String)> {
-    let content = match fs::read_to_string(CONFIG_PATH) {
+    let content = match fs::read_to_string(config_path()) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
@@ -566,7 +576,7 @@ pub fn refresh_get_apps() -> Vec<(String, i32, String, String)> {
 }
 
 pub fn refresh_add_app(pkg: &str, timeout: i32, active: &str, idle: &str) {
-    let content = fs::read_to_string(CONFIG_PATH).unwrap_or_default();
+    let content = fs::read_to_string(config_path()).unwrap_or_default();
     let mut lines: Vec<String> = content.lines().map(String::from).collect();
     let new_line = format!("{},{},{},{}", pkg, timeout, active, idle);
     let mut found = false;
@@ -583,13 +593,13 @@ pub fn refresh_add_app(pkg: &str, timeout: i32, active: &str, idle: &str) {
     if !found {
         lines.push(new_line);
     }
-    let _ = fs::write(CONFIG_PATH, lines.join("\n") + "\n");
+    let _ = fs::write(config_path(), lines.join("\n") + "\n");
     REFRESH_FORCE_RELOAD.store(true, Ordering::Release);
     wake();
 }
 
 pub fn refresh_del_app(pkg: &str) -> bool {
-    let content = match fs::read_to_string(CONFIG_PATH) {
+    let content = match fs::read_to_string(config_path()) {
         Ok(s) => s,
         Err(_) => return false,
     };
@@ -604,7 +614,7 @@ pub fn refresh_del_app(pkg: &str) -> bool {
         })
         .map(String::from)
         .collect();
-    let _ = fs::write(CONFIG_PATH, lines.join("\n") + "\n");
+    let _ = fs::write(config_path(), lines.join("\n") + "\n");
     REFRESH_FORCE_RELOAD.store(true, Ordering::Release);
     wake();
     true
