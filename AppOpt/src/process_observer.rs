@@ -240,10 +240,9 @@ extern "C" fn on_transact(
 
             if fg {
                 let fd = FG_EVENTFD.load(Ordering::Acquire);
-                alog!("  notifying eventfd={} pid={} uid={}", fd, pid, uid);
+                alog!("  notifying eventfd={} uid={}", fd, uid);
                 if fd >= 0 {
-                    // 打包 uid (高32位) + pid (低32位) 到 eventfd
-                    let val: u64 = ((uid as u32 as u64) << 32) | (pid as u32 as u64);
+                    let val: u64 = uid as u32 as u64;
                     unsafe { libc::write(fd, &val as *const u64 as *const _, 8); }
                 }
             }
@@ -366,7 +365,7 @@ pub fn init_observer(eventfd: i32) -> bool {
     }
 }
 
-pub fn get_package_name(uid: i32, _pid: i32) -> Option<String> {
+pub fn get_package_name(uid: i32) -> Option<String> {
     // 每次调用前检查 mtime，变化时重载
     reload_if_mtime_changed();
 
