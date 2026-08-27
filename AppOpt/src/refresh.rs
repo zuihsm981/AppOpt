@@ -247,14 +247,16 @@ fn switch_to_idle(state: &mut RefreshState) {
     state.is_paused = true;
 }
 
-/// IProcessObserver 回调触发：通过 eventfd 收到 pid
-/// 从 process_observer 的 PID_CACHE 获取包名
-fn handle_fg_change(state: &mut RefreshState, pid: i32) {
-    ralog!("handle_fg_change: pid={}", pid);
-    let pkg = match crate::process_observer::get_package_name(pid) {
+/// IProcessObserver 回调触发：通过 eventfd 收到打包的 uid+pid
+/// 用 uid 查 packages.list 映射表获取包名，回退读 /proc/<pid>/cmdline
+fn handle_fg_change(state: &mut RefreshState, packed: u64) {
+    let uid = (packed >> 32) as i32;
+    let pid = (packed & 0xFFFFFFFF) as i32;
+    ralog!("handle_fg_change: pid={} uid={}", pid, uid);
+    let pkg = match crate::process_observer::get_package_name(uid, pid) {
         Some(p) => p,
         None => {
-            ralog!("  package not found in PID_CACHE for pid={}", pid);
+            ralog!("  package not found for uid={} pid={}", uid, pid);
             return;
         }
     };
@@ -502,11 +504,11 @@ pub fn refresh_init() {
                         handle_backlight_change(&mut state);
                     }
                     3 => {
-                        // IProcessObserver 回调: 读取 pid，查缓存获取包名
+                        // IProcessObserver 回调: 读取打包的 uid+pid
                         let mut val: u64 = 0;
                         unsafe { libc::read(fg_fd, &mut val as *mut _ as *mut _, 8); }
-                        ralog!("epoll: fg eventfd triggered, pid={}", val);
-                        handle_fg_change(&mut state, val as i32);
+                        ralog!("epoll: fg eventfd triggered, val={}", val);
+                        handle_fg_change(&mut state, val);
                     }
                     _ => {}
                 }
