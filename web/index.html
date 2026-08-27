@@ -298,6 +298,24 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 </div>
 </div>
 
+<div id="modal-rf-app" class="modal-bg" hidden>
+<div class="modal">
+<h3 id="mrf-title">添加应用刷新率</h3>
+<div class="sg-wrap"><input id="mrf-pkg" placeholder="输入应用包名"><div class="sg-box" id="sg-rf-pkg" hidden></div></div>
+<select id="mrf-active" style="width:100%;margin-bottom:10px;background:var(--bg);border:1px solid transparent;border-radius:10px;padding:9px 12px;font-size:14px;font-family:inherit;color:var(--fg)">
+<option value="120">活跃: 120Hz</option><option value="90">活跃: 90Hz</option><option value="60">活跃: 60Hz</option>
+</select>
+<select id="mrf-idle" style="width:100%;margin-bottom:10px;background:var(--bg);border:1px solid transparent;border-radius:10px;padding:9px 12px;font-size:14px;font-family:inherit;color:var(--fg)">
+<option value="120">空闲: 120Hz</option><option value="90">空闲: 90Hz</option><option value="60">空闲: 60Hz</option>
+</select>
+<input id="mrf-timeout" type="number" min="1" max="3600" value="10" placeholder="空闲超时(秒)">
+<div class="modal-actions">
+<button class="btn-outline" id="mrf-cancel">取消</button>
+<button class="btn" id="mrf-save">保存</button>
+</div>
+</div>
+</div>
+
 <div id="toast"></div>
 <script>
 const $=id=>document.getElementById(id);
@@ -708,27 +726,61 @@ async function loadRefresh(){
     },3000);
   }catch(e){toast(e.message)}
 }
+let rfAppsData=[];
 async function loadRefreshApps(){
   try{
     const d=await api('/api/refresh/apps');
-    const apps=d.apps||[],box=$('rf-apps');
-    if(!apps.length){box.innerHTML='<div class="empty">暂无按应用配置<br>使用全局配置</div>';return}
-    box.innerHTML=apps.map(a=>`<div class="rule-row"><span class="rule-name">${esc(a.pkg)}</span><span class="rule-sub">${a.timeout}s ${a.active}→${a.idle}</span><button class="icon-btn danger" data-rfdel="${esc(a.pkg)}" title="删除">${ICO_TRASH}</button></div>`).join('');
+    rfAppsData=d.apps||[];
+    const box=$('rf-apps');
+    if(!rfAppsData.length){box.innerHTML='<div class="empty">暂无按应用配置<br>使用全局配置</div>';return}
+    box.innerHTML=rfAppsData.map(a=>`<div class="rule-row"><span class="rule-name">${esc(a.pkg)}</span><span class="rule-sub">${a.timeout}s ${a.active}→${a.idle}</span><button class="icon-btn" data-rfedit="${esc(a.pkg)}" title="编辑">${ICO_EDIT}</button><button class="icon-btn danger" data-rfdel="${esc(a.pkg)}" title="删除">${ICO_TRASH}</button></div>`).join('');
   }catch(e){toast(e.message)}
 }
 $('rf-save').onclick=async()=>{
   try{await api('/api/refresh/config',{timeout:Math.max(1,+$('rf-timeout').value||30),active:$('rf-active').value,idle:$('rf-idle').value});toast('已保存');loadRefresh()}
   catch(e){toast(e.message)}
 };
-$('rf-add').onclick=async()=>{
-  const pkg=prompt('输入应用包名:');if(!pkg||!pkg.trim())return;
-  const to=prompt('空闲超时(秒):','10');if(!to)return;
-  const act=prompt('活跃刷新率(120/90/60):','120');if(!act)return;
-  const idl=prompt('空闲刷新率(120/90/60):','60');if(!idl)return;
-  try{await api('/api/refresh/app',{pkg:pkg.trim(),timeout:+to||10,active:act,idle:idl});toast('已添加');loadRefreshApps()}
-  catch(e){toast(e.message)}
+function openRfAppModal(pkg){
+  if(pkg){
+    $('mrf-title').textContent='编辑应用刷新率';
+    const a=rfAppsData.find(x=>x.pkg===pkg);
+    if(a){
+      $('mrf-pkg').value=a.pkg;
+      $('mrf-pkg').readOnly=true;
+      $('mrf-active').value=a.active;
+      $('mrf-idle').value=a.idle;
+      $('mrf-timeout').value=a.timeout;
+    }
+  }else{
+    $('mrf-title').textContent='添加应用刷新率';
+    $('mrf-pkg').value='';
+    $('mrf-pkg').readOnly=false;
+    $('mrf-active').value='120';
+    $('mrf-idle').value='60';
+    $('mrf-timeout').value='';
+  }
+  $('modal-rf-app').hidden=false;
+}
+suggest_bind($('mrf-pkg'),$('sg-rf-pkg'),{});
+$('mrf-cancel').onclick=()=>$('modal-rf-app').hidden=true;
+let mrfSaving=false;
+$('mrf-save').onclick=async()=>{
+  if(mrfSaving)return;
+  const pkg=$('mrf-pkg').value.trim();
+  if(!pkg)return toast('请输入应用包名');
+  mrfSaving=true;
+  try{
+    await api('/api/refresh/app',{pkg,timeout:Math.max(1,+$('mrf-timeout').value||10),active:$('mrf-active').value,idle:$('mrf-idle').value});
+    $('modal-rf-app').hidden=true;
+    toast('已保存');
+    loadRefreshApps();
+  }catch(e){toast(e.message)}
+  finally{mrfSaving=false}
 };
+$('rf-add').onclick=()=>openRfAppModal();
 $('rf-apps').addEventListener('click',e=>{
+  const ed=e.target.closest('[data-rfedit]');
+  if(ed){openRfAppModal(ed.dataset.rfedit);return}
   const del=e.target.closest('[data-rfdel]');if(!del)return;
   const pkg=del.dataset.rfdel;
   $('mc-msg').textContent='删除 '+pkg+' 的刷新率配置';
