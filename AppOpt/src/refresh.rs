@@ -318,14 +318,16 @@ fn handle_backlight_change(state: &mut RefreshState) {
     let Some(path) = &state.backlight_path else { return };
     let brightness = read_backlight(path);
     if brightness && !state.prev_backlight {
-        // 0 → >0：切回活跃刷新率 + 启动定时器
+        // 0 → >0：亮屏
+        ralog!("亮屏: 切回活跃刷新率 + 启动定时器");
         if state.is_paused || state.current_applied_mode == state.current_idle {
             set_refresh_rate(state, state.current_active);
             state.is_paused = false;
         }
         reset_timer(state, true);
     } else if !brightness && state.prev_backlight {
-        // >0 → 0：关闭定时器
+        // >0 → 0：灭屏
+        ralog!("灭屏: 关闭定时器");
         timerfd_cancel(state.timer_fd);
         state.last_reset_time = None;
     }
@@ -440,6 +442,9 @@ pub fn refresh_init() {
             reset_timer(&mut state, true);
         }
     }
+
+    // 加载 UID → 包名映射表
+    crate::process_observer::init_uid_map();
 
     // 注册 IProcessObserver 回调
     let observer_ok = crate::process_observer::init_observer(fg_fd);
