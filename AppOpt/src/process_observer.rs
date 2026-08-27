@@ -54,6 +54,7 @@ type FnReadString = unsafe extern "C" fn(
     Option<extern "C" fn(*mut c_void, *mut *mut c_char, i32) -> bool>,
 ) -> c_int;
 type FnJoinThreadPool = unsafe extern "C" fn();
+type FnStartThreadPool = unsafe extern "C" fn();
 type FnAssociateClass = unsafe extern "C" fn(*mut c_void, *const c_void) -> bool;
 
 struct BinderNdk {
@@ -69,6 +70,7 @@ struct BinderNdk {
     read_i32: FnReadI32,
     read_string: FnReadString,
     join_thread_pool: FnJoinThreadPool,
+    start_thread_pool: FnStartThreadPool,
     associate_class: FnAssociateClass,
 }
 
@@ -97,11 +99,12 @@ fn ndk() -> Option<&'static BinderNdk> {
         let p_read_i32 = sym("AParcel_readInt32");
         let p_read_string = sym("AParcel_readString");
         let p_join = sym("ABinderProcess_joinThreadPool");
+        let p_start = sym("ABinderProcess_startThreadPool");
         let p_associate = sym("AIBinder_associateClass");
         if p_get_service.is_null() || p_class_define.is_null() || p_binder_new.is_null()
             || p_prepare_tx.is_null() || p_transact.is_null() || p_parcel_delete.is_null()
             || p_write_string.is_null() || p_write_binder.is_null() || p_write_i32.is_null()
-            || p_read_i32.is_null() || p_read_string.is_null() || p_join.is_null() || p_associate.is_null()
+            || p_read_i32.is_null() || p_read_string.is_null() || p_join.is_null() || p_start.is_null() || p_associate.is_null()
         { alog!("部分 dlsym 为 null"); return None; }
         
         alog!("所有 dlsym 成功");
@@ -118,6 +121,7 @@ fn ndk() -> Option<&'static BinderNdk> {
             read_i32: std::mem::transmute(p_read_i32),
             read_string: std::mem::transmute(p_read_string),
             join_thread_pool: std::mem::transmute(p_join),
+            start_thread_pool: std::mem::transmute(p_start),
             associate_class: std::mem::transmute(p_associate),
         })
     }).as_ref()
@@ -149,11 +153,11 @@ extern "C" fn on_transact(
     alog!("on_transact code=0x{:04x}", code);
     let ndk = match ndk() { Some(n) => n, None => return STATUS_UNKNOWN_TRANSACTION };
 
-    // 【核心修复 1】：正确读取 AIDL Interface Token (1个 i32 strict mode + 1个 string)
-    // 之前只读 string 会导致后续 pid/uid 读取错位 4 字节！
+    // 读取 AIDL Interface Token (i32 strict mode + string descriptor)
     let mut strict_mode = 0i32;
-    let _ = unsafe { (ndk.read_i32)(in_parcel, &mut strict_mode) };
-    let _token = read_string(in_parcel).unwrap_or_default();
+    let sm_status = unsafe { (ndk.read_i32)(in_parcel, &mut strict_mode) };
+    let token = read_string(in_parcel);
+    alog!("  token: sm_status={} strict={} desc={:?}", sm_status, strict_mode, token);
 
     match code {
         TX_ON_PROCESS_STARTED => {
@@ -165,24 +169,25 @@ extern "C" fn on_transact(
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut package_uid) };
             let package_name = read_string(in_parcel).unwrap_or_default();
             let _process_name = read_string(in_parcel).unwrap_or_default();
-            alog!("onProcessStarted: pid={} pkg={}", pid, package_name);
+            alog!("onProcessStarted: pid={} pkg={} proc={}", pid, package_name, _process_name);
             PID_CACHE.lock().unwrap().insert(pid, package_name);
             STATUS_OK
         }
         TX_ON_FG_ACTIVITIES_CHANGED => {
             let mut pid = 0i32;
             let mut uid = 0i32;
-            let mut fg_val = 0i32; // 使用 i32 读取 boolean 兼容性更好
-            
+            let mut fg_val = 0i32;
+
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut pid) };
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut uid) };
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut fg_val) };
-            
+
             let fg = fg_val != 0;
             alog!("onFGChanged: pid={} uid={} fg={}", pid, uid, fg);
-            
+
             if fg {
                 let fd = FG_EVENTFD.load(Ordering::Acquire);
+                alog!("  notifying eventfd={} pid={}", fd, pid);
                 if fd >= 0 {
                     let val: u64 = pid as u64;
                     unsafe { libc::write(fd, &val as *const u64 as *const _, 8); }
@@ -244,6 +249,7 @@ fn read_string(parcel: *mut c_void) -> Option<String> {
     let status = unsafe {
         (ndk.read_string)(parcel, &mut ctx as *mut _ as *mut c_void, Some(allocator))
     };
+    alog!("  read_string: status={} length={} buf_null={}", status, ctx.length, ctx.buffer.is_null());
 
     let result = if status != STATUS_OK {
         None
@@ -323,25 +329,36 @@ pub fn init_observer(eventfd: i32) -> bool {
     }
     alog!("prepareTransaction=ok");
     
-    // 写入 Interface Token
-    let iface = b"android.app.IActivityManager\0";
-    let iface_len = (iface.len() - 1) as i32;
-    let _ = unsafe { (ndk.write_i32)(in_parcel, 0) };
-    let _ = unsafe { (ndk.write_string)(in_parcel, iface.as_ptr() as *const c_char, iface_len) };
+    // NDK 的 prepareTransaction 已自动写入 Interface Token (UTF-16, 与 Java 端 enforceInterface 兼容)
+    // 手动再写一次会导致双重 token → Java 端 readStrongBinder 读到第二个 token 而非 observer → 静默失败
+    // 只需写入 observer binder 参数
     let _ = unsafe { (ndk.write_binder)(in_parcel, observer) };
     
     let mut out_parcel: *mut c_void = std::ptr::null_mut();
     let status = unsafe { (ndk.transact)(am, TX_REGISTER_PROCESS_OBSERVER, &mut in_parcel, &mut out_parcel, 0) };
     alog!("transact: status={}", status);
     
+    // 检查 reply 中的异常码 (Java 端 enforceInterface/readStrongBinder 失败会返回异常)
+    if status == STATUS_OK && !out_parcel.is_null() {
+        let mut exception_code = 0i32;
+        let _ = unsafe { (ndk.read_i32)(out_parcel, &mut exception_code) };
+        alog!("reply exception_code={}", exception_code);
+        if exception_code != 0 {
+            alog!("服务端异常! 注册可能未生效");
+        }
+    }
+    
     unsafe { (ndk.parcel_delete)(in_parcel) };
     if !out_parcel.is_null() { unsafe { (ndk.parcel_delete)(out_parcel) }; }
     
     if status == STATUS_OK {
         alog!("注册成功, 启动 binder 线程池");
+        let start_fn = ndk.start_thread_pool;
         let join_fn = ndk.join_thread_pool;
         std::thread::spawn(move || {
-            alog!("binder 线程池启动");
+            alog!("startThreadPool");
+            unsafe { start_fn(); }
+            alog!("joinThreadPool (阻塞)");
             unsafe { join_fn(); }
         });
         alog!("init_observer 完成");
