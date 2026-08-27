@@ -245,6 +245,8 @@ fn switch_to_idle(state: &mut RefreshState) {
     }
     set_refresh_rate(state, state.current_idle);
     state.is_paused = true;
+    timerfd_cancel(state.timer_fd);
+    state.last_reset_time = None;
 }
 
 /// IProcessObserver 回调触发：通过 eventfd 收到打包的 uid+pid
