@@ -114,7 +114,8 @@ fn ndk() -> Option<&'static BinderNdk> {
 const STATUS_OK: c_int = 0;
 const STATUS_UNKNOWN_TRANSACTION: c_int = -29;
 
-static FG_EVENTFD: AtomicI32 = AtomicI32::new(-1);
+// fg 事件通过 socketpair(SOCK_DGRAM) 传递包名（字符串），不再是 eventfd 传 uid
+static FG_SEND_FD: AtomicI32 = AtomicI32::new(-1);
 
 // ── UID → 包名映射表（从 /data/system/packages.list 加载）──
 struct UidMap {
@@ -239,11 +240,22 @@ extern "C" fn on_transact(
             alog!("onFGChanged: pid={} uid={} fg={}", pid, uid, fg);
 
             if fg {
-                let fd = FG_EVENTFD.load(Ordering::Acquire);
-                alog!("  notifying eventfd={} uid={}", fd, uid);
-                if fd >= 0 {
-                    let val: u64 = uid as u32 as u64;
-                    unsafe { libc::write(fd, &val as *const u64 as *const _, 8); }
+                // 先重载 packages.list（mtime 变化才重载），再查 HashMap，保证包名映射最新
+                reload_if_mtime_changed();
+                // get_package_name 只是"提取包名"：系统包在加载 packages.list 时已被 @system 过滤掉，
+                // 系统 uid 在映射表中没有条目 → 返回 None → 不通知；命中时拿到的必然是有效包名，
+                // 直接把包名（字符串）通过 socketpair 发给 refresh 线程，refresh 侧无需再查表
+                if let Some(pkg) = get_package_name(uid) {
+                    let fd = FG_SEND_FD.load(Ordering::Acquire);
+                    alog!("  notifying pkg={} fd={}", pkg, fd);
+                    if fd >= 0 {
+                        let bytes = pkg.as_bytes();
+                        unsafe {
+                            libc::send(fd, bytes.as_ptr() as *const libc::c_void, bytes.len(), 0);
+                        }
+                    }
+                } else {
+                    alog!("  skip uid={} (not in uid map)", uid);
                 }
             }
             STATUS_OK
@@ -290,9 +302,9 @@ fn get_am_class() -> *mut c_void {
     }).0
 }
 
-pub fn init_observer(eventfd: i32) -> bool {
-    alog!("init_observer 开始, eventfd={}", eventfd);
-    FG_EVENTFD.store(eventfd, Ordering::Release);
+pub fn init_observer(send_fd: i32) -> bool {
+    alog!("init_observer 开始, send_fd={}", send_fd);
+    FG_SEND_FD.store(send_fd, Ordering::Release);
     
     let ndk = match ndk() { Some(n) => n, None => return false };
     let class = get_observer_class();
@@ -365,10 +377,8 @@ pub fn init_observer(eventfd: i32) -> bool {
     }
 }
 
+/// 纯查表：调用前需先 reload_if_mtime_changed() 保证映射最新
 pub fn get_package_name(uid: i32) -> Option<String> {
-    // 每次调用前检查 mtime，变化时重载
-    reload_if_mtime_changed();
-
     let guard = UID_MAP.lock().unwrap();
     guard.map.get(&uid).cloned().filter(|s| !s.is_empty())
 }
