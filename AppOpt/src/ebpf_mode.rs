@@ -165,18 +165,28 @@ impl KpmHandle {
         kpm_ctl0(&self.key, &args, out)
     }
 
-    /// 导出模块日志环到本地文件 (返回写入字节数)
+    /// 导出模块日志环到本地文件: 先写 stats(含 log_lines 计数) 再写 logs
     pub fn dump_logs(&self, path: &str) -> std::io::Result<usize> {
+        let mut st = [0u8; 256];
+        let sn = {
+            let args = CString::new("stats").unwrap_or_default();
+            kpm_ctl0(&self.key, &args, &mut st)
+        };
         let mut buf = vec![0u8; 8192];
         let n = {
             let args = CString::new("logs").unwrap_or_default();
             kpm_ctl0(&self.key, &args, &mut buf)
         };
-        if n < 0 {
-            return Err(std::io::Error::from_raw_os_error(-n as i32));
+        let mut out = Vec::with_capacity(512);
+        out.extend_from_slice(b"--- stats ---\n");
+        if sn > 0 {
+            out.extend_from_slice(&st[..sn as usize]);
         }
-        let mut out = Vec::with_capacity(n as usize + 1);
-        out.extend_from_slice(&buf[..n as usize]);
+        out.push(b'\n');
+        out.extend_from_slice(b"--- logs ---\n");
+        if n > 0 {
+            out.extend_from_slice(&buf[..n as usize]);
+        }
         out.push(b'\n');
         let out_len = out.len();
         std::fs::write(path, out)?;
