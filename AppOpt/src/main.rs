@@ -36,6 +36,8 @@ use crate::web::{
 
 pub const MAX_PKG_LEN: usize = 128;
 pub const MAX_THREAD_LEN: usize = 32;
+/// KPM 模块日志导出路径 (dump_logs 每 10s 刷新)
+pub const KPM_LOG_PATH: &str = "/data/local/tmp/appopt_kpm.log";
 
 pub static CONFIG_UPDATED: AtomicBool = AtomicBool::new(false);
 
@@ -213,6 +215,7 @@ fn main() {
 
     let mut proc_state: Option<ProcScanState> = None;
     let mut affinity_deadline = Instant::now();
+    let mut kpm_log_deadline = Instant::now();
     let prog_start = Instant::now();
     let mut web_stats_deadline = Instant::now();
     // 预支 60 秒使首次重试立即到期
@@ -276,6 +279,7 @@ fn main() {
                 } else {
                     println!("工作模式切换: KPM 事件驱动");
                     full_scan(&cfg, &mut new_es);
+                    let _ = new_es.bpf.dump_logs(KPM_LOG_PATH);
                     ebpf_state = Some(new_es);
                     affinity_deadline = Instant::now();
                 }
@@ -308,6 +312,7 @@ fn main() {
                     continue;
                 }
                 full_scan(&cfg, &mut new_es);
+                let _ = new_es.bpf.dump_logs(KPM_LOG_PATH);
                 ebpf_state = Some(new_es);
             }
             continue;
@@ -330,6 +335,12 @@ fn main() {
             if affinity_deadline.elapsed() >= Duration::from_secs(3 * interval) {
                 affinity_check(es, &cfg);
                 affinity_deadline = Instant::now();
+            }
+
+            // 周期导出 KPM 模块日志到本地文件 (便于排查 input 事件等)
+            if kpm_log_deadline.elapsed() >= Duration::from_secs(10) {
+                let _ = es.bpf.dump_logs(KPM_LOG_PATH);
+                kpm_log_deadline = Instant::now();
             }
         } else {
             let cache = proc_state.get_or_insert_with(ProcScanState::new);
