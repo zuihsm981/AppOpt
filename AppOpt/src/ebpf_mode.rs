@@ -73,7 +73,8 @@ unsafe fn supercall(
     a3: *mut u8,
     a4: usize,
 ) -> i64 {
-    libc::syscall(NR_SUPERCALL, key, ver_and_cmd(cmd), a1, a2, a3, a4) as i64
+    // Rust 2024: unsafe_op_in_unsafe_fn, 体内 unsafe 调用需显式 unsafe 块
+    unsafe { libc::syscall(NR_SUPERCALL, key, ver_and_cmd(cmd), a1, a2, a3, a4) as i64 }
 }
 
 /// 向 KPM 模块发送 ctl0 命令; out 为可选输出缓冲
@@ -177,8 +178,9 @@ impl KpmHandle {
         let mut out = Vec::with_capacity(n as usize + 1);
         out.extend_from_slice(&buf[..n as usize]);
         out.push(b'\n');
+        let out_len = out.len();
         std::fs::write(path, out)?;
-        Ok(out.len())
+        Ok(out_len)
     }
 }
 
