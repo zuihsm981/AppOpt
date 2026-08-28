@@ -140,8 +140,8 @@ fn main() {
                 }
             }
             "-v" => {
-                if crate::ebpf_mode::ebpf_probe() {
-                    println!("AppOpt 版本 {} eBPF", env!("CARGO_PKG_VERSION"));
+                if crate::ebpf_mode::kpm_probe() {
+                    println!("AppOpt 版本 {} KPM", env!("CARGO_PKG_VERSION"));
                 } else {
                     println!("AppOpt 版本 {}", env!("CARGO_PKG_VERSION"));
                 }
@@ -269,12 +269,12 @@ fn main() {
             ebpf_retry_at = Instant::now();
             if let Some(mut new_es) = ebpf_init() {
                 if comm_map_init(&mut new_es.bpf, &cfg.pkgs, new_es.comm_capacity) {
-                    eprintln!("eBPF: 白名单容量不足，保持 /proc 轮询");
+                    eprintln!("KPM: 白名单容量不足，保持 /proc 轮询");
                     if mode == 0 {
                         EBPF_GAVE_UP.store(true, Ordering::Relaxed);
                     }
                 } else {
-                    println!("工作模式切换: eBPF 事件驱动");
+                    println!("工作模式切换: KPM 事件驱动");
                     full_scan(&cfg, &mut new_es);
                     ebpf_state = Some(new_es);
                     affinity_deadline = Instant::now();
@@ -304,7 +304,7 @@ fn main() {
             ebpf_state = None;
             if let Some(mut new_es) = ebpf_init() {
                 if comm_map_init(&mut new_es.bpf, &cfg.pkgs, new_es.comm_capacity) {
-                    eprintln!("eBPF: 重载后白名单容量仍不足，回退到 /proc 轮询");
+                    eprintln!("KPM: 重载后白名单容量仍不足，回退到 /proc 轮询");
                     continue;
                 }
                 full_scan(&cfg, &mut new_es);
@@ -347,7 +347,7 @@ fn main() {
         }
 
         if ebpf_dead {
-            eprintln!("eBPF: 事件通道断开，回退到 /proc 轮询");
+            eprintln!("KPM: 事件通道断开，回退到 /proc 轮询");
             ebpf_state = None;
             let cache = proc_state.get_or_insert_with(ProcScanState::new);
             cache.scan_all_proc = true;
@@ -371,7 +371,7 @@ fn main() {
                 pkgs: cfg.pkgs.len(),
                 hit_pkgs,
                 threads,
-                ebpf: ebpf_state.is_some(),
+                kpm: ebpf_state.is_some(),
                 uptime: prog_start.elapsed().as_secs(),
             });
         }
