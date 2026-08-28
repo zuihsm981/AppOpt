@@ -6,7 +6,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -14,7 +14,7 @@ use crate::apply_affinity::{read_cmdline, task_tids};
 use crate::cache::ProcCache;
 use crate::config::{
     config_reload_now, spec_like,
-    CHECK_INTERVAL, CONFIG_FILE, CURRENT_CONFIG, FORCE_RELOAD, PARSE_FAILS,
+    CHECK_INTERVAL, CONFIG_FILE, CURRENT_CONFIG, PARSE_FAILS,
 };
 use crate::cpuset::{base_cpuset, create_cpuset_dir, parse_cpu_spec, CpuSet, CpuTopology, DEFAULT_CPUSET_NAME};
 use crate::ebpf_mode::kpm_probe;
@@ -28,6 +28,22 @@ pub static MODE_FORCE: AtomicU8 = AtomicU8::new(0);
 pub static WEB_ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub static WEB_STATS: Mutex<Option<WebStats>> = Mutex::new(None);
+
+/// 状态页可见性: 前端状态页可见时每 3s 轮询 /api/status; 离开状态页/隐藏/关闭
+/// 即停止该请求。窗口取 2 个轮询间隔, 超过即视为未查看, 跳过统计汇总。
+const WEB_ACTIVE_WINDOW: Duration = Duration::from_secs(6);
+static LAST_WEB_REQ: Mutex<Option<Instant>> = Mutex::new(None);
+
+pub fn mark_web_active() {
+    *LAST_WEB_REQ.lock().unwrap() = Some(Instant::now());
+}
+
+pub fn web_active() -> bool {
+    LAST_WEB_REQ
+        .lock()
+        .unwrap()
+        .is_some_and(|t| t.elapsed() < WEB_ACTIVE_WINDOW)
+}
 
 #[derive(Clone)]
 pub struct WebStats {
@@ -198,7 +214,10 @@ fn dispatch(out: &mut TcpStream, req: &Request) {
     }
 
     let (status, body) = match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/api/status") => (200, status_json()),
+        ("GET", "/api/status") => {
+                mark_web_active();   /* 状态页轮询信号: 只有状态页可见才持续请求 */
+                (200, status_json())
+            },
         ("GET", "/api/rules") => (200, rules_json()),
         ("GET", "/api/config") => (200, config_json()),
         ("POST", "/api/rule") => rule_api(req),
@@ -557,14 +576,14 @@ fn config_set_api(req: &Request) -> (u16, String) {
             && cfg.topo.cpuset_enabled {
                 create_cpuset_dir(&base_cpuset(), &cfg.topo.present_str, &cfg.topo.mems_str);
             }
-        FORCE_RELOAD.store(true, Ordering::Release);
+        crate::config::request_config_reload();
     }
     if let Some(p) = path {
         if std::fs::metadata(p).is_err() {
             let _ = std::fs::write(p, "# 规则编写与使用说明请参考 http://AppOpt.suto.top\n\n");
         }
         *lock_ignore_poison(&CONFIG_FILE) = p.to_string();
-        FORCE_RELOAD.store(true, Ordering::Release);
+        crate::config::request_config_reload();
     }
 
     settings_save();
