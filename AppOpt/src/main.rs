@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use crate::config::{config_loader, init_inotify, load_config, CHECK_INTERVAL, CONFIG_FILE, CURRENT_CONFIG};
 use crate::cpuset::{init_cpu_topo, set_base_cpuset};
 use crate::ebpf_mode::{
-    full_scan, event_dispatch, comm_map_init,
+    debug_log, full_scan, event_dispatch, comm_map_init,
     ebpf_init, EbpfState,
 };
 use crate::proc_mode::{cache_sync, ProcScanState};
@@ -83,6 +83,7 @@ fn print_help(prog_name: &str) {
 }
 
 fn main() {
+    debug_log("=== AppOpt main() started (new binary with activate) ===");
     let args: Vec<String> = env::args().collect();
     let prog_name = &args[0];
 
@@ -276,7 +277,9 @@ fn main() {
                 } else {
                     println!("工作模式切换: KPM 事件驱动");
                     full_scan(&cfg, &mut new_es);
+                    debug_log("main: about to call activate() [mode-switch path]");
                     new_es.bpf.activate();   /* AppOpt 初始化完成后才让 KPM 注册钩子 */
+                    debug_log("main: activate() done [mode-switch path]");
                     ebpf_state = Some(new_es);
                     affinity_deadline = Instant::now();
                 }
@@ -309,7 +312,9 @@ fn main() {
                     continue;
                 }
                 full_scan(&cfg, &mut new_es);
+                debug_log("main: about to call activate() [reload path]");
                 new_es.bpf.activate();   /* AppOpt 初始化完成后才让 KPM 注册钩子 */
+                debug_log("main: activate() done [reload path]");
                 ebpf_state = Some(new_es);
             }
             continue;
