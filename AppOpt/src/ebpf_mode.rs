@@ -1,19 +1,27 @@
-use std::collections::{HashMap, HashSet};
+//! eBPF 事件驱动模式 → KPM(Kernel Patch Module)事件驱动模式
+//!
+//! 原实现用 aya 加载 eBPF 程序并读 RingBuf; 现改为通过 KernelPatch SuperCall
+//! (syscall 45 = __NR_truncate) 与 appopt-kpm KPM 内核模块通信。
+//!
+//! 内核侧等价逻辑在 AppOpt-kpm/appopt_kpm.c:
+//!   - tracepoint sched_process_fork/exec/exit + task_rename
+//!   - 内联挂钩 input_handle_event (1s 节流)
+//!   - 白名单(包名前/末 8 字节键, comm 8 字节滑动匹配)、APPLIED tid 表、256KB 事件环形缓冲
+//! 用户态通过 ctl0 命令配置/读取, 事件结构 EbpfProcEvent 与内核 appopt_proc_event_t
+//! 布局完全一致 (28B), event_dispatch/affinity 逻辑与原先保持一致。
+
+use std::collections::HashSet;
 use std::ffi::CString;
-use std::fs;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::raw::{c_char, c_int};
 use std::sync::mpsc;
 use std::thread;
-
-use aya::maps::{Array as AyaArray, HashMap as AyaHashMap};
-use aya::{programs::{KProbe as AyaKProbe, TracePoint as AyaTracePoint}, Ebpf, EbpfLoader, Pod};
 
 use crate::apply_affinity::{affinity_set, proc_walk, task_tids, tid_comm};
 use crate::cache::ProcCache;
 use crate::config::{AppConfig, CURRENT_CONFIG};
 use crate::cpuset::CpuSet;
 
-/// eBPF 进程事件，布局需与内核态 ProcEvent 一致
+/// eBPF 进程事件, 布局需与内核态 appopt_proc_event_t 完全一致 (28B)
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct EbpfProcEvent {
@@ -29,16 +37,127 @@ pub const EBPF_EVENT_RENAME: u32 = 3;
 pub const EBPF_EVENT_EXIT: u32 = 4;
 pub const EBPF_EVENT_INPUT: u32 = 5;
 
-/// 用户态注入内核的 tracepoint 字段偏移，布局需与内核态 TracepointOffsets 一致
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct EbpfOffsets {
-    fork_child_pid: u32,
-    fork_child_comm: u32,
-    rename_newcomm: u32,
+/* ================= KernelPatch SuperCall 传输 ================= */
+
+/// SuperCall 复用 syscall 45 (__NR_truncate)
+const NR_SUPERCALL: i64 = 45;
+const SUPERCALL_HELLO: i64 = 0x1000;
+const SUPERCALL_KPM_CONTROL: i64 = 0x1022;
+const SUPERCALL_HELLO_MAGIC: i64 = 0x11581158;
+
+/// KPM 模块名 (与 appopt_kpm.c KPM_NAME 一致)
+const KPM_MODULE: &[u8] = b"appopt-kpm\0";
+
+/// KernelPatch superkey (可由环境变量 APPOPT_KPM_KEY 覆盖; 空则用 "su" 探测)
+fn kpm_key() -> CString {
+    if let Ok(k) = std::env::var("APPOPT_KPM_KEY") {
+        if !k.is_empty() {
+            return CString::new(k).unwrap_or_default();
+        }
+    }
+    CString::new("su").unwrap_or_default()
 }
 
-unsafe impl Pod for EbpfOffsets {}
+/// 构造 SuperCall 命令参数: [31:16]=0x1158 magic, [15:0]=cmd, [63:32]=版本(可留 0)
+#[inline]
+fn ver_and_cmd(cmd: i64) -> i64 {
+    (0x1158i64 << 16) | (cmd & 0xffff)
+}
+
+/// 裸 SuperCall, 返回内核返回值 (负数=错误)
+unsafe fn supercall(
+    key: *const c_char,
+    cmd: i64,
+    a1: *const c_char,
+    a2: *const c_char,
+    a3: *mut u8,
+    a4: usize,
+) -> i64 {
+    libc::syscall(NR_SUPERCALL, key, ver_and_cmd(cmd), a1, a2, a3, a4) as i64
+}
+
+/// 向 KPM 模块发送 ctl0 命令; out 为可选输出缓冲
+fn kpm_ctl0(key: &CString, args: &CString, out: &mut [u8]) -> i64 {
+    // out 为空时用本地缓冲 (必须存活到 supercall 返回)
+    let mut tmp = [0u8; 64];
+    let (ptr, len) = if out.is_empty() {
+        (tmp.as_mut_ptr(), tmp.len())
+    } else {
+        (out.as_mut_ptr(), out.len())
+    };
+    unsafe {
+        supercall(
+            key.as_ptr(),
+            SUPERCALL_KPM_CONTROL,
+            KPM_MODULE.as_ptr() as *const c_char,
+            args.as_ptr(),
+            ptr,
+            len,
+        )
+    }
+}
+
+/// KernelPatch 是否就绪
+fn kp_ready(key: &CString) -> bool {
+    unsafe { supercall(key.as_ptr(), SUPERCALL_HELLO, std::ptr::null(), std::ptr::null(), std::ptr::null_mut(), 0) == SUPERCALL_HELLO_MAGIC }
+}
+
+/// KPM 传输句柄 (占用原 EbpfState.bpf 字段, 保持 main.rs 接口不变)
+pub struct KpmHandle {
+    key: CString,
+}
+
+impl KpmHandle {
+    pub fn new() -> Self {
+        Self { key: kpm_key() }
+    }
+
+    /// 确认模块已加载: ping 成功即视为已加载
+    fn ping(&self) -> bool {
+        let args = CString::new("ping").unwrap_or_default();
+        let mut out = [0u8; 16];
+        kpm_ctl0(&self.key, &args, &mut out) >= 0 && out[0] == b'p'
+    }
+
+    /// 确认模块已加载 (由 APatch 管理器加载; AppOpt 不自动部署/加载)
+    fn verify_loaded(&self) -> bool {
+        self.ping()
+    }
+
+    /// ctl0 命令封装
+    fn cmd(&self, args: &str) -> i64 {
+        let c = CString::new(args).unwrap_or_default();
+        kpm_ctl0(&self.key, &c, &mut [])
+    }
+
+    fn applied_set(&self, tid: i32, bits: u64) {
+        let s = format!("applied_set {} {:x}", tid, bits);
+        self.cmd(&s);
+    }
+
+    fn applied_del(&self, tid: i32) {
+        let s = format!("applied_del {}", tid);
+        self.cmd(&s);
+    }
+
+    fn applied_clear(&self) {
+        self.cmd("clear_applied");
+    }
+
+    /// 设置白名单 (包名集合), 返回 true 表示失败需要回退
+    fn set_whitelist(&self, pkgs: &HashSet<String>) -> bool {
+        let mut s = String::from("set_whitelist ");
+        for (i, p) in pkgs.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(p);
+        }
+        let c = CString::new(s).unwrap_or_default();
+        let mut out = [0u8; 16];
+        kpm_ctl0(&self.key, &c, &mut out) >= 0
+    }
+}
 
 /// 将内核 comm 截断于首个 NUL 并 trim 尾部空白
 fn comm_str(comm: &[u8; 16]) -> &str {
@@ -49,15 +168,16 @@ fn comm_str(comm: &[u8; 16]) -> &str {
 pub struct EbpfState {
     pub event_rx: mpsc::Receiver<EbpfProcEvent>,
     pub reader_thread: Option<thread::JoinHandle<()>>,
-    pub bpf: Ebpf,
+    /// 原 aya Ebpf 替换为 KPM 传输句柄; 字段名保持 bpf 以兼容 main.rs
+    pub bpf: KpmHandle,
     pub cache: ProcCache,
-    pub wakeup_fd: RawFd,
+    pub wakeup_fd: c_int,
     pub comm_capacity: u32,
 }
 
 impl Drop for EbpfState {
     fn drop(&mut self) {
-        // 写 eventfd 唤醒 reader 线程的 epoll_wait 后 join 等待退出
+        // 写 eventfd 唤醒 reader 线程后 join
         if self.wakeup_fd >= 0 {
             let val: u64 = 1;
             unsafe {
@@ -73,268 +193,33 @@ impl Drop for EbpfState {
     }
 }
 
-pub fn ebpf_probe() -> bool {
-    fs::metadata("/sys/kernel/btf/vmlinux").is_ok()
+/// KPM 探测: KernelPatch 就绪 且 模块可通信 (ping)
+pub fn kpm_probe() -> bool {
+    let key = kpm_key();
+    if !kp_ready(&key) {
+        return false;
+    }
+    let handle = KpmHandle::new();
+    handle.ping()
 }
 
-fn attach_tracepoint(bpf: &mut Ebpf, category: &str, name: &str, required: bool) -> bool {
-    let Some(prog) = bpf.program_mut(name) else {
-        if required {
-            eprintln!("eBPF: 未找到 {} 程序", name);
-        }
-        return false;
-    };
-    let Ok(tp): Result<&mut AyaTracePoint, _> = prog.try_into() else {
-        if required {
-            eprintln!("eBPF: {} 类型转换失败", name);
-        }
-        return false;
-    };
-    if let Err(e) = tp.load() {
-        if required {
-            eprintln!("eBPF: {} 加载失败 ({})", name, e);
-        }
-        return false;
-    }
-    if let Err(e) = tp.attach(category, name) {
-        if required {
-            eprintln!("eBPF: {} 附加失败 ({})", name, e);
-        }
-        return false;
-    }
-    true
-}
-
-/// attach kprobe，required=false 时失败不阻断 eBPF 初始化
-fn attach_kprobe(bpf: &mut Ebpf, name: &str, function: &str, required: bool) -> bool {
-    let Some(prog) = bpf.program_mut(name) else {
-        if required {
-            eprintln!("eBPF: 未找到 {} 程序", name);
-        }
-        return false;
-    };
-    let Ok(kp): Result<&mut AyaKProbe, _> = prog.try_into() else {
-        if required {
-            eprintln!("eBPF: {} 类型转换失败", name);
-        }
-        return false;
-    };
-    if let Err(e) = kp.load() {
-        if required {
-            eprintln!("eBPF: {} 加载失败 ({})", name, e);
-        }
-        return false;
-    }
-    if let Err(e) = kp.attach(function, 0) {
-        if required {
-            eprintln!("eBPF: {} 附加失败 ({})", name, e);
-        }
-        return false;
-    }
-    true
-}
-
-/// 构建白名单键，每个包名生成前 8 字节与末 8 字节键
-fn comm_keys_build<'a, I: IntoIterator<Item = &'a String>>(pkgs: I) -> Vec<[u8; 8]> {
-    let mut entries: Vec<[u8; 8]> = Vec::new();
-    for pkg in pkgs {
-        let bytes = pkg.as_bytes();
-        if bytes.is_empty() {
-            continue;
-        }
-
-        let mut prefix_key = [0u8; 8];
-        let prefix_len = bytes.len().min(8);
-        prefix_key[..prefix_len].copy_from_slice(&bytes[..prefix_len]);
-        entries.push(prefix_key);
-
-        if bytes.len() > 8 {
-            let mut suffix_key = [0u8; 8];
-            let start = bytes.len() - 8;
-            suffix_key.copy_from_slice(&bytes[start..]);
-            entries.push(suffix_key);
-        }
-    }
-    entries.sort();
-    entries.dedup();
-    entries
-}
-
-/// 初始化 TARGET_COMM_MAP，返回 true 表示需重载
-pub fn comm_map_init(bpf: &mut Ebpf, pkgs: &HashSet<String>, comm_capacity: u32) -> bool {
-    let entries = comm_keys_build(pkgs.iter());
-
-    if entries.len() > comm_capacity as usize {
-        eprintln!(
-            "eBPF: 白名单容量不足（需 {} > 现 {}），触发内核端重载",
-            entries.len(),
-            comm_capacity
-        );
-        return true;
-    }
-
-    let Some(map) = bpf.map_mut("TARGET_COMM_MAP") else {
-        eprintln!("eBPF: 未找到 TARGET_COMM_MAP");
-        return false;
-    };
-    let mut target_map = match AyaHashMap::<_, [u8; 8], u32>::try_from(map) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("eBPF: TARGET_COMM_MAP 类型转换失败 ({})", e);
-            return false;
-        }
-    };
-
-    let old_keys: Vec<[u8; 8]> = target_map.keys().filter_map(|r| r.ok()).collect();
-    for key in &old_keys {
-        let _ = target_map.remove(key);
-    }
-
-    let mut count = 0;
-    for key in &entries {
-        if target_map.insert(key, 1, 0).is_ok() {
-            count += 1;
-        }
-    }
-
-    if count < entries.len() {
-        eprintln!(
-            "eBPF: 白名单插入部分失败（{}/{}），触发重载",
-            count,
-            entries.len()
-        );
-        return true;
-    }
-
-    println!(
-        "eBPF: 白名单已配置，{} 个包名 > {} 条匹配规则",
-        pkgs.len(),
-        count
-    );
-    false
-}
-
-/// 检测 tracefs 根路径，现代内核优先 tracing 旧内核回退 debug/tracing
-fn tracefs_root() -> Option<&'static str> {
-    if fs::metadata("/sys/kernel/tracing").is_ok() {
-        return Some("/sys/kernel/tracing");
-    }
-    if fs::metadata("/sys/kernel/debug/tracing").is_ok() {
-        return Some("/sys/kernel/debug/tracing");
-    }
-    None
-}
-
-/// 解析 tracepoint format 文件提取字段名到偏移映射，字段名剥离数组下标
-fn tracepoint_parse(root: &str, category: &str, name: &str) -> Option<HashMap<String, u32>> {
-    let path = format!("{}/events/{}/{}/format", root, category, name);
-    let content = fs::read_to_string(&path).ok()?;
-    let mut offsets = HashMap::new();
-    for line in content.lines() {
-        let Some(rest) = line.trim().strip_prefix("field:") else {
-            continue;
-        };
-        let parts: Vec<&str> = rest.split(';').map(|s| s.trim()).collect();
-        if parts.len() < 2 {
-            continue;
-        }
-        let field_name = parts[0].split_whitespace().last().unwrap_or("").split('[').next().unwrap_or("");
-        if field_name.is_empty() {
-            continue;
-        }
-        for part in &parts[1..] {
-            if let Some(off_str) = part.strip_prefix("offset:")
-                && let Ok(off) = off_str.trim().parse::<u32>() {
-                    offsets.insert(field_name.to_string(), off);
-                    break;
-                }
-        }
-    }
-    Some(offsets)
-}
-
-/// 解析本机 format 文件并注入 OFFSETS_MAP 索引 0，失败返回 false 由调用方回退 /proc
-fn offsets_inject(bpf: &mut Ebpf) -> bool {
-    let Some(root) = tracefs_root() else {
-        eprintln!("eBPF: tracefs 不可用，回退到 /proc 轮询");
-        return false;
-    };
-
-    let offsets = (|| {
-        let fork_fields = tracepoint_parse(root, "sched", "sched_process_fork")?;
-        let rename_fields = tracepoint_parse(root, "task", "task_rename")?;
-        Some(EbpfOffsets {
-            fork_child_pid: *fork_fields.get("child_pid")?,
-            fork_child_comm: *fork_fields.get("child_comm")?,
-            rename_newcomm: *rename_fields.get("newcomm")?,
-        })
-    })();
-    let Some(offsets) = offsets else {
-        eprintln!(
-            "eBPF: tracepoint format 解析失败 [{}]，回退到 /proc 轮询",
-            root
-        );
-        return false;
-    };
-
-    let Some(map) = bpf.map_mut("OFFSETS_MAP") else {
-        eprintln!("eBPF: 未找到 OFFSETS_MAP，回退到 /proc 轮询");
-        return false;
-    };
-    let Ok(mut offsets_map) = AyaArray::<_, EbpfOffsets>::try_from(map) else {
-        eprintln!("eBPF: OFFSETS_MAP 类型转换失败，回退到 /proc 轮询");
-        return false;
-    };
-    if offsets_map.set(0, offsets, 0).is_err() {
-        eprintln!("eBPF: OFFSETS_MAP 注入失败，回退到 /proc 轮询");
-        return false;
-    }
-
-    println!(
-        "eBPF: tracepoint 偏移注入 [{}] fork[child_pid={}, child_comm={}] rename[newcomm={}]",
-        root, offsets.fork_child_pid, offsets.fork_child_comm, offsets.rename_newcomm
-    );
-    true
-}
-
-/// 初始化 eBPF，加载程序 attach tracepoint 创建 RingBuf 线程，失败回退 /proc
+/// 初始化 KPM 事件驱动: 确保模块加载, 启动 reader 线程
+/// 失败返回 None, 由调用方回退 /proc 轮询
 pub fn ebpf_init() -> Option<EbpfState> {
-    if !ebpf_probe() {
-        eprintln!("eBPF: 内核不支持（缺少 BTF），回退到 /proc 轮询");
+    let key = kpm_key();
+    if !kp_ready(&key) {
+        eprintln!("KPM: KernelPatch 未就绪, 回退到 /proc 轮询");
         return None;
     }
 
-    let ebpf_path = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.join("AppOpt-ebpf")))?;
-
-    if !ebpf_path.exists() {
-        eprintln!("eBPF: 未找到 {}，回退到 /proc 轮询", ebpf_path.display());
+    let handle = KpmHandle { key };
+    if !handle.verify_loaded() {
+        eprintln!("KPM: appopt-kpm 模块未加载 (请用 APatch 管理器加载), 回退到 /proc 轮询");
         return None;
     }
 
-    let ebpf_data = match fs::read(&ebpf_path) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!(
-                "eBPF: 读取 {} 失败 ({})，回退到 /proc 轮询",
-                ebpf_path.display(),
-                e
-            );
-            return None;
-        }
-    };
-
-    if ebpf_data.is_empty() {
-        eprintln!("eBPF: {} 文件为空，回退到 /proc 轮询", ebpf_path.display());
-        return None;
-    }
-
-    println!(
-        "eBPF: 从 {} 加载程序 ({} bytes)",
-        ebpf_path.display(),
-        ebpf_data.len()
-    );
+    // 配置 input 节流 (与 eBPF 默认 1s 一致)
+    handle.cmd("input_ms 1000");
 
     let pkgs_len = crate::lock_ignore_poison(&CURRENT_CONFIG)
         .as_ref()
@@ -342,171 +227,132 @@ pub fn ebpf_init() -> Option<EbpfState> {
         .unwrap_or(0);
     let capacity = (pkgs_len * 2).max(512).next_power_of_two() as u32;
 
-    let mut loader = EbpfLoader::new();
-    loader.map_max_entries("TARGET_COMM_MAP", capacity);
-    let mut bpf = match loader.load(&ebpf_data) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("eBPF: 加载失败 ({})，回退到 /proc 轮询", e);
-            return None;
-        }
-    };
-
-    // attach 前注入偏移避免首批事件读到空 map
-    if !offsets_inject(&mut bpf) {
-        return None;
-    }
-
-    if !attach_tracepoint(&mut bpf, "sched", "sched_process_fork", true) {
-        return None;
-    }
-    if !attach_tracepoint(&mut bpf, "sched", "sched_process_exec", true) {
-        return None;
-    }
-    if !attach_tracepoint(&mut bpf, "sched", "sched_process_exit", true) {
-        return None;
-    }
-    if !attach_tracepoint(&mut bpf, "task", "task_rename", true) {
-        return None;
-    }
-    // kprobe input_event 用于刷新率模块的用户活动检测
-    // 替代 tracepoint input:input_event（高通内核可能不存在此 tracepoint）
-    // kprobe input_handle_event 用于用户活动检测（触摸/按键）
-    attach_kprobe(&mut bpf, "kprobe_input_event", "input_handle_event", false);
-
-    let ring_buf = match bpf.take_map("EVENTS") {
-        Some(map) => match aya::maps::RingBuf::try_from(map) {
-            Ok(rb) => rb,
-            Err(e) => {
-                eprintln!("eBPF: EVENTS map 类型转换失败 ({})，回退到 /proc 轮询", e);
-                return None;
-            }
-        },
-        None => {
-            eprintln!("eBPF: 未找到 EVENTS map，回退到 /proc 轮询");
-            return None;
-        }
-    };
-
     let (tx, rx) = mpsc::channel::<EbpfProcEvent>();
     let wakeup_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     if wakeup_fd < 0 {
-        eprintln!("eBPF: eventfd 创建失败，回退到 /proc 轮询");
+        eprintln!("KPM: eventfd 创建失败, 回退到 /proc 轮询");
         return None;
     }
+
+    // reader 线程通过 supercall drain 轮询事件
+    let reader_key = kpm_key();
     let reader_thread = thread::spawn(move || {
-        ebpf_reader(ring_buf, tx, wakeup_fd);
+        kpm_reader(reader_key, tx, wakeup_fd);
     });
 
-    println!("eBPF: 初始化成功");
+    println!("KPM: 事件驱动初始化成功 (appopt-kpm)");
 
     Some(EbpfState {
         event_rx: rx,
         reader_thread: Some(reader_thread),
-        bpf,
+        bpf: handle,
         cache: ProcCache::new(),
         wakeup_fd,
         comm_capacity: capacity,
     })
 }
 
-/// RingBuf 读取线程，epoll 阻塞等待事件 wakeup_fd 用于 Drop 唤醒退出
-fn ebpf_reader(
-    mut ring_buf: aya::maps::RingBuf<aya::maps::MapData>,
-    tx: mpsc::Sender<EbpfProcEvent>,
-    wakeup_fd: RawFd,
-) {
-    let name = CString::new("EbpfReader").unwrap();
+/// reader 线程: 轮询 drain, 解析事件送入 mpsc; wakeup_fd 用于 Drop 唤醒退出
+fn kpm_reader(key: CString, tx: mpsc::Sender<EbpfProcEvent>, wakeup_fd: c_int) {
+    let name = CString::new("KpmReader").unwrap();
     unsafe {
         libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
     }
 
+    // epoll: 仅监听 wakeup_fd, 用 50ms 超时轮询 drain
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epfd < 0 {
-        eprintln!("eBPF: epoll_create1 失败");
+        eprintln!("KPM: epoll_create1 失败");
         return;
     }
-
-    let ring_fd = ring_buf.as_raw_fd();
-    let mut ring_ev: libc::epoll_event = unsafe { std::mem::zeroed() };
-    ring_ev.events = libc::EPOLLIN as u32;
-    ring_ev.u64 = 0;
-    if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, ring_fd, &mut ring_ev) } < 0 {
-        eprintln!("eBPF: epoll_ctl ADD ring_fd 失败");
-        unsafe { libc::close(epfd) };
-        return;
-    }
-
     let mut wake_ev: libc::epoll_event = unsafe { std::mem::zeroed() };
     wake_ev.events = libc::EPOLLIN as u32;
     wake_ev.u64 = 1;
     if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, wakeup_fd, &mut wake_ev) } < 0 {
-        eprintln!("eBPF: epoll_ctl ADD wakeup_fd 失败");
+        eprintln!("KPM: epoll_ctl ADD wakeup_fd 失败");
         unsafe { libc::close(epfd) };
         return;
     }
 
-    let mut events: [libc::epoll_event; 2] = unsafe { std::mem::zeroed() };
+    let mut events: [libc::epoll_event; 1] = unsafe { std::mem::zeroed() };
+    // 单次 drain 缓冲: 8KB, 约 292 个事件
+    let mut buf = vec![0u8; 8192];
+
     loop {
-        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 2, -1) };
-        if n <= 0 {
-            if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 1, 50) };
+        if n < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
             break;
         }
-
         // wakeup 事件优先退出
-        if events.iter().take(n as usize).any(|e| e.u64 == 1) {
+        if n > 0 && events[0].u64 == 1 {
             break;
         }
 
-        while let Some(item) = ring_buf.next() {
-            let bytes: &[u8] = &item;
-            if bytes.len() >= std::mem::size_of::<EbpfProcEvent>() {
+        // 轮询 drain, 直到暂时无事件
+        loop {
+            let args = CString::new("drain").unwrap_or_default();
+            let got = unsafe {
+                let (ptr, len) = (buf.as_mut_ptr(), buf.len());
+                supercall(key.as_ptr(), SUPERCALL_KPM_CONTROL,
+                          KPM_MODULE.as_ptr() as *const c_char,
+                          args.as_ptr(), ptr, len)
+            };
+            if got <= 0 {
+                break;
+            }
+            let bytes = got as usize;
+            let ev_sz = std::mem::size_of::<EbpfProcEvent>();
+            let mut off = 0;
+            while off + ev_sz <= bytes {
                 let event: EbpfProcEvent =
-                    unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const EbpfProcEvent) };
+                    unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off) as *const EbpfProcEvent) };
                 if tx.send(event).is_err() {
                     unsafe { libc::close(epfd) };
                     return;
                 }
+                off += ev_sz;
+            }
+            // 若一次就取满, 可能还有更多, 继续; 否则退出内层循环
+            if bytes < buf.len() {
+                break;
             }
         }
     }
     unsafe { libc::close(epfd) };
 }
 
-fn applied_get(bpf: &mut Ebpf) -> Option<AyaHashMap<&mut aya::maps::MapData, u32, u64>> {
-    AyaHashMap::<_, u32, u64>::try_from(bpf.map_mut("APPLIED_MAP")?).ok()
-}
-
-fn applied_set(bpf: &mut Ebpf, tid: i32, cpus: &CpuSet) {
-    let Some(mut applied) = applied_get(bpf) else { return };
-    if let Err(e) = applied.insert(tid as u32, cpus.bits[0], 0) {
-        eprintln!("eBPF: APPLIED_MAP 插入失败 tid={} ({})，map 可能已满", tid, e);
+/// 配置白名单; 返回 true 表示需重载 (KPM 白名单容量固定 16384, 不会触发)
+pub fn comm_map_init(bpf: &mut KpmHandle, pkgs: &HashSet<String>, _comm_capacity: u32) -> bool {
+    if !bpf.set_whitelist(pkgs) {
+        eprintln!("KPM: 白名单配置失败");
+        return true;
     }
+    println!("KPM: 白名单已配置, {} 个包名", pkgs.len());
+    false
 }
 
-fn applied_del(bpf: &mut Ebpf, tid: i32) {
-    let Some(mut applied) = applied_get(bpf) else { return };
-    let _ = applied.remove(&(tid as u32));
+fn applied_set(bpf: &KpmHandle, tid: i32, cpus: &CpuSet) {
+    bpf.applied_set(tid, cpus.bits[0]);
 }
 
-fn applied_clear(bpf: &mut Ebpf) {
-    let Some(mut m) = applied_get(bpf) else { return };
-    let keys: Vec<u32> = m.keys().filter_map(|r| r.ok()).collect();
-    for k in &keys {
-        let _ = m.remove(k);
-    }
+fn applied_del(bpf: &KpmHandle, tid: i32) {
+    bpf.applied_del(tid);
 }
 
-/// 应用亲和性并写 APPLIED_MAP，返回 true 表示 tid 已退出
+fn applied_clear(bpf: &KpmHandle) {
+    bpf.applied_clear();
+}
+
+/// 应用亲和性并写 APPLIED 表, 返回 true 表示 tid 已退出
 fn affinity_apply(
     tid: i32,
     cpus: &CpuSet,
     cpuset_dir: &str,
     cfg: &AppConfig,
-    bpf: &mut Ebpf,
+    bpf: &KpmHandle,
 ) -> bool {
     let dead = affinity_set(tid, cpus, cpuset_dir, &cfg.topo);
     if !dead {
@@ -515,7 +361,7 @@ fn affinity_apply(
     dead
 }
 
-/// 事件派发，按 event_type 增量处理 FORK/RENAME/EXEC/EXIT
+/// 事件派发, 按 event_type 增量处理 FORK/RENAME/EXEC/EXIT (与 aya 版一致)
 pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfState) {
     let tid = event.tid;
     let pid = event.pid;
@@ -524,22 +370,22 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
     match event.event_type {
         EBPF_EVENT_EXIT => {
             state.cache.task_del(tid);
-            applied_del(&mut state.bpf, tid);
+            applied_del(&state.bpf, tid);
         }
 
         EBPF_EVENT_EXEC
-            if !event_apply(&mut state.cache, &mut state.bpf, tid, pid, comm, cfg) => {
+            if !event_apply(&mut state.cache, &state.bpf, tid, pid, comm, cfg) => {
                 state.cache.task_del(tid);
-                applied_del(&mut state.bpf, tid);
+                applied_del(&state.bpf, tid);
             }
 
         EBPF_EVENT_FORK => {
             // 子线程继承父线程亲和性与 cpuset
-            // 内核态已插入 APPLIED_MAP 占位，RENAME 时触发完整处理
+            // 内核态已插入 APPLIED 表占位, RENAME 时触发完整处理
         }
 
         EBPF_EVENT_RENAME => {
-            event_apply(&mut state.cache, &mut state.bpf, tid, pid, comm, cfg);
+            event_apply(&mut state.cache, &state.bpf, tid, pid, comm, cfg);
         }
 
         EBPF_EVENT_INPUT => {
@@ -553,7 +399,7 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
 /// 统一事件处理 pkg_lookup_comm 到 task_apply
 fn event_apply(
     cache: &mut ProcCache,
-    bpf: &mut Ebpf,
+    bpf: &KpmHandle,
     tid: i32,
     pid: i32,
     comm: &str,
@@ -572,14 +418,14 @@ fn event_apply(
 pub fn affinity_check(state: &mut EbpfState, cfg: &AppConfig) {
     let dead_tids = state.cache.affinity_sync(&cfg.topo);
     for tid in dead_tids {
-        applied_del(&mut state.bpf, tid);
+        applied_del(&state.bpf, tid);
     }
 }
 
 /// 启动或配置更新时全量扫描 /proc
 pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
     state.cache.clear();
-    applied_clear(&mut state.bpf);
+    applied_clear(&state.bpf);
 
     proc_walk(cfg, |_| true, |pid, pkg, has_thread_rules| {
         let Some(tids) = task_tids(pid) else { return };
@@ -590,7 +436,7 @@ pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
                 String::new()
             };
             state.cache.task_apply(tid, pid, pkg, &t_name, cfg, |tid, cpus, cpuset_dir| {
-                affinity_apply(tid, cpus, cpuset_dir, cfg, &mut state.bpf)
+                affinity_apply(tid, cpus, cpuset_dir, cfg, &state.bpf)
             });
         }
     });
