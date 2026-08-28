@@ -130,68 +130,6 @@ impl KpmHandle {
         let c = CString::new(args).unwrap_or_default();
         kpm_ctl0(&self.key, &c, &mut [])
     }
-
-    fn applied_set(&self, tid: i32, bits: u64) {
-        let s = format!("applied_set {} {:x}", tid, bits);
-        self.cmd(&s);
-    }
-
-    fn applied_del(&self, tid: i32) {
-        let s = format!("applied_del {}", tid);
-        self.cmd(&s);
-    }
-
-    fn applied_clear(&self) {
-        self.cmd("clear_applied");
-    }
-
-    /// 设置白名单 (包名集合), 返回 true 表示失败需要回退
-    fn set_whitelist(&self, pkgs: &HashSet<String>) -> bool {
-        let mut s = String::from("set_whitelist ");
-        for (i, p) in pkgs.iter().enumerate() {
-            if i > 0 {
-                s.push(',');
-            }
-            s.push_str(p);
-        }
-        let c = CString::new(s).unwrap_or_default();
-        let mut out = [0u8; 16];
-        kpm_ctl0(&self.key, &c, &mut out) >= 0
-    }
-
-    /// 文本统计
-    pub fn stats(&self, out: &mut [u8]) -> i64 {
-        let args = CString::new("stats").unwrap_or_default();
-        kpm_ctl0(&self.key, &args, out)
-    }
-
-    /// 导出模块日志环到本地文件: 先写 stats(含 log_lines 计数) 再写 logs
-    pub fn dump_logs(&self, path: &str) -> std::io::Result<usize> {
-        let mut st = [0u8; 256];
-        let sn = {
-            let args = CString::new("stats").unwrap_or_default();
-            kpm_ctl0(&self.key, &args, &mut st)
-        };
-        let mut buf = vec![0u8; 8192];
-        let n = {
-            let args = CString::new("logs").unwrap_or_default();
-            kpm_ctl0(&self.key, &args, &mut buf)
-        };
-        let mut out = Vec::with_capacity(512);
-        out.extend_from_slice(b"--- stats ---\n");
-        if sn > 0 {
-            out.extend_from_slice(&st[..sn as usize]);
-        }
-        out.push(b'\n');
-        out.extend_from_slice(b"--- logs ---\n");
-        if n > 0 {
-            out.extend_from_slice(&buf[..n as usize]);
-        }
-        out.push(b'\n');
-        let out_len = out.len();
-        std::fs::write(path, out)?;
-        Ok(out_len)
-    }
 }
 
 /// 将内核 comm 截断于首个 NUL 并 trim 尾部空白
