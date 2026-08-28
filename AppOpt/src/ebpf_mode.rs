@@ -136,8 +136,9 @@ impl KpmHandle {
         self.cmd(&s);
     }
 
-    /// 武装 input kprobe (AppOpt 启动完成、系统稳定后调用)
-    fn input_on(&self) {
+    /// AppOpt 初始化完成后激活 KPM: 注册 tracepoint(start) + 武装 input kprobe(input_on)
+    pub fn activate(&self) {
+        self.cmd("start");
         self.cmd("input_on");
     }
 
@@ -223,8 +224,6 @@ pub fn ebpf_init() -> Option<EbpfState> {
         eprintln!("KPM: appopt-kpm 模块未加载 (请用 APatch 管理器加载), 回退到 /proc 轮询");
         return None;
     }
-    // 输入检测 kprobe 按需武装 (非 init 注册, 避免早期启动卡第一屏; 卸载时模块会安全卸断点)
-    handle.input_on();
 
     // 配置 input 节流 (与 eBPF 默认 1s 一致)
     handle.cmd("input_ms 1000");
@@ -422,13 +421,7 @@ fn event_apply(
     })
 }
 
-/// 定期纠正 affinity_sync 清死亡 tid
-pub fn affinity_check(state: &mut EbpfState, cfg: &AppConfig) {
-    let dead_tids = state.cache.affinity_sync(&cfg.topo);
-    for tid in dead_tids {
-        applied_del(&state.bpf, tid);
-    }
-}
+/// 周期重钉已由内核 sched_setaffinity 拦截接管 (KPM 模式); /proc 回退模式仍用 affinity_sync
 
 /// 启动或配置更新时全量扫描 /proc
 pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
