@@ -130,6 +130,34 @@ impl KpmHandle {
         let c = CString::new(args).unwrap_or_default();
         kpm_ctl0(&self.key, &c, &mut [])
     }
+
+    fn applied_set(&self, tid: i32, bits: u64) {
+        let s = format!("applied_set {} {:x}", tid, bits);
+        self.cmd(&s);
+    }
+
+    fn applied_del(&self, tid: i32) {
+        let s = format!("applied_del {}", tid);
+        self.cmd(&s);
+    }
+
+    fn applied_clear(&self) {
+        self.cmd("clear_applied");
+    }
+
+    /// 设置白名单 (包名集合), 返回 true 表示失败需要回退
+    fn set_whitelist(&self, pkgs: &HashSet<String>) -> bool {
+        let mut s = String::from("set_whitelist ");
+        for (i, p) in pkgs.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(p);
+        }
+        let c = CString::new(s).unwrap_or_default();
+        let mut out = [0u8; 16];
+        kpm_ctl0(&self.key, &c, &mut out) >= 0
+    }
 }
 
 /// 将内核 comm 截断于首个 NUL 并 trim 尾部空白
