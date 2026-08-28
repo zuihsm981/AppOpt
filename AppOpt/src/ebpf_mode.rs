@@ -21,6 +21,22 @@ use crate::cache::ProcCache;
 use crate::config::{AppConfig, CURRENT_CONFIG};
 use crate::cpuset::CpuSet;
 
+/// 调试日志: 追加到 /data/local/tmp/appopt_debug.log (可靠, 不受启动方式影响)
+pub fn debug_log(msg: &str) {
+    use std::io::Write;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/data/local/tmp/appopt_debug.log")
+    {
+        let _ = writeln!(f, "[{}] {}", ts, msg);
+    }
+}
+
 /// eBPF 进程事件, 布局需与内核态 appopt_proc_event_t 完全一致 (28B)
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -128,7 +144,9 @@ impl KpmHandle {
     /// ctl0 命令封装
     fn cmd(&self, args: &str) -> i64 {
         let c = CString::new(args).unwrap_or_default();
-        kpm_ctl0(&self.key, &c, &mut [])
+        let rc = kpm_ctl0(&self.key, &c, &mut []);
+        debug_log(&format!("cmd '{}' rc={}", args, rc));
+        rc
     }
 
     fn applied_set(&self, tid: i32, bits: u64) {
@@ -138,8 +156,12 @@ impl KpmHandle {
 
     /// AppOpt 初始化完成后激活 KPM: 注册 tracepoint(start) + 武装 input kprobe(input_on)
     pub fn activate(&self) {
-        self.cmd("start");
-        self.cmd("input_on");
+        debug_log("activate: sending start");
+        let r1 = self.cmd("start");
+        debug_log(&format!("activate: start done rc={}", r1));
+        debug_log("activate: sending input_on");
+        let r2 = self.cmd("input_on");
+        debug_log(&format!("activate: input_on done rc={}", r2));
     }
 
     fn applied_del(&self, tid: i32) {
@@ -213,17 +235,22 @@ pub fn kpm_probe() -> bool {
 /// 初始化 KPM 事件驱动: 确保模块加载, 启动 reader 线程
 /// 失败返回 None, 由调用方回退 /proc 轮询
 pub fn ebpf_init() -> Option<EbpfState> {
+    debug_log("ebpf_init: enter");
     let key = kpm_key();
     if !kp_ready(&key) {
+        debug_log("ebpf_init: KP not ready, fallback to /proc");
         eprintln!("KPM: KernelPatch 未就绪, 回退到 /proc 轮询");
         return None;
     }
+    debug_log("ebpf_init: KP ready");
 
     let handle = KpmHandle { key };
     if !handle.verify_loaded() {
+        debug_log("ebpf_init: module not loaded, fallback to /proc");
         eprintln!("KPM: appopt-kpm 模块未加载 (请用 APatch 管理器加载), 回退到 /proc 轮询");
         return None;
     }
+    debug_log("ebpf_init: module loaded (ping ok)");
 
     // 配置 input 节流 (与 eBPF 默认 1s 一致)
     handle.cmd("input_ms 1000");
@@ -248,6 +275,7 @@ pub fn ebpf_init() -> Option<EbpfState> {
     });
 
     println!("KPM: 事件驱动初始化成功 (appopt-kpm)");
+    debug_log("ebpf_init: returning Some(EbpfState) — activate() should follow full_scan");
 
     Some(EbpfState {
         event_rx: rx,
