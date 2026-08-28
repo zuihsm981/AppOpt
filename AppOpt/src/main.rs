@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use crate::config::{config_loader, init_inotify, load_config, CHECK_INTERVAL, CONFIG_FILE, CURRENT_CONFIG};
 use crate::cpuset::{init_cpu_topo, set_base_cpuset};
 use crate::ebpf_mode::{
-    affinity_check, full_scan, event_dispatch, comm_map_init,
+    full_scan, event_dispatch, comm_map_init,
     ebpf_init, EbpfState,
 };
 use crate::proc_mode::{cache_sync, ProcScanState};
@@ -276,6 +276,7 @@ fn main() {
                 } else {
                     println!("工作模式切换: KPM 事件驱动");
                     full_scan(&cfg, &mut new_es);
+                    new_es.bpf.activate();   /* AppOpt 初始化完成后才让 KPM 注册钩子 */
                     ebpf_state = Some(new_es);
                     affinity_deadline = Instant::now();
                 }
@@ -308,6 +309,7 @@ fn main() {
                     continue;
                 }
                 full_scan(&cfg, &mut new_es);
+                new_es.bpf.activate();   /* AppOpt 初始化完成后才让 KPM 注册钩子 */
                 ebpf_state = Some(new_es);
             }
             continue;
@@ -326,11 +328,7 @@ fn main() {
                     ebpf_dead = true;
                 }
             }
-
-            if affinity_deadline.elapsed() >= Duration::from_secs(3 * interval) {
-                affinity_check(es, &cfg);
-                affinity_deadline = Instant::now();
-            }
+            /* 周期重钉已由内核 sched_setaffinity 拦截接管, KPM 模式不再用户态轮询纠偏 */
         } else {
             let cache = proc_state.get_or_insert_with(ProcScanState::new);
             if config_changed {
@@ -356,8 +354,10 @@ fn main() {
             affinity_deadline = Instant::now();
         }
 
-        // web 状态统计，低频更新避免高频事件循环下的额外开销
+        // web 状态统计，仅状态页可见(在轮询)时执行; 离开状态页/隐藏/关闭即停止,
+        // 低频更新避免高频事件循环下的额外开销
         if WEB_ENABLED.load(Ordering::Relaxed)
+            && crate::web::web_active()
             && web_stats_deadline.elapsed() >= Duration::from_secs(2)
         {
             web_stats_deadline = Instant::now();
