@@ -3,7 +3,7 @@ use std::ffi::CString;
 use std::fs;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -17,6 +17,16 @@ pub static INOTIFY_WD: AtomicI32 = AtomicI32::new(-1);
 /// 运行时可调参数，web 端热更新
 pub static CHECK_INTERVAL: AtomicU64 = AtomicU64::new(2);
 pub static FORCE_RELOAD: AtomicBool = AtomicBool::new(false);
+/// 无 inotify 时的重载通知: config_loader 阻塞等待, web 侧 request_config_reload 唤醒
+static RELOAD_M: Mutex<()> = Mutex::new(());
+static RELOAD_CV: Condvar = Condvar::new();
+
+/// 请求配置热加载 (通知驱动, 不轮询文件): 置 FORCE_RELOAD 并唤醒 config_loader
+pub fn request_config_reload() {
+    FORCE_RELOAD.store(true, Ordering::Release);
+    { let _g = RELOAD_M.lock().unwrap(); }   // 与等待方互斥, 保证等待方能见到新标志
+    RELOAD_CV.notify_all();
+}
 pub static CONFIG_FILE: Mutex<String> = Mutex::new(String::new());
 
 pub struct AffinityRule {
@@ -352,8 +362,12 @@ pub fn config_loader() {
         if INOTIFY_SUPPORTED.load(Ordering::Acquire) {
             inotify_handle(interval, &mut last_mtime);
         } else {
-            config_reload(&mut last_mtime);
-            thread::sleep(Duration::from_secs(interval));
+            /* 无 inotify: 不轮询文件, 阻塞等待重载通知 (request_config_reload) */
+            let mut guard = RELOAD_M.lock().unwrap();
+            while !FORCE_RELOAD.load(Ordering::Acquire) {
+                guard = RELOAD_CV.wait(guard).unwrap();
+            }
+            /* 携 FORCE_RELOAD=true 落回循环顶部, 由 swap 触发重载 */
         }
     }
 }
