@@ -25,7 +25,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 .row .value{font-weight:600;text-align:right;word-break:break-all}
 .mono{font-family:var(--mono);font-size:13px}
 .badge{padding:2px 10px;border-radius:999px;font-size:12px;font-weight:600}
-.badge.ebpf{background:rgba(52,199,89,.14);color:#248a3d}
+.badge.kpm{background:rgba(52,199,89,.14);color:#248a3d}
 .badge.proc{background:rgba(0,122,255,.13);color:#0062cc}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .stat{background:var(--bg);border-radius:12px;padding:12px 8px;text-align:center}
@@ -177,11 +177,11 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="card-title">工作模式</div>
 <div class="seg" id="seg-mode">
 <button data-mode="0">自动</button>
-<button data-mode="1">eBPF</button>
+<button data-mode="1">KPM</button>
 <button data-mode="2">Proc</button>
 </div>
 <div class="hint" id="c-mode-active">当前生效: -</div>
-<div class="hint" id="c-ebpf-hint" style="color:var(--orange)" hidden>此设备内核不支持 eBPF，强制 eBPF 时将保持 Proc 轮询</div>
+<div class="hint" id="c-kpm-hint" style="color:var(--orange)" hidden>未检测到 KPM（KernelPatch/模块未加载），强制 KPM 时将保持 Proc 轮询</div>
 </div>
 <div class="card">
 <div class="card-title">扫描参数</div>
@@ -259,7 +259,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="card-title">使用说明</div>
 <div class="text"><ol>
 <li>规则页点击「添加」，输入应用包名，可同时配置包级默认（可选）与多条线程规则后一次保存</li>
-<li>设置页可切换 eBPF / Proc 工作模式、cpuset 目录名、检查间隔与配置文件路径</li>
+<li>设置页可切换 KPM / Proc 工作模式、cpuset 目录名、检查间隔与配置文件路径</li>
 <li>配置文件也可直接手工编辑，保存后自动热加载</li>
 <li>更多规则编写说明参考官网文档</li>
 </ol></div>
@@ -321,7 +321,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 function fmtUp(s){s=+s||0;const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d>0?d+'天'+h+'小时':h>0?h+'小时'+m+'分':m>0?m+'分':'刚刚'}
-const modeLabel=m=>m==='ebpf'?'eBPF 事件驱动':'Proc 轮询';
+const modeLabel=m=>m==='kpm'?'KPM 事件驱动':'Proc 轮询';
 async function api(path,body){
   const opts=body!==undefined?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{};
   const r=await fetch(path,opts);
@@ -352,7 +352,7 @@ async function refreshStat(){
     const d=await api('/api/status');
     const mb=$('s-mode');
     mb.textContent=modeLabel(d.mode);
-    mb.className='badge '+(d.mode==='ebpf'?'ebpf':'proc');
+    mb.className='badge '+(d.mode==='kpm'?'kpm':'proc');
     $('s-up').textContent=fmtUp(d.uptime);
     $('s-ver').textContent='v'+(d.version||'?');
     $('s-rules').textContent=d.rules;
@@ -679,7 +679,7 @@ async function loadCfg(){
     const d=await api('/api/config');
     document.querySelectorAll('#seg-mode button').forEach(b=>b.classList.toggle('on',+b.dataset.mode===d.mode));
     $('c-mode-active').textContent='当前生效: '+modeLabel(d.mode_active);
-    $('c-ebpf-hint').hidden=d.ebpf_available;
+    $('c-kpm-hint').hidden=d.kpm_available;
     $('c-interval').value=d.interval;
     $('c-cpuset').value=d.cpuset_name;
     $('c-file').value=d.config_file;
