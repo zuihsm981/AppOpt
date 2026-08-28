@@ -136,6 +136,11 @@ impl KpmHandle {
         self.cmd(&s);
     }
 
+    /// 武装 input kprobe (AppOpt 启动完成、系统稳定后调用)
+    fn input_on(&self) {
+        self.cmd("input_on");
+    }
+
     fn applied_del(&self, tid: i32) {
         let s = format!("applied_del {}", tid);
         self.cmd(&s);
@@ -218,6 +223,8 @@ pub fn ebpf_init() -> Option<EbpfState> {
         eprintln!("KPM: appopt-kpm 模块未加载 (请用 APatch 管理器加载), 回退到 /proc 轮询");
         return None;
     }
+    // 输入检测 kprobe 按需武装 (非 init 注册, 避免早期启动卡第一屏; 卸载时模块会安全卸断点)
+    handle.input_on();
 
     // 配置 input 节流 (与 eBPF 默认 1s 一致)
     handle.cmd("input_ms 1000");
