@@ -17,7 +17,7 @@ use crate::config::{
     CHECK_INTERVAL, CONFIG_FILE, CURRENT_CONFIG, FORCE_RELOAD, PARSE_FAILS,
 };
 use crate::cpuset::{base_cpuset, create_cpuset_dir, parse_cpu_spec, CpuSet, CpuTopology, DEFAULT_CPUSET_NAME};
-use crate::ebpf_mode::ebpf_probe;
+use crate::ebpf_mode::kpm_probe;
 use crate::rule_edit::{rule_delete, rule_delete_pkg, rule_rename, rule_upsert, RuleEdit};
 use crate::{lock_ignore_poison, EBPF_GAVE_UP, MAX_PKG_LEN, MAX_THREAD_LEN};
 
@@ -35,7 +35,7 @@ pub struct WebStats {
     pub pkgs: usize,
     pub hit_pkgs: usize,
     pub threads: usize,
-    pub ebpf: bool,
+    pub kpm: bool,
     pub uptime: u64,
 }
 
@@ -262,12 +262,12 @@ fn status_json() -> String {
         pkgs: 0,
         hit_pkgs: 0,
         threads: 0,
-        ebpf: false,
+        kpm: false,
         uptime: 0,
     });
     json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "mode": if s.ebpf { "ebpf" } else { "proc" },
+        "mode": if s.kpm { "kpm" } else { "proc" },
         "uptime": s.uptime,
         "rules": s.rules,
         "pkgs": s.pkgs,
@@ -509,8 +509,8 @@ fn config_json() -> String {
     let cfg = current_cfg();
     json!({
         "mode": MODE_FORCE.load(Ordering::Relaxed),
-        "mode_active": if stats.is_some_and(|s| s.ebpf) { "ebpf" } else { "proc" },
-        "ebpf_available": ebpf_probe(),
+        "mode_active": if stats.is_some_and(|s| s.kpm) { "kpm" } else { "proc" },
+        "kpm_available": kpm_probe(),
         "interval": CHECK_INTERVAL.load(Ordering::Relaxed).max(1),
         "cpuset_name": base_cpuset().rsplit('/').next().unwrap_or_default(),
         "config_file": lock_ignore_poison(&CONFIG_FILE).clone(),
@@ -543,7 +543,7 @@ fn config_set_api(req: &Request) -> (u16, String) {
 
     if let Some(m) = mode {
         MODE_FORCE.store(m as u8, Ordering::Relaxed);
-        // 用户主动切回 eBPF 方向时清除放弃标记允许重试
+        // 用户主动切回 KPM 方向时清除放弃标记允许重试
         if m != 2 {
             EBPF_GAVE_UP.store(false, Ordering::Relaxed);
         }
