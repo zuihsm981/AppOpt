@@ -157,6 +157,29 @@ impl KpmHandle {
         let mut out = [0u8; 16];
         kpm_ctl0(&self.key, &c, &mut out) >= 0
     }
+
+    /// 文本统计
+    pub fn stats(&self, out: &mut [u8]) -> i64 {
+        let args = CString::new("stats").unwrap_or_default();
+        kpm_ctl0(&self.key, &args, out)
+    }
+
+    /// 导出模块日志环到本地文件 (返回写入字节数)
+    pub fn dump_logs(&self, path: &str) -> std::io::Result<usize> {
+        let mut buf = vec![0u8; 8192];
+        let n = {
+            let args = CString::new("logs").unwrap_or_default();
+            kpm_ctl0(&self.key, &args, &mut buf)
+        };
+        if n < 0 {
+            return Err(std::io::Error::from_raw_os_error(-n as i32));
+        }
+        let mut out = Vec::with_capacity(n as usize + 1);
+        out.extend_from_slice(&buf[..n as usize]);
+        out.push(b'\n');
+        std::fs::write(path, out)?;
+        Ok(out.len())
+    }
 }
 
 /// 将内核 comm 截断于首个 NUL 并 trim 尾部空白
