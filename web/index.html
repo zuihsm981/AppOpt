@@ -346,6 +346,13 @@ document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{
 
 function startStat(){stopStat();refreshStat();statTimer=setInterval(refreshStat,3000)}
 function stopStat(){if(statTimer){clearInterval(statTimer);statTimer=null}}
+// 轮询可见性管理: 仅前端打开/可见时轮询; 隐藏/失焦/关闭页面即停止
+function pausePolling(){stopStat();if(rfTimer){clearInterval(rfTimer);rfTimer=null}}
+function resumePolling(){if(activeTab==='status')startStat();else if(activeTab==='refresh')loadRefresh()}
+document.addEventListener('visibilitychange',()=>{if(document.hidden)pausePolling();else resumePolling()});
+window.addEventListener('blur',()=>pausePolling());
+window.addEventListener('focus',()=>resumePolling());
+window.addEventListener('pagehide',()=>pausePolling());
 async function refreshStat(){
   if(document.hidden)return;
   try{
