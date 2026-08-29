@@ -361,10 +361,13 @@ fn kpm_reader(key: CString, tx: mpsc::Sender<EbpfProcEvent>, wakeup_fd: c_int) {
 
 /// 配置白名单; 返回 true 表示需重载 (KPM 白名单容量固定 16384, 不会触发)
 pub fn comm_map_init(bpf: &mut KpmHandle, pkgs: &HashSet<String>, _comm_capacity: u32) -> bool {
+    debug_log(&format!("comm_map_init: enter, {} pkgs", pkgs.len()));
     if !bpf.set_whitelist(pkgs) {
+        debug_log("comm_map_init: set_whitelist FAILED → return true (failure)");
         eprintln!("KPM: 白名单配置失败");
         return true;
     }
+    debug_log("comm_map_init: set_whitelist ok → return false (success)");
     println!("KPM: 白名单已配置, {} 个包名", pkgs.len());
     false
 }
