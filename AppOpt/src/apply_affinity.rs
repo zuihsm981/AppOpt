@@ -71,6 +71,15 @@ pub fn affinity_set(
             eprintln!("KPM affinity_set: tid={} already ok cpus={}", tid, cpus.to_range_string());
             return false;
         }
+    // 先设置亲和性，再写 cpuset：
+    // cgroup v1 cpuset 要求目标 cpuset 的 cpus 必须包含任务当前的 cpus_allowed，
+    // 否则写入 tasks 返回 EINVAL。先把任务亲和性收紧到目标 CPU 集合，
+    // 使 cpus_allowed ⊆ 目标 cpuset.cpus，写入才能成功。
+    if let Err(e) = cpus.set_affinity(tid) {
+        eprintln!("KPM affinity_set: tid={} sched_setaffinity ERR {} (ESRCH={})", tid, e, e.raw_os_error() == Some(libc::ESRCH));
+        return e.raw_os_error() == Some(libc::ESRCH);
+    }
+    eprintln!("KPM affinity_set: tid={} sched_setaffinity OK cpus={}", tid, cpus.to_range_string());
     if topo.cpuset_enabled {
         let tasks_path = if cpuset_dir.is_empty() {
             format!("{}/tasks", base_cpuset())
@@ -92,11 +101,6 @@ pub fn affinity_set(
     } else {
         eprintln!("KPM affinity_set: tid={} cpuset_enabled=false cpus={}", tid, cpus.to_range_string());
     }
-    if let Err(e) = cpus.set_affinity(tid) {
-        eprintln!("KPM affinity_set: tid={} sched_setaffinity ERR {} (ESRCH={})", tid, e, e.raw_os_error() == Some(libc::ESRCH));
-        return e.raw_os_error() == Some(libc::ESRCH);
-    }
-    eprintln!("KPM affinity_set: tid={} sched_setaffinity OK cpus={}", tid, cpus.to_range_string());
     false
 }
 
