@@ -65,21 +65,18 @@ pub fn affinity_set(
     cpuset_dir: &str,
     topo: &CpuTopology,
 ) -> bool {
-    // sched_getaffinity 短路，已符合目标零开销返回
-    if let Some(curr) = CpuSet::get_affinity(tid)
-        && curr == *cpus {
-            eprintln!("KPM affinity_set: tid={} already ok cpus={}", tid, cpus.to_range_string());
-            return false;
+    // 亲和性检查: 已符合则跳过 sched_setaffinity, 但 cpuset 归属仍尝试写入。
+    // 这样后续 RENAME 事件(任务已稳定)能重试 cpuset 放置, 弥补首次 EINVAL。
+    let affinity_ok = CpuSet::get_affinity(tid).is_some_and(|curr| curr == *cpus);
+    if !affinity_ok {
+        if let Err(e) = cpus.set_affinity(tid) {
+            eprintln!("KPM affinity_set: tid={} sched_setaffinity ERR {} (ESRCH={})", tid, e, e.raw_os_error() == Some(libc::ESRCH));
+            return e.raw_os_error() == Some(libc::ESRCH);
         }
-    // 先设置亲和性，再写 cpuset：
-    // cgroup v1 cpuset 要求目标 cpuset 的 cpus 必须包含任务当前的 cpus_allowed，
-    // 否则写入 tasks 返回 EINVAL。先把任务亲和性收紧到目标 CPU 集合，
-    // 使 cpus_allowed ⊆ 目标 cpuset.cpus，写入才能成功。
-    if let Err(e) = cpus.set_affinity(tid) {
-        eprintln!("KPM affinity_set: tid={} sched_setaffinity ERR {} (ESRCH={})", tid, e, e.raw_os_error() == Some(libc::ESRCH));
-        return e.raw_os_error() == Some(libc::ESRCH);
+        eprintln!("KPM affinity_set: tid={} sched_setaffinity OK cpus={}", tid, cpus.to_range_string());
+    } else {
+        eprintln!("KPM affinity_set: tid={} already ok cpus={}", tid, cpus.to_range_string());
     }
-    eprintln!("KPM affinity_set: tid={} sched_setaffinity OK cpus={}", tid, cpus.to_range_string());
     if topo.cpuset_enabled {
         let tasks_path = if cpuset_dir.is_empty() {
             format!("{}/tasks", base_cpuset())
