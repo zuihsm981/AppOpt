@@ -92,7 +92,8 @@ pub fn affinity_sync(&mut self, topo: &CpuTopology) {
             }
         })
         .collect();
-    for tid in dead_tids {
+     for tid in dead_tids {
         self.task_del(tid);
-    }
+     }
+ }
 }
