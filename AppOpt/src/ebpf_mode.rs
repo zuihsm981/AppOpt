@@ -211,6 +211,29 @@ pub fn kpm_probe() -> bool {
     handle.ping()
 }
 
+/// 查找 Zygote 相关进程的所有线程 tid (cmdline 以 "zygote" 开头, 含 zygote/zygote64/usap)
+fn find_zygote_tids() -> Vec<i32> {
+    let mut tids = Vec::new();
+    if let Ok(entries) = fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else { continue };
+            let Ok(cmdline) = fs::read(format!("/proc/{}/cmdline", pid)) else { continue };
+            let s = String::from_utf8_lossy(&cmdline);
+            if !s.starts_with("zygote") {
+                continue;
+            }
+            if let Ok(task_dir) = fs::read_dir(format!("/proc/{}/task", pid)) {
+                for t in task_dir.flatten() {
+                    if let Ok(tid) = t.file_name().to_string_lossy().parse::<i32>() {
+                        tids.push(tid);
+                    }
+                }
+            }
+        }
+    }
+    tids
+}
+
 /// 初始化 KPM 事件驱动: 确保模块加载, 启动 reader 线程
 /// 失败返回 None, 由调用方回退 /proc 轮询
 pub fn ebpf_init() -> Option<EbpfState> {
@@ -253,6 +276,14 @@ pub fn ebpf_init() -> Option<EbpfState> {
         .unwrap_or_default();
     handle.set_whitelist(&pkgs);
     handle.activate();
+
+    /* 把 Zygote 加入 APPLIED 表 (bits=0): Zygote fork 出的子进程
+     * (如 com.bilibili.app.in:ijkservice) 会在 FORK 探针中被占位,
+     * RENAME 时 tracked=true 直接通过, 无需依赖 whitelist_matched。
+     * bits=0 不影响 Zygote 自身 (sched_setaffinity kprobe 见 bits=0 不干预)。 */
+    for tid in find_zygote_tids() {
+        handle.applied_set(tid, 0);
+    }
 
 
     Some(EbpfState {
@@ -356,9 +387,9 @@ fn applied_clear(bpf: &KpmHandle) {
 }
 
 /// 应用亲和性并写 APPLIED 表, 返回 true 表示 tid 已退出
-/// KPM 事件路径: 只设置 CPU 亲和性(立即生效), cpuset 归属由定期 affinity_sync 延迟放置。
-/// 原因: 事件触发时任务刚创建/改名, Android 可能尚未完成对任务的 cpuset 迁移,
-/// 立即写 AppOpt cpuset 会被 EINVAL 拒绝。cpuset_dir 参数在此路径不使用。
+/// 事件驱动路径: 调用完整 affinity_set (sched_setaffinity + cpuset 写入)。
+/// 任务刚创建时 cpuset 可能 EINVAL, 但后续 RENAME 事件(如 re-initialized>)
+/// 会重试 affinity_set, 任务稳定后 cpuset 放置成功。
 fn affinity_apply(
     tid: i32,
     cpus: &CpuSet,
@@ -366,17 +397,8 @@ fn affinity_apply(
     cfg: &AppConfig,
     bpf: &KpmHandle,
 ) -> bool {
-    eprintln!("KPM affinity_apply: tid={} cpus={} (cpuset delayed, dir='{}')", tid, cpus.to_range_string(), cpuset_dir);
-    let dead = match cpus.set_affinity(tid) {
-        Err(e) => {
-            eprintln!("KPM affinity_apply: tid={} sched_setaffinity ERR {} (ESRCH={})", tid, e, e.raw_os_error() == Some(libc::ESRCH));
-            e.raw_os_error() == Some(libc::ESRCH)
-        }
-        Ok(()) => {
-            eprintln!("KPM affinity_apply: tid={} sched_setaffinity OK cpus={}", tid, cpus.to_range_string());
-            false
-        }
-    };
+    eprintln!("KPM affinity_apply: tid={} cpus={} cpuset_dir='{}'", tid, cpus.to_range_string(), cpuset_dir);
+    let dead = affinity_set(tid, cpus, cpuset_dir, &cfg.topo);
     if !dead {
         applied_set(bpf, tid, cpus);
         eprintln!("KPM affinity_apply: tid={} applied_set bits={:#x}", tid, cpus.bits[0]);
