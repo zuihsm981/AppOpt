@@ -126,5 +126,17 @@ pub fn comm_to_pkg(pid: i32, comm: &str, cfg: &AppConfig) -> Option<String> {
             }
         }
     }
+    // comm 含 ':' 是子进程特征 (如 "bilibili.app.in:ijk"): 取 ':' 前部分,
+    // 若它是某个包名的子串则匹配 (覆盖 comm 截断导致 8 字节键不命中的情况)。
+    if let Some(idx) = comm.find(':') {
+        let base = &comm[..idx];
+        if base.len() >= 3 {
+            for pkg in &cfg.pkgs {
+                if pkg.contains(base) {
+                    return Some(pkg.clone());
+                }
+            }
+        }
+    }
     None
 }
