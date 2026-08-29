@@ -212,7 +212,8 @@ pub fn kpm_probe() -> bool {
     handle.ping()
 }
 
-/// 查找 Zygote 相关进程的所有线程 tid (cmdline 以 "zygote" 开头, 含 zygote/zygote64/usap)
+/// 查找 Zygote 相关进程的所有线程 tid
+/// (cmdline 匹配 zygote/app_process/usap 前缀, 覆盖 zygote/zygote64/app_process32/app_process64/usap)
 fn find_zygote_tids() -> Vec<i32> {
     let mut tids = Vec::new();
     if let Ok(entries) = fs::read_dir("/proc") {
@@ -220,7 +221,7 @@ fn find_zygote_tids() -> Vec<i32> {
             let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else { continue };
             let Ok(cmdline) = fs::read(format!("/proc/{}/cmdline", pid)) else { continue };
             let s = String::from_utf8_lossy(&cmdline);
-            if !s.starts_with("zygote") {
+            if !(s.starts_with("zygote") || s.starts_with("app_process") || s.starts_with("usap")) {
                 continue;
             }
             if let Ok(task_dir) = fs::read_dir(format!("/proc/{}/task", pid)) {
@@ -469,6 +470,12 @@ fn event_apply(
 pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
     state.cache.clear();
     applied_clear(&state.bpf);
+    /* full_scan 清空了 APPLIED 表, Zygote 的 tid 也随之丢失。
+     * 必须重新把 Zygote 加入 APPLIED (bits=0), 否则之后 Zygote fork 的
+     * 子进程无法被 FORK 探针占位, RENAME 事件被过滤, 子进程匹配不到。 */
+    for tid in find_zygote_tids() {
+        state.bpf.applied_set(tid, 0);
+    }
 
     proc_walk(cfg, |_| true, |pid, pkg, has_thread_rules| {
         let Some(tids) = task_tids(pid) else { return };
