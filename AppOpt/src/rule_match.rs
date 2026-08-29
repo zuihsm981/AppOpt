@@ -1,9 +1,9 @@
 use std::ffi::CString;
 
 use crate::apply_affinity::read_cmdline;
-use crate::MAX_THREAD_LEN;
 use crate::config::AppConfig;
 use crate::cpuset::{ensure_cpuset_dir, CpuSet};
+use crate::MAX_THREAD_LEN;
 
 /// 线程亲和性计算结果
 pub struct AffinityResult {
@@ -92,7 +92,8 @@ pub fn comm_to_pkg(pid: i32, comm: &str, cfg: &AppConfig) -> Option<String> {
         // 优先用 cmdline 完整命令匹配 (comm 截断后前缀/后缀可能匹配到错误包)
         if let Some(cmd) = read_cmdline(pid) {
             for pkg in &cfg.pkgs {
-                if cmd == pkg || cmd.starts_with(pkg) {
+                // 修复类型比较错误：解引用 pkg 或使用 .as_str()
+                if cmd == *pkg || cmd.starts_with(pkg) {
                     return Some(pkg.clone());
                 }
             }
