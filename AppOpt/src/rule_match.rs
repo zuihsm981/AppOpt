@@ -90,10 +90,11 @@ pub fn comm_to_pkg(pid: i32, comm: &str, cfg: &AppConfig) -> Option<String> {
     }
     if comm.len() >= 15 {
         // 优先用 cmdline 完整命令匹配 (comm 截断后前缀/后缀可能匹配到错误包)
+        // 支持子进程: com.bilibili.app.in:download → com.bilibili.app.in
         if let Some(cmd) = read_cmdline(pid) {
             for pkg in &cfg.pkgs {
-                // 修复类型比较错误：解引用 pkg 或使用 .as_str()
-                if cmd == *pkg || cmd.starts_with(pkg) {
+                // 修复类型不匹配：cmd 是 String，pkg 是 &String，需解引用或调用 as_str()
+                if cmd == *pkg || cmd.starts_with(&format!("{}:", pkg)) {
                     return Some(pkg.clone());
                 }
             }
