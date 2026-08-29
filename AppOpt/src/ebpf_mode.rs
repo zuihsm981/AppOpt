@@ -406,9 +406,7 @@ fn applied_clear(bpf: &KpmHandle) {
 }
 
 /// 应用亲和性并写 APPLIED 表, 返回 true 表示 tid 已退出
-/// 事件驱动路径: 调用完整 affinity_set (sched_setaffinity + cpuset 写入)。
-/// 任务刚创建时 cpuset 可能 EINVAL, 但后续 RENAME 事件(如 re-initialized>)
-/// 会重试 affinity_set, 任务稳定后 cpuset 放置成功。
+/// 事件驱动路径: 调用完整 affinity_set (sched_setaffinity + cpuset 写入), 直接操作。
 fn affinity_apply(
     tid: i32,
     cpus: &CpuSet,
