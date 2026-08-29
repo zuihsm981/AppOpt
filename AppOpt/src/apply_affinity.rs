@@ -100,8 +100,13 @@ pub(crate) fn proc_walk(
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else { continue };
         total += 1;
         if !filter(pid) { continue; }
-        let Some(pkg) = read_cmdline(pid).or_else(|| tid_comm(pid)) else { continue };
-        if !cfg.pkgs.contains(&pkg) { continue; }
+        let Some(cmd) = read_cmdline(pid).or_else(|| tid_comm(pid)) else { continue };
+        /* 匹配白名单包名, 支持子进程: com.bilibili.app.in:download → com.bilibili.app.in */
+        let pkg = cfg.pkgs
+            .iter()
+            .find(|p| cmd == **p || cmd.starts_with(&format!("{}:", p)))
+            .cloned();
+        let Some(pkg) = pkg else { continue };
         f(pid, &pkg, cfg.has_thread_rules.contains(&pkg));
         count += 1;
     }
