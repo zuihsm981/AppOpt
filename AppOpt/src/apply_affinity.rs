@@ -89,13 +89,13 @@ pub fn affinity_set(
         match fs::OpenOptions::new().append(true).open(&tasks_path) {
             Ok(mut f) => {
                 if let Err(e) = writeln!(f, "{}", tid) {
-                    eprintln!("KPM affinity_set: tid={} cpuset '{}' WRITE FAIL: {}", tid, tasks_path, e);
+                    eprintln!("KPM affinity_set: tid={} cpuset '{}' WRITE FAIL: {} (errno={})", tid, tasks_path, e, e.raw_os_error().unwrap_or(-1));
                 } else {
                     eprintln!("KPM affinity_set: tid={} cpuset '{}' OK", tid, tasks_path);
                 }
             }
             Err(e) => {
-                eprintln!("KPM affinity_set: tid={} cpuset '{}' OPEN FAIL: {}", tid, tasks_path, e);
+                eprintln!("KPM affinity_set: tid={} cpuset '{}' OPEN FAIL: {} (errno={})", tid, tasks_path, e, e.raw_os_error().unwrap_or(-1));
             }
         }
     } else {
