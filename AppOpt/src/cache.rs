@@ -79,22 +79,20 @@ impl ProcCache {
         true
     }
 
-    /// 遍历 tasks 应用亲和性，返回 dead_tids 供 eBPF 调用方清理 APPLIED_MAP
-    pub fn affinity_sync(&mut self, topo: &CpuTopology) -> Vec<i32> {
-        let dead_tids: Vec<i32> = self
-            .tasks
-            .iter()
-            .filter_map(|(tid, e)| {
-                if affinity_set(*tid, &e.cpus, &e.cpuset_dir, topo) {
-                    Some(*tid)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        for tid in &dead_tids {
-            self.task_del(*tid);
-        }
-        dead_tids
+    /// 遍历 tasks 重新应用亲和性，清理已退出的条目（内部处理，不返回列表）
+pub fn affinity_sync(&mut self, topo: &CpuTopology) {
+    let dead_tids: Vec<i32> = self
+        .tasks
+        .iter()
+        .filter_map(|(tid, e)| {
+            if affinity_set(*tid, &e.cpus, &e.cpuset_dir, topo) {
+                Some(*tid)
+            } else {
+                None
+            }
+        })
+        .collect();
+    for tid in dead_tids {
+        self.task_del(tid);
     }
 }
