@@ -394,8 +394,13 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
             }
 
         EBPF_EVENT_FORK => {
-            // 子线程继承父线程亲和性与 cpuset
-            // 内核态已插入 APPLIED 表占位, RENAME 时触发完整处理
+            /* 修复: FORK 事件也调用 event_apply 处理
+             * 原因: 父进程已在 APPLIED 表时, child_tid 已被 bitmask=0 占位;
+             * event_apply 通过 cache.pkg_lookup_comm 回退到父进程的 pkg,
+             * 调用 task_apply 重新以正确的 cpuset 设置子进程亲和性;
+             * 若父进程仅白名单匹配(未在 APPLIED), 子进程在后续 RENAME 事件中
+             * 会重新走 whitelist_matched 检查并正确匹配 */
+            event_apply(&mut state.cache, &state.bpf, tid, pid, comm, cfg);
         }
 
         EBPF_EVENT_RENAME => {
