@@ -77,11 +77,18 @@ pub fn affinity_set(
         } else {
             format!("{}/{}/tasks", base_cpuset(), cpuset_dir)
         };
-        eprintln!("KPM affinity_set: tid={} write cpuset '{}'", tid, tasks_path);
-        let _ = fs::OpenOptions::new()
-            .append(true)
-            .open(&tasks_path)
-            .and_then(|mut f| writeln!(f, "{}", tid));
+        match fs::OpenOptions::new().append(true).open(&tasks_path) {
+            Ok(mut f) => {
+                if let Err(e) = writeln!(f, "{}", tid) {
+                    eprintln!("KPM affinity_set: tid={} cpuset '{}' WRITE FAIL: {}", tid, tasks_path, e);
+                } else {
+                    eprintln!("KPM affinity_set: tid={} cpuset '{}' OK", tid, tasks_path);
+                }
+            }
+            Err(e) => {
+                eprintln!("KPM affinity_set: tid={} cpuset '{}' OPEN FAIL: {}", tid, tasks_path, e);
+            }
+        }
     } else {
         eprintln!("KPM affinity_set: tid={} cpuset_enabled=false cpus={}", tid, cpus.to_range_string());
     }
