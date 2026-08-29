@@ -236,6 +236,23 @@ fn find_zygote_tids() -> Vec<i32> {
     tids
 }
 
+/// 调试日志: 同时输出到 stderr 和 /data/local/tmp/appopt_debug.log
+/// (文件方式可靠, 不受 AppOpt 启动方式影响; stderr 仅前台终端可见)
+macro_rules! kpm_log {
+    ($($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        eprintln!("{}", msg);
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/data/local/tmp/appopt_debug.log")
+        {
+            let _ = writeln!(f, "{}", msg);
+        }
+    }};
+}
+
 /// 初始化 KPM 事件驱动: 确保模块加载, 启动 reader 线程
 /// 失败返回 None, 由调用方回退 /proc 轮询
 pub fn ebpf_init() -> Option<EbpfState> {
@@ -400,10 +417,12 @@ fn affinity_apply(
     bpf: &KpmHandle,
 ) -> bool {
     eprintln!("KPM affinity_apply: tid={} cpus={} cpuset_dir='{}'", tid, cpus.to_range_string(), cpuset_dir);
+    kpm_log!("KPM affinity_apply: tid={} cpus={} cpuset_dir='{}'", tid, cpus.to_range_string(), cpuset_dir);
     let dead = affinity_set(tid, cpus, cpuset_dir, &cfg.topo);
     if !dead {
-        applied_set(bpf, tid, cpus);
+        applied_set(bpf, tid, cpus.bits[0]);
         eprintln!("KPM affinity_apply: tid={} applied_set bits={:#x}", tid, cpus.bits[0]);
+        kpm_log!("KPM affinity_apply: tid={} applied_set bits={:#x}", tid, cpus.bits[0]);
     }
     dead
 }
@@ -414,6 +433,7 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
     let pid = event.pid;
     let comm = comm_str(&event.comm);
     eprintln!("KPM event: type={} tid={} pid={} comm='{}'", event.event_type, tid, pid, comm);
+    kpm_log!("KPM event: type={} tid={} pid={} comm='{}'", event.event_type, tid, pid, comm);
 
     match event.event_type {
         EBPF_EVENT_EXIT => {
@@ -455,6 +475,7 @@ fn event_apply(
 ) -> bool {
     let pkg_result = cache.pkg_lookup_comm(pid, comm, cfg);
     eprintln!("KPM event_apply: tid={} pid={} comm='{}' pkg={:?}", tid, pid, comm, pkg_result);
+    kpm_log!("KPM event_apply: tid={} pid={} comm='{}' pkg={:?}", tid, pid, comm, pkg_result);
     let Some(pkg) = pkg_result else {
         return false;
     };
