@@ -68,6 +68,7 @@ pub fn affinity_set(
     // sched_getaffinity 短路，已符合目标零开销返回
     if let Some(curr) = CpuSet::get_affinity(tid)
         && curr == *cpus {
+            eprintln!("KPM affinity_set: tid={} already ok cpus={}", tid, cpus.to_range_string());
             return false;
         }
     if topo.cpuset_enabled {
@@ -76,15 +77,19 @@ pub fn affinity_set(
         } else {
             format!("{}/{}/tasks", base_cpuset(), cpuset_dir)
         };
+        eprintln!("KPM affinity_set: tid={} write cpuset '{}'", tid, tasks_path);
         let _ = fs::OpenOptions::new()
             .append(true)
             .open(&tasks_path)
             .and_then(|mut f| writeln!(f, "{}", tid));
+    } else {
+        eprintln!("KPM affinity_set: tid={} cpuset_enabled=false cpus={}", tid, cpus.to_range_string());
     }
     if let Err(e) = cpus.set_affinity(tid) {
+        eprintln!("KPM affinity_set: tid={} sched_setaffinity ERR {} (ESRCH={})", tid, e, e.raw_os_error() == Some(libc::ESRCH));
         return e.raw_os_error() == Some(libc::ESRCH);
     }
-
+    eprintln!("KPM affinity_set: tid={} sched_setaffinity OK cpus={}", tid, cpus.to_range_string());
     false
 }
 
