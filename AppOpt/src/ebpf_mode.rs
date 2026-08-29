@@ -356,6 +356,9 @@ fn applied_clear(bpf: &KpmHandle) {
 }
 
 /// 应用亲和性并写 APPLIED 表, 返回 true 表示 tid 已退出
+/// KPM 事件路径: 只设置 CPU 亲和性(立即生效), cpuset 归属由定期 affinity_sync 延迟放置。
+/// 原因: 事件触发时任务刚创建/改名, Android 可能尚未完成对任务的 cpuset 迁移,
+/// 立即写 AppOpt cpuset 会被 EINVAL 拒绝。cpuset_dir 参数在此路径不使用。
 fn affinity_apply(
     tid: i32,
     cpus: &CpuSet,
@@ -363,10 +366,19 @@ fn affinity_apply(
     cfg: &AppConfig,
     bpf: &KpmHandle,
 ) -> bool {
-    eprintln!("KPM affinity_apply: tid={} cpus={} cpuset_dir='{}'", tid, cpus.to_range_string(), cpuset_dir);
-    let dead = affinity_set(tid, cpus, cpuset_dir, &cfg.topo);
+    eprintln!("KPM affinity_apply: tid={} cpus={} (cpuset delayed, dir='{}')", tid, cpus.to_range_string(), cpuset_dir);
+    let dead = match cpus.set_affinity(tid) {
+        Err(e) => {
+            eprintln!("KPM affinity_apply: tid={} sched_setaffinity ERR {} (ESRCH={})", tid, e, e.raw_os_error() == Some(libc::ESRCH));
+            e.raw_os_error() == Some(libc::ESRCH)
+        }
+        Ok(()) => {
+            eprintln!("KPM affinity_apply: tid={} sched_setaffinity OK cpus={}", tid, cpus.to_range_string());
+            false
+        }
+    };
     if !dead {
-        applied_set(bpf, tid, cpus);
+        applied_set(bpf, tid, cpus.bits[0]);
         eprintln!("KPM affinity_apply: tid={} applied_set bits={:#x}", tid, cpus.bits[0]);
     }
     dead
