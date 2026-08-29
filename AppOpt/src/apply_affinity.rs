@@ -5,6 +5,7 @@ use std::os::unix::fs::FileExt;
 use crate::{MAX_PKG_LEN, MAX_THREAD_LEN};
 use crate::config::AppConfig;
 use crate::cpuset::{base_cpuset, CpuSet, CpuTopology};
+use crate::rule_match::comm_to_pkg;
 
 /// 栈上构建 /proc/{pid}/{suffix} 路径读取文件
 fn read_proc_file<'a>(pid: i32, suffix: &str, buf: &'a mut [u8]) -> Option<&'a [u8]> {
@@ -100,13 +101,9 @@ pub(crate) fn proc_walk(
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else { continue };
         total += 1;
         if !filter(pid) { continue; }
-        let Some(cmd) = read_cmdline(pid).or_else(|| tid_comm(pid)) else { continue };
-        /* 匹配白名单包名, 支持子进程: com.bilibili.app.in:download → com.bilibili.app.in */
-        let pkg = cfg.pkgs
-            .iter()
-            .find(|p| cmd == **p || cmd.starts_with(&format!("{}:", p)))
-            .cloned();
-        let Some(pkg) = pkg else { continue };
+        /* 用 comm_to_pkg 匹配: 支持 cmdline 精确匹配 + 子进程(pkg:suffix) + 截断 comm 前缀/后缀回退 */
+        let comm = tid_comm(pid).unwrap_or_default();
+        let Some(pkg) = comm_to_pkg(pid, &comm, cfg) else { continue };
         f(pid, &pkg, cfg.has_thread_rules.contains(&pkg));
         count += 1;
     }
