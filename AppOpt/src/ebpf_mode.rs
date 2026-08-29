@@ -22,21 +22,6 @@ use crate::config::{AppConfig, CURRENT_CONFIG};
 use crate::cpuset::CpuSet;
 
 /// 调试日志: 追加到 /data/local/tmp/appopt_debug.log (可靠, 不受启动方式影响)
-pub fn debug_log(msg: &str) {
-    use std::io::Write;
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/data/local/tmp/appopt_debug.log")
-    {
-        let _ = writeln!(f, "[{}] {}", ts, msg);
-    }
-}
-
 /// eBPF 进程事件, 布局需与内核态 appopt_proc_event_t 完全一致 (28B)
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -144,9 +129,7 @@ impl KpmHandle {
     /// ctl0 命令封装
     fn cmd(&self, args: &str) -> i64 {
         let c = CString::new(args).unwrap_or_default();
-        let rc = kpm_ctl0(&self.key, &c, &mut []);
-        debug_log(&format!("cmd '{}' rc={}", args, rc));
-        rc
+        kpm_ctl0(&self.key, &c, &mut [])
     }
 
     fn applied_set(&self, tid: i32, bits: u64) {
@@ -156,12 +139,8 @@ impl KpmHandle {
 
     /// AppOpt 初始化完成后激活 KPM: 注册 tracepoint(start) + 武装 input kprobe(input_on)
     pub fn activate(&self) {
-        debug_log("activate: sending start");
-        let r1 = self.cmd("start");
-        debug_log(&format!("activate: start done rc={}", r1));
-        debug_log("activate: sending input_on");
-        let r2 = self.cmd("input_on");
-        debug_log(&format!("activate: input_on done rc={}", r2));
+        self.cmd("start");
+        self.cmd("input_on");
     }
 
     fn applied_del(&self, tid: i32) {
@@ -235,22 +214,17 @@ pub fn kpm_probe() -> bool {
 /// 初始化 KPM 事件驱动: 确保模块加载, 启动 reader 线程
 /// 失败返回 None, 由调用方回退 /proc 轮询
 pub fn ebpf_init() -> Option<EbpfState> {
-    debug_log("ebpf_init: enter");
     let key = kpm_key();
     if !kp_ready(&key) {
-        debug_log("ebpf_init: KP not ready, fallback to /proc");
         eprintln!("KPM: KernelPatch 未就绪, 回退到 /proc 轮询");
         return None;
     }
-    debug_log("ebpf_init: KP ready");
 
     let handle = KpmHandle { key };
     if !handle.verify_loaded() {
-        debug_log("ebpf_init: module not loaded, fallback to /proc");
         eprintln!("KPM: appopt-kpm 模块未加载 (请用 APatch 管理器加载), 回退到 /proc 轮询");
         return None;
     }
-    debug_log("ebpf_init: module loaded (ping ok)");
 
     // 配置 input 节流 (与 eBPF 默认 1s 一致)
     handle.cmd("input_ms 1000");
@@ -274,8 +248,11 @@ pub fn ebpf_init() -> Option<EbpfState> {
         kpm_reader(reader_key, tx, wakeup_fd);
     });
 
+    /* 模块已加载且 reader 就绪, 直接激活: start(注册 tracepoint + sched_setaffinity 拦截)
+     * + input_on(武装 input kprobe)。不再依赖 main.rs 的条件分支, 模块自动启动即激活。 */
+    handle.activate();
+
     println!("KPM: 事件驱动初始化成功 (appopt-kpm)");
-    debug_log("ebpf_init: returning Some(EbpfState) — activate() should follow full_scan");
 
     Some(EbpfState {
         event_rx: rx,
@@ -361,13 +338,10 @@ fn kpm_reader(key: CString, tx: mpsc::Sender<EbpfProcEvent>, wakeup_fd: c_int) {
 
 /// 配置白名单; 返回 true 表示需重载 (KPM 白名单容量固定 16384, 不会触发)
 pub fn comm_map_init(bpf: &mut KpmHandle, pkgs: &HashSet<String>, _comm_capacity: u32) -> bool {
-    debug_log(&format!("comm_map_init: enter, {} pkgs", pkgs.len()));
     if !bpf.set_whitelist(pkgs) {
-        debug_log("comm_map_init: set_whitelist FAILED → return true (failure)");
         eprintln!("KPM: 白名单配置失败");
         return true;
     }
-    debug_log("comm_map_init: set_whitelist ok → return false (success)");
     println!("KPM: 白名单已配置, {} 个包名", pkgs.len());
     false
 }
