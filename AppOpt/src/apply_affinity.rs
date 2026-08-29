@@ -59,24 +59,20 @@ pub(crate) fn task_tids(pid: i32) -> Option<Vec<i32>> {
 }
 
 /// 对单线程应用亲和性，返回 true 表示 ESRCH 线程已退出
+/// 顺序: 先放置 cpuset (归属), 再设置亲和性 (掩码)。
 pub fn affinity_set(
     tid: i32,
     cpus: &CpuSet,
     cpuset_dir: &str,
     topo: &CpuTopology,
 ) -> bool {
-    // 亲和性检查: 已符合则跳过 sched_setaffinity, 但 cpuset 归属仍尝试写入。
-    // 这样后续 RENAME 事件(任务已稳定)能重试 cpuset 放置, 弥补首次 EINVAL。
-    let affinity_ok = CpuSet::get_affinity(tid).is_some_and(|curr| curr == *cpus);
-    if !affinity_ok {
-        if let Err(e) = cpus.set_affinity(tid) {
-            eprintln!("KPM affinity_set: tid={} sched_setaffinity ERR {} (ESRCH={})", tid, e, e.raw_os_error() == Some(libc::ESRCH));
-            return e.raw_os_error() == Some(libc::ESRCH);
+    // 亲和性已符合目标: 零开销短路返回
+    if let Some(curr) = CpuSet::get_affinity(tid)
+        && curr == *cpus {
+            eprintln!("KPM affinity_set: tid={} already ok cpus={}", tid, cpus.to_range_string());
+            return false;
         }
-        eprintln!("KPM affinity_set: tid={} sched_setaffinity OK cpus={}", tid, cpus.to_range_string());
-    } else {
-        eprintln!("KPM affinity_set: tid={} already ok cpus={}", tid, cpus.to_range_string());
-    }
+    // 先放置 cpuset (把任务移入 AppOpt 子 cpuset)
     if topo.cpuset_enabled {
         let tasks_path = if cpuset_dir.is_empty() {
             format!("{}/tasks", base_cpuset())
@@ -98,6 +94,12 @@ pub fn affinity_set(
     } else {
         eprintln!("KPM affinity_set: tid={} cpuset_enabled=false cpus={}", tid, cpus.to_range_string());
     }
+    // 再设置 CPU 亲和性
+    if let Err(e) = cpus.set_affinity(tid) {
+        eprintln!("KPM affinity_set: tid={} sched_setaffinity ERR {} (ESRCH={})", tid, e, e.raw_os_error() == Some(libc::ESRCH));
+        return e.raw_os_error() == Some(libc::ESRCH);
+    }
+    eprintln!("KPM affinity_set: tid={} sched_setaffinity OK cpus={}", tid, cpus.to_range_string());
     false
 }
 
