@@ -7,6 +7,24 @@ use crate::config::AppConfig;
 use crate::cpuset::{base_cpuset, CpuSet, CpuTopology};
 use crate::rule_match::comm_to_pkg;
 
+/// 调试日志: 同时输出到 stderr 和 /data/local/tmp/appopt_debug.log
+/// (文件方式可靠, 不受 AppOpt 启动方式影响; stderr 仅前台终端可见)
+macro_rules! kpm_log {
+    ($($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        eprintln!("{}", msg);
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/data/local/tmp/appopt_debug.log")
+        {
+            let _ = f.write_all(msg.as_bytes());
+            let _ = f.write_all(b"\n");
+        }
+    }};
+}
+
 /// 栈上构建 /proc/{pid}/{suffix} 路径读取文件
 fn read_proc_file<'a>(pid: i32, suffix: &str, buf: &'a mut [u8]) -> Option<&'a [u8]> {
     let mut path = [0u8; 32];
@@ -79,27 +97,27 @@ pub fn affinity_set(
         match fs::OpenOptions::new().append(true).open(&tasks_path) {
             Ok(mut f) => {
                 if let Err(e) = writeln!(f, "{}", tid) {
-                    eprintln!("KPM affinity_set: tid={} cpuset '{}' WRITE FAIL: {} (errno={})", tid, tasks_path, e, e.raw_os_error().unwrap_or(-1));
+                    kpm_log!("KPM affinity_set: tid={} cpuset '{}' WRITE FAIL: {} (errno={})", tid, tasks_path, e, e.raw_os_error().unwrap_or(-1));
                 } else {
-                    eprintln!("KPM affinity_set: tid={} cpuset '{}' OK", tid, tasks_path);
+                    kpm_log!("KPM affinity_set: tid={} cpuset '{}' OK", tid, tasks_path);
                 }
             }
             Err(e) => {
-                eprintln!("KPM affinity_set: tid={} cpuset '{}' OPEN FAIL: {} (errno={})", tid, tasks_path, e, e.raw_os_error().unwrap_or(-1));
+                kpm_log!("KPM affinity_set: tid={} cpuset '{}' OPEN FAIL: {} (errno={})", tid, tasks_path, e, e.raw_os_error().unwrap_or(-1));
             }
         }
     } else {
-        eprintln!("KPM affinity_set: tid={} cpuset_enabled=false cpus={}", tid, cpus.to_range_string());
+        kpm_log!("KPM affinity_set: tid={} cpuset_enabled=false cpus={}", tid, cpus.to_range_string());
     }
     // 再设置 CPU 亲和性 (已正确则跳过)
     if !affinity_ok {
         if let Err(e) = cpus.set_affinity(tid) {
-            eprintln!("KPM affinity_set: tid={} sched_setaffinity ERR {} (ESRCH={})", tid, e, e.raw_os_error() == Some(libc::ESRCH));
+            kpm_log!("KPM affinity_set: tid={} sched_setaffinity ERR {} (ESRCH={})", tid, e, e.raw_os_error() == Some(libc::ESRCH));
             return e.raw_os_error() == Some(libc::ESRCH);
         }
-        eprintln!("KPM affinity_set: tid={} sched_setaffinity OK cpus={}", tid, cpus.to_range_string());
+        kpm_log!("KPM affinity_set: tid={} sched_setaffinity OK cpus={}", tid, cpus.to_range_string());
     } else {
-        eprintln!("KPM affinity_set: tid={} already ok cpus={}", tid, cpus.to_range_string());
+        kpm_log!("KPM affinity_set: tid={} already ok cpus={}", tid, cpus.to_range_string());
     }
     false
 }
