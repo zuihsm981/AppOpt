@@ -216,11 +216,13 @@ pub fn kpm_probe() -> bool {
 pub fn ebpf_init() -> Option<EbpfState> {
     let key = kpm_key();
     if !kp_ready(&key) {
+        eprintln!("KPM: KernelPatch 未就绪, 回退到 /proc 轮询");
         return None;
     }
 
     let handle = KpmHandle { key };
     if !handle.verify_loaded() {
+        eprintln!("KPM: appopt-kpm 模块未加载 (请用 APatch 管理器加载), 回退到 /proc 轮询");
         return None;
     }
 
@@ -236,6 +238,7 @@ pub fn ebpf_init() -> Option<EbpfState> {
     let (tx, rx) = mpsc::channel::<EbpfProcEvent>();
     let wakeup_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     if wakeup_fd < 0 {
+        eprintln!("KPM: eventfd 创建失败, 回退到 /proc 轮询");
         return None;
     }
 
@@ -249,6 +252,7 @@ pub fn ebpf_init() -> Option<EbpfState> {
      * + input_on(武装 input kprobe)。不再依赖 main.rs 的条件分支, 模块自动启动即激活。 */
     handle.activate();
 
+    println!("KPM: 事件驱动初始化成功 (appopt-kpm)");
 
     Some(EbpfState {
         event_rx: rx,
@@ -270,12 +274,14 @@ fn kpm_reader(key: CString, tx: mpsc::Sender<EbpfProcEvent>, wakeup_fd: c_int) {
     // epoll: 仅监听 wakeup_fd, 用 50ms 超时轮询 drain
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epfd < 0 {
+        eprintln!("KPM: epoll_create1 失败");
         return;
     }
     let mut wake_ev: libc::epoll_event = unsafe { std::mem::zeroed() };
     wake_ev.events = libc::EPOLLIN as u32;
     wake_ev.u64 = 1;
     if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, wakeup_fd, &mut wake_ev) } < 0 {
+        eprintln!("KPM: epoll_ctl ADD wakeup_fd 失败");
         unsafe { libc::close(epfd) };
         return;
     }
@@ -333,8 +339,10 @@ fn kpm_reader(key: CString, tx: mpsc::Sender<EbpfProcEvent>, wakeup_fd: c_int) {
 /// 配置白名单; 返回 true 表示需重载 (KPM 白名单容量固定 16384, 不会触发)
 pub fn comm_map_init(bpf: &mut KpmHandle, pkgs: &HashSet<String>, _comm_capacity: u32) -> bool {
     if !bpf.set_whitelist(pkgs) {
+        eprintln!("KPM: 白名单配置失败");
         return true;
     }
+    println!("KPM: 白名单已配置, {} 个包名", pkgs.len());
     false
 }
 
@@ -371,6 +379,8 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
     let pid = event.pid;
     let comm = comm_str(&event.comm);
 
+    eprintln!("KPM event: type={} pid={} tid={} comm='{}'", event.event_type, pid, tid, comm);
+
     match event.event_type {
         EBPF_EVENT_EXIT => {
             state.cache.task_del(tid);
@@ -384,8 +394,13 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
             }
 
         EBPF_EVENT_FORK => {
-            // 子线程继承父线程亲和性与 cpuset
-            // 内核态已插入 APPLIED 表占位, RENAME 时触发完整处理
+            /* 修复: FORK 事件也调用 event_apply 处理
+             * 原因: 父进程已在 APPLIED 表时, child_tid 已被 bitmask=0 占位;
+             * event_apply 通过 cache.pkg_lookup_comm 回退到父进程的 pkg,
+             * 调用 task_apply 重新以正确的 cpuset 设置子进程亲和性;
+             * 若父进程仅白名单匹配(未在 APPLIED), 子进程在后续 RENAME 事件中
+             * 会重新走 whitelist_matched 检查并正确匹配 */
+            event_apply(&mut state.cache, &state.bpf, tid, pid, comm, cfg);
         }
 
         EBPF_EVENT_RENAME => {
@@ -410,6 +425,7 @@ fn event_apply(
     cfg: &AppConfig,
 ) -> bool {
     let pkg_result = cache.pkg_lookup_comm(pid, comm, cfg);
+    eprintln!("KPM event_apply: pid={} tid={} comm='{}' pkg={:?}", pid, tid, comm, pkg_result);
     let Some(pkg) = pkg_result else {
         return false;
     };
