@@ -1,9 +1,9 @@
 use std::ffi::CString;
 
 use crate::apply_affinity::read_cmdline;
+use crate::MAX_THREAD_LEN;
 use crate::config::AppConfig;
 use crate::cpuset::{ensure_cpuset_dir, CpuSet};
-use crate::MAX_THREAD_LEN;
 
 /// 线程亲和性计算结果
 pub struct AffinityResult {
@@ -93,8 +93,7 @@ pub fn comm_to_pkg(pid: i32, comm: &str, cfg: &AppConfig) -> Option<String> {
         // 支持子进程: com.bilibili.app.in:download → com.bilibili.app.in
         if let Some(cmd) = read_cmdline(pid) {
             for pkg in &cfg.pkgs {
-                // 修复类型不匹配：cmd 是 String，pkg 是 &String，需解引用或调用 as_str()
-                if cmd == *pkg || cmd.starts_with(&format!("{}:", pkg)) {
+                if cmd == pkg.as_str() || cmd.starts_with(&format!("{}:", pkg)) {
                     return Some(pkg.clone());
                 }
             }
