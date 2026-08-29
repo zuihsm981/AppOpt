@@ -366,7 +366,7 @@ fn affinity_apply(
     eprintln!("KPM affinity_apply: tid={} cpus={} cpuset_dir='{}'", tid, cpus.to_range_string(), cpuset_dir);
     let dead = affinity_set(tid, cpus, cpuset_dir, &cfg.topo);
     if !dead {
-        applied_set(bpf, tid, cpus.bits[0]);
+        applied_set(bpf, tid, cpus);
         eprintln!("KPM affinity_apply: tid={} applied_set bits={:#x}", tid, cpus.bits[0]);
     }
     dead
