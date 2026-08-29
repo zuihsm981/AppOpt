@@ -269,12 +269,15 @@ fn main() {
         {
             ebpf_retry_at = Instant::now();
             if let Some(mut new_es) = ebpf_init() {
+                debug_log("main: ebpf_init returned Some, calling comm_map_init");
                 if comm_map_init(&mut new_es.bpf, &cfg.pkgs, new_es.comm_capacity) {
+                    debug_log("main: comm_map_init FAILED (capacity), staying /proc");
                     eprintln!("KPM: 白名单容量不足，保持 /proc 轮询");
                     if mode == 0 {
                         EBPF_GAVE_UP.store(true, Ordering::Relaxed);
                     }
                 } else {
+                    debug_log("main: comm_map_init ok, calling full_scan + activate");
                     println!("工作模式切换: KPM 事件驱动");
                     full_scan(&cfg, &mut new_es);
                     debug_log("main: about to call activate() [mode-switch path]");
@@ -307,10 +310,13 @@ fn main() {
         if need_reload {
             ebpf_state = None;
             if let Some(mut new_es) = ebpf_init() {
+                debug_log("main: [reload] ebpf_init returned Some, calling comm_map_init");
                 if comm_map_init(&mut new_es.bpf, &cfg.pkgs, new_es.comm_capacity) {
+                    debug_log("main: [reload] comm_map_init FAILED, fallback /proc");
                     eprintln!("KPM: 重载后白名单容量仍不足，回退到 /proc 轮询");
                     continue;
                 }
+                debug_log("main: [reload] comm_map_init ok, calling full_scan + activate");
                 full_scan(&cfg, &mut new_es);
                 debug_log("main: about to call activate() [reload path]");
                 new_es.bpf.activate();   /* AppOpt 初始化完成后才让 KPM 注册钩子 */
