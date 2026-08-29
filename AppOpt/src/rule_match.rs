@@ -1,5 +1,6 @@
 use std::ffi::CString;
 
+use crate::apply_affinity::read_cmdline;
 use crate::MAX_THREAD_LEN;
 use crate::config::AppConfig;
 use crate::cpuset::{ensure_cpuset_dir, CpuSet};
@@ -81,12 +82,21 @@ fn fnmatch_c(pattern: &CString, string: &str) -> bool {
     unsafe { libc::fnmatch(pattern.as_ptr(), buf.as_ptr() as *const _, libc::FNM_NOESCAPE) == 0 }
 }
 
-/// 通过内核 comm 匹配配置包名
-pub fn comm_to_pkg(comm: &str, cfg: &AppConfig) -> Option<String> {
+/// 通过内核 comm 匹配配置包名。长 comm(≥15字节, 可能被 16 字节上限截断)时,
+/// 通过 /proc/<pid>/cmdline 读取完整命令匹配白名单, 避免前缀/后缀误杀。
+pub fn comm_to_pkg(pid: i32, comm: &str, cfg: &AppConfig) -> Option<String> {
     if cfg.pkgs.contains(comm) {
         return Some(comm.to_string());
     }
     if comm.len() >= 15 {
+        // 优先用 cmdline 完整命令匹配 (comm 截断后前缀/后缀可能匹配到错误包)
+        if let Some(cmd) = read_cmdline(pid) {
+            for pkg in &cfg.pkgs {
+                if cmd == pkg || cmd.starts_with(pkg) {
+                    return Some(pkg.clone());
+                }
+            }
+        }
         for pkg in &cfg.pkgs {
             if pkg.starts_with(comm) {
                 return Some(pkg.clone());
