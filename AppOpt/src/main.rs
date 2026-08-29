@@ -326,14 +326,6 @@ fn main() {
                     ebpf_dead = true;
                 }
             }
-            /* 定期 affinity_sync 作为事件驱动的补偿:
-             * KPM 事件在任务刚创建/改名时触发, 此时 Android 可能尚未完成 cpuset 迁移,
-             * 直接写 AppOpt cpuset 会被 EINVAL 拒绝。定期重放 cache 中任务的
-             * affinity_set(含 cpuset 归属), 在任务状态稳定后保证最终进入 AppOpt。 */
-            if affinity_deadline.elapsed() >= Duration::from_secs(5 * interval) {
-                es.cache.affinity_sync(&cfg.topo);
-                affinity_deadline = Instant::now();
-            }
         } else {
             let cache = proc_state.get_or_insert_with(ProcScanState::new);
             if config_changed {
