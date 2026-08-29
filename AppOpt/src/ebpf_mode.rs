@@ -379,6 +379,8 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
     let pid = event.pid;
     let comm = comm_str(&event.comm);
 
+    eprintln!("KPM event: type={} pid={} tid={} comm='{}'", event.event_type, pid, tid, comm);
+
     match event.event_type {
         EBPF_EVENT_EXIT => {
             state.cache.task_del(tid);
@@ -417,7 +419,9 @@ fn event_apply(
     comm: &str,
     cfg: &AppConfig,
 ) -> bool {
-    let Some(pkg) = cache.pkg_lookup_comm(pid, comm, cfg) else {
+    let pkg_result = cache.pkg_lookup_comm(pid, comm, cfg);
+    eprintln!("KPM event_apply: pid={} tid={} comm='{}' pkg={:?}", pid, tid, comm, pkg_result);
+    let Some(pkg) = pkg_result else {
         return false;
     };
 
