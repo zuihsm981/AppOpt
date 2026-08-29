@@ -378,7 +378,7 @@ fn affinity_apply(
         }
     };
     if !dead {
-        applied_set(bpf, tid, cpus.bits[0]);
+        applied_set(bpf, tid, cpus);
         eprintln!("KPM affinity_apply: tid={} applied_set bits={:#x}", tid, cpus.bits[0]);
     }
     dead
