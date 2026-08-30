@@ -65,13 +65,11 @@ pub fn cache_stats(cache: &ProcCache) -> (usize, usize) {
 pub fn web_start() {
     let listener = match TcpListener::bind(("127.0.0.1", WEB_PORT)) {
         Ok(l) => l,
-        Err(e) => {
-            eprintln!("Web: 监听 127.0.0.1:{} 失败 ({})", WEB_PORT, e);
+        Err(_) => {
             return;
         }
     };
     WEB_ENABLED.store(true, Ordering::Release);
-    println!("Web: 前端已启用 http://127.0.0.1:{}/", WEB_PORT);
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             thread::spawn(move || conn_handle(stream));
@@ -666,9 +664,7 @@ impl Settings {
                 f.sync_all()
             })
             .and_then(|_| fs::rename(&tmp, path));
-        if let Err(e) = res {
-            eprintln!("警告: 设置写入 {} 失败: {}", path, e);
-        }
+        let _ = res;
     }
 }
 
@@ -676,21 +672,14 @@ pub fn settings_load(path: &str) -> Settings {
     match fs::read_to_string(path) {
         Ok(text) => match serde_json::from_str::<Value>(&text) {
             Ok(v) => Settings::from_json(&v),
-            Err(e) => {
-                eprintln!("警告: {} 已损坏({})，使用默认设置", path, e);
-                Settings::default()
-            }
+            Err(_) => Settings::default(),
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let d = Settings::default();
             d.save(path);
-            println!("设置文件不存在，已写入默认设置: {}", path);
             d
         }
-        Err(e) => {
-            eprintln!("警告: 读取 {} 失败({})，使用默认设置", path, e);
-            Settings::default()
-        }
+        Err(_) => Settings::default(),
     }
 }
 
