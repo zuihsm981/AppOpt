@@ -213,6 +213,10 @@ fn main() {
 
     let mut proc_state: Option<ProcScanState> = None;
     let mut affinity_deadline = Instant::now();
+    /* KPM 事件空闲触发: 收到 RENAME/EXEC 时只记录; 事件空闲 3 秒(应用完全启动)
+     * 后执行一次 affinity_sync (先 cpuset 后亲和性), 只执行一次, 直到再次收到事件 */
+    let mut last_kpm_event = Instant::now();
+    let mut kpm_pending_sync = false;
     let prog_start = Instant::now();
     let mut web_stats_deadline = Instant::now();
     // 预支 60 秒使首次重试立即到期
@@ -314,17 +318,30 @@ fn main() {
         }
 
         if let Some(es) = ebpf_state.as_mut() {
-            match es.event_rx.recv_timeout(Duration::from_secs(1)) {
+            let got_event = match es.event_rx.recv_timeout(Duration::from_secs(1)) {
                 Ok(event) => {
                     event_dispatch(&event, &cfg, es);
                     while let Ok(event) = es.event_rx.try_recv() {
                         event_dispatch(&event, &cfg, es);
                     }
+                    true
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => false,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     ebpf_dead = true;
+                    false
                 }
+            };
+            if got_event {
+                /* 事件活跃: 只记录 (affinity_apply 仅更新 APPLIED), 标记待 sync */
+                last_kpm_event = Instant::now();
+                kpm_pending_sync = true;
+            } else if kpm_pending_sync && last_kpm_event.elapsed() >= Duration::from_secs(3) {
+                /* 事件空闲 3 秒 (应用完全启动, 任务稳定):
+                 * 执行一次 affinity_sync (遍历 cache, 先 cpuset 后亲和性),
+                 * 只执行一次, 直到再次收到新事件 */
+                es.cache.affinity_sync(&cfg.topo);
+                kpm_pending_sync = false;
             }
         } else {
             let cache = proc_state.get_or_insert_with(ProcScanState::new);
