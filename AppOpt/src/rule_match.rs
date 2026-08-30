@@ -109,19 +109,28 @@ pub fn comm_to_pkg(pid: i32, comm: &str, cfg: &AppConfig) -> Option<String> {
             }
         }
     }
-    // 8 字节键滑动匹配 (与内核 KPM whitelist_matched 一致):
-    // 包名前 8 / 末 8 字节, 在 comm 上做 8 字节窗口滑动。
-    // 覆盖子进程 comm 截断片段, 如 comm="bilibili.app.in:ijk" 含 "i.app.in" (包名末 8 字节)。
-    if comm.len() >= 8 {
+    // 8 字节键滑动 + 变长前缀比较 (与内核 KPM whitelist_matched 完全一致):
+    // 键 = 包名前 8 / 末 8 字节 (不足 8 时按实际长度, 等价于遇 \0 停止);
+    // 窗口位置 pos 0..=8 (comm 上限 16, 16-8=8), 每个窗口对键做前缀比较。
+    // 覆盖短包名 (如 "com.via" 前缀 7 字节可匹配 comm="com.via:thread")
+    // 与子进程 comm 截断片段 (如 comm="bilibili.app.in:ijk" 含 末 8 字节键 "i.app.in")。
+    if !comm.is_empty() {
         let cb = comm.as_bytes();
-        let max_pos = cb.len() - 8;
-        for pkg in &cfg.pkgs {
-            let pb = pkg.as_bytes();
-            let prefix8 = pb.get(..8).unwrap_or(pb);
-            let suffix8 = if pb.len() > 8 { pb.get(pb.len() - 8..).unwrap_or(pb) } else { prefix8 };
-            for pos in 0..=max_pos {
-                if &cb[pos..pos + 8] == prefix8 || &cb[pos..pos + 8] == suffix8 {
+        for pos in 0..=8usize {
+            if pos >= cb.len() {
+                break;
+            }
+            for pkg in &cfg.pkgs {
+                let pb = pkg.as_bytes();
+                let prefix8 = &pb[..pb.len().min(8)];
+                if cb[pos..].starts_with(prefix8) {
                     return Some(pkg.clone());
+                }
+                if pb.len() > 8 {
+                    let suffix8 = &pb[pb.len() - 8..];
+                    if cb[pos..].starts_with(suffix8) {
+                        return Some(pkg.clone());
+                    }
                 }
             }
         }
