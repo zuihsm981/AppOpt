@@ -497,8 +497,8 @@ fn applied_clear(bpf: &KpmHandle) {
 fn affinity_apply(
     tid: i32,
     cpus: &CpuSet,
-    cpuset_dir: &str,
-    cfg: &AppConfig,
+    _cpuset_dir: &str,
+    _cfg: &AppConfig,
     bpf: &KpmHandle,
 ) -> bool {
     applied_set(bpf, tid, cpus);
