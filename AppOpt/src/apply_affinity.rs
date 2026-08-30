@@ -94,7 +94,7 @@ pub fn affinity_set(
         } else {
             format!("{}/{}/tasks", base_cpuset(), cpuset_dir)
         };
-        match fs::OpenOptions::new().append(true).open(&tasks_path) {
+        match fs::OpenOptions::new().write(true).open(&tasks_path) {
             Ok(mut f) => {
                 if let Err(e) = writeln!(f, "{}", tid) {
                     kpm_log!("KPM affinity_set: tid={} cpuset '{}' WRITE FAIL: {} (errno={})", tid, tasks_path, e, e.raw_os_error().unwrap_or(-1));
