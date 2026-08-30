@@ -37,11 +37,6 @@ pub const EBPF_EVENT_EXEC: u32 = 2;
 pub const EBPF_EVENT_RENAME: u32 = 3;
 pub const EBPF_EVENT_EXIT: u32 = 4;
 pub const EBPF_EVENT_INPUT: u32 = 5;
-/// 空闲信号 (非真实进程事件): reader 线程收到 FORK/EXEC/RENAME 事件后启动 1 秒周期定时器,
-/// 每 1 秒发一次空闲信号 → 主线程执行一次 affinity_sync (延迟 cpuset 放置 + 亲和性设置),
-/// 持续有此类事件则持续每 1 秒同步, 直到无此类事件 (当前 1 秒周期内未收到) 停止。
-/// EXIT/INPUT 事件不触发同步。
-pub const EBPF_EVENT_IDLE: u32 = 0;
 
 /* ================= KernelPatch SuperCall 传输 ================= */
 
@@ -308,31 +303,13 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
     })
 }
 
-/// 启动 timerfd 周期定时器: 从当前时刻起每 secs 秒触发一次 (周期模式)
-fn arm_timer(tfd: c_int, secs: i64) {
-    let new_value = libc::itimerspec {
-        it_interval: libc::timespec { tv_sec: secs, tv_nsec: 0 },
-        it_value: libc::timespec { tv_sec: secs, tv_nsec: 0 },
-    };
-    unsafe { libc::timerfd_settime(tfd, 0, &new_value, std::ptr::null_mut()); }
-}
-
-/// 停止 timerfd (清空定时器, 一次性/周期均取消)
-fn disarm_timer(tfd: c_int) {
-    let new_value = libc::itimerspec {
-        it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
-        it_value: libc::timespec { tv_sec: 0, tv_nsec: 0 },
-    };
-    unsafe { libc::timerfd_settime(tfd, 0, &new_value, std::ptr::null_mut()); }
-}
-
 fn kpm_reader(key: CString, tx: mpsc::Sender<EbpfProcEvent>, wakeup_fd: c_int, kpm_wake_fd: c_int) {
     let name = CString::new("KpmReader").unwrap();
     unsafe {
         libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
     }
 
-    // epoll: 监听 wakeup_fd (退出信号) + timerfd (事件空闲延迟触发)
+    // epoll: 仅监听 wakeup_fd (退出信号); 事件处理由主循环 drain mpsc 完成
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epfd < 0 {
         return;
@@ -344,81 +321,30 @@ fn kpm_reader(key: CString, tx: mpsc::Sender<EbpfProcEvent>, wakeup_fd: c_int, k
         unsafe { libc::close(epfd) };
         return;
     }
-    // timerfd: 收到事件时启动 1 秒周期定时器; 每 1 秒触发发空闲信号 → affinity_sync,
-    // 持续有事件则持续每 1 秒同步, 直到无事件 (当前 1 秒周期内未收到事件) 停止
-    let tfd = unsafe {
-        libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC | libc::TFD_NONBLOCK)
-    };
-    if tfd < 0 {
-        unsafe { libc::close(epfd) };
-        return;
-    }
-    let mut timer_ev: libc::epoll_event = unsafe { std::mem::zeroed() };
-    timer_ev.events = libc::EPOLLIN as u32;
-    timer_ev.u64 = 2;
-    if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, tfd, &mut timer_ev) } < 0 {
-        unsafe { libc::close(tfd) };
-        unsafe { libc::close(epfd) };
-        return;
-    }
 
-    let mut events: [libc::epoll_event; 2] = unsafe { std::mem::zeroed() };
+    let mut events: [libc::epoll_event; 1] = unsafe { std::mem::zeroed() };
     // 单次 drain 缓冲: 8KB, 约 292 个事件
     let mut buf = vec![0u8; 8192];
-    // timerfd 周期状态: timer_armed 定时器是否在运行; activity 当前 1 秒周期内是否收到过真实事件
-    let mut timer_armed = false;
-    let mut activity = false;
 
     loop {
-        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 2, 50) };
+        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 1, 100) };
         if n < 0 {
             if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
             break;
         }
-        // 处理 wakeup/timerfd 就绪
+        // 处理 wakeup 就绪 (退出信号)
         for i in 0..n {
             let e = &events[i as usize];
             if e.u64 == 1 {
                 // wakeup: 退出
-                unsafe { libc::close(tfd) };
                 unsafe { libc::close(epfd) };
                 return;
             }
-            if e.u64 == 2 {
-                // timerfd 周期触发: 事件流活跃时每 1 秒发一次空闲信号 → affinity_sync
-                if activity {
-                    let idle = EbpfProcEvent {
-                        pid: 0,
-                        tid: 0,
-                        comm: [0u8; 16],
-                        event_type: EBPF_EVENT_IDLE,
-                    };
-                    if tx.send(idle).is_err() {
-                        unsafe { libc::close(tfd) };
-                        unsafe { libc::close(epfd) };
-                        return;
-                    }
-                    // 唤醒主循环处理 IDLE (affinity_sync)
-                    let val: u64 = 1;
-                    let _ = unsafe { libc::write(kpm_wake_fd, &val as *const u64 as *const _, 8) };
-                    // 进入下一个 1 秒周期
-                    activity = false;
-                } else {
-                    // 当前周期无真实事件: 事件流已停止, 停止周期定时器 (直到下次事件重新启动)
-                    disarm_timer(tfd);
-                    timer_armed = false;
-                }
-                // 清空 timerfd 计数
-                let mut tmp = [0u8; 8];
-                let _ = unsafe { libc::read(tfd, tmp.as_mut_ptr() as *mut _, 8) };
-            }
         }
 
-        // 轮询 drain, 直到暂时无事件
-        // 只有收到 FORK/EXEC/RENAME 事件才视为需要同步 (EXIT/INPUT 不触发 affinity_sync)
-        let mut need_sync = false;
+        // 轮询 drain, 直到暂时无事件 (事件全部转发给主循环处理)
         loop {
             let args = CString::new("drain").unwrap_or_default();
             let got = unsafe {
@@ -436,14 +362,7 @@ fn kpm_reader(key: CString, tx: mpsc::Sender<EbpfProcEvent>, wakeup_fd: c_int, k
             while off + ev_sz <= bytes {
                 let event: EbpfProcEvent =
                     unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off) as *const EbpfProcEvent) };
-                if event.event_type == EBPF_EVENT_FORK
-                    || event.event_type == EBPF_EVENT_EXEC
-                    || event.event_type == EBPF_EVENT_RENAME
-                {
-                    need_sync = true;
-                }
                 if tx.send(event).is_err() {
-                    unsafe { libc::close(tfd) };
                     unsafe { libc::close(epfd) };
                     return;
                 }
@@ -457,17 +376,7 @@ fn kpm_reader(key: CString, tx: mpsc::Sender<EbpfProcEvent>, wakeup_fd: c_int, k
                 break;
             }
         }
-        // 收到 FORK/EXEC/RENAME: 标记当前周期活跃; 若定时器未运行则启动 1 秒周期定时器
-        // (持续有此类事件 → 每 1 秒发一次 IDLE → 主线程 affinity_sync; 无此类事件 → 下个周期停止)
-        if need_sync {
-            activity = true;
-            if !timer_armed {
-                arm_timer(tfd, 1);
-                timer_armed = true;
-            }
-        }
     }
-    unsafe { libc::close(tfd) };
     unsafe { libc::close(epfd) };
 }
 
@@ -587,8 +496,8 @@ pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
     });
 
     /* full_scan 本身包含实际应用: 立即对 cache 内全部任务执行
-     * affinity_sync (cpuset 放置 + sched_setaffinity)。
+     * affinity_sync (仅设置 CPU 亲和性, 不做 cpuset 放置)。
      * 依赖此点: 配置更新后无论是否有后续进程事件, 亲和性都会立即生效,
-     * 不等待 IDLE 事件; 调用方无需在 full_scan 后再调一次 affinity_sync。 */
+     * 不依赖事件驱动定时; 调用方无需在 full_scan 后再调一次 affinity_sync。 */
     state.cache.affinity_sync(&cfg.topo);
 }
