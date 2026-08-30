@@ -8,12 +8,9 @@ use crate::rule_match::comm_to_pkg;
 
 /// 栈上构建 /proc/{pid}/{suffix} 路径读取文件
 fn read_proc_file<'a>(pid: i32, suffix: &str, buf: &'a mut [u8]) -> Option<&'a [u8]> {
-    let mut path = [0u8; 32];
-    let mut cur = std::io::Cursor::new(&mut path[..]);
-    write!(cur, "/proc/{}/{}", pid, suffix).ok()?;
-    let len = cur.position() as usize;
-    let path_str = std::str::from_utf8(&path[..len]).ok()?;
-    let file = fs::File::open(path_str).ok()?;
+    // 使用 format! 动态构建路径，避免固定缓冲区溢出的风险
+    let path = format!("/proc/{}/{}", pid, suffix);
+    let file = fs::File::open(&path).ok()?;
     let n = file.read_at(buf, 0).ok()?;
     (n > 0).then_some(&buf[..n])
 }
@@ -43,12 +40,9 @@ pub(crate) fn tid_comm(tid: i32) -> Option<String> {
 }
 
 pub(crate) fn task_tids(pid: i32) -> Option<Vec<i32>> {
-    let mut path_buf = [0u8; 32];
-    let mut cur = std::io::Cursor::new(&mut path_buf[..]);
-    write!(cur, "/proc/{}/task", pid).ok()?;
-    let len = cur.position() as usize;
-    let task_path = std::str::from_utf8(&path_buf[..len]).unwrap();
-    let task_dir = fs::read_dir(task_path).ok()?;
+    // 使用 format! 动态构建路径
+    let task_path = format!("/proc/{}/task", pid);
+    let task_dir = fs::read_dir(&task_path).ok()?;
     Some(
         task_dir
             .flatten()
