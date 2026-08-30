@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use crate::config::{config_loader, init_inotify, load_config, CHECK_INTERVAL, CONFIG_FILE, CURRENT_CONFIG};
 use crate::cpuset::{init_cpu_topo, set_base_cpuset};
 use crate::ebpf_mode::{
-    full_scan, event_dispatch, comm_map_init,
+    full_scan, event_dispatch, comm_map_init, EBPF_EVENT_IDLE,
     ebpf_init, EbpfState,
 };
 use crate::proc_mode::{cache_sync, ProcScanState};
@@ -43,10 +43,7 @@ pub static CONFIG_UPDATED: AtomicBool = AtomicBool::new(false);
 pub static EBPF_GAVE_UP: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn lock_ignore_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|e| {
-        eprintln!("警告: 互斥锁中毒，尝试恢复...");
-        e.into_inner()
-    })
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn print_help(prog_name: &str) {
@@ -97,7 +94,6 @@ fn main() {
                 i += 1;
                 if i < args.len() {
                     cli_cfg = Some(args[i].clone());
-                    println!("配置文件: {}", args[i]);
                 } else {
                     eprintln!("错误: -c 需要指定配置文件路径");
                     process::exit(1);
@@ -115,7 +111,6 @@ fn main() {
                         }
                     };
                     cli_interval = Some(val);
-                    println!("检查间隔: {} 秒", val);
                 } else {
                     eprintln!("错误: -s 需要指定时间间隔");
                     process::exit(1);
@@ -133,7 +128,6 @@ fn main() {
                         eprintln!("目录名不能为空或包含路径分隔符");
                         process::exit(1);
                     }
-                    println!("cpuset 目录名: {}", args[i]);
                 } else {
                     eprintln!("错误: -b 需要指定 cpuset 目录名");
                     process::exit(1);
@@ -173,9 +167,7 @@ fn main() {
 
     if fs::metadata(&config_file).is_err() {
         let initial_content = "# 规则编写与使用说明请参考 http://AppOpt.suto.top\n\n";
-        if fs::write(&config_file, initial_content).is_ok() {
-            println!("配置文件不存在，重建一个空的配置文件: {}", config_file);
-        }
+        let _ = fs::write(&config_file, initial_content);
     }
 
     {
@@ -213,10 +205,6 @@ fn main() {
 
     let mut proc_state: Option<ProcScanState> = None;
     let mut affinity_deadline = Instant::now();
-    /* KPM 事件空闲触发: 收到 RENAME/EXEC 时只记录; 事件空闲 3 秒(应用完全启动)
-     * 后执行一次 affinity_sync (先 cpuset 后亲和性), 只执行一次, 直到再次收到事件 */
-    let mut last_kpm_event = Instant::now();
-    let mut kpm_pending_sync = false;
     let prog_start = Instant::now();
     let mut web_stats_deadline = Instant::now();
     // 预支 60 秒使首次重试立即到期
@@ -226,8 +214,6 @@ fn main() {
 
     // 刷新率控制模块，独立线程运行，通过 eBPF 事件驱动
     refresh::refresh_init();
-
-    println!("启动AppOpt服务 v{}", env!("CARGO_PKG_VERSION"));
 
     // 恢复的强制 proc 模式无需 eBPF 初始化
     let mut ebpf_state: Option<EbpfState> =
@@ -249,13 +235,11 @@ fn main() {
 
         // 配置加载线程 panic 恢复
         if config_handle.is_finished() {
-            eprintln!("警告: 配置加载线程异常退出，尝试重启...");
             config_handle = thread::spawn(config_loader);
         }
 
         // 强制 /proc 时卸载 eBPF 并触发全量扫描
         if mode == 2 && ebpf_state.is_some() {
-            println!("工作模式切换: /proc 轮询");
             ebpf_state = None;
             let cache = proc_state.get_or_insert_with(ProcScanState::new);
             cache.scan_all_proc = true;
@@ -273,12 +257,10 @@ fn main() {
             ebpf_retry_at = Instant::now();
             if let Some(mut new_es) = ebpf_init() {
                 if comm_map_init(&mut new_es.bpf, &cfg.pkgs, new_es.comm_capacity) {
-                    eprintln!("KPM: 白名单容量不足，保持 /proc 轮询");
                     if mode == 0 {
                         EBPF_GAVE_UP.store(true, Ordering::Relaxed);
                     }
                 } else {
-                    println!("工作模式切换: KPM 事件驱动");
                     full_scan(&cfg, &mut new_es);
                     ebpf_state = Some(new_es);
                     affinity_deadline = Instant::now();
@@ -308,7 +290,6 @@ fn main() {
             ebpf_state = None;
             if let Some(mut new_es) = ebpf_init() {
                 if comm_map_init(&mut new_es.bpf, &cfg.pkgs, new_es.comm_capacity) {
-                    eprintln!("KPM: 重载后白名单容量仍不足，回退到 /proc 轮询");
                     continue;
                 }
                 full_scan(&cfg, &mut new_es);
@@ -318,30 +299,28 @@ fn main() {
         }
 
         if let Some(es) = ebpf_state.as_mut() {
-            let got_event = match es.event_rx.recv_timeout(Duration::from_secs(1)) {
+            match es.event_rx.recv_timeout(Duration::from_secs(1)) {
                 Ok(event) => {
-                    event_dispatch(&event, &cfg, es);
-                    while let Ok(event) = es.event_rx.try_recv() {
+                    if event.event_type == EBPF_EVENT_IDLE {
+                        /* timerfd 空闲信号: 3 秒无事件 (应用完全启动, 任务稳定),
+                         * 执行一次 affinity_sync (遍历 cache, 先 cpuset 后亲和性)。
+                         * 只执行一次, 下次收到事件后 timerfd 重新计时。 */
+                        es.cache.affinity_sync(&cfg.topo);
+                    } else {
                         event_dispatch(&event, &cfg, es);
                     }
-                    true
+                    while let Ok(event) = es.event_rx.try_recv() {
+                        if event.event_type == EBPF_EVENT_IDLE {
+                            es.cache.affinity_sync(&cfg.topo);
+                        } else {
+                            event_dispatch(&event, &cfg, es);
+                        }
+                    }
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => false,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     ebpf_dead = true;
-                    false
                 }
-            };
-            if got_event {
-                /* 事件活跃: 只记录 (affinity_apply 仅更新 APPLIED), 标记待 sync */
-                last_kpm_event = Instant::now();
-                kpm_pending_sync = true;
-            } else if kpm_pending_sync && last_kpm_event.elapsed() >= Duration::from_secs(3) {
-                /* 事件空闲 3 秒 (应用完全启动, 任务稳定):
-                 * 执行一次 affinity_sync (遍历 cache, 先 cpuset 后亲和性),
-                 * 只执行一次, 直到再次收到新事件 */
-                es.cache.affinity_sync(&cfg.topo);
-                kpm_pending_sync = false;
             }
         } else {
             let cache = proc_state.get_or_insert_with(ProcScanState::new);
@@ -359,7 +338,6 @@ fn main() {
         }
 
         if ebpf_dead {
-            eprintln!("KPM: 事件通道断开，回退到 /proc 轮询");
             ebpf_state = None;
             let cache = proc_state.get_or_insert_with(ProcScanState::new);
             cache.scan_all_proc = true;
