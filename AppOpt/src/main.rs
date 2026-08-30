@@ -17,12 +17,14 @@ mod web;
 use std::env;
 use std::fs;
 use std::process;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use crate::config::{config_loader, init_inotify, load_config, CHECK_INTERVAL, CONFIG_FILE, CURRENT_CONFIG};
+use crate::config::{
+    init_inotify, load_config, inotify_drain,
+    CHECK_INTERVAL, CONFIG_FILE, CONFIG_WAKE_FD, CURRENT_CONFIG,
+};
 use crate::cpuset::{init_cpu_topo, set_base_cpuset};
 use crate::ebpf_mode::{
     full_scan, event_dispatch, comm_map_init, EBPF_EVENT_IDLE,
@@ -31,16 +33,11 @@ use crate::ebpf_mode::{
 use crate::proc_mode::{cache_sync, ProcScanState};
 use crate::web::{
     cache_stats, settings_load, settings_save, web_start, WebStats,
-    WEB_ENABLED, WEB_STATS, MODE_FORCE, SETTINGS_FILE,
+    WEB_ENABLED, WEB_STATS, MODE_FORCE, MODE_SWITCH_FD, SETTINGS_FILE,
 };
 
 pub const MAX_PKG_LEN: usize = 128;
 pub const MAX_THREAD_LEN: usize = 32;
-
-pub static CONFIG_UPDATED: AtomicBool = AtomicBool::new(false);
-
-/// 自动模式下 eBPF 初始化失败后的放弃标记，用户强制切换时清除
-pub static EBPF_GAVE_UP: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn lock_ignore_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
@@ -190,7 +187,6 @@ fn main() {
         let mut guard = lock_ignore_poison(&CURRENT_CONFIG);
         *guard = Some(Arc::new(initial_config));
     }
-    CONFIG_UPDATED.store(true, Ordering::Release);
 
     init_inotify(&config_file);
 
@@ -200,171 +196,256 @@ fn main() {
         settings_save();
     }
 
-    // 守护进程模式，保存 JoinHandle 用于 panic 恢复检测
-    let mut config_handle = thread::spawn(config_loader);
-
-    let mut proc_state: Option<ProcScanState> = None;
-    let mut affinity_deadline = Instant::now();
-    let prog_start = Instant::now();
-    let mut web_stats_deadline = Instant::now();
-    // 预支 60 秒使首次重试立即到期
-    let mut ebpf_retry_at = Instant::now()
-        .checked_sub(Duration::from_secs(60))
-        .unwrap_or_else(Instant::now);
-
     // 刷新率控制模块，独立线程运行，通过 eBPF 事件驱动
     refresh::refresh_init();
 
-    // 恢复的强制 proc 模式无需 eBPF 初始化
-    let mut ebpf_state: Option<EbpfState> =
-        if MODE_FORCE.load(Ordering::Relaxed) == 2 { None } else { ebpf_init() };
-    // 仅自动模式失败一次即放弃；强制 eBPF 需持续重试，强制 proc 无需 eBPF
-    if ebpf_state.is_none() && MODE_FORCE.load(Ordering::Relaxed) == 0 {
-        EBPF_GAVE_UP.store(true, Ordering::Relaxed);
+    let prog_start = Instant::now();
+    let mut proc_state: Option<ProcScanState> = None;
+    let mut ebpf_state: Option<EbpfState> = None;
+
+    // ================= 纯事件驱动主循环 =================
+    // 事件源: KPM 事件唤醒 eventfd / inotify / 模式切换 eventfd / 配置重载 eventfd
+    //          /proc 回退模式的周期 timerfd (仅 KPM 不可用时启用)
+    const EV_KPM: u64 = 1;
+    const EV_INOTIFY: u64 = 2;
+    const EV_MODE: u64 = 3;
+    const EV_CONFIG: u64 = 4;
+    const EV_PROC: u64 = 5;
+
+    let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+    if epfd < 0 {
+        eprintln!("初始化 epoll 失败");
+        process::exit(1);
     }
-
-    loop {
-        // 先 swap CONFIG_UPDATED 再获取 cfg 防止漏更新
-        let config_changed = CONFIG_UPDATED.swap(false, Ordering::AcqRel);
-        let Some(cfg) = lock_ignore_poison(&CURRENT_CONFIG).clone() else {
-            thread::sleep(Duration::from_millis(100));
-            continue;
-        };
-        let interval = CHECK_INTERVAL.load(Ordering::Relaxed).max(1);
-        let mode = MODE_FORCE.load(Ordering::Relaxed);
-
-        // 配置加载线程 panic 恢复
-        if config_handle.is_finished() {
-            config_handle = thread::spawn(config_loader);
+    fn epoll_add(epfd: i32, fd: i32, tag: u64) {
+        if fd < 0 {
+            return;
         }
-
-        // 强制 /proc 时卸载 eBPF 并触发全量扫描
-        if mode == 2 && ebpf_state.is_some() {
-            ebpf_state = None;
-            let cache = proc_state.get_or_insert_with(ProcScanState::new);
-            cache.scan_all_proc = true;
-            cache.last_proc_count = 0;
-            cache.force_affinity = true;
-            affinity_deadline = Instant::now();
+        let mut ev: libc::epoll_event = unsafe { std::mem::zeroed() };
+        ev.events = libc::EPOLLIN as u32;
+        ev.u64 = tag;
+        unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fd, &mut ev) };
+    }
+    fn read_eventfd(fd: i32) {
+        if fd < 0 {
+            return;
         }
-
-        // eBPF 缺失时周期重试，自动模式失败一次后放弃，强制模式持续重试
-        if mode != 2
-            && ebpf_state.is_none()
-            && (mode == 1 || !EBPF_GAVE_UP.load(Ordering::Relaxed))
-            && ebpf_retry_at.elapsed() >= Duration::from_secs(30)
-        {
-            ebpf_retry_at = Instant::now();
-            if let Some(mut new_es) = ebpf_init() {
-                if comm_map_init(&mut new_es.bpf, &cfg.pkgs, new_es.comm_capacity) {
-                    if mode == 0 {
-                        EBPF_GAVE_UP.store(true, Ordering::Relaxed);
-                    }
-                } else {
-                    full_scan(&cfg, &mut new_es);
-                    ebpf_state = Some(new_es);
-                    affinity_deadline = Instant::now();
-                }
-            } else if mode == 0 {
-                EBPF_GAVE_UP.store(true, Ordering::Relaxed);
-            }
-        }
-
-        let mut ebpf_dead = false;
-
-        let need_reload = if let Some(es) = ebpf_state.as_mut() {
-            if config_changed {
-                let r = comm_map_init(&mut es.bpf, &cfg.pkgs, es.comm_capacity);
-                if !r {
-                    full_scan(&cfg, es);
-                }
-                r
-            } else {
-                false
+        let mut buf = [0u8; 8];
+        let _ = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, 8) };
+    }
+    fn arm_periodic(tfd: i32, secs: i64) {
+        let ts = libc::timespec { tv_sec: secs, tv_nsec: 0 };
+        let it = libc::itimerspec { it_interval: ts, it_value: ts };
+        unsafe { libc::timerfd_settime(tfd, 0, &it, std::ptr::null_mut()) };
+    }
+    fn disarm_timerfd(tfd: i32) {
+        let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        let it = libc::itimerspec { it_interval: zero, it_value: zero };
+        unsafe { libc::timerfd_settime(tfd, 0, &it, std::ptr::null_mut()) };
+    }
+    // 配置变更后应用到当前模式: KPM 重载白名单 + 全量扫描; /proc 标记全量重扫
+    fn apply_config(
+        ebpf_state: &mut Option<EbpfState>,
+        proc_state: &mut Option<ProcScanState>,
+        cfg: Option<&crate::config::AppConfig>,
+    ) {
+        let Some(cfg) = cfg else { return };
+        if let Some(es) = ebpf_state.as_mut() {
+            let r = comm_map_init(&mut es.bpf, &cfg.pkgs, es.comm_capacity);
+            if !r {
+                full_scan(cfg, es);
             }
         } else {
-            false
-        };
+            let ps = proc_state.get_or_insert_with(ProcScanState::new);
+            ps.scan_all_proc = true;
+            ps.last_proc_count = 0;
+            ps.force_affinity = true;
+        }
+    }
 
-        if need_reload {
-            ebpf_state = None;
-            if let Some(mut new_es) = ebpf_init() {
-                if comm_map_init(&mut new_es.bpf, &cfg.pkgs, new_es.comm_capacity) {
-                    continue;
+    // KPM 事件唤醒 eventfd: reader 收到事件后写入, 主循环 epoll 唤醒
+    let kpm_wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    epoll_add(epfd, kpm_wake_fd, EV_KPM);
+    // 模式切换 eventfd: web 端修改 MODE_FORCE 后写入
+    let mode_switch_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    MODE_SWITCH_FD.store(mode_switch_fd, Ordering::Relaxed);
+    epoll_add(epfd, mode_switch_fd, EV_MODE);
+    // 配置重载 eventfd: web 端写配置/规则后由 config_reload_now 写入
+    let config_wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    CONFIG_WAKE_FD.store(config_wake_fd, Ordering::Relaxed);
+    epoll_add(epfd, config_wake_fd, EV_CONFIG);
+    // inotify fd: 配置文件修改
+    let inotify_fd = crate::config::INOTIFY_FD.load(Ordering::Acquire);
+    epoll_add(epfd, inotify_fd, EV_INOTIFY);
+    // /proc 回退模式周期 timerfd
+    let proc_timer_fd = unsafe {
+        libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC | libc::TFD_NONBLOCK)
+    };
+    epoll_add(epfd, proc_timer_fd, EV_PROC);
+
+    // 初始 eBPF 初始化 (强制 /proc 模式不尝试)
+    if MODE_FORCE.load(Ordering::Relaxed) != 2 {
+        if let Some(mut es) = ebpf_init(kpm_wake_fd) {
+            let cfg = lock_ignore_poison(&CURRENT_CONFIG).clone();
+            if let Some(cfg) = cfg {
+                if !comm_map_init(&mut es.bpf, &cfg.pkgs, es.comm_capacity) {
+                    full_scan(&cfg, &mut es);
                 }
-                full_scan(&cfg, &mut new_es);
-                ebpf_state = Some(new_es);
             }
+            ebpf_state = Some(es);
+        }
+    }
+    // /proc 模式: 周期 timerfd 立即启动; KPM 模式: 保持 disarm
+    if ebpf_state.is_none() {
+        let interval = CHECK_INTERVAL.load(Ordering::Relaxed).max(1);
+        arm_periodic(proc_timer_fd, interval as i64);
+    }
+
+    let mut events = [unsafe { std::mem::zeroed::<libc::epoll_event>() }; 8];
+
+    loop {
+        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 8, -1) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break;
+        }
+        if n == 0 {
             continue;
         }
 
-        if let Some(es) = ebpf_state.as_mut() {
-            match es.event_rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(event) => {
-                    if event.event_type == EBPF_EVENT_IDLE {
-                        /* timerfd 周期信号: 收到事件后每 1 秒触发一次 (直到无事件),
-                         * 执行 affinity_sync (遍历 cache, 先 cpuset 后亲和性)。 */
-                        es.cache.affinity_sync(&cfg.topo);
-                    } else {
-                        event_dispatch(&event, &cfg, es);
-                    }
-                    while let Ok(event) = es.event_rx.try_recv() {
-                        if event.event_type == EBPF_EVENT_IDLE {
-                            es.cache.affinity_sync(&cfg.topo);
-                        } else {
-                            event_dispatch(&event, &cfg, es);
+        let mut cfg = lock_ignore_poison(&CURRENT_CONFIG).clone();
+        let mut kpm_died = false;
+
+        for i in 0..n as usize {
+            let ev = events[i];
+            match ev.u64 {
+                EV_KPM => {
+                    read_eventfd(kpm_wake_fd);
+                    if let Some(es) = ebpf_state.as_mut() {
+                        loop {
+                            match es.event_rx.try_recv() {
+                                Ok(event) => {
+                                    if event.event_type == EBPF_EVENT_IDLE {
+                                        /* reader 周期信号: 每 1 秒触发一次 (直到无事件),
+                                         * 执行 affinity_sync (遍历 cache, 先 cpuset 后亲和性)。 */
+                                        let Some(cfg) =
+                                            lock_ignore_poison(&CURRENT_CONFIG).clone()
+                                        else {
+                                            continue;
+                                        };
+                                        es.cache.affinity_sync(&cfg.topo);
+                                    } else {
+                                        let Some(cfg) =
+                                            lock_ignore_poison(&CURRENT_CONFIG).clone()
+                                        else {
+                                            continue;
+                                        };
+                                        event_dispatch(&event, &cfg, es);
+                                    }
+                                }
+                                Err(mpsc::TryRecvError::Empty) => break,
+                                Err(mpsc::TryRecvError::Disconnected) => {
+                                    kpm_died = true;
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    ebpf_dead = true;
+                EV_INOTIFY => {
+                    if crate::config::inotify_drain() {
+                        // 配置已重载: 应用到当前模式
+                        cfg = lock_ignore_poison(&CURRENT_CONFIG).clone();
+                        apply_config(&mut ebpf_state, &mut proc_state, cfg.as_ref());
+                    }
                 }
+                EV_MODE => {
+                    read_eventfd(mode_switch_fd);
+                    let mode = MODE_FORCE.load(Ordering::Relaxed);
+                    if mode == 2 {
+                        // 强制 /proc: 卸载 eBPF
+                        if ebpf_state.take().is_some() {
+                            let ps = proc_state.get_or_insert_with(ProcScanState::new);
+                            ps.scan_all_proc = true;
+                            ps.last_proc_count = 0;
+                            ps.force_affinity = true;
+                        }
+                    } else if ebpf_state.is_none() {
+                        // 自动/强制 KPM: 尝试初始化
+                        if let Some(mut es) = ebpf_init(kpm_wake_fd) {
+                            if let Some(cfg) = cfg.as_ref() {
+                                if !comm_map_init(&mut es.bpf, &cfg.pkgs, es.comm_capacity) {
+                                    full_scan(cfg, &mut es);
+                                }
+                            }
+                            ebpf_state = Some(es);
+                        }
+                    } else {
+                        // 已在 KPM 模式: 重新应用配置 (白名单可能变化)
+                        apply_config(&mut ebpf_state, &mut proc_state, cfg.as_ref());
+                    }
+                }
+                EV_CONFIG => {
+                    read_eventfd(config_wake_fd);
+                    cfg = lock_ignore_poison(&CURRENT_CONFIG).clone();
+                    apply_config(&mut ebpf_state, &mut proc_state, cfg.as_ref());
+                }
+                EV_PROC => {
+                    read_eventfd(proc_timer_fd);
+                    // /proc 回退模式周期同步
+                    if ebpf_state.is_none() {
+                        let Some(cfg) = cfg.as_ref() else { continue };
+                        let ps = proc_state.get_or_insert_with(ProcScanState::new);
+                        cache_sync(ps, cfg);
+                        if ps.force_affinity {
+                            ps.cache.affinity_sync(&cfg.topo);
+                            ps.force_affinity = false;
+                        }
+                    }
+                }
+                _ => {}
             }
-        } else {
-            let cache = proc_state.get_or_insert_with(ProcScanState::new);
-            if config_changed {
-                cache.scan_all_proc = true;
-                cache.last_proc_count = 0;
-            }
-            cache_sync(cache, &cfg);
-            if affinity_deadline.elapsed() >= Duration::from_secs(5 * interval) || cache.force_affinity {
-                cache.cache.affinity_sync(&cfg.topo);
-                affinity_deadline = Instant::now();
-                cache.force_affinity = false;
-            }
-            thread::sleep(Duration::from_secs(interval));
         }
 
-        if ebpf_dead {
+        // KPM 通道断开: 回退 /proc 并启动周期 timerfd
+        if kpm_died {
             ebpf_state = None;
-            let cache = proc_state.get_or_insert_with(ProcScanState::new);
-            cache.scan_all_proc = true;
-            cache.last_proc_count = 0;
-            cache.force_affinity = true;
-            affinity_deadline = Instant::now();
+            let ps = proc_state.get_or_insert_with(ProcScanState::new);
+            ps.scan_all_proc = true;
+            ps.last_proc_count = 0;
+            ps.force_affinity = true;
         }
 
-        // web 状态统计，仅状态页可见(在轮询)时执行; 离开状态页/隐藏/关闭即停止,
-        // 低频更新避免高频事件循环下的额外开销
-        if WEB_ENABLED.load(Ordering::Relaxed)
-            && crate::web::web_active()
-            && web_stats_deadline.elapsed() >= Duration::from_secs(2)
-        {
-            web_stats_deadline = Instant::now();
+        // 周期 timerfd 与模式联动: /proc 模式启动, KPM 模式停止
+        let interval = CHECK_INTERVAL.load(Ordering::Relaxed).max(1);
+        if ebpf_state.is_none() {
+            arm_periodic(proc_timer_fd, interval as i64);
+        } else {
+            disarm_timerfd(proc_timer_fd);
+        }
+
+        // web 状态统计: 事件驱动更新 (收到事件时刷新, 不再定时轮询)
+        if WEB_ENABLED.load(Ordering::Relaxed) && crate::web::web_active() {
             let (threads, hit_pkgs) = match (&ebpf_state, &proc_state) {
                 (Some(es), _) => cache_stats(&es.cache),
                 (None, Some(ps)) => cache_stats(&ps.cache),
                 _ => (0, 0),
             };
-            *lock_ignore_poison(&WEB_STATS) = Some(WebStats {
-                rules: cfg.rules.len(),
-                pkgs: cfg.pkgs.len(),
-                hit_pkgs,
-                threads,
-                kpm: ebpf_state.is_some(),
-                uptime: prog_start.elapsed().as_secs(),
-            });
+            if let Some(cfg) = cfg.as_ref() {
+                *lock_ignore_poison(&WEB_STATS) = Some(WebStats {
+                    rules: cfg.rules.len(),
+                    pkgs: cfg.pkgs.len(),
+                    hit_pkgs,
+                    threads,
+                    kpm: ebpf_state.is_some(),
+                    uptime: prog_start.elapsed().as_secs(),
+                });
+            }
         }
     }
+
+    unsafe { libc::close(epfd) };
 }
