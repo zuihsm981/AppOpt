@@ -585,4 +585,10 @@ pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
             });
         }
     });
+
+    /* full_scan 本身包含实际应用: 立即对 cache 内全部任务执行
+     * affinity_sync (cpuset 放置 + sched_setaffinity)。
+     * 依赖此点: 配置更新后无论是否有后续进程事件, 亲和性都会立即生效,
+     * 不等待 IDLE 事件; 调用方无需在 full_scan 后再调一次 affinity_sync。 */
+    state.cache.affinity_sync(&cfg.topo);
 }
