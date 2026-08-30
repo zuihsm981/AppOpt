@@ -302,9 +302,8 @@ fn main() {
             match es.event_rx.recv_timeout(Duration::from_secs(1)) {
                 Ok(event) => {
                     if event.event_type == EBPF_EVENT_IDLE {
-                        /* timerfd 空闲信号: 3 秒无事件 (应用完全启动, 任务稳定),
-                         * 执行一次 affinity_sync (遍历 cache, 先 cpuset 后亲和性)。
-                         * 只执行一次, 下次收到事件后 timerfd 重新计时。 */
+                        /* timerfd 周期信号: 收到事件后每 1 秒触发一次 (直到无事件),
+                         * 执行 affinity_sync (遍历 cache, 先 cpuset 后亲和性)。 */
                         es.cache.affinity_sync(&cfg.topo);
                     } else {
                         event_dispatch(&event, &cfg, es);
