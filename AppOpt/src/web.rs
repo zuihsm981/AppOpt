@@ -19,13 +19,25 @@ use crate::config::{
 use crate::cpuset::{base_cpuset, create_cpuset_dir, parse_cpu_spec, CpuSet, CpuTopology, DEFAULT_CPUSET_NAME};
 use crate::ebpf_mode::kpm_probe;
 use crate::rule_edit::{rule_delete, rule_delete_pkg, rule_rename, rule_upsert, RuleEdit};
-use crate::{lock_ignore_poison, EBPF_GAVE_UP, MAX_PKG_LEN, MAX_THREAD_LEN};
+use crate::{lock_ignore_poison, MAX_PKG_LEN, MAX_THREAD_LEN};
 
 pub const WEB_PORT: u16 = 8889;
 const INDEX_HTML: &str = include_str!("../web/index.html");
 
 pub static MODE_FORCE: AtomicU8 = AtomicU8::new(0);
 pub static WEB_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// 模式切换通知 fd (eventfd): web 端修改 MODE_FORCE 后写入, 唤醒主循环 epoll
+pub static MODE_SWITCH_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// 通知主循环模式已变更 (事件驱动, 不轮询)
+pub fn notify_mode_switch() {
+    let fd = MODE_SWITCH_FD.load(Ordering::Relaxed);
+    if fd >= 0 {
+        let val: u64 = 1;
+        unsafe { libc::write(fd, &val as *const u64 as *const _, 8); }
+    }
+}
 
 pub static WEB_STATS: Mutex<Option<WebStats>> = Mutex::new(None);
 
@@ -560,10 +572,7 @@ fn config_set_api(req: &Request) -> (u16, String) {
 
     if let Some(m) = mode {
         MODE_FORCE.store(m as u8, Ordering::Relaxed);
-        // 用户主动切回 KPM 方向时清除放弃标记允许重试
-        if m != 2 {
-            EBPF_GAVE_UP.store(false, Ordering::Relaxed);
-        }
+        notify_mode_switch();
     }
     if let Some(n) = interval {
         CHECK_INTERVAL.store(n, Ordering::Relaxed);
