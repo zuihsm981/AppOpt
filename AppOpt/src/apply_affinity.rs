@@ -94,30 +94,33 @@ pub fn affinity_set(
         } else {
             format!("{}/{}/tasks", base_cpuset(), cpuset_dir)
         };
-        match fs::OpenOptions::new().write(true).open(&tasks_path) {
+        // 构造待写入数据: tid + 换行 (cpuset tasks 文件格式)
+        let data = format!("{}\n", tid);
+        kpm_log!("cpuset-> '{}' data='{}'", tasks_path, data.trim_end());
+        match fs::OpenOptions::new().append(true).open(&tasks_path) {
             Ok(mut f) => {
-                if let Err(e) = writeln!(f, "{}", tid) {
-                    kpm_log!("KPM affinity_set: tid={} cpuset '{}' WRITE FAIL: {} (errno={})", tid, tasks_path, e, e.raw_os_error().unwrap_or(-1));
+                if let Err(e) = f.write_all(data.as_bytes()) {
+                    kpm_log!("cpuset! FAIL '{}' data='{}' errno={}", tasks_path, data.trim_end(), e.raw_os_error().unwrap_or(-1));
                 } else {
-                    kpm_log!("KPM affinity_set: tid={} cpuset '{}' OK", tid, tasks_path);
+                    kpm_log!("cpuset! OK  '{}' data='{}'", tasks_path, data.trim_end());
                 }
             }
             Err(e) => {
-                kpm_log!("KPM affinity_set: tid={} cpuset '{}' OPEN FAIL: {} (errno={})", tid, tasks_path, e, e.raw_os_error().unwrap_or(-1));
+                kpm_log!("cpuset! OPENFAIL '{}' errno={}", tasks_path, e.raw_os_error().unwrap_or(-1));
             }
         }
     } else {
-        kpm_log!("KPM affinity_set: tid={} cpuset_enabled=false cpus={}", tid, cpus.to_range_string());
+        kpm_log!("cpuset! disabled cpus={}", cpus.to_range_string());
     }
     // 再设置 CPU 亲和性 (已正确则跳过)
     if !affinity_ok {
         if let Err(e) = cpus.set_affinity(tid) {
-            kpm_log!("KPM affinity_set: tid={} sched_setaffinity ERR {} (ESRCH={})", tid, e, e.raw_os_error() == Some(libc::ESRCH));
+            kpm_log!("aff! tid={} sched_setaffinity ERR errno={}", tid, e.raw_os_error().unwrap_or(-1));
             return e.raw_os_error() == Some(libc::ESRCH);
         }
-        kpm_log!("KPM affinity_set: tid={} sched_setaffinity OK cpus={}", tid, cpus.to_range_string());
+        kpm_log!("aff! tid={} sched_setaffinity OK cpus={}", tid, cpus.to_range_string());
     } else {
-        kpm_log!("KPM affinity_set: tid={} already ok cpus={}", tid, cpus.to_range_string());
+        kpm_log!("aff! tid={} already ok cpus={}", tid, cpus.to_range_string());
     }
     false
 }
