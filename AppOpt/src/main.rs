@@ -27,8 +27,8 @@ use crate::config::{
 };
 use crate::cpuset::{init_cpu_topo, set_base_cpuset};
 use crate::ebpf_mode::{
-    full_scan, event_dispatch, comm_map_init, EBPF_EVENT_IDLE,
-    ebpf_init, EbpfState,
+    full_scan, event_dispatch, comm_map_init, EBPF_EVENT_FORK, EBPF_EVENT_EXEC,
+    EBPF_EVENT_RENAME, ebpf_init, EbpfState,
 };
 use crate::proc_mode::{cache_sync, ProcScanState};
 use crate::web::{
@@ -325,26 +325,23 @@ fn main() {
                 EV_KPM => {
                     read_eventfd(kpm_wake_fd);
                     if let Some(es) = ebpf_state.as_mut() {
+                        // 本批事件中是否含 FORK/EXEC/RENAME (需要立即同步亲和性)
+                        let mut need_sync = false;
                         loop {
                             match es.event_rx.try_recv() {
                                 Ok(event) => {
-                                    if event.event_type == EBPF_EVENT_IDLE {
-                                        /* reader 周期信号: 每 1 秒触发一次 (直到无事件),
-                                         * 执行 affinity_sync (遍历 cache, 先 cpuset 后亲和性)。 */
-                                        let Some(cfg) =
-                                            lock_ignore_poison(&CURRENT_CONFIG).clone()
-                                        else {
-                                            continue;
-                                        };
-                                        es.cache.affinity_sync(&cfg.topo);
-                                    } else {
-                                        let Some(cfg) =
-                                            lock_ignore_poison(&CURRENT_CONFIG).clone()
-                                        else {
-                                            continue;
-                                        };
-                                        event_dispatch(&event, &cfg, es);
+                                    if event.event_type == EBPF_EVENT_FORK
+                                        || event.event_type == EBPF_EVENT_EXEC
+                                        || event.event_type == EBPF_EVENT_RENAME
+                                    {
+                                        need_sync = true;
                                     }
+                                    let Some(cfg) =
+                                        lock_ignore_poison(&CURRENT_CONFIG).clone()
+                                    else {
+                                        continue;
+                                    };
+                                    event_dispatch(&event, &cfg, es);
                                 }
                                 Err(mpsc::TryRecvError::Empty) => break,
                                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -352,6 +349,14 @@ fn main() {
                                     break;
                                 }
                             }
+                        }
+                        // 收到 FORK/EXEC/RENAME: 立即执行 affinity_sync (仅设置 CPU 亲和性),
+                        // 不依赖定时器/IDLE; 无此类事件时仅增量更新 cache
+                        if need_sync {
+                            let Some(cfg) = lock_ignore_poison(&CURRENT_CONFIG).clone() else {
+                                continue;
+                            };
+                            es.cache.affinity_sync(&cfg.topo);
                         }
                     }
                 }
