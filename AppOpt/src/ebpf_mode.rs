@@ -22,7 +22,6 @@ use crate::cache::ProcCache;
 use crate::config::{AppConfig, CURRENT_CONFIG};
 use crate::cpuset::CpuSet;
 
-/// 调试日志: 追加到 /data/local/tmp/appopt_debug.log (可靠, 不受启动方式影响)
 /// eBPF 进程事件, 布局需与内核态 appopt_proc_event_t 完全一致 (28B)
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -38,6 +37,9 @@ pub const EBPF_EVENT_EXEC: u32 = 2;
 pub const EBPF_EVENT_RENAME: u32 = 3;
 pub const EBPF_EVENT_EXIT: u32 = 4;
 pub const EBPF_EVENT_INPUT: u32 = 5;
+/// 空闲信号 (非真实进程事件): reader 线程 timerfd 检测到事件空闲 3 秒后发出,
+/// 主线程收到后执行一次 affinity_sync (延迟 cpuset 放置 + 亲和性设置)
+pub const EBPF_EVENT_IDLE: u32 = 0;
 
 /* ================= KernelPatch SuperCall 传输 ================= */
 
@@ -236,23 +238,6 @@ fn find_zygote_tids() -> Vec<i32> {
     tids
 }
 
-/// 调试日志: 同时输出到 stderr 和 /data/local/tmp/appopt_debug.log
-/// (文件方式可靠, 不受 AppOpt 启动方式影响; stderr 仅前台终端可见)
-macro_rules! kpm_log {
-    ($($arg:tt)*) => {{
-        let msg = format!($($arg)*);
-        eprintln!("{}", msg);
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/data/local/tmp/appopt_debug.log")
-        {
-            let _ = writeln!(f, "{}", msg);
-        }
-    }};
-}
-
 /// 初始化 KPM 事件驱动: 确保模块加载, 启动 reader 线程
 /// 失败返回 None, 由调用方回退 /proc 轮询
 pub fn ebpf_init() -> Option<EbpfState> {
@@ -316,13 +301,22 @@ pub fn ebpf_init() -> Option<EbpfState> {
 }
 
 /// reader 线程: 轮询 drain, 解析事件送入 mpsc; wakeup_fd 用于 Drop 唤醒退出
+/// 重置 timerfd: 从当前时刻起 secs 秒后触发一次 (一次性)
+fn arm_timer(tfd: c_int, secs: i64) {
+    let new_value = libc::itimerspec {
+        it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
+        it_value: libc::timespec { tv_sec: secs, tv_nsec: 0 },
+    };
+    unsafe { libc::timerfd_settime(tfd, 0, &new_value, std::ptr::null_mut()); }
+}
+
 fn kpm_reader(key: CString, tx: mpsc::Sender<EbpfProcEvent>, wakeup_fd: c_int) {
     let name = CString::new("KpmReader").unwrap();
     unsafe {
         libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
     }
 
-    // epoll: 仅监听 wakeup_fd, 用 50ms 超时轮询 drain
+    // epoll: 监听 wakeup_fd (退出信号) + timerfd (事件空闲延迟触发)
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epfd < 0 {
         return;
@@ -334,25 +328,65 @@ fn kpm_reader(key: CString, tx: mpsc::Sender<EbpfProcEvent>, wakeup_fd: c_int) {
         unsafe { libc::close(epfd) };
         return;
     }
+    // timerfd: 收到事件时重置 3 秒; 3 秒无事件则触发, 发空闲信号
+    let tfd = unsafe {
+        libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC | libc::TFD_NONBLOCK)
+    };
+    if tfd < 0 {
+        unsafe { libc::close(epfd) };
+        return;
+    }
+    let mut timer_ev: libc::epoll_event = unsafe { std::mem::zeroed() };
+    timer_ev.events = libc::EPOLLIN as u32;
+    timer_ev.u64 = 2;
+    if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, tfd, &mut timer_ev) } < 0 {
+        unsafe { libc::close(tfd) };
+        unsafe { libc::close(epfd) };
+        return;
+    }
 
-    let mut events: [libc::epoll_event; 1] = unsafe { std::mem::zeroed() };
+    let mut events: [libc::epoll_event; 2] = unsafe { std::mem::zeroed() };
     // 单次 drain 缓冲: 8KB, 约 292 个事件
     let mut buf = vec![0u8; 8192];
 
     loop {
-        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 1, 50) };
+        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 2, 50) };
         if n < 0 {
             if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
             break;
         }
-        // wakeup 事件优先退出
-        if n > 0 && events[0].u64 == 1 {
-            break;
+        // 处理 wakeup/timerfd 就绪
+        for i in 0..n {
+            let e = &events[i as usize];
+            if e.u64 == 1 {
+                // wakeup: 退出
+                unsafe { libc::close(tfd) };
+                unsafe { libc::close(epfd) };
+                return;
+            }
+            if e.u64 == 2 {
+                // timerfd 触发: 3 秒无事件 (应用完全启动), 发空闲信号
+                let idle = EbpfProcEvent {
+                    pid: 0,
+                    tid: 0,
+                    comm: [0u8; 16],
+                    event_type: EBPF_EVENT_IDLE,
+                };
+                if tx.send(idle).is_err() {
+                    unsafe { libc::close(tfd) };
+                    unsafe { libc::close(epfd) };
+                    return;
+                }
+                // 清空 timerfd 计数 (一次性, 不再 arm, 等下次事件重新 arm)
+                let mut tmp = [0u8; 8];
+                let _ = unsafe { libc::read(tfd, tmp.as_mut_ptr() as *mut _, 8) };
+            }
         }
 
         // 轮询 drain, 直到暂时无事件
+        let mut got_any = false;
         loop {
             let args = CString::new("drain").unwrap_or_default();
             let got = unsafe {
@@ -364,6 +398,7 @@ fn kpm_reader(key: CString, tx: mpsc::Sender<EbpfProcEvent>, wakeup_fd: c_int) {
             if got <= 0 {
                 break;
             }
+            got_any = true;
             let bytes = got as usize;
             let ev_sz = std::mem::size_of::<EbpfProcEvent>();
             let mut off = 0;
@@ -371,6 +406,7 @@ fn kpm_reader(key: CString, tx: mpsc::Sender<EbpfProcEvent>, wakeup_fd: c_int) {
                 let event: EbpfProcEvent =
                     unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off) as *const EbpfProcEvent) };
                 if tx.send(event).is_err() {
+                    unsafe { libc::close(tfd) };
                     unsafe { libc::close(epfd) };
                     return;
                 }
@@ -381,7 +417,12 @@ fn kpm_reader(key: CString, tx: mpsc::Sender<EbpfProcEvent>, wakeup_fd: c_int) {
                 break;
             }
         }
+        // 收到真实事件: 重置 3 秒定时器 (延迟 cpuset 放置)
+        if got_any {
+            arm_timer(tfd, 3);
+        }
     }
+    unsafe { libc::close(tfd) };
     unsafe { libc::close(epfd) };
 }
 
@@ -415,9 +456,7 @@ fn affinity_apply(
     cfg: &AppConfig,
     bpf: &KpmHandle,
 ) -> bool {
-    kpm_log!("affinity_apply: tid={} cpus={} (delayed, APPLIED only)", tid, cpus.to_range_string());
     applied_set(bpf, tid, cpus);
-    kpm_log!("affinity_apply: tid={} APPLIED bits={:#x}", tid, cpus.bits[0]);
     false
 }
 
@@ -426,8 +465,6 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
     let tid = event.tid;
     let pid = event.pid;
     let comm = comm_str(&event.comm);
-    eprintln!("KPM event: type={} tid={} pid={} comm='{}'", event.event_type, tid, pid, comm);
-    kpm_log!("KPM event: type={} tid={} pid={} comm='{}'", event.event_type, tid, pid, comm);
 
     match event.event_type {
         EBPF_EVENT_EXIT => {
@@ -468,8 +505,6 @@ fn event_apply(
     cfg: &AppConfig,
 ) -> bool {
     let pkg_result = cache.pkg_lookup_comm(pid, comm, cfg);
-    eprintln!("KPM event_apply: tid={} pid={} comm='{}' pkg={:?}", tid, pid, comm, pkg_result);
-    kpm_log!("KPM event_apply: tid={} pid={} comm='{}' pkg={:?}", tid, pid, comm, pkg_result);
     let Some(pkg) = pkg_result else {
         return false;
     };
