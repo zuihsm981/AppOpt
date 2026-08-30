@@ -37,8 +37,10 @@ pub const EBPF_EVENT_EXEC: u32 = 2;
 pub const EBPF_EVENT_RENAME: u32 = 3;
 pub const EBPF_EVENT_EXIT: u32 = 4;
 pub const EBPF_EVENT_INPUT: u32 = 5;
-/// 空闲信号 (非真实进程事件): reader 线程 timerfd 检测到事件空闲 3 秒后发出,
-/// 主线程收到后执行一次 affinity_sync (延迟 cpuset 放置 + 亲和性设置)
+/// 空闲信号 (非真实进程事件): reader 线程收到 FORK/EXEC/RENAME 事件后启动 1 秒周期定时器,
+/// 每 1 秒发一次空闲信号 → 主线程执行一次 affinity_sync (延迟 cpuset 放置 + 亲和性设置),
+/// 持续有此类事件则持续每 1 秒同步, 直到无此类事件 (当前 1 秒周期内未收到) 停止。
+/// EXIT/INPUT 事件不触发同步。
 pub const EBPF_EVENT_IDLE: u32 = 0;
 
 /* ================= KernelPatch SuperCall 传输 ================= */
@@ -300,12 +302,20 @@ pub fn ebpf_init() -> Option<EbpfState> {
     })
 }
 
-/// reader 线程: 轮询 drain, 解析事件送入 mpsc; wakeup_fd 用于 Drop 唤醒退出
-/// 重置 timerfd: 从当前时刻起 secs 秒后触发一次 (一次性)
+/// 启动 timerfd 周期定时器: 从当前时刻起每 secs 秒触发一次 (周期模式)
 fn arm_timer(tfd: c_int, secs: i64) {
     let new_value = libc::itimerspec {
-        it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
+        it_interval: libc::timespec { tv_sec: secs, tv_nsec: 0 },
         it_value: libc::timespec { tv_sec: secs, tv_nsec: 0 },
+    };
+    unsafe { libc::timerfd_settime(tfd, 0, &new_value, std::ptr::null_mut()); }
+}
+
+/// 停止 timerfd (清空定时器, 一次性/周期均取消)
+fn disarm_timer(tfd: c_int) {
+    let new_value = libc::itimerspec {
+        it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
+        it_value: libc::timespec { tv_sec: 0, tv_nsec: 0 },
     };
     unsafe { libc::timerfd_settime(tfd, 0, &new_value, std::ptr::null_mut()); }
 }
@@ -328,7 +338,8 @@ fn kpm_reader(key: CString, tx: mpsc::Sender<EbpfProcEvent>, wakeup_fd: c_int) {
         unsafe { libc::close(epfd) };
         return;
     }
-    // timerfd: 收到事件时重置 3 秒; 3 秒无事件则触发, 发空闲信号
+    // timerfd: 收到事件时启动 1 秒周期定时器; 每 1 秒触发发空闲信号 → affinity_sync,
+    // 持续有事件则持续每 1 秒同步, 直到无事件 (当前 1 秒周期内未收到事件) 停止
     let tfd = unsafe {
         libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC | libc::TFD_NONBLOCK)
     };
@@ -348,6 +359,9 @@ fn kpm_reader(key: CString, tx: mpsc::Sender<EbpfProcEvent>, wakeup_fd: c_int) {
     let mut events: [libc::epoll_event; 2] = unsafe { std::mem::zeroed() };
     // 单次 drain 缓冲: 8KB, 约 292 个事件
     let mut buf = vec![0u8; 8192];
+    // timerfd 周期状态: timer_armed 定时器是否在运行; activity 当前 1 秒周期内是否收到过真实事件
+    let mut timer_armed = false;
+    let mut activity = false;
 
     loop {
         let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 2, 50) };
@@ -367,26 +381,35 @@ fn kpm_reader(key: CString, tx: mpsc::Sender<EbpfProcEvent>, wakeup_fd: c_int) {
                 return;
             }
             if e.u64 == 2 {
-                // timerfd 触发: 3 秒无事件 (应用完全启动), 发空闲信号
-                let idle = EbpfProcEvent {
-                    pid: 0,
-                    tid: 0,
-                    comm: [0u8; 16],
-                    event_type: EBPF_EVENT_IDLE,
-                };
-                if tx.send(idle).is_err() {
-                    unsafe { libc::close(tfd) };
-                    unsafe { libc::close(epfd) };
-                    return;
+                // timerfd 周期触发: 事件流活跃时每 1 秒发一次空闲信号 → affinity_sync
+                if activity {
+                    let idle = EbpfProcEvent {
+                        pid: 0,
+                        tid: 0,
+                        comm: [0u8; 16],
+                        event_type: EBPF_EVENT_IDLE,
+                    };
+                    if tx.send(idle).is_err() {
+                        unsafe { libc::close(tfd) };
+                        unsafe { libc::close(epfd) };
+                        return;
+                    }
+                    // 进入下一个 1 秒周期
+                    activity = false;
+                } else {
+                    // 当前周期无真实事件: 事件流已停止, 停止周期定时器 (直到下次事件重新启动)
+                    disarm_timer(tfd);
+                    timer_armed = false;
                 }
-                // 清空 timerfd 计数 (一次性, 不再 arm, 等下次事件重新 arm)
+                // 清空 timerfd 计数
                 let mut tmp = [0u8; 8];
                 let _ = unsafe { libc::read(tfd, tmp.as_mut_ptr() as *mut _, 8) };
             }
         }
 
         // 轮询 drain, 直到暂时无事件
-        let mut got_any = false;
+        // 只有收到 FORK/EXEC/RENAME 事件才视为需要同步 (EXIT/INPUT 不触发 affinity_sync)
+        let mut need_sync = false;
         loop {
             let args = CString::new("drain").unwrap_or_default();
             let got = unsafe {
@@ -398,13 +421,18 @@ fn kpm_reader(key: CString, tx: mpsc::Sender<EbpfProcEvent>, wakeup_fd: c_int) {
             if got <= 0 {
                 break;
             }
-            got_any = true;
             let bytes = got as usize;
             let ev_sz = std::mem::size_of::<EbpfProcEvent>();
             let mut off = 0;
             while off + ev_sz <= bytes {
                 let event: EbpfProcEvent =
                     unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off) as *const EbpfProcEvent) };
+                if event.event_type == EBPF_EVENT_FORK
+                    || event.event_type == EBPF_EVENT_EXEC
+                    || event.event_type == EBPF_EVENT_RENAME
+                {
+                    need_sync = true;
+                }
                 if tx.send(event).is_err() {
                     unsafe { libc::close(tfd) };
                     unsafe { libc::close(epfd) };
@@ -417,9 +445,14 @@ fn kpm_reader(key: CString, tx: mpsc::Sender<EbpfProcEvent>, wakeup_fd: c_int) {
                 break;
             }
         }
-        // 收到真实事件: 重置 3 秒定时器 (延迟 cpuset 放置)
-        if got_any {
-            arm_timer(tfd, 3);
+        // 收到 FORK/EXEC/RENAME: 标记当前周期活跃; 若定时器未运行则启动 1 秒周期定时器
+        // (持续有此类事件 → 每 1 秒发一次 IDLE → 主线程 affinity_sync; 无此类事件 → 下个周期停止)
+        if need_sync {
+            activity = true;
+            if !timer_armed {
+                arm_timer(tfd, 1);
+                timer_armed = true;
+            }
         }
     }
     unsafe { libc::close(tfd) };
