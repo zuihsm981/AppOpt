@@ -17,7 +17,7 @@ use std::os::raw::{c_char, c_int};
 use std::sync::mpsc;
 use std::thread;
 
-use crate::apply_affinity::{affinity_set, proc_walk, task_tids, tid_comm};
+use crate::apply_affinity::{proc_walk, task_tids, tid_comm};
 use crate::cache::ProcCache;
 use crate::config::{AppConfig, CURRENT_CONFIG};
 use crate::cpuset::CpuSet;
@@ -405,8 +405,9 @@ fn applied_clear(bpf: &KpmHandle) {
     bpf.applied_clear();
 }
 
-/// 应用亲和性并写 APPLIED 表, 返回 true 表示 tid 已退出
-/// 事件驱动路径: 调用完整 affinity_set (sched_setaffinity + cpuset 写入), 直接操作。
+/// 事件驱动路径: 只更新 APPLIED 表 (供 sched_setaffinity kprobe 拦截),
+/// 不立即设置亲和性/放置 cpuset。实际设置由主循环定期 affinity_sync
+/// 在应用完全启动、任务稳定后统一执行 (先 cpuset 后亲和性)。
 fn affinity_apply(
     tid: i32,
     cpus: &CpuSet,
@@ -414,15 +415,10 @@ fn affinity_apply(
     cfg: &AppConfig,
     bpf: &KpmHandle,
 ) -> bool {
-    eprintln!("KPM affinity_apply: tid={} cpus={} cpuset_dir='{}'", tid, cpus.to_range_string(), cpuset_dir);
-    kpm_log!("KPM affinity_apply: tid={} cpus={} cpuset_dir='{}'", tid, cpus.to_range_string(), cpuset_dir);
-    let dead = affinity_set(tid, cpus, cpuset_dir, &cfg.topo);
-    if !dead {
-        applied_set(bpf, tid, cpus);
-        eprintln!("KPM affinity_apply: tid={} applied_set bits={:#x}", tid, cpus.bits[0]);
-        kpm_log!("KPM affinity_apply: tid={} applied_set bits={:#x}", tid, cpus.bits[0]);
-    }
-    dead
+    kpm_log!("affinity_apply: tid={} cpus={} (delayed, APPLIED only)", tid, cpus.to_range_string());
+    applied_set(bpf, tid, cpus);
+    kpm_log!("affinity_apply: tid={} APPLIED bits={:#x}", tid, cpus.bits[0]);
+    false
 }
 
 /// 事件派发, 按 event_type 增量处理 FORK/RENAME/EXEC/EXIT (与 aya 版一致)
