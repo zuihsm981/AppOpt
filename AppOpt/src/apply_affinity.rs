@@ -7,24 +7,6 @@ use crate::config::AppConfig;
 use crate::cpuset::{base_cpuset, CpuSet, CpuTopology};
 use crate::rule_match::comm_to_pkg;
 
-/// 调试日志: 同时输出到 stderr 和 /data/local/tmp/appopt_debug.log
-/// (文件方式可靠, 不受 AppOpt 启动方式影响; stderr 仅前台终端可见)
-macro_rules! kpm_log {
-    ($($arg:tt)*) => {{
-        let msg = format!($($arg)*);
-        eprintln!("{}", msg);
-        use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/data/local/tmp/appopt_debug.log")
-        {
-            let _ = f.write_all(msg.as_bytes());
-            let _ = f.write_all(b"\n");
-        }
-    }};
-}
-
 /// 栈上构建 /proc/{pid}/{suffix} 路径读取文件
 fn read_proc_file<'a>(pid: i32, suffix: &str, buf: &'a mut [u8]) -> Option<&'a [u8]> {
     let mut path = [0u8; 32];
@@ -96,31 +78,15 @@ pub fn affinity_set(
         };
         // 构造待写入数据: tid + 换行 (cpuset tasks 文件格式)
         let data = format!("{}\n", tid);
-        kpm_log!("cpuset-> '{}' data='{}'", tasks_path, data.trim_end());
-        match fs::OpenOptions::new().append(true).open(&tasks_path) {
-            Ok(mut f) => {
-                if let Err(e) = f.write_all(data.as_bytes()) {
-                    kpm_log!("cpuset! FAIL '{}' data='{}' errno={}", tasks_path, data.trim_end(), e.raw_os_error().unwrap_or(-1));
-                } else {
-                    kpm_log!("cpuset! OK  '{}' data='{}'", tasks_path, data.trim_end());
-                }
-            }
-            Err(e) => {
-                kpm_log!("cpuset! OPENFAIL '{}' errno={}", tasks_path, e.raw_os_error().unwrap_or(-1));
-            }
+        if let Ok(mut f) = fs::OpenOptions::new().append(true).open(&tasks_path) {
+            let _ = f.write_all(data.as_bytes());
         }
-    } else {
-        kpm_log!("cpuset! disabled cpus={}", cpus.to_range_string());
     }
     // 再设置 CPU 亲和性 (已正确则跳过)
     if !affinity_ok {
         if let Err(e) = cpus.set_affinity(tid) {
-            kpm_log!("aff! tid={} sched_setaffinity ERR errno={}", tid, e.raw_os_error().unwrap_or(-1));
             return e.raw_os_error() == Some(libc::ESRCH);
         }
-        kpm_log!("aff! tid={} sched_setaffinity OK cpus={}", tid, cpus.to_range_string());
-    } else {
-        kpm_log!("aff! tid={} already ok cpus={}", tid, cpus.to_range_string());
     }
     false
 }
