@@ -22,7 +22,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
 
 use crate::config::{
-    init_inotify, load_config, inotify_drain,
+    init_inotify, load_config,
     CHECK_INTERVAL, CONFIG_FILE, CONFIG_WAKE_FD, CURRENT_CONFIG,
 };
 use crate::cpuset::{init_cpu_topo, set_base_cpuset};
@@ -359,7 +359,7 @@ fn main() {
                     if crate::config::inotify_drain() {
                         // 配置已重载: 应用到当前模式
                         cfg = lock_ignore_poison(&CURRENT_CONFIG).clone();
-                        apply_config(&mut ebpf_state, &mut proc_state, cfg.as_ref());
+                        apply_config(&mut ebpf_state, &mut proc_state, cfg.as_deref());
                     }
                 }
                 EV_MODE => {
@@ -385,13 +385,13 @@ fn main() {
                         }
                     } else {
                         // 已在 KPM 模式: 重新应用配置 (白名单可能变化)
-                        apply_config(&mut ebpf_state, &mut proc_state, cfg.as_ref());
+                        apply_config(&mut ebpf_state, &mut proc_state, cfg.as_deref());
                     }
                 }
                 EV_CONFIG => {
                     read_eventfd(config_wake_fd);
                     cfg = lock_ignore_poison(&CURRENT_CONFIG).clone();
-                    apply_config(&mut ebpf_state, &mut proc_state, cfg.as_ref());
+                    apply_config(&mut ebpf_state, &mut proc_state, cfg.as_deref());
                 }
                 EV_PROC => {
                     read_eventfd(proc_timer_fd);
