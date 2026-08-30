@@ -185,6 +185,8 @@ pub struct EbpfState {
     pub bpf: KpmHandle,
     pub cache: ProcCache,
     pub wakeup_fd: c_int,
+    /// 事件到达通知 fd (eventfd): reader 收到事件后写入, 唤醒主循环 epoll
+    pub kpm_wake_fd: c_int,
     pub comm_capacity: u32,
 }
 
@@ -203,6 +205,8 @@ impl Drop for EbpfState {
         if self.wakeup_fd >= 0 {
             unsafe { libc::close(self.wakeup_fd); }
         }
+        // kpm_wake_fd 由主循环创建并管理生命周期, Drop 不关闭
+        self.kpm_wake_fd = -1;
     }
 }
 
@@ -241,8 +245,9 @@ fn find_zygote_tids() -> Vec<i32> {
 }
 
 /// 初始化 KPM 事件驱动: 确保模块加载, 启动 reader 线程
-/// 失败返回 None, 由调用方回退 /proc 轮询
-pub fn ebpf_init() -> Option<EbpfState> {
+/// 失败返回 None, 由调用方回退 /proc 轮询。
+/// kpm_wake_fd 由主循环创建并注册 epoll, reader 收到事件后写入以唤醒主循环。
+pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
     let key = kpm_key();
     if !kp_ready(&key) {
         return None;
@@ -268,10 +273,10 @@ pub fn ebpf_init() -> Option<EbpfState> {
         return None;
     }
 
-    // reader 线程通过 supercall drain 轮询事件
+    // reader 线程通过 supercall drain 轮询事件, 收到事件后写 kpm_wake_fd 唤醒主循环
     let reader_key = kpm_key();
     let reader_thread = thread::spawn(move || {
-        kpm_reader(reader_key, tx, wakeup_fd);
+        kpm_reader(reader_key, tx, wakeup_fd, kpm_wake_fd);
     });
 
     /* 先设置白名单再激活: start 注册 tracepoint 后立即开始过滤事件,
@@ -298,6 +303,7 @@ pub fn ebpf_init() -> Option<EbpfState> {
         bpf: handle,
         cache: ProcCache::new(),
         wakeup_fd,
+        kpm_wake_fd,
         comm_capacity: capacity,
     })
 }
@@ -320,7 +326,7 @@ fn disarm_timer(tfd: c_int) {
     unsafe { libc::timerfd_settime(tfd, 0, &new_value, std::ptr::null_mut()); }
 }
 
-fn kpm_reader(key: CString, tx: mpsc::Sender<EbpfProcEvent>, wakeup_fd: c_int) {
+fn kpm_reader(key: CString, tx: mpsc::Sender<EbpfProcEvent>, wakeup_fd: c_int, kpm_wake_fd: c_int) {
     let name = CString::new("KpmReader").unwrap();
     unsafe {
         libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
@@ -394,6 +400,9 @@ fn kpm_reader(key: CString, tx: mpsc::Sender<EbpfProcEvent>, wakeup_fd: c_int) {
                         unsafe { libc::close(epfd) };
                         return;
                     }
+                    // 唤醒主循环处理 IDLE (affinity_sync)
+                    let val: u64 = 1;
+                    let _ = unsafe { libc::write(kpm_wake_fd, &val as *const u64 as *const _, 8) };
                     // 进入下一个 1 秒周期
                     activity = false;
                 } else {
@@ -438,6 +447,9 @@ fn kpm_reader(key: CString, tx: mpsc::Sender<EbpfProcEvent>, wakeup_fd: c_int) {
                     unsafe { libc::close(epfd) };
                     return;
                 }
+                // 唤醒主循环处理该事件
+                let val: u64 = 1;
+                let _ = unsafe { libc::write(kpm_wake_fd, &val as *const u64 as *const _, 8) };
                 off += ev_sz;
             }
             // 若一次就取满, 可能还有更多, 继续; 否则退出内层循环
