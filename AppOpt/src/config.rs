@@ -326,12 +326,6 @@ pub fn load_config(
         .filter(|r| !r.thread.is_empty())
         .map(|r| r.pkg.clone())
         .collect();
-    let num_rules = rules.len();
-
-    println!("配置文件解析完成，共加载 {} 条规则", num_rules);
-    if fail_cnt > 0 {
-        eprintln!("警告: {} 条规则因格式无效被跳过", fail_cnt);
-    }
 
     Some(AppConfig {
         rules,
@@ -375,13 +369,11 @@ pub fn config_loader() {
 pub fn init_inotify(config_file: &str) {
     let inotify_fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
     if inotify_fd < 0 {
-        println!("inotify初始化失败，使用轮询模式");
         return;
     }
     let cfg_cstr = match CString::new(config_file) {
         Ok(c) => c,
         Err(_) => {
-            eprintln!("错误: 配置文件路径包含非法字符，使用轮询模式");
             unsafe { libc::close(inotify_fd); }
             return;
         }
@@ -397,12 +389,10 @@ pub fn init_inotify(config_file: &str) {
         INOTIFY_SUPPORTED.store(true, Ordering::Release);
         INOTIFY_FD.store(inotify_fd, Ordering::Release);
         INOTIFY_WD.store(wd, Ordering::Release);
-        println!("启用inotify监控配置文件变更");
     } else {
         unsafe {
             libc::close(inotify_fd);
         }
-        println!("inotify初始化失败，使用轮询模式");
     }
 }
 
@@ -520,7 +510,6 @@ fn inotify_rewatch(inotify_fd: i32) -> bool {
     let cfg_cstr = match CString::new(lock_ignore_poison(&CONFIG_FILE).clone()) {
         Ok(c) => c,
         Err(_) => {
-            eprintln!("错误: 配置文件路径包含非法字符，降级为轮询模式");
             disable_inotify(inotify_fd);
             return false;
         }
