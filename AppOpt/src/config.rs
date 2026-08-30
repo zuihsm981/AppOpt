@@ -3,11 +3,10 @@ use std::ffi::CString;
 use std::fs;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
-use std::time::{Duration, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::UNIX_EPOCH;
 
-use crate::{lock_ignore_poison, CONFIG_UPDATED, MAX_PKG_LEN, MAX_THREAD_LEN};
+use crate::{lock_ignore_poison, MAX_PKG_LEN, MAX_THREAD_LEN};
 use crate::cpuset::{base_cpuset, create_cpuset_dir, parse_cpu_spec, CpuSet, CpuTopology};
 
 pub static INOTIFY_SUPPORTED: AtomicBool = AtomicBool::new(false);
@@ -16,16 +15,20 @@ pub static INOTIFY_WD: AtomicI32 = AtomicI32::new(-1);
 
 /// 运行时可调参数，web 端热更新
 pub static CHECK_INTERVAL: AtomicU64 = AtomicU64::new(2);
-pub static FORCE_RELOAD: AtomicBool = AtomicBool::new(false);
-/// 无 inotify 时的重载通知: config_loader 阻塞等待, web 侧 request_config_reload 唤醒
-static RELOAD_M: Mutex<()> = Mutex::new(());
-static RELOAD_CV: Condvar = Condvar::new();
 
-/// 请求配置热加载 (通知驱动, 不轮询文件): 置 FORCE_RELOAD 并唤醒 config_loader
+/// 配置重载通知 fd (eventfd): web 端修改 cpuset/路径后写入, 唤醒主循环 epoll 处理
+pub static CONFIG_WAKE_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// 请求配置热加载 (事件驱动, 不轮询文件): 写 eventfd 通知主循环
 pub fn request_config_reload() {
-    FORCE_RELOAD.store(true, Ordering::Release);
-    { let _g = RELOAD_M.lock().unwrap(); }   // 与等待方互斥, 保证等待方能见到新标志
-    RELOAD_CV.notify_all();
+    let fd = CONFIG_WAKE_FD.load(Ordering::Relaxed);
+    if fd >= 0 {
+        let val: u64 = 1;
+        unsafe { libc::write(fd, &val as *const u64 as *const _, 8); }
+    } else {
+        // fd 尚未初始化 (启动早期): 直接重载
+        config_reload_now();
+    }
 }
 pub static CONFIG_FILE: Mutex<String> = Mutex::new(String::new());
 
@@ -335,35 +338,69 @@ pub fn load_config(
     })
 }
 
-pub fn config_loader() {
-    let name = CString::new("ConfigLoader").unwrap();
-    unsafe {
-        libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
+/// 主循环直接处理 inotify 事件 (阻塞版): 返回 true 表示配置已变更需应用。
+/// 由主循环在 inotify fd 可读时调用; 无 inotify 时返回 false。
+pub fn inotify_drain() -> bool {
+    if !INOTIFY_SUPPORTED.load(Ordering::Acquire) {
+        return false;
     }
+    let inotify_fd = INOTIFY_FD.load(Ordering::Acquire);
 
-    let mut last_mtime: i64 = -1;
+    #[repr(align(8))]
+    struct InotifyBuf([u8; 4096]);
+    let mut buf = InotifyBuf([0u8; 4096]);
+    let mut reload_needed = false;
+    let mut needs_rewatch = false;
+    let hdr = std::mem::size_of::<libc::inotify_event>();
 
     loop {
-        let interval = CHECK_INTERVAL.load(Ordering::Relaxed).max(1);
-        if FORCE_RELOAD.swap(false, Ordering::AcqRel) {
-            last_mtime = -1;
-            if INOTIFY_SUPPORTED.load(Ordering::Acquire) {
-                let fd = INOTIFY_FD.load(Ordering::Acquire);
-                inotify_rewatch(fd);
+        let len = unsafe {
+            libc::read(
+                inotify_fd,
+                buf.0.as_mut_ptr() as *mut libc::c_void,
+                buf.0.len(),
+            )
+        };
+        if len <= 0 {
+            let err = io::Error::last_os_error();
+            let errno = err.raw_os_error();
+            if errno == Some(libc::EAGAIN)
+                || errno == Some(libc::EWOULDBLOCK)
+                || errno == Some(libc::EINTR)
+            {
+                break;
             }
-            config_reload(&mut last_mtime);
+            disable_inotify(inotify_fd);
+            return false;
         }
-        if INOTIFY_SUPPORTED.load(Ordering::Acquire) {
-            inotify_handle(interval, &mut last_mtime);
-        } else {
-            /* 无 inotify: 不轮询文件, 阻塞等待重载通知 (request_config_reload) */
-            let mut guard = RELOAD_M.lock().unwrap();
-            while !FORCE_RELOAD.load(Ordering::Acquire) {
-                guard = RELOAD_CV.wait(guard).unwrap();
+
+        let mut offset = 0;
+        while offset + hdr <= len as usize {
+            let event = unsafe { &*(buf.0.as_ptr().add(offset) as *const libc::inotify_event) };
+            if event.mask & (libc::IN_CLOSE_WRITE | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0
+            {
+                reload_needed = true;
+                if event.mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0 {
+                    needs_rewatch = true;
+                }
             }
-            /* 携 FORCE_RELOAD=true 落回循环顶部, 由 swap 触发重载 */
+            offset += hdr + event.len as usize;
         }
     }
+
+    if needs_rewatch {
+        if !inotify_rewatch(inotify_fd) {
+            return false;
+        }
+    }
+
+    if reload_needed {
+        // 直接重载 (不写 CONFIG_WAKE_FD, 由主循环 inotify 分支统一应用, 避免重复通知)
+        let mut mtime: i64 = -1;
+        config_reload(&mut mtime);
+        return true;
+    }
+    false
 }
 
 pub fn init_inotify(config_file: &str) {
@@ -417,88 +454,16 @@ fn config_reload(last_mtime: &mut i64) {
         let mut guard = lock_ignore_poison(&CURRENT_CONFIG);
         *guard = Some(Arc::new(new_cfg));
     }
-    CONFIG_UPDATED.store(true, Ordering::Release);
 }
 
 pub fn config_reload_now() {
     let mut mtime: i64 = -1;
     config_reload(&mut mtime);
-}
-
-fn inotify_handle(interval: u64, last_mtime: &mut i64) {
-    let inotify_fd = INOTIFY_FD.load(Ordering::Acquire);
-
-    let mut pfd = libc::pollfd {
-        fd: inotify_fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-
-    let ret = unsafe { libc::poll(&mut pfd, 1, (interval as libc::c_int) * 1000) };
-
-    if ret < 0 {
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EINTR) {
-            return;
-        }
-        disable_inotify(inotify_fd);
-        return;
-    } else if ret == 0 {
-        return;
-    }
-
-    #[repr(align(8))]
-    struct InotifyBuf([u8; 4096]);
-    let mut buf = InotifyBuf([0u8; 4096]);
-    let mut reload_needed = false;
-    let mut needs_rewatch = false;
-    let hdr = std::mem::size_of::<libc::inotify_event>();
-
-    loop {
-        let len = unsafe {
-            libc::read(
-                inotify_fd,
-                buf.0.as_mut_ptr() as *mut libc::c_void,
-                buf.0.len(),
-            )
-        };
-        if len <= 0 {
-            let err = io::Error::last_os_error();
-            let errno = err.raw_os_error();
-            if errno == Some(libc::EAGAIN)
-                || errno == Some(libc::EWOULDBLOCK)
-                || errno == Some(libc::EINTR)
-            {
-                break;
-            }
-            disable_inotify(inotify_fd);
-            return;
-        }
-
-        let mut offset = 0;
-        while offset + hdr <= len as usize {
-            let event = unsafe { &*(buf.0.as_ptr().add(offset) as *const libc::inotify_event) };
-            if event.mask & (libc::IN_CLOSE_WRITE | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0
-            {
-                reload_needed = true;
-                *last_mtime = -1;
-                if event.mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0 {
-                    needs_rewatch = true;
-                }
-            }
-            offset += hdr + event.len as usize;
-        }
-    }
-
-    if needs_rewatch {
-        thread::sleep(Duration::from_secs(interval));
-        if !inotify_rewatch(inotify_fd) {
-            return;
-        }
-    }
-
-    if reload_needed {
-        config_reload(last_mtime);
+    // 通知主循环应用新配置 (事件驱动; fd 未初始化时跳过, 启动早期由主循环自行加载)
+    let fd = CONFIG_WAKE_FD.load(Ordering::Relaxed);
+    if fd >= 0 {
+        let val: u64 = 1;
+        unsafe { libc::write(fd, &val as *const u64 as *const _, 8); }
     }
 }
 
