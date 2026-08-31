@@ -59,6 +59,12 @@ pub static CURRENT_CONFIG: Mutex<Option<Arc<AppConfig>>> = Mutex::new(None);
 
 pub static PARSE_FAILS: AtomicUsize = AtomicUsize::new(0);
 
+/// 默认参与刷新率前台识别的系统桌面。它不需要 CPU 亲和性规则，
+/// 刷新率未配置专属项时直接使用全局 active/idle 配置。
+pub const DEFAULT_REFRESH_PACKAGE: &str = "com.android.launcher3";
+/// com.android.launcher3 在当前系统中的实际进程 comm。
+pub const DEFAULT_REFRESH_COMM: &str = "droid.launcher3";
+
 /// 校验 CPU 规格形态
 pub fn spec_like(s: &str) -> bool {
     let mut any = false;
