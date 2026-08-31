@@ -29,6 +29,8 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 .badge.proc{background:rgba(0,122,255,.13);color:#0062cc}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .stat{background:var(--bg);border-radius:12px;padding:12px 8px;text-align:center}
+.stat.clickable{cursor:pointer;transition:background .12s,transform .12s}
+.stat.clickable:active{background:rgba(0,122,255,.08);transform:scale(.96)}
 .stat .num{font-size:24px;font-weight:700;font-variant-numeric:tabular-nums}
 .stat .lbl{font-size:12px;color:var(--sub);margin-top:2px}
 .chip{display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:600;font-family:var(--mono);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -149,7 +151,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="card">
 <div class="card-title">进程</div>
 <div class="grid2">
-<div class="stat"><div class="num" id="s-hit">0</div><div class="lbl">命中应用</div></div>
+<div class="stat clickable" id="s-hit-card" role="button" tabindex="0" title="点击查看命中的具体应用包名"><div class="num" id="s-hit">0</div><div class="lbl">命中应用</div></div>
 <div class="stat"><div class="num" id="s-threads">0</div><div class="lbl">绑定线程</div></div>
 <div class="stat"><div class="num" id="s-procs">0</div><div class="lbl">系统进程</div></div>
 <div class="stat"><div class="num" id="s-cores">0</div><div class="lbl">CPU 核心</div></div>
@@ -316,6 +318,17 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 </div>
 </div>
 
+<div id="modal-hit" class="modal-bg" hidden>
+<div class="modal">
+<h3>命中应用</h3>
+<div class="hint" id="mhit-summary" style="margin-bottom:10px"></div>
+<div id="mhit-list" style="max-height:52vh;overflow:auto"></div>
+<div class="modal-actions">
+<button class="btn" id="mhit-close">关闭</button>
+</div>
+</div>
+</div>
+
 <div id="toast"></div>
 <script>
 const $=id=>document.getElementById(id);
@@ -353,6 +366,7 @@ document.addEventListener('visibilitychange',()=>{if(document.hidden)pausePollin
 window.addEventListener('blur',()=>pausePolling());
 window.addEventListener('focus',()=>resumePolling());
 window.addEventListener('pagehide',()=>pausePolling());
+let hitList=[];
 async function refreshStat(){
   if(document.hidden)return;
   try{
@@ -368,6 +382,7 @@ async function refreshStat(){
     $('s-pf').hidden=!pf;
     $('s-pf').textContent=pf?pf+' 行规则因格式无效被跳过，请检查配置文件':'';
     $('s-hit').textContent=d.hit_pkgs;
+    hitList=Array.isArray(d.hit_list)?d.hit_list:[];
     $('s-threads').textContent=d.threads;
     $('s-procs').textContent=d.total_procs;
     $('s-cores').textContent=d.cores;
@@ -381,6 +396,19 @@ async function refreshStat(){
     $('s-row-pcore').hidden=!vis.includes('p-core');
   }catch(e){}
 }
+
+// 命中应用列表弹窗: 点击"命中应用"统计块展示具体包名
+function showHitList(){
+  $('mhit-summary').textContent='共 '+hitList.length+' 个命中应用';
+  const box=$('mhit-list');
+  if(!hitList.length){box.innerHTML='<div class="empty">暂无命中应用</div>';}
+  else{box.innerHTML=hitList.map(p=>`<div class="rule-row"><span class="rule-name mono">${esc(p)}</span></div>`).join('');}
+  $('modal-hit').hidden=false;
+}
+$('s-hit-card').onclick=showHitList;
+$('s-hit-card').addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();showHitList()}});
+$('mhit-close').onclick=()=>$('modal-hit').hidden=true;
+$('modal-hit').addEventListener('click',e=>{if(e.target===$('modal-hit'))$('modal-hit').hidden=true});
 
 let rulesData=[];
 function chipCls(s){return s==='e-core'?'e':s==='p-core'?'p':s==='hp-core'?'h':'c'}
