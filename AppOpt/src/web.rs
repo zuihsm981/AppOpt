@@ -617,7 +617,7 @@ impl Default for Settings {
             mode: 0,
             check_interval: 2,
             cpuset_name: DEFAULT_CPUSET_NAME.to_string(),
-            config_file: "./applist.conf".to_string(),
+            config_file: "./appopt.conf".to_string(),
         }
     }
 }
