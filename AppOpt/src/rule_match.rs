@@ -82,6 +82,9 @@ fn fnmatch_c(pattern: &CString, string: &str) -> bool {
     unsafe { libc::fnmatch(pattern.as_ptr(), buf.as_ptr() as *const _, libc::FNM_NOESCAPE) == 0 }
 }
 
+/// CPU 规则扫描仍按原有 cfg.pkgs 匹配；默认 launcher 的 PID 映射只在
+/// `ebpf_mode::full_scan` 中额外建立，不在此处扩大 CPU 规则匹配范围。
+
 /// 通过内核 comm 匹配配置包名。长 comm(≥15字节, 可能被 16 字节上限截断)时,
 /// 通过 /proc/<pid>/cmdline 读取完整命令匹配白名单, 避免前缀/后缀误杀。
 pub fn comm_to_pkg(pid: i32, comm: &str, cfg: &AppConfig) -> Option<String> {
