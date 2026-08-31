@@ -276,10 +276,13 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
 
     /* 先设置白名单再激活: start 注册 tracepoint 后立即开始过滤事件,
      * 若白名单为空则所有新进程事件被丢弃, 导致直接打开应用不设置亲和性 */
-    let pkgs = crate::lock_ignore_poison(&CURRENT_CONFIG)
+    let mut pkgs = crate::lock_ignore_poison(&CURRENT_CONFIG)
         .as_ref()
         .map(|cfg| cfg.pkgs.clone())
         .unwrap_or_default();
+    // 桌面是刷新率模块的默认白名单成员，不依赖 CPU 规则存在与否。
+    pkgs.insert(crate::config::DEFAULT_REFRESH_PACKAGE.to_string());
+    pkgs.insert(crate::config::DEFAULT_REFRESH_COMM.to_string());
     handle.set_whitelist(&pkgs);
     handle.activate();
 
@@ -382,7 +385,10 @@ fn kpm_reader(key: CString, tx: mpsc::Sender<EbpfProcEvent>, wakeup_fd: c_int, k
 
 /// 配置白名单; 返回 true 表示需重载 (KPM 白名单容量固定 16384, 不会触发)
 pub fn comm_map_init(bpf: &mut KpmHandle, pkgs: &HashSet<String>, _comm_capacity: u32) -> bool {
-    if !bpf.set_whitelist(pkgs) {
+    let mut refresh_pkgs = pkgs.clone();
+    refresh_pkgs.insert(crate::config::DEFAULT_REFRESH_PACKAGE.to_string());
+    refresh_pkgs.insert(crate::config::DEFAULT_REFRESH_COMM.to_string());
+    if !bpf.set_whitelist(&refresh_pkgs) {
         return true;
     }
     false
@@ -422,6 +428,8 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
 
     match event.event_type {
         EBPF_EVENT_EXIT => {
+            // task_del 会在该 PID 的最后一个线程退出后再移除共享索引；
+            // 不能在单个线程退出时无条件删除 PID→包名映射。
             state.cache.task_del(tid);
             applied_del(&state.bpf, tid);
         }
@@ -473,6 +481,24 @@ fn event_apply(
 /// 启动或配置更新时全量扫描 /proc
 pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
     state.cache.clear();
+
+    // full_scan 时额外扫描当前已经存在的默认桌面进程。
+    // 当前系统中该进程的 comm 为 droid.launcher3；它不需要 CPU 规则，
+    // 但必须进入共享 PID_PKG，并绑定全局刷新率配置。
+    let mut launcher_found = false;
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else { continue };
+            if tid_comm(pid).as_deref() == Some(crate::config::DEFAULT_REFRESH_COMM) {
+                crate::cache::pkg_track_pid(pid, crate::config::DEFAULT_REFRESH_PACKAGE);
+                launcher_found = true;
+            }
+        }
+    }
+    if launcher_found {
+        crate::refresh::refresh_bind_default_launcher();
+    }
+
     applied_clear(&state.bpf);
     /* full_scan 清空了 APPLIED 表, Zygote 的 tid 也随之丢失。
      * 必须重新把 Zygote 加入 APPLIED (bits=0), 否则之后 Zygote fork 的
