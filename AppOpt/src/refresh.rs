@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::{mpsc, Mutex};
 use std::thread;
 use std::time::Instant;
 
@@ -10,18 +10,9 @@ const MODE_120: i32 = 0;
 const MODE_60: i32 = 1;
 const MODE_90: i32 = 2;
 
-/// 配置文件绝对路径：以可执行文件所在目录为基准，
-/// 避免重启后工作目录（cwd）变化导致找不到/重建配置（应用配置被清空）
+/// 配置文件绝对路径：与 config.rs 统一（refresh_config.conf，可执行文件同目录）
 fn config_path() -> &'static str {
-    static PATH: OnceLock<String> = OnceLock::new();
-    PATH.get_or_init(|| {
-        let mut p = std::env::current_exe()
-            .or_else(|_| std::env::current_dir())
-            .unwrap_or_else(|_| std::path::PathBuf::from("."));
-        p.pop(); // 去掉可执行文件名，得到模块目录
-        p.push("refresh_config.conf");
-        p.to_string_lossy().into_owned()
-    })
+    crate::config::refresh_config_path()
 }
 
 pub const EVENT_INPUT: u32 = 5;
@@ -72,73 +63,40 @@ struct RefreshState {
     timer_fd: i32,
 }
 
-fn parse_mode(s: &str) -> i32 {
-    match s.trim() {
-        "120" => MODE_120,
-        "90" => MODE_90,
-        "60" => MODE_60,
-        _ => MODE_60,
-    }
-}
-
 fn create_default_config() {
-    if !std::path::Path::new(config_path()).exists() {
-        let _ = fs::write(config_path(), "timeout=30\nactive=120\nidle=60\n# packageName,timeout,activeMode,idleMode\n");
+    if !std::path::Path::new(crate::config::refresh_config_path()).exists() {
+        let _ = fs::write(
+            crate::config::refresh_config_path(),
+            "timeout=30\nactive=120\nidle=60\n# packageName,timeout,activeMode,idleMode\n",
+        );
     }
 }
 
+/// 从共享 CURRENT_CONFIG 读取刷新率全局配置（统一加载，避免线程内重复读文件）
 fn load_global_config(state: &mut RefreshState) {
-    let content = match fs::read_to_string(config_path()) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((k, v)) = line.split_once('=') {
-            match k.trim() {
-                "timeout" => {
-                    if let Ok(t) = v.trim().parse::<i32>() {
-                        if t > 0 {
-                            state.timeout_seconds = t;
-                        }
-                    }
-                }
-                "active" => state.active_mode = parse_mode(v),
-                "idle" => state.idle_mode = parse_mode(v),
-                _ => {}
-            }
-        }
-    }
+    let cfg = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
+    let Some(cfg) = cfg else { return };
+    state.timeout_seconds = cfg.refresh_timeout;
+    state.active_mode = cfg.refresh_active;
+    state.idle_mode = cfg.refresh_idle;
     state.current_active = state.active_mode;
     state.current_idle = state.idle_mode;
     state.current_timeout = state.timeout_seconds;
     state.timer_enabled = state.current_idle != state.current_active;
 }
 
+/// 从共享 CURRENT_CONFIG 读取按应用刷新率配置（统一加载）
 fn load_app_configs(state: &mut RefreshState) {
     state.app_configs.clear();
-    let content = match fs::read_to_string(config_path()) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let parts: Vec<&str> = line.split(',').collect();
-        if parts.len() != 4 {
-            continue;
-        }
+    let cfg = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
+    let Some(cfg) = cfg else { return };
+    for (pkg, (timeout, active_mode, idle_mode)) in &cfg.app_refresh_configs {
         state.app_configs.insert(
-            parts[0].trim().to_string(),
+            pkg.clone(),
             AppRefreshConfig {
-                timeout: parts[1].trim().parse::<i32>().unwrap_or(30),
-                active_mode: parse_mode(parts[2].trim()),
-                idle_mode: parse_mode(parts[3].trim()),
+                timeout: *timeout,
+                active_mode: *active_mode,
+                idle_mode: *idle_mode,
             },
         );
     }
@@ -217,25 +175,38 @@ fn switch_to_idle(state: &mut RefreshState) {
     state.last_reset_time = None;
 }
 
-/// IProcessObserver 回调触发：直接收到包名（socketpair 传递，系统过滤已在 UID 映射表完成）
-fn handle_fg_change(state: &mut RefreshState, pkg: &str) {
+/// IProcessObserver 回调触发：收到 pid，从共享 ProcCache(PID_PKG) 查包名
+/// 白名单准入（两道防线，参考 优化.md）：
+///   防线一：数据可用性检查（查不到包名即丢弃）
+///   防线二：白名单准入（仅 launcher 或已配置应用）
+fn handle_fg_change(state: &mut RefreshState, pid: i32) {
+    // 防线一：从共享 pid→pkg 索引获取包名（防御性检查）
+    let Some(pkg) = crate::cache::pkg_lookup_pid(pid) else {
+        return; // 极端情况：进程在回调触发时恰好退出/尚未入库
+    };
     if pkg.is_empty() || pkg == state.last_applied_pkg {
         return;
     }
 
+    // 防线二：白名单准入检查（唯一真正的过滤器）
+    let is_launcher = pkg == "com.android.launcher3";
+    let is_managed = state.app_configs.contains_key(&pkg);
+    if !is_launcher && !is_managed {
+        return; // 系统设置、状态栏、弹窗、未配置应用全部丢弃
+    }
+
     // 判断切换前/后的应用是否已配置（决定是否应用全局活跃刷新率）
-    // 注意：last_applied_pkg 为空串时不可能是已配置 uid，故无需单独判断是否有上一应用
     let prev_configured = state.app_configs.contains_key(&state.last_applied_pkg);
-    let cur_configured = state.app_configs.contains_key(pkg);
+    let cur_configured = is_launcher || is_managed;
 
     let now = Instant::now();
-    state.current_package = pkg.to_string();
-    state.last_applied_pkg = pkg.to_string();
+    state.current_package = pkg.clone();
+    state.last_applied_pkg = pkg.clone();
     state.last_apply_time = Some(now);
 
-    apply_app_config(state, pkg);
-    // 未配置 uid 之间切换时不重新应用全局活跃刷新率；
-    // 仅当从已配置 uid 切换到未配置 uid（或切到已配置 uid）时才应用活跃刷新率
+    apply_app_config(state, &pkg);
+    // 未配置应用之间切换时不重新应用全局活跃刷新率；
+    // 仅当从已配置应用切换到未配置应用（或切到已配置应用）时才应用活跃刷新率
     if prev_configured || cur_configured {
         set_refresh_rate(state, state.current_active);
     }
@@ -375,10 +346,7 @@ pub fn refresh_init() {
     let active = state.current_active;
     set_refresh_rate(&mut state, active);
 
-    // 加载 UID → 包名映射表
-    crate::process_observer::init_uid_map();
-
-    // 注册 IProcessObserver 回调
+    // 注册 IProcessObserver 回调（回调只传 pid，包名由共享 ProcCache 查询）
     let _ = crate::process_observer::init_observer(fg_send_fd);
 
     let name = CString::new("RefreshRate").unwrap();
@@ -404,8 +372,8 @@ pub fn refresh_init() {
         unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fg_recv_fd, &mut ev); }
 
         let mut events: [libc::epoll_event; 3] = unsafe { std::mem::zeroed() };
-        // 复用固定缓冲：from_utf8 直接借用，读取路径零堆分配（包名均为合法 UTF-8）
-        let mut fg_buf = [0u8; 512];
+        // fg socketpair 接收缓冲（4 字节 pid i32）
+        let mut fg_buf = [0u8; 4];
 
         loop {
             // maxevents 与 events 缓冲大小一致（3 个已注册 fd，最多返回 3 个事件）
@@ -435,8 +403,8 @@ pub fn refresh_init() {
                         switch_to_idle(&mut state);
                     }
                     3 => {
-                        // IProcessObserver 回调: 读取包名（socketpair datagram，无需再查表）
-                        // 复用 fg_buf，from_utf8 直接借用 &str，不产生堆分配
+                        // IProcessObserver 回调: 读取 pid（socketpair datagram，4 字节 i32），
+                        // 包名由 handle_fg_change 从共享 ProcCache 查询
                         let n = unsafe {
                             libc::recv(
                                 fg_recv_fd,
@@ -445,10 +413,9 @@ pub fn refresh_init() {
                                 0,
                             )
                         };
-                        if n > 0 {
-                            if let Ok(pkg) = std::str::from_utf8(&fg_buf[..n as usize]) {
-                                handle_fg_change(&mut state, pkg);
-                            }
+                        if n == 4 {
+                            let pid = i32::from_ne_bytes([fg_buf[0], fg_buf[1], fg_buf[2], fg_buf[3]]);
+                            handle_fg_change(&mut state, pid);
                         }
                     }
                     _ => {}
@@ -482,28 +449,15 @@ pub fn refresh_on_event(event_type: u32, _pid: i32) {
 // ===== Web API =====
 
 pub fn refresh_get_config() -> (i32, String, String) {
-    let content = fs::read_to_string(config_path()).unwrap_or_default();
-    let mut timeout = 30;
-    let mut active = "120".to_string();
-    let mut idle = "60".to_string();
-    for line in content.lines() {
-        let line = line.trim();
-        if let Some((k, v)) = line.split_once('=') {
-            match k.trim() {
-                "timeout" => {
-                    if let Ok(t) = v.trim().parse::<i32>() {
-                        if t > 0 {
-                            timeout = t;
-                        }
-                    }
-                }
-                "active" => active = v.trim().to_string(),
-                "idle" => idle = v.trim().to_string(),
-                _ => {}
-            }
-        }
+    // 从共享 CURRENT_CONFIG 读取（统一加载；未就绪时回退默认值）
+    if let Some(cfg) = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone() {
+        return (
+            cfg.refresh_timeout,
+            crate::config::refresh_mode_str(cfg.refresh_active).to_string(),
+            crate::config::refresh_mode_str(cfg.refresh_idle).to_string(),
+        );
     }
-    (timeout, active, idle)
+    (30, "120".to_string(), "60".to_string())
 }
 
 pub fn refresh_set_config(timeout: i32, active: &str, idle: &str) {
@@ -546,11 +500,30 @@ pub fn refresh_set_config(timeout: i32, active: &str, idle: &str) {
     }
 
     let _ = fs::write(config_path(), lines.join("\n") + "\n");
+    // 同步共享配置（仅刷新率，不触发 CPU 重载）+ 独立通知 refresh 线程
+    crate::config::reload_refresh_only();
     REFRESH_FORCE_RELOAD.store(true, Ordering::Release);
     wake();
 }
 
 pub fn refresh_get_apps() -> Vec<(String, i32, String, String)> {
+    // 从共享 CURRENT_CONFIG 读取（统一加载；未就绪时回退文件）
+    if let Some(cfg) = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone() {
+        if !cfg.app_refresh_configs.is_empty() {
+            return cfg
+                .app_refresh_configs
+                .iter()
+                .map(|(pkg, (t, a, i))| {
+                    (
+                        pkg.clone(),
+                        *t,
+                        crate::config::refresh_mode_str(*a).to_string(),
+                        crate::config::refresh_mode_str(*i).to_string(),
+                    )
+                })
+                .collect();
+        }
+    }
     let content = match fs::read_to_string(config_path()) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
@@ -594,6 +567,8 @@ pub fn refresh_add_app(pkg: &str, timeout: i32, active: &str, idle: &str) {
         lines.push(new_line);
     }
     let _ = fs::write(config_path(), lines.join("\n") + "\n");
+    // 同步共享配置（仅刷新率）+ 独立通知 refresh 线程
+    crate::config::reload_refresh_only();
     REFRESH_FORCE_RELOAD.store(true, Ordering::Release);
     wake();
 }
@@ -615,6 +590,8 @@ pub fn refresh_del_app(pkg: &str) -> bool {
         .map(String::from)
         .collect();
     let _ = fs::write(config_path(), lines.join("\n") + "\n");
+    // 同步共享配置（仅刷新率）+ 独立通知 refresh 线程
+    crate::config::reload_refresh_only();
     REFRESH_FORCE_RELOAD.store(true, Ordering::Release);
     wake();
     true
