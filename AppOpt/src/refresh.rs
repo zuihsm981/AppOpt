@@ -36,6 +36,8 @@ pub struct RefreshStatus {
 
 enum RefreshEvent {
     Input,
+    /// full_scan 发现已存在的默认桌面后，要求刷新线程绑定全局配置。
+    BindDefaultLauncher,
 }
 
 struct AppRefreshConfig {
@@ -102,11 +104,28 @@ fn set_refresh_rate(state: &mut RefreshState, mode: i32) {
     state.current_applied_mode = mode;
 }
 
+fn bind_default_launcher(state: &mut RefreshState) {
+    state.current_package = crate::config::DEFAULT_REFRESH_PACKAGE.to_string();
+    state.last_applied_pkg = state.current_package.clone();
+    // 默认 launcher 永远使用全局 timeout/active/idle。
+    apply_app_config(state, crate::config::DEFAULT_REFRESH_PACKAGE);
+    set_refresh_rate(state, state.current_active);
+    reset_timer(state, true);
+}
+
 fn apply_app_config(state: &mut RefreshState, pkg: &str) {
-    if let Some(cfg) = state.app_configs.get(pkg) {
-        state.current_timeout = cfg.timeout;
-        state.current_active = cfg.active_mode;
-        state.current_idle = cfg.idle_mode;
+    // com.android.launcher3 是默认桌面白名单成员，始终绑定全局刷新率配置；
+    // 即使配置文件中残留同名 refresh_app 行，也不能把桌面切到应用级覆盖值。
+    if pkg != crate::config::DEFAULT_REFRESH_PACKAGE {
+        if let Some(cfg) = state.app_configs.get(pkg) {
+            state.current_timeout = cfg.timeout;
+            state.current_active = cfg.active_mode;
+            state.current_idle = cfg.idle_mode;
+        } else {
+            state.current_timeout = state.timeout_seconds;
+            state.current_active = state.active_mode;
+            state.current_idle = state.idle_mode;
+        }
     } else {
         state.current_timeout = state.timeout_seconds;
         state.current_active = state.active_mode;
@@ -167,7 +186,7 @@ fn switch_to_idle(state: &mut RefreshState) {
 }
 
 /// IProcessObserver 回调触发：收到 pid，从共享 ProcCache(PID_PKG) 查包名
-/// 白名单准入（两道防线，参考 优化.md）：
+/// 白名单准入（两道防线，参考 优化.md）；默认桌面绑定全局刷新率配置：
 ///   防线一：数据可用性检查（查不到包名即丢弃）
 ///   防线二：白名单准入（仅 launcher 或已配置应用）
 fn handle_fg_change(state: &mut RefreshState, pid: i32) {
@@ -180,7 +199,9 @@ fn handle_fg_change(state: &mut RefreshState, pid: i32) {
     }
 
     // 防线二：白名单准入检查（唯一真正的过滤器）
-    let is_launcher = pkg == "com.android.launcher3";
+    // 默认桌面不需要 app_refresh_configs 专属条目，直接走全局
+    // timeout/active/idle；只有其他包才查应用级覆盖配置。
+    let is_launcher = pkg == crate::config::DEFAULT_REFRESH_PACKAGE;
     let is_managed = state.app_configs.contains_key(&pkg);
     if !is_launcher && !is_managed {
         return; // 系统设置、状态栏、弹窗、未配置应用全部丢弃
@@ -330,8 +351,7 @@ pub fn refresh_init() {
     load_global_config(&mut state);
     load_app_configs(&mut state);
 
-    // 初始化完成后应用一次全局配置的活跃刷新率
-    // （之后的前台切换判定见 handle_fg_change：未配置→未配置不再重复应用全局活跃刷新率）
+    // 初始化时先应用一次全局 active 刷新率；launcher 的全局绑定由 full_scan 事件完成。
     let active = state.current_active;
     set_refresh_rate(&mut state, active);
 
@@ -382,6 +402,9 @@ pub fn refresh_init() {
                         while let Ok(event) = rx.try_recv() {
                             match event {
                                 RefreshEvent::Input => handle_input(&mut state),
+                                RefreshEvent::BindDefaultLauncher => {
+                                    bind_default_launcher(&mut state)
+                                }
                             }
                         }
                         check_config(&mut state);
@@ -421,6 +444,15 @@ pub fn refresh_init() {
             libc::close(fg_send_fd);
         }
     });
+}
+
+/// full_scan 发现默认 launcher PID 后，请求刷新线程绑定全局配置。
+pub fn refresh_bind_default_launcher() {
+    let guard = REFRESH_TX.lock().unwrap();
+    if let Some(tx) = guard.as_ref() {
+        let _ = tx.send(RefreshEvent::BindDefaultLauncher);
+        wake();
+    }
 }
 
 pub fn refresh_on_event(event_type: u32, _pid: i32) {
