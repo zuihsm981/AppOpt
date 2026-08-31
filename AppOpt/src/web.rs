@@ -69,12 +69,11 @@ pub struct WebStats {
     pub uptime: u64,
 }
 
-/// 缓存统计: 返回 (线程数, 命中包名数, 命中包名列表)
+/// 缓存统计: 返回 (线程数, 命中包名数, 命中包名列表)。
+/// 命中包名由 ProcCache 增量维护，避免每次 Web 请求扫描全部线程。
 pub fn cache_stats(cache: &ProcCache) -> (usize, usize, Vec<String>) {
-    let mut pkgs: Vec<String> = cache.tasks.values().map(|e| e.pkg.clone()).collect();
-    pkgs.sort();
-    pkgs.dedup();
-    (cache.tasks.len(), pkgs.len(), pkgs)
+    let hit_list = cache.hit_package_list();
+    (cache.tasks.len(), hit_list.len(), hit_list)
 }
 
 /// 启动 web 前端
