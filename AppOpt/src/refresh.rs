@@ -10,9 +10,9 @@ const MODE_120: i32 = 0;
 const MODE_60: i32 = 1;
 const MODE_90: i32 = 2;
 
-/// 配置文件绝对路径：与 config.rs 统一（refresh_config.conf，可执行文件同目录）
-fn config_path() -> &'static str {
-    crate::config::refresh_config_path()
+/// 刷新率配置与 CPU 规则共用 CONFIG_FILE 指向的主配置文件。
+fn config_path() -> String {
+    crate::lock_ignore_poison(&crate::config::CONFIG_FILE).clone()
 }
 
 pub const EVENT_INPUT: u32 = 5;
@@ -61,15 +61,6 @@ struct RefreshState {
     last_apply_time: Option<Instant>,
     last_input_time: Option<Instant>,
     timer_fd: i32,
-}
-
-fn create_default_config() {
-    if !std::path::Path::new(crate::config::refresh_config_path()).exists() {
-        let _ = fs::write(
-            crate::config::refresh_config_path(),
-            "timeout=30\nactive=120\nidle=60\n# packageName,timeout,activeMode,idleMode\n",
-        );
-    }
 }
 
 /// 从共享 CURRENT_CONFIG 读取刷新率全局配置（统一加载，避免线程内重复读文件）
@@ -271,8 +262,6 @@ fn wake() {
 }
 
 pub fn refresh_init() {
-    create_default_config();
-
     let wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     if wake_fd < 0 {
         return;
@@ -461,10 +450,10 @@ pub fn refresh_get_config() -> (i32, String, String) {
 }
 
 pub fn refresh_set_config(timeout: i32, active: &str, idle: &str) {
-    // 原地编辑而非覆盖整个文件：只替换 timeout/active/idle 三个全局配置键的值，
-    // 保留原有行顺序、注释、空行与应用配置行（不做 trim、不丢弃空行、不重排），
-    // 缺失的键追加到文件末尾。
-    let content = fs::read_to_string(config_path()).unwrap_or_default();
+    // 原地编辑主配置文件：只替换刷新率字段，保留 CPU 规则、注释、空行和应用配置。
+    // 使用 refresh_ 前缀，确保不会与 CPU 规则语法混淆。
+    let path = config_path();
+    let content = fs::read_to_string(&path).unwrap_or_default();
     let mut found_timeout = false;
     let mut found_active = false;
     let mut found_idle = false;
@@ -474,32 +463,34 @@ pub fn refresh_set_config(timeout: i32, active: &str, idle: &str) {
         let trimmed = line.trim();
         let Some((k, _v)) = trimmed.split_once('=') else { continue };
         match k.trim() {
-            "timeout" => {
-                *line = format!("timeout={}", timeout);
+            "refresh_timeout" => {
+                *line = format!("refresh_timeout={}", timeout);
                 found_timeout = true;
             }
-            "active" => {
-                *line = format!("active={}", active);
+            "refresh_active" => {
+                *line = format!("refresh_active={}", active);
                 found_active = true;
             }
-            "idle" => {
-                *line = format!("idle={}", idle);
+            "refresh_idle" => {
+                *line = format!("refresh_idle={}", idle);
                 found_idle = true;
             }
             _ => {}
         }
     }
     if !found_timeout {
-        lines.push(format!("timeout={}", timeout));
+        lines.push(format!("refresh_timeout={}", timeout));
     }
     if !found_active {
-        lines.push(format!("active={}", active));
+        lines.push(format!("refresh_active={}", active));
     }
     if !found_idle {
-        lines.push(format!("idle={}", idle));
+        lines.push(format!("refresh_idle={}", idle));
     }
 
-    let _ = fs::write(config_path(), lines.join("\n") + "\n");
+    if fs::write(&path, lines.join("\n") + "\n").is_err() {
+        return;
+    }
     // 同步共享配置（仅刷新率，不触发 CPU 重载）+ 独立通知 refresh 线程
     crate::config::reload_refresh_only();
     REFRESH_FORCE_RELOAD.store(true, Ordering::Release);
@@ -507,57 +498,37 @@ pub fn refresh_set_config(timeout: i32, active: &str, idle: &str) {
 }
 
 pub fn refresh_get_apps() -> Vec<(String, i32, String, String)> {
-    // 从共享 CURRENT_CONFIG 读取（统一加载；未就绪时回退文件）
-    if let Some(cfg) = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone() {
-        if !cfg.app_refresh_configs.is_empty() {
-            return cfg
-                .app_refresh_configs
-                .iter()
-                .map(|(pkg, (t, a, i))| {
-                    (
-                        pkg.clone(),
-                        *t,
-                        crate::config::refresh_mode_str(*a).to_string(),
-                        crate::config::refresh_mode_str(*i).to_string(),
-                    )
-                })
-                .collect();
-        }
-    }
-    let content = match fs::read_to_string(config_path()) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
+    // 刷新率应用配置只从共享 CURRENT_CONFIG 返回，不再单独读取配置文件。
+    let Some(cfg) = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone() else {
+        return Vec::new();
     };
-    let mut apps = Vec::new();
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let parts: Vec<&str> = line.split(',').collect();
-        if parts.len() != 4 {
-            continue;
-        }
-        apps.push((
-            parts[0].trim().to_string(),
-            parts[1].trim().parse::<i32>().unwrap_or(30),
-            parts[2].trim().to_string(),
-            parts[3].trim().to_string(),
-        ));
-    }
-    apps
+    cfg.app_refresh_configs
+        .iter()
+        .map(|(pkg, (t, a, i))| {
+            (
+                pkg.clone(),
+                *t,
+                crate::config::refresh_mode_str(*a).to_string(),
+                crate::config::refresh_mode_str(*i).to_string(),
+            )
+        })
+        .collect()
 }
 
 pub fn refresh_add_app(pkg: &str, timeout: i32, active: &str, idle: &str) {
-    let content = fs::read_to_string(config_path()).unwrap_or_default();
+    let path = config_path();
+    let content = fs::read_to_string(&path).unwrap_or_default();
     let mut lines: Vec<String> = content.lines().map(String::from).collect();
-    let new_line = format!("{},{},{},{}", pkg, timeout, active, idle);
+    let new_line = format!("refresh_app,{},{},{},{}", pkg, timeout, active, idle);
     let mut found = false;
     for line in lines.iter_mut() {
         if line.trim().starts_with('#') || line.trim().is_empty() {
             continue;
         }
-        if line.split(',').next().map(|s| s.trim() == pkg).unwrap_or(false) {
+        let fields: Vec<&str> = line.split(',').map(str::trim).collect();
+        if (fields.len() == 5 && fields[0] == "refresh_app" && fields[1] == pkg)
+            || (fields.len() == 4 && fields[0] == pkg)
+        {
             *line = new_line.clone();
             found = true;
             break;
@@ -566,7 +537,9 @@ pub fn refresh_add_app(pkg: &str, timeout: i32, active: &str, idle: &str) {
     if !found {
         lines.push(new_line);
     }
-    let _ = fs::write(config_path(), lines.join("\n") + "\n");
+    if fs::write(&path, lines.join("\n") + "\n").is_err() {
+        return;
+    }
     // 同步共享配置（仅刷新率）+ 独立通知 refresh 线程
     crate::config::reload_refresh_only();
     REFRESH_FORCE_RELOAD.store(true, Ordering::Release);
@@ -574,7 +547,8 @@ pub fn refresh_add_app(pkg: &str, timeout: i32, active: &str, idle: &str) {
 }
 
 pub fn refresh_del_app(pkg: &str) -> bool {
-    let content = match fs::read_to_string(config_path()) {
+    let path = config_path();
+    let content = match fs::read_to_string(&path) {
         Ok(s) => s,
         Err(_) => return false,
     };
@@ -585,11 +559,15 @@ pub fn refresh_del_app(pkg: &str) -> bool {
             if line.is_empty() || line.starts_with('#') {
                 return true;
             }
-            line.split(',').next().map(|s| s.trim() != pkg).unwrap_or(true)
+            let fields: Vec<&str> = line.split(',').map(str::trim).collect();
+            !((fields.len() == 5 && fields[0] == "refresh_app" && fields[1] == pkg)
+                || (fields.len() == 4 && fields[0] == pkg))
         })
         .map(String::from)
         .collect();
-    let _ = fs::write(config_path(), lines.join("\n") + "\n");
+    if fs::write(&path, lines.join("\n") + "\n").is_err() {
+        return false;
+    }
     // 同步共享配置（仅刷新率）+ 独立通知 refresh 线程
     crate::config::reload_refresh_only();
     REFRESH_FORCE_RELOAD.store(true, Ordering::Release);
