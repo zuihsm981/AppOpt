@@ -278,7 +278,7 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
      * 若白名单为空则所有新进程事件被丢弃, 导致直接打开应用不设置亲和性 */
     let mut pkgs = crate::lock_ignore_poison(&CURRENT_CONFIG)
         .as_ref()
-        .map(|cfg| cfg.pkgs.clone())
+        .map(|cfg| cfg.target_pkgs.clone())
         .unwrap_or_default();
     // 桌面是刷新率模块的默认白名单成员，不依赖 CPU 规则存在与否。
     pkgs.insert(crate::config::DEFAULT_REFRESH_PACKAGE.to_string());
