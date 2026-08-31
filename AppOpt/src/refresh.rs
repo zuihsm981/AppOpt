@@ -22,6 +22,25 @@ static WAKE_FD: AtomicI32 = AtomicI32::new(-1);
 static REFRESH_STATUS: Mutex<Option<RefreshStatus>> = Mutex::new(None);
 static REFRESH_TX: Mutex<Option<mpsc::Sender<RefreshEvent>>> = Mutex::new(None);
 
+/// 刷新率线程正在等待解析的前台 pid（冷启动竞态）。
+/// cache.rs 在 pkg_track_pid 写入 PID_PKG 后按此值零成本过滤，命中才通知。
+static REFRESH_PENDING_PID: AtomicI32 = AtomicI32::new(0);
+
+/// 供 cache.rs 通知：若刷新率线程正在等待该 pid 的包名入库，则发事件唤醒。
+pub fn notify_pkg_tracked(pid: i32) {
+    if pid <= 0 {
+        return;
+    }
+    if REFRESH_PENDING_PID.load(Ordering::Acquire) != pid {
+        return; // 非等待中的 pid，零成本过滤，不打扰刷新率线程
+    }
+    let guard = REFRESH_TX.lock().unwrap();
+    if let Some(tx) = guard.as_ref() {
+        let _ = tx.send(RefreshEvent::PkgTracked(pid));
+        wake();
+    }
+}
+
 #[derive(Clone)]
 pub struct RefreshStatus {
     pub current_mode: i32,
@@ -38,6 +57,8 @@ enum RefreshEvent {
     Input,
     /// full_scan 发现已存在的默认桌面后，要求刷新线程绑定全局配置。
     BindDefaultLauncher,
+    /// cache 层写入 PID_PKG 后通知：若该 pid 正是线程等待的前台 pid，立即应用刷新率。
+    PkgTracked(i32),
 }
 
 struct AppRefreshConfig {
@@ -63,10 +84,6 @@ struct RefreshState {
     last_apply_time: Option<Instant>,
     last_input_time: Option<Instant>,
     timer_fd: i32,
-    /// 冷启动竞态：fg 回调早于 KPM 事件填充 PID_PKG 时，缓存待解析的前台 pid，
-    /// 主循环用短超时轮询重试，直到 KPM 完成填充后应用刷新率。
-    pending_fg_pid: Option<i32>,
-    pending_fg_until: Option<Instant>,
 }
 
 /// 从共享 CURRENT_CONFIG 读取刷新率全局配置（统一加载，避免线程内重复读文件）
@@ -228,34 +245,17 @@ fn try_apply_fg(state: &mut RefreshState, pid: i32) -> bool {
 
 /// IProcessObserver 回调触发：收到 pid 后先试应用刷新率。
 /// 冷启动竞态：新进程 fg 回调可能早于 KPM 事件处理完成、PID_PKG 尚未填充，
-/// 此时挂起最新前台 pid，由主循环短超时轮询重试（KPM 填充后自然命中）。
-/// 新回调总是覆盖旧 pending，确保"最后前台者优先"。
+/// 此时登记 REFRESH_PENDING_PID；cache 层 pkg_track_pid 命中该 pid 时通过
+/// mpsc 事件通知刷新率线程立即应用（事件驱动，无轮询、无超时兜底）。
 fn handle_fg_change(state: &mut RefreshState, pid: i32) {
-    // PID_PKG 已有该 pid → 直接决定（应用刷新率，或按白名单丢弃），不挂起。
+    // PID_PKG 已有该 pid → 直接决定（应用刷新率，或按白名单丢弃），不登记。
     if crate::cache::pkg_lookup_pid(pid).is_some() {
         try_apply_fg(state, pid);
         return;
     }
-    // 冷启动竞态：PID_PKG 尚无该 pid（KPM 事件链未处理完），挂起重试。
-    state.pending_fg_pid = Some(pid);
-    state.pending_fg_until = Some(Instant::now() + Duration::from_millis(1000));
-}
-
-/// 冷启动竞态重试：KPM 事件链填充 PID_PKG 后，把挂起的 fg pid 重新应用刷新率。
-fn retry_pending_fg(state: &mut RefreshState) {
-    let Some(pid) = state.pending_fg_pid else { return };
-    // 超时放弃（KPM 事件链 1s 内未填充，不再等）
-    if state.pending_fg_until.is_some_and(|d| Instant::now() >= d) {
-        state.pending_fg_pid = None;
-        state.pending_fg_until = None;
-        return;
-    }
-    // PID_PKG 已有该 pid → 重新走完整应用流程
-    if crate::cache::pkg_lookup_pid(pid).is_some() {
-        state.pending_fg_pid = None;
-        state.pending_fg_until = None;
-        try_apply_fg(state, pid);
-    }
+    // 冷启动竞态：PID_PKG 尚无该 pid（KPM 事件链未处理完）。登记等待 pid，
+    // 待 pkg_track_pid 写入后由 PkgTracked 事件驱动应用。
+    REFRESH_PENDING_PID.store(pid, Ordering::Release);
 }
 
 /// input 事件触发：用户活动
@@ -379,8 +379,6 @@ pub fn refresh_init() {
         last_apply_time: None,
         last_input_time: None,
         timer_fd,
-        pending_fg_pid: None,
-        pending_fg_until: None,
     };
 
     load_global_config(&mut state);
@@ -420,9 +418,9 @@ pub fn refresh_init() {
         let mut fg_buf = [0u8; 4];
 
         loop {
-            // 有待解析 fg pid 时用 50ms 短超时轮询重试; 否则阻塞等待事件
-            let timeout_ms: i32 = if state.pending_fg_pid.is_some() { 50 } else { -1 };
-            let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 3, timeout_ms) };
+            // 事件驱动：阻塞等待事件；无轮询、无超时兜底。
+            // 冷启动竞态由 cache 层 pkg_track_pid → PkgTracked 事件直接解决。
+            let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 3, -1) };
             if n < 0 {
                 if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                     continue;
@@ -440,6 +438,14 @@ pub fn refresh_init() {
                                 RefreshEvent::Input => handle_input(&mut state),
                                 RefreshEvent::BindDefaultLauncher => {
                                     bind_default_launcher(&mut state)
+                                }
+                                // cache 层 pkg_track_pid 命中待解析前台 pid 的通知。
+                                // 事件驱动：收到即应用并清除等待标记。
+                                RefreshEvent::PkgTracked(pid) => {
+                                    if REFRESH_PENDING_PID.load(Ordering::Acquire) == pid {
+                                        REFRESH_PENDING_PID.store(0, Ordering::Release);
+                                    }
+                                    try_apply_fg(&mut state, pid);
                                 }
                             }
                         }
@@ -469,8 +475,6 @@ pub fn refresh_init() {
                     _ => {}
                 }
             }
-            // 每轮都尝试重试挂起的 fg pid（冷启动竞态: KPM 事件链填充 PID_PKG 后命中）
-            retry_pending_fg(&mut state);
             update_status(&state);
         }
 
