@@ -19,6 +19,9 @@ pub fn pkg_lookup_pid(pid: i32) -> Option<String> {
 pub fn pkg_track_pid(pid: i32, pkg: &str) {
     if pid > 0 && !pkg.is_empty() {
         PID_PKG.lock().unwrap().insert(pid, pkg.to_string());
+        // 若刷新率线程正等待该 pid 的包名（冷启动竞态），事件驱动立即通知，
+        // 替代轮询等待：KPM 事件链填充 PID_PKG 后刷新率即刻生效。
+        crate::refresh::notify_pkg_tracked(pid);
     }
 }
 
