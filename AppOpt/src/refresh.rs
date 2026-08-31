@@ -185,14 +185,33 @@ fn switch_to_idle(state: &mut RefreshState) {
     state.last_reset_time = None;
 }
 
+/// 冷启动竞态兜底：PID_PKG 尚未填充（新进程 fg 回调早于 KPM 事件处理完成）时，
+/// 从 /proc/<pid>/comm + cmdline 按需解析包名并回填 PID_PKG。
+/// 实测：点击图标冷启动新进程时，AMS 的 onForegroundActivitiesChanged 回调
+/// 常早于 KPM 事件处理完成，PID_PKG 尚无该 pid，若不兜底则刷新率无法切换。
+/// 只在 fg 切换冷路径触发（非热路径），一次性开销可接受。
+fn fg_pkg_fallback(pid: i32) -> Option<String> {
+    let comm = crate::apply_affinity::tid_comm(pid)?;
+    let cfg = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone()?;
+    let pkg = crate::rule_match::comm_to_pkg(pid, &comm, &cfg)?;
+    crate::cache::pkg_track_pid(pid, &pkg);
+    Some(pkg)
+}
+
 /// IProcessObserver 回调触发：收到 pid，从共享 ProcCache(PID_PKG) 查包名
 /// 白名单准入（两道防线，参考 优化.md）；默认桌面绑定全局刷新率配置：
-///   防线一：数据可用性检查（查不到包名即丢弃）
+///   防线一：数据可用性检查（查不到包名先按需解析一次，仍无则丢弃）
 ///   防线二：白名单准入（仅 launcher 或已配置应用）
 fn handle_fg_change(state: &mut RefreshState, pid: i32) {
-    // 防线一：从共享 pid→pkg 索引获取包名（防御性检查）
-    let Some(pkg) = crate::cache::pkg_lookup_pid(pid) else {
-        return; // 极端情况：进程在回调触发时恰好退出/尚未入库
+    // 防线一：优先从共享 pid→pkg 索引获取包名（热路径零文件 I/O）
+    let pkg = match crate::cache::pkg_lookup_pid(pid) {
+        Some(p) => p,
+        // 冷启动竞态：新进程 fg 回调可能早于 KPM 事件处理完成，PID_PKG 尚未
+        // 填充。按需解析一次并回填，避免“直接打开应用刷新率不生效”。
+        None => match fg_pkg_fallback(pid) {
+            Some(p) => p,
+            None => return, // 进程恰好退出/无法解析
+        },
     };
     if pkg.is_empty() || pkg == state.last_applied_pkg {
         return;
