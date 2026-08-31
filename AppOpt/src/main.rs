@@ -46,7 +46,7 @@ pub(crate) fn lock_ignore_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'
 fn print_help(prog_name: &str) {
     println!("Usage: {} [OPTIONS]", prog_name);
     println!("Options:");
-    println!("  -c <config_file>   指定配置文件 (默认: ./applist.conf)");
+    println!("  -c <config_file>   指定统一配置文件 (默认: ./appopt.conf)");
     println!("  -s <interval>      设置检查间隔(秒) (必须>=1, 默认: 2)");
     println!("  -b <cpuset_name>   指定 BASE_CPUSET 目录名 (默认: AppOpt)");
     println!("  -w                 启用网页前端 (仅本机 127.0.0.1:8889)");
@@ -54,7 +54,7 @@ fn print_help(prog_name: &str) {
     println!("  -h                 显示帮助信息");
     println!();
     println!("示例:");
-    println!("  {} -c /data/applist.conf -s 3", prog_name);
+    println!("  {} -c /data/appopt.conf -s 3", prog_name);
     println!("  {} -b MyAppOpt", prog_name);
     println!();
     println!("应用设置保存于 ./AppOpt.json，首次运行自动创建；");
@@ -74,6 +74,12 @@ fn print_help(prog_name: &str) {
     println!("  }}");
     println!("  线程 RenderThread 绑定到 CPU 6-7");
     println!("  线程 Thread-1 绑定到 CPU 0-5");
+    println!();
+    println!("刷新率配置（与上述规则共用此文件）:");
+    println!("  refresh_timeout=30");
+    println!("  refresh_active=120");
+    println!("  refresh_idle=60");
+    println!("  refresh_app,com.example.game,30,120,60");
 }
 
 fn main() {
@@ -153,7 +159,13 @@ fn main() {
 
     // 应用设置持久化于 AppOpt.json，命令行参数优先覆盖
     let st = settings_load(SETTINGS_FILE);
-    let config_file = cli_cfg.unwrap_or(st.config_file);
+    let config_file = match cli_cfg {
+        Some(path) => path,
+        None if st.config_file == "./applist.conf" => "./appopt.conf".to_string(),
+        None => st.config_file,
+    };
+    // 默认配置升级：applist.conf -> appopt.conf；-c 显式指定的路径不受影响。
+    crate::config::migrate_legacy_main_config(&config_file);
     let sleep_interval = cli_interval.unwrap_or(st.check_interval);
     let cpuset_name = cli_cpuset.unwrap_or(st.cpuset_name);
     let web_enable = cli_web || st.web_enable;
@@ -163,9 +175,12 @@ fn main() {
     let topo = init_cpu_topo();
 
     if fs::metadata(&config_file).is_err() {
-        let initial_content = "# 规则编写与使用说明请参考 http://AppOpt.suto.top\n\n";
+        let initial_content = "# 规则编写与使用说明请参考 http://AppOpt.suto.top\n# 刷新率字段与 CPU 规则共用此文件\nrefresh_timeout=30\nrefresh_active=120\nrefresh_idle=60\n\n";
         let _ = fs::write(&config_file, initial_content);
     }
+    // 兼容旧版本：将 refresh_config.conf 内容一次性并入当前主配置文件。
+    // 迁移完成后刷新率模块不再依赖该独立文件。
+    crate::config::migrate_legacy_refresh_config(&config_file);
 
     {
         let mut guard = lock_ignore_poison(&CONFIG_FILE);
