@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs;
 use std::io;
@@ -32,6 +32,7 @@ pub fn request_config_reload() {
 }
 pub static CONFIG_FILE: Mutex<String> = Mutex::new(String::new());
 
+#[derive(Clone)]
 pub struct AffinityRule {
     pub pkg: String,
     pub thread: String,
@@ -40,11 +41,18 @@ pub struct AffinityRule {
     pub cpus: CpuSet,
 }
 
+#[derive(Clone)]
 pub struct AppConfig {
     pub rules: Vec<AffinityRule>,
     pub pkgs: HashSet<String>,
     pub has_thread_rules: HashSet<String>,
     pub topo: CpuTopology,
+    /// 刷新率全局配置（统一加载，供 refresh 模块从共享 CURRENT_CONFIG 读取）
+    pub refresh_timeout: i32,
+    pub refresh_active: i32,
+    pub refresh_idle: i32,
+    /// 按应用刷新率配置: pkg -> (timeout, active_mode, idle_mode)
+    pub app_refresh_configs: HashMap<String, (i32, i32, i32)>,
 }
 
 pub static CURRENT_CONFIG: Mutex<Option<Arc<AppConfig>>> = Mutex::new(None);
@@ -330,12 +338,93 @@ pub fn load_config(
         .map(|r| r.pkg.clone())
         .collect();
 
+    // 统一加载刷新率配置（独立 refresh_config.conf，持久化文件；加载后填充共享 AppConfig）
+    let (refresh_timeout, refresh_active, refresh_idle, app_refresh_configs) =
+        load_refresh_cfg();
+
     Some(AppConfig {
         rules,
         pkgs,
         has_thread_rules,
         topo: topo.clone(),
+        refresh_timeout,
+        refresh_active,
+        refresh_idle,
+        app_refresh_configs,
     })
+}
+
+/// 读取刷新率配置文件（与 AppOpt 同目录 refresh_config.conf），解析全局配置与应用配置。
+/// 由 config.rs 统一加载，refresh 模块从共享 CURRENT_CONFIG 读取，不再各自读文件。
+pub fn load_refresh_cfg() -> (i32, i32, i32, HashMap<String, (i32, i32, i32)>) {
+    let mut timeout = 30;
+    let mut active = 0i32; // MODE_120
+    let mut idle = 1i32;   // MODE_60
+    let mut apps: HashMap<String, (i32, i32, i32)> = HashMap::new();
+
+    let content = fs::read_to_string(refresh_config_path()).unwrap_or_default();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            match k.trim() {
+                "timeout" => {
+                    if let Ok(t) = v.trim().parse::<i32>() {
+                        if t > 0 {
+                            timeout = t;
+                        }
+                    }
+                }
+                "active" => active = parse_refresh_mode(v),
+                "idle" => idle = parse_refresh_mode(v),
+                _ => {}
+            }
+            continue;
+        }
+        // 应用级刷新率行: pkg,timeout,activeMode,idleMode
+        let parts: Vec<&str> = line.split(',').collect();
+        if parts.len() == 4 && !parts[0].trim().is_empty() {
+            let pkg = parts[0].trim().to_string();
+            let t = parts[1].trim().parse::<i32>().unwrap_or(30).max(1);
+            let a = parse_refresh_mode(parts[2].trim());
+            let i = parse_refresh_mode(parts[3].trim());
+            apps.insert(pkg, (t, a, i));
+        }
+    }
+    (timeout, active, idle, apps)
+}
+
+/// 刷新率配置绝对路径：以可执行文件所在目录为基准（与 refresh.rs 保持一致）
+pub fn refresh_config_path() -> &'static str {
+    static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let mut p = std::env::current_exe()
+            .or_else(|_| std::env::current_dir())
+            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+        p.pop(); // 去掉可执行文件名，得到模块目录
+        p.push("refresh_config.conf");
+        p.to_string_lossy().into_owned()
+    })
+}
+
+/// 解析刷新率模式字符串 → 内部模式码 (0=120, 1=60, 2=90)
+pub fn parse_refresh_mode(s: &str) -> i32 {
+    match s.trim() {
+        "120" => 0,
+        "90" => 2,
+        _ => 1, // 60 或默认
+    }
+}
+
+/// 内部模式码 → 显示字符串
+pub fn refresh_mode_str(mode: i32) -> &'static str {
+    match mode {
+        0 => "120",
+        2 => "90",
+        _ => "60",
+    }
 }
 
 /// 主循环直接处理 inotify 事件 (阻塞版): 返回 true 表示配置已变更需应用。
@@ -464,6 +553,23 @@ pub fn config_reload_now() {
     if fd >= 0 {
         let val: u64 = 1;
         unsafe { libc::write(fd, &val as *const u64 as *const _, 8); }
+    }
+}
+
+/// 仅重载刷新率配置到共享 CURRENT_CONFIG（不写 CONFIG_WAKE_FD、不触发 CPU 全量重载）。
+/// 供 refresh 模块保存刷新率配置后调用，保持"保存配置的通知分离"：
+/// CPU 规则保存 → CONFIG_WAKE_FD；刷新率配置保存 → 此处轻量更新 + REFRESH_FORCE_RELOAD。
+pub fn reload_refresh_only() {
+    let (refresh_timeout, refresh_active, refresh_idle, app_refresh_configs) =
+        load_refresh_cfg();
+    let mut guard = lock_ignore_poison(&CURRENT_CONFIG);
+    if let Some(cfg) = guard.as_ref() {
+        let mut new_cfg = (**cfg).clone();
+        new_cfg.refresh_timeout = refresh_timeout;
+        new_cfg.refresh_active = refresh_active;
+        new_cfg.refresh_idle = refresh_idle;
+        new_cfg.app_refresh_configs = app_refresh_configs;
+        *guard = Some(Arc::new(new_cfg));
     }
 }
 
