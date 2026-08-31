@@ -1,9 +1,13 @@
 #![allow(dead_code)]
 //! IProcessObserver binder 回调实现（dlopen 运行时加载 libbinder_ndk.so）
+//!
+//! 触发分离/数据共享（参考 优化.md）：
+//! Binder 回调只提取 pid，通过 socketpair(SOCK_DGRAM) 发送 pid（4 字节 i32），
+//! 不再依赖 /data/system/packages.list / UID 映射表。
+//! 刷新率模块从共享 ProcCache（PID_PKG）按 pid 查包名，热路径零文件 I/O。
 
-use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::{OnceLock};
 use std::sync::atomic::{AtomicI32, Ordering};
 use libc::{c_char, c_int, dlopen, dlsym, RTLD_LAZY};
 
@@ -104,83 +108,9 @@ fn ndk() -> Option<&'static BinderNdk> {
 const STATUS_OK: c_int = 0;
 const STATUS_UNKNOWN_TRANSACTION: c_int = -29;
 
-// fg 事件通过 socketpair(SOCK_DGRAM) 传递包名（字符串），不再是 eventfd 传 uid
+// fg 事件通过 socketpair(SOCK_DGRAM) 传递 pid（4 字节 i32），
+// 刷新率模块从共享 ProcCache（PID_PKG）按 pid 查包名，热路径零文件 I/O
 static FG_SEND_FD: AtomicI32 = AtomicI32::new(-1);
-
-// ── UID → 包名映射表（从 /data/system/packages.list 加载）──
-struct UidMap {
-    map: HashMap<i32, String>,
-    last_mtime: i64,
-}
-
-static UID_MAP: LazyLock<Mutex<UidMap>> = LazyLock::new(|| {
-    Mutex::new(UidMap {
-        map: HashMap::new(),
-        last_mtime: -1,
-    })
-});
-
-const PACKAGES_LIST: &str = "/data/system/packages.list";
-
-/// 读取 packages.list 并更新映射表（含 @system 过滤）
-fn load_packages_list() {
-    let content = match std::fs::read_to_string(PACKAGES_LIST) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-
-    let mut map = HashMap::new();
-    for line in content.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 2 {
-            continue;
-        }
-        let pkg = parts[0];
-        let last = parts.last().unwrap();
-        // 过滤：末尾 @system 且非 com.android.launcher3
-        if *last == "@system" && pkg != "com.android.launcher3" {
-            continue;
-        }
-        if let Ok(uid) = parts[1].parse::<i32>() {
-            map.insert(uid, pkg.to_string());
-        }
-    }
-
-    let current_mtime = std::fs::metadata(PACKAGES_LIST)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(-1);
-
-    let mut guard = UID_MAP.lock().unwrap();
-    guard.map = map;
-    guard.last_mtime = current_mtime;
-}
-
-/// 初始化阶段加载 packages.list
-pub fn init_uid_map() {
-    load_packages_list();
-}
-
-/// 检查 mtime，变化时重新加载
-fn reload_if_mtime_changed() {
-    let current_mtime = std::fs::metadata(PACKAGES_LIST)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(-1);
-
-    {
-        let guard = UID_MAP.lock().unwrap();
-        if guard.last_mtime == current_mtime {
-            return;
-        }
-    }
-
-    load_packages_list();
-}
 
 struct SendClass(*mut c_void);
 unsafe impl Send for SendClass {}
@@ -216,30 +146,25 @@ extern "C" fn on_transact(
             STATUS_OK
         }
         TX_ON_FG_ACTIVITIES_CHANGED => {
-            let mut _pid = 0i32;
-            let mut uid = 0i32;
+            let mut pid = 0i32;
+            let mut _uid = 0i32;
             let mut fg_val = 0i32;
 
-            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _pid) };
-            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut uid) };
+            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut pid) };
+            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _uid) };
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut fg_val) };
 
             let fg = fg_val != 0;
 
-            if fg {
-                // 先重载 packages.list（mtime 变化才重载），再查 HashMap，保证包名映射最新
-                reload_if_mtime_changed();
-                // get_package_name 只是"提取包名"：系统包在加载 packages.list 时已被 @system 过滤掉，
-                // 系统 uid 在映射表中没有条目 → 返回 None → 不通知；命中时拿到的必然是有效包名，
-                // 直接把包名（字符串）通过 socketpair 发给 refresh 线程，refresh 侧无需再查表
-                if let Some(pkg) = get_package_name(uid) {
-                    let fd = FG_SEND_FD.load(Ordering::Acquire);
-                    if fd >= 0 {
-                        let bytes = pkg.as_bytes();
-                        let _ = unsafe {
-                            libc::send(fd, bytes.as_ptr() as *const libc::c_void, bytes.len(), 0)
-                        };
-                    }
+            if fg && pid > 0 {
+                // 触发分离：Binder 回调只传 pid（4 字节），包名由刷新率模块从共享
+                // ProcCache（PID_PKG）按 pid 查询，热路径零 packages.list 文件 I/O。
+                // 系统界面/未配置应用的白名单过滤在 refresh 侧完成（两道防线）。
+                let fd = FG_SEND_FD.load(Ordering::Acquire);
+                if fd >= 0 {
+                    let _ = unsafe {
+                        libc::send(fd, &pid as *const i32 as *const libc::c_void, 4, 0)
+                    };
                 }
             }
             STATUS_OK
@@ -348,12 +273,6 @@ pub fn init_observer(send_fd: i32) -> bool {
     } else {
         false
     }
-}
-
-/// 纯查表：调用前需先 reload_if_mtime_changed() 保证映射最新
-pub fn get_package_name(uid: i32) -> Option<String> {
-    let guard = UID_MAP.lock().unwrap();
-    guard.map.get(&uid).cloned().filter(|s| !s.is_empty())
 }
 
 /// binder 直连 SurfaceFlinger 设置刷新率：事务码 1035，一个 int32 参数
