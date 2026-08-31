@@ -83,7 +83,7 @@ pub(crate) fn proc_walk(
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else { continue };
         total += 1;
         if !filter(pid) { continue; }
-        /* 用 comm_to_pkg 匹配: 支持 cmdline 精确匹配 + 子进程(pkg:suffix) + 截断 comm 前缀/后缀回退 */
+        /* 用 comm_to_pkg 匹配: 完整包名/子进程走内存快速路径，截断 comm 才校验 cmdline */
         let comm = tid_comm(pid).unwrap_or_default();
         let Some(pkg) = comm_to_pkg(pid, &comm, cfg) else { continue };
         f(pid, &pkg, cfg.has_thread_rules.contains(&pkg));
