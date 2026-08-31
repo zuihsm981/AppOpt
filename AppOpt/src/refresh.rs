@@ -4,7 +4,7 @@ use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{mpsc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const MODE_120: i32 = 0;
 const MODE_60: i32 = 1;
@@ -63,6 +63,10 @@ struct RefreshState {
     last_apply_time: Option<Instant>,
     last_input_time: Option<Instant>,
     timer_fd: i32,
+    /// 冷启动竞态：fg 回调早于 KPM 事件填充 PID_PKG 时，缓存待解析的前台 pid，
+    /// 主循环用短超时轮询重试，直到 KPM 完成填充后应用刷新率。
+    pending_fg_pid: Option<i32>,
+    pending_fg_until: Option<Instant>,
 }
 
 /// 从共享 CURRENT_CONFIG 读取刷新率全局配置（统一加载，避免线程内重复读文件）
@@ -185,45 +189,22 @@ fn switch_to_idle(state: &mut RefreshState) {
     state.last_reset_time = None;
 }
 
-/// 冷启动竞态兜底：PID_PKG 尚未填充（新进程 fg 回调早于 KPM 事件处理完成）时，
-/// 从 /proc/<pid>/comm + cmdline 按需解析包名并回填 PID_PKG。
-/// 实测：点击图标冷启动新进程时，AMS 的 onForegroundActivitiesChanged 回调
-/// 常早于 KPM 事件处理完成，PID_PKG 尚无该 pid，若不兜底则刷新率无法切换。
-/// 只在 fg 切换冷路径触发（非热路径），一次性开销可接受。
-fn fg_pkg_fallback(pid: i32) -> Option<String> {
-    let comm = crate::apply_affinity::tid_comm(pid)?;
-    let cfg = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone()?;
-    let pkg = crate::rule_match::comm_to_pkg(pid, &comm, &cfg)?;
-    crate::cache::pkg_track_pid(pid, &pkg);
-    Some(pkg)
-}
-
-/// IProcessObserver 回调触发：收到 pid，从共享 ProcCache(PID_PKG) 查包名
-/// 白名单准入（两道防线，参考 优化.md）；默认桌面绑定全局刷新率配置：
-///   防线一：数据可用性检查（查不到包名先按需解析一次，仍无则丢弃）
-///   防线二：白名单准入（仅 launcher 或已配置应用）
-fn handle_fg_change(state: &mut RefreshState, pid: i32) {
-    // 防线一：优先从共享 pid→pkg 索引获取包名（热路径零文件 I/O）
-    let pkg = match crate::cache::pkg_lookup_pid(pid) {
-        Some(p) => p,
-        // 冷启动竞态：新进程 fg 回调可能早于 KPM 事件处理完成，PID_PKG 尚未
-        // 填充。按需解析一次并回填，避免“直接打开应用刷新率不生效”。
-        None => match fg_pkg_fallback(pid) {
-            Some(p) => p,
-            None => return, // 进程恰好退出/无法解析
-        },
+/// 把刷新率应用到前台 pid（先查 PID_PKG 包名，再白名单准入）。
+/// 供 fg 回调与 pending 重试共用；返回是否成功应用。
+fn try_apply_fg(state: &mut RefreshState, pid: i32) -> bool {
+    // 防线一：从共享 pid→pkg 索引获取包名
+    let Some(pkg) = crate::cache::pkg_lookup_pid(pid) else {
+        return false;
     };
     if pkg.is_empty() || pkg == state.last_applied_pkg {
-        return;
+        return true; // 已应用过，无需重复
     }
 
     // 防线二：白名单准入检查（唯一真正的过滤器）
-    // 默认桌面不需要 app_refresh_configs 专属条目，直接走全局
-    // timeout/active/idle；只有其他包才查应用级覆盖配置。
     let is_launcher = pkg == crate::config::DEFAULT_REFRESH_PACKAGE;
     let is_managed = state.app_configs.contains_key(&pkg);
     if !is_launcher && !is_managed {
-        return; // 系统设置、状态栏、弹窗、未配置应用全部丢弃
+        return false; // 系统设置、状态栏、弹窗、未配置应用全部丢弃
     }
 
     // 判断切换前/后的应用是否已配置（决定是否应用全局活跃刷新率）
@@ -242,6 +223,39 @@ fn handle_fg_change(state: &mut RefreshState, pid: i32) {
         set_refresh_rate(state, state.current_active);
     }
     reset_timer(state, true);
+    true
+}
+
+/// IProcessObserver 回调触发：收到 pid 后先试应用刷新率。
+/// 冷启动竞态：新进程 fg 回调可能早于 KPM 事件处理完成、PID_PKG 尚未填充，
+/// 此时挂起最新前台 pid，由主循环短超时轮询重试（KPM 填充后自然命中）。
+/// 新回调总是覆盖旧 pending，确保"最后前台者优先"。
+fn handle_fg_change(state: &mut RefreshState, pid: i32) {
+    // PID_PKG 已有该 pid → 直接决定（应用刷新率，或按白名单丢弃），不挂起。
+    if crate::cache::pkg_lookup_pid(pid).is_some() {
+        try_apply_fg(state, pid);
+        return;
+    }
+    // 冷启动竞态：PID_PKG 尚无该 pid（KPM 事件链未处理完），挂起重试。
+    state.pending_fg_pid = Some(pid);
+    state.pending_fg_until = Some(Instant::now() + Duration::from_millis(1000));
+}
+
+/// 冷启动竞态重试：KPM 事件链填充 PID_PKG 后，把挂起的 fg pid 重新应用刷新率。
+fn retry_pending_fg(state: &mut RefreshState) {
+    let Some(pid) = state.pending_fg_pid else { return };
+    // 超时放弃（KPM 事件链 1s 内未填充，不再等）
+    if state.pending_fg_until.is_some_and(|d| Instant::now() >= d) {
+        state.pending_fg_pid = None;
+        state.pending_fg_until = None;
+        return;
+    }
+    // PID_PKG 已有该 pid → 重新走完整应用流程
+    if crate::cache::pkg_lookup_pid(pid).is_some() {
+        state.pending_fg_pid = None;
+        state.pending_fg_until = None;
+        try_apply_fg(state, pid);
+    }
 }
 
 /// input 事件触发：用户活动
@@ -365,6 +379,8 @@ pub fn refresh_init() {
         last_apply_time: None,
         last_input_time: None,
         timer_fd,
+        pending_fg_pid: None,
+        pending_fg_until: None,
     };
 
     load_global_config(&mut state);
@@ -404,10 +420,11 @@ pub fn refresh_init() {
         let mut fg_buf = [0u8; 4];
 
         loop {
-            // maxevents 与 events 缓冲大小一致（3 个已注册 fd，最多返回 3 个事件）
-            let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 3, -1) };
-            if n <= 0 {
-                if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            // 有待解析 fg pid 时用 50ms 短超时轮询重试; 否则阻塞等待事件
+            let timeout_ms: i32 = if state.pending_fg_pid.is_some() { 50 } else { -1 };
+            let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 3, timeout_ms) };
+            if n < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                     continue;
                 }
                 break;
@@ -452,6 +469,8 @@ pub fn refresh_init() {
                     _ => {}
                 }
             }
+            // 每轮都尝试重试挂起的 fg pid（冷启动竞态: KPM 事件链填充 PID_PKG 后命中）
+            retry_pending_fg(&mut state);
             update_status(&state);
         }
 
