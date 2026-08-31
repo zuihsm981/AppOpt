@@ -434,11 +434,14 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
             applied_del(&state.bpf, tid);
         }
 
-        EBPF_EVENT_EXEC
-            if !event_apply(&mut state.cache, &state.bpf, tid, pid, comm, cfg) => {
-                state.cache.task_del(tid);
+        EBPF_EVENT_EXEC => {
+            // EXEC 可能复用同一个 pid，先清掉旧进程的任务和 PID_PKG 映射，
+            // 再用新的 cmdline/comm 重新识别，避免沿用旧包名。
+            state.cache.pid_exec(pid);
+            if !event_apply(&mut state.cache, &state.bpf, tid, pid, comm, cfg) {
                 applied_del(&state.bpf, tid);
             }
+        }
 
         EBPF_EVENT_FORK => {
             // 子线程继承父线程亲和性与 cpuset
