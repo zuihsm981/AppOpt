@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -62,15 +62,19 @@ pub struct WebStats {
     pub rules: usize,
     pub pkgs: usize,
     pub hit_pkgs: usize,
+    /// 当前命中(被管理)的具体包名列表, 供状态页点击展示
+    pub hit_list: Vec<String>,
     pub threads: usize,
     pub kpm: bool,
     pub uptime: u64,
 }
 
-/// 缓存统计
-pub fn cache_stats(cache: &ProcCache) -> (usize, usize) {
-    let pkgs: HashSet<&str> = cache.tasks.values().map(|e| e.pkg.as_str()).collect();
-    (cache.tasks.len(), pkgs.len())
+/// 缓存统计: 返回 (线程数, 命中包名数, 命中包名列表)
+pub fn cache_stats(cache: &ProcCache) -> (usize, usize, Vec<String>) {
+    let mut pkgs: Vec<String> = cache.tasks.values().map(|e| e.pkg.clone()).collect();
+    pkgs.sort();
+    pkgs.dedup();
+    (cache.tasks.len(), pkgs.len(), pkgs)
 }
 
 /// 启动 web 前端
@@ -290,6 +294,7 @@ fn status_json() -> String {
         rules: 0,
         pkgs: 0,
         hit_pkgs: 0,
+        hit_list: Vec::new(),
         threads: 0,
         kpm: false,
         uptime: 0,
@@ -302,6 +307,7 @@ fn status_json() -> String {
         "pkgs": s.pkgs,
         "parse_fail": PARSE_FAILS.load(Ordering::Relaxed),
         "hit_pkgs": s.hit_pkgs,
+        "hit_list": s.hit_list,
         "threads": s.threads,
         "total_procs": sys_procs(),
         "interval": CHECK_INTERVAL.load(Ordering::Relaxed).max(1),
