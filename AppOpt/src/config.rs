@@ -208,7 +208,96 @@ fn add_rule(
     true
 }
 
-/// 加载配置文件，返回 None 表示未变化或解析失败
+/// 解析统一配置文件中的刷新率记录。
+///
+/// 刷新率记录使用 `refresh_` 前缀，避免与 CPU 规则的 `pkg=cpus` 语法冲突。
+///   refresh_timeout=30
+///   refresh_active=120
+///   refresh_idle=60
+///   refresh_app,com.example.game,30,120,60
+///
+/// 返回 true 表示该行是刷新率记录，调用方不应再把它当作 CPU 规则解析。
+pub fn is_refresh_config_line(line: &str) -> bool {
+    let line = strip_comment(line).trim();
+    if let Some((key, _)) = line.split_once('=') {
+        if matches!(key.trim(), "refresh_timeout" | "refresh_active" | "refresh_idle") {
+            return true;
+        }
+    }
+    let parts: Vec<&str> = line.split(',').map(str::trim).collect();
+    parts.len() == 5 && parts[0] == "refresh_app"
+}
+
+fn parse_refresh_config_line(
+    line: &str,
+    timeout: &mut i32,
+    active: &mut i32,
+    idle: &mut i32,
+    apps: &mut HashMap<String, (i32, i32, i32)>,
+) -> bool {
+    let line = strip_comment(line).trim();
+    if let Some((key, value)) = line.split_once('=') {
+        match key.trim() {
+            "refresh_timeout" => {
+                if let Ok(value) = value.trim().parse::<i32>() {
+                    if value > 0 {
+                        *timeout = value;
+                    }
+                }
+                return true;
+            }
+            "refresh_active" => {
+                *active = parse_refresh_mode(value);
+                return true;
+            }
+            "refresh_idle" => {
+                *idle = parse_refresh_mode(value);
+                return true;
+            }
+            _ => {}
+        }
+    }
+
+    let parts: Vec<&str> = line.split(',').map(str::trim).collect();
+    let (pkg, timeout, active, idle) = if parts.len() == 5 && parts[0] == "refresh_app" {
+        (parts[1], parts[2], parts[3], parts[4])
+    } else {
+        return false;
+    };
+    if pkg.is_empty() {
+        return true;
+    }
+    let app_timeout = timeout.parse::<i32>().unwrap_or(30).max(1);
+    apps.insert(
+        pkg.to_string(),
+        (app_timeout, parse_refresh_mode(active), parse_refresh_mode(idle)),
+    );
+    true
+}
+
+/// 只读取统一主配置文件中的刷新率字段。
+/// 刷新率保存后的轻量同步使用此函数，不重新解析 CPU 规则。
+pub fn load_refresh_config(config_file: &str) -> (i32, i32, i32, HashMap<String, (i32, i32, i32)>) {
+    let mut timeout = 30;
+    let mut active = 0;
+    let mut idle = 1;
+    let mut apps = HashMap::new();
+    if let Ok(content) = fs::read_to_string(config_file) {
+        for line in content.lines() {
+            let _ = parse_refresh_config_line(
+                line,
+                &mut timeout,
+                &mut active,
+                &mut idle,
+                &mut apps,
+            );
+        }
+    }
+    (timeout, active, idle, apps)
+}
+
+/// 加载统一主配置文件，返回 None 表示未变化或解析失败。
+/// CPU 亲和性规则和刷新率记录均从此文件解析，并一起发布到 CURRENT_CONFIG。
 pub fn load_config(
     config_file: &str,
     topo: &CpuTopology,
@@ -230,6 +319,10 @@ pub fn load_config(
 
     let mut rules: Vec<AffinityRule> = Vec::new();
     let mut fail_cnt: usize = 0;
+    // 刷新率与 CPU 规则共用同一个配置文件；这些字段最终写入 AppConfig，
+    // 由 refresh 线程从 CURRENT_CONFIG 读取。
+    let (mut refresh_timeout, mut refresh_active, mut refresh_idle, mut app_refresh_configs) =
+        (30, 0, 1, HashMap::new());
     let mut cur_pkg = String::new();
     let mut pending_pkg = String::new();
     let mut in_block = false;
@@ -237,6 +330,18 @@ pub fn load_config(
     for line in content.lines() {
         let p = line.trim();
         if p.is_empty() || p.starts_with('#') || p.starts_with("//") {
+            continue;
+        }
+
+        // 刷新率配置与 CPU 规则共用主配置文件。识别后跳过 CPU 规则解析，
+        // 同时把值写入 AppConfig，避免出现“字段存在但永远是默认值”的问题。
+        if parse_refresh_config_line(
+            p,
+            &mut refresh_timeout,
+            &mut refresh_active,
+            &mut refresh_idle,
+            &mut app_refresh_configs,
+        ) {
             continue;
         }
 
@@ -338,10 +443,6 @@ pub fn load_config(
         .map(|r| r.pkg.clone())
         .collect();
 
-    // 统一加载刷新率配置（独立 refresh_config.conf，持久化文件；加载后填充共享 AppConfig）
-    let (refresh_timeout, refresh_active, refresh_idle, app_refresh_configs) =
-        load_refresh_cfg();
-
     Some(AppConfig {
         rules,
         pkgs,
@@ -354,60 +455,8 @@ pub fn load_config(
     })
 }
 
-/// 读取刷新率配置文件（与 AppOpt 同目录 refresh_config.conf），解析全局配置与应用配置。
-/// 由 config.rs 统一加载，refresh 模块从共享 CURRENT_CONFIG 读取，不再各自读文件。
-pub fn load_refresh_cfg() -> (i32, i32, i32, HashMap<String, (i32, i32, i32)>) {
-    let mut timeout = 30;
-    let mut active = 0i32; // MODE_120
-    let mut idle = 1i32;   // MODE_60
-    let mut apps: HashMap<String, (i32, i32, i32)> = HashMap::new();
-
-    let content = fs::read_to_string(refresh_config_path()).unwrap_or_default();
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((k, v)) = line.split_once('=') {
-            match k.trim() {
-                "timeout" => {
-                    if let Ok(t) = v.trim().parse::<i32>() {
-                        if t > 0 {
-                            timeout = t;
-                        }
-                    }
-                }
-                "active" => active = parse_refresh_mode(v),
-                "idle" => idle = parse_refresh_mode(v),
-                _ => {}
-            }
-            continue;
-        }
-        // 应用级刷新率行: pkg,timeout,activeMode,idleMode
-        let parts: Vec<&str> = line.split(',').collect();
-        if parts.len() == 4 && !parts[0].trim().is_empty() {
-            let pkg = parts[0].trim().to_string();
-            let t = parts[1].trim().parse::<i32>().unwrap_or(30).max(1);
-            let a = parse_refresh_mode(parts[2].trim());
-            let i = parse_refresh_mode(parts[3].trim());
-            apps.insert(pkg, (t, a, i));
-        }
-    }
-    (timeout, active, idle, apps)
-}
-
-/// 刷新率配置绝对路径：以可执行文件所在目录为基准（与 refresh.rs 保持一致）
-pub fn refresh_config_path() -> &'static str {
-    static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PATH.get_or_init(|| {
-        let mut p = std::env::current_exe()
-            .or_else(|_| std::env::current_dir())
-            .unwrap_or_else(|_| std::path::PathBuf::from("."));
-        p.pop(); // 去掉可执行文件名，得到模块目录
-        p.push("refresh_config.conf");
-        p.to_string_lossy().into_owned()
-    })
-}
+/// 刷新率配置由 `load_config(CONFIG_FILE, ...)` 统一解析；不再由 refresh 模块
+/// 读取独立文件，避免共享配置与磁盘配置分裂。
 
 /// 解析刷新率模式字符串 → 内部模式码 (0=120, 1=60, 2=90)
 pub fn parse_refresh_mode(s: &str) -> i32 {
@@ -484,10 +533,10 @@ pub fn inotify_drain() -> bool {
     }
 
     if reload_needed {
-        // 直接重载 (不写 CONFIG_WAKE_FD, 由主循环 inotify 分支统一应用, 避免重复通知)
+        // 统一解析后只在 CPU 规则实际变化时通知主循环；刷新率字段的
+        // CURRENT_CONFIG 更新不会触发 CPU 全量扫描，通知仍然分离。
         let mut mtime: i64 = -1;
-        config_reload(&mut mtime);
-        return true;
+        return config_reload(&mut mtime);
     }
     false
 }
@@ -531,23 +580,38 @@ fn disable_inotify(inotify_fd: i32) {
     INOTIFY_WD.store(-1, Ordering::Release);
 }
 
-fn config_reload(last_mtime: &mut i64) {
-    let Some(cfg) = lock_ignore_poison(&CURRENT_CONFIG).clone() else {
-        return;
+fn cpu_config_changed(old: &AppConfig, new: &AppConfig) -> bool {
+    if old.rules.len() != new.rules.len()
+        || old.pkgs != new.pkgs
+        || old.has_thread_rules != new.has_thread_rules
+    {
+        return true;
+    }
+    old.rules.iter().zip(&new.rules).any(|(a, b)| {
+        a.pkg != b.pkg
+            || a.thread != b.thread
+            || a.cpuset_dir != b.cpuset_dir
+            || a.cpus != b.cpus
+    })
+}
+
+fn config_reload(last_mtime: &mut i64) -> bool {
+    let Some(old_cfg) = lock_ignore_poison(&CURRENT_CONFIG).clone() else {
+        return false;
     };
     let file = lock_ignore_poison(&CONFIG_FILE).clone();
-    let Some(new_cfg) = load_config(&file, &cfg.topo, last_mtime) else {
-        return;
+    let Some(new_cfg) = load_config(&file, &old_cfg.topo, last_mtime) else {
+        return false;
     };
-    {
-        let mut guard = lock_ignore_poison(&CURRENT_CONFIG);
-        *guard = Some(Arc::new(new_cfg));
-    }
+    let cpu_changed = cpu_config_changed(&old_cfg, &new_cfg);
+    let mut guard = lock_ignore_poison(&CURRENT_CONFIG);
+    *guard = Some(Arc::new(new_cfg));
+    cpu_changed
 }
 
 pub fn config_reload_now() {
     let mut mtime: i64 = -1;
-    config_reload(&mut mtime);
+    let _ = config_reload(&mut mtime);
     // 通知主循环应用新配置 (事件驱动; fd 未初始化时跳过, 启动早期由主循环自行加载)
     let fd = CONFIG_WAKE_FD.load(Ordering::Relaxed);
     if fd >= 0 {
@@ -556,12 +620,17 @@ pub fn config_reload_now() {
     }
 }
 
-/// 仅重载刷新率配置到共享 CURRENT_CONFIG（不写 CONFIG_WAKE_FD、不触发 CPU 全量重载）。
-/// 供 refresh 模块保存刷新率配置后调用，保持"保存配置的通知分离"：
-/// CPU 规则保存 → CONFIG_WAKE_FD；刷新率配置保存 → 此处轻量更新 + REFRESH_FORCE_RELOAD。
+/// 仅从统一主配置文件重载刷新率字段到共享 CURRENT_CONFIG。
+/// 不写 CONFIG_WAKE_FD，保持“保存配置的通知分离”：CPU 规则保存走主循环，
+/// 刷新率保存只更新共享刷新率字段并由 refresh 线程自行唤醒。
 pub fn reload_refresh_only() {
+    let file = {
+        let guard = lock_ignore_poison(&CURRENT_CONFIG);
+        if guard.is_none() { return; }
+        lock_ignore_poison(&CONFIG_FILE).clone()
+    };
     let (refresh_timeout, refresh_active, refresh_idle, app_refresh_configs) =
-        load_refresh_cfg();
+        load_refresh_config(&file);
     let mut guard = lock_ignore_poison(&CURRENT_CONFIG);
     if let Some(cfg) = guard.as_ref() {
         let mut new_cfg = (**cfg).clone();
@@ -570,6 +639,73 @@ pub fn reload_refresh_only() {
         new_cfg.refresh_idle = refresh_idle;
         new_cfg.app_refresh_configs = app_refresh_configs;
         *guard = Some(Arc::new(new_cfg));
+    }
+}
+
+/// 将旧默认主配置 applist.conf 迁移为统一的 appopt.conf。
+/// 仅在目标不存在时执行，避免覆盖用户显式指定的配置文件。
+pub fn migrate_legacy_main_config(config_file: &str) {
+    let target = std::path::Path::new(config_file);
+    if target.exists() || target.file_name().and_then(|n| n.to_str()) != Some("appopt.conf") {
+        return;
+    }
+    let Some(parent) = target.parent() else { return };
+    let legacy = parent.join("applist.conf");
+    if !legacy.exists() { return; }
+    // rename 保证后续只有一个权威配置文件；失败时复制，避免启动因迁移失败而丢配置。
+    if fs::rename(&legacy, target).is_err() {
+        if let Ok(content) = fs::read(&legacy) {
+            let _ = fs::write(target, content);
+        }
+    }
+}
+
+/// 旧版本曾把刷新率写到可执行文件目录下的 refresh_config.conf。
+/// 启动时只做一次兼容迁移，之后所有读写均使用 CONFIG_FILE。
+pub fn migrate_legacy_refresh_config(config_file: &str) {
+    let mut legacy = std::env::current_exe()
+        .or_else(|_| std::env::current_dir())
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    legacy.pop();
+    legacy.push("refresh_config.conf");
+    if legacy == std::path::Path::new(config_file) || !legacy.exists() {
+        return;
+    }
+    let Ok(content) = fs::read_to_string(&legacy) else { return };
+    let mut additions = Vec::new();
+    for line in content.lines() {
+        let line = strip_comment(line).trim();
+        if line.is_empty() { continue; }
+        if let Some((key, value)) = line.split_once('=') {
+            let key = match key.trim() {
+                "timeout" | "refresh_timeout" => "refresh_timeout",
+                "active" | "refresh_active" => "refresh_active",
+                "idle" | "refresh_idle" => "refresh_idle",
+                _ => continue,
+            };
+            additions.push(format!("{}={}", key, value.trim()));
+        } else {
+            let parts: Vec<&str> = line.split(',').map(str::trim).collect();
+            if parts.len() == 5 && parts[0] == "refresh_app" {
+                additions.push(parts.join(","));
+            } else if parts.len() == 4 && !parts[0].is_empty() {
+                additions.push(format!("refresh_app,{}", parts.join(",")));
+            }
+        }
+    }
+    if additions.is_empty() { return; }
+    let mut main = fs::read_to_string(config_file).unwrap_or_default();
+    if !main.ends_with('\n') { main.push('\n'); }
+    main.push_str("\n# Migrated refresh-rate settings\n");
+    main.push_str(&additions.join("\n"));
+    main.push('\n');
+    let tmp = format!("{}.tmp", config_file);
+    if fs::File::create(&tmp)
+        .and_then(|mut f| { use std::io::Write; f.write_all(main.as_bytes())?; f.sync_all() })
+        .and_then(|_| fs::rename(&tmp, config_file))
+        .is_ok()
+    {
+        let _ = fs::remove_file(legacy);
     }
 }
 
