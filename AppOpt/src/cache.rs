@@ -148,7 +148,7 @@ impl ProcCache {
     pub fn pkg_lookup_comm(&mut self, pid: i32, comm: &str, cfg: &AppConfig) -> Option<String> {
         // 正缓存: 已确认是目标包
         if let Some(pkg) = self.pid_pkgs.get(&pid).cloned() {
-            if cfg.pkgs.contains(&pkg) {
+            if cfg.target_pkgs.contains(&pkg) {
                 return Some(pkg);
             }
             // 配置已变化但旧映射尚未被全量扫描清理时，立即丢弃旧值。
@@ -164,6 +164,11 @@ impl ProcCache {
         let pkg = comm_to_pkg(pid, comm, cfg);
         if let Some(pkg) = &pkg {
             self.pid_pkgs.insert(pid, pkg.clone());
+            // 立即登记共享 PID_PKG（供刷新率模块按 pid 查包名）。
+            // 不能只等 task_apply 成功：只配置刷新率、没有 CPU 亲和性规则
+            // 的应用 thread_affinity 会返回 None 而 task_apply 失败，
+            // 若不在此登记，刷新率前台回调将永远查不到该应用的包名。
+            pkg_track_pid(pid, pkg);
         } else {
             self.negative_pids.insert(pid, comm.to_string());
         }
@@ -183,6 +188,14 @@ impl ProcCache {
     where
         F: FnOnce(i32, &CpuSet, &str) -> bool,
     {
+        // 目标包（CPU 规则 ∪ 刷新率配置）即登记共享 PID_PKG，供刷新率模块按 pid 查包名。
+        // 只配置刷新率、没有 CPU 规则的应用 thread_affinity 会返回 None，若在此 return
+        // 前不登记，full_scan / proc 路径将永远不登记其 PID→包名，刷新率切换永不生效。
+        if cfg.target_pkgs.contains(pkg) {
+            self.pid_pkgs.insert(pid, pkg.to_string());
+            pkg_track_pid(pid, pkg);
+        }
+
         let thread_name = if cfg.has_thread_rules.contains(pkg) { comm } else { "" };
         let Some(result) = thread_affinity(pkg, thread_name, cfg) else {
             return false;
