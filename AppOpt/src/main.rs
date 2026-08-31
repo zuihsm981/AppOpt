@@ -449,16 +449,17 @@ fn main() {
 
         // web 状态统计: 事件驱动更新 (收到事件时刷新, 不再定时轮询)
         if WEB_ENABLED.load(Ordering::Relaxed) && crate::web::web_active() {
-            let (threads, hit_pkgs) = match (&ebpf_state, &proc_state) {
+            let (threads, hit_pkgs, hit_list) = match (&ebpf_state, &proc_state) {
                 (Some(es), _) => cache_stats(&es.cache),
                 (None, Some(ps)) => cache_stats(&ps.cache),
-                _ => (0, 0),
+                _ => (0, 0, Vec::new()),
             };
             if let Some(cfg) = cfg.as_ref() {
                 *lock_ignore_poison(&WEB_STATS) = Some(WebStats {
                     rules: cfg.rules.len(),
                     pkgs: cfg.pkgs.len(),
                     hit_pkgs,
+                    hit_list,
                     threads,
                     kpm: ebpf_state.is_some(),
                     uptime: prog_start.elapsed().as_secs(),
