@@ -1,9 +1,20 @@
 use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 
 use crate::apply_affinity::affinity_set;
 use crate::config::AppConfig;
 use crate::cpuset::{CpuSet, CpuTopology};
 use crate::rule_match::{comm_to_pkg, thread_affinity};
+
+/// 全局共享 pid→pkg 索引：由 ProcCache 的增删方法统一维护，
+/// 供刷新率模块在 Binder 回调热路径 O(1) 查包名（替代原 packages.list 文件 I/O）。
+/// 触发分离：CPU 模块只写，刷新率模块只读，互不通知。
+pub static PID_PKG: LazyLock<Mutex<HashMap<i32, String>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 供刷新率模块查询 pid→pkg（只读共享索引）
+pub fn pkg_lookup_pid(pid: i32) -> Option<String> {
+    PID_PKG.lock().unwrap().get(&pid).cloned()
+}
 
 pub struct TaskEntry {
     pub pid: i32,
@@ -27,6 +38,7 @@ impl ProcCache {
 
     pub fn clear(&mut self) {
         self.tasks.clear();
+        PID_PKG.lock().unwrap().clear();
     }
 
     pub fn task_del(&mut self, tid: i32) {
@@ -76,6 +88,8 @@ impl ProcCache {
                 is_thread_rule: result.is_thread_rule,
             },
         );
+        // 同步维护共享 pid→pkg 索引
+        PID_PKG.lock().unwrap().insert(pid, pkg.to_string());
         true
     }
 
