@@ -44,7 +44,12 @@ pub struct AffinityRule {
 #[derive(Clone)]
 pub struct AppConfig {
     pub rules: Vec<AffinityRule>,
+    /// CPU 亲和性规则覆盖的应用包名
     pub pkgs: HashSet<String>,
+    /// 需要识别的目标包 = CPU 规则包 ∪ 刷新率配置包。
+    /// 只配置了刷新率（无 CPU 规则）的应用也必须被进程识别并登记 PID_PKG，
+    /// 否则刷新率前台回调查不到包名、刷新率永不生效。
+    pub target_pkgs: HashSet<String>,
     pub has_thread_rules: HashSet<String>,
     pub topo: CpuTopology,
     /// 刷新率全局配置（统一加载，供 refresh 模块从共享 CURRENT_CONFIG 读取）
@@ -449,9 +454,18 @@ pub fn load_config(
         .map(|r| r.pkg.clone())
         .collect();
 
+    // 需要识别的目标包 = CPU 规则包 ∪ 刷新率配置包。
+    // 只配置了刷新率（无 CPU 规则）的应用也必须被识别并登记 PID_PKG，
+    // 否则刷新率前台回调查不到包名、刷新率永不生效。
+    let mut target_pkgs = pkgs.clone();
+    for pkg in app_refresh_configs.keys() {
+        target_pkgs.insert(pkg.clone());
+    }
+
     Some(AppConfig {
         rules,
         pkgs,
+        target_pkgs,
         has_thread_rules,
         topo: topo.clone(),
         refresh_timeout,
@@ -644,6 +658,12 @@ pub fn reload_refresh_only() {
         new_cfg.refresh_active = refresh_active;
         new_cfg.refresh_idle = refresh_idle;
         new_cfg.app_refresh_configs = app_refresh_configs;
+        // 刷新率配置变化后重建 target_pkgs（CPU 规则包 ∪ 刷新率配置包）
+        let mut target_pkgs = new_cfg.pkgs.clone();
+        for pkg in new_cfg.app_refresh_configs.keys() {
+            target_pkgs.insert(pkg.clone());
+        }
+        new_cfg.target_pkgs = target_pkgs;
         *guard = Some(Arc::new(new_cfg));
     }
 }
