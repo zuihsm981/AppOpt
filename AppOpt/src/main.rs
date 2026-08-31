@@ -269,6 +269,10 @@ fn main() {
             let r = comm_map_init(&mut es.bpf, &cfg.pkgs, es.comm_capacity);
             if !r {
                 full_scan(cfg, es);
+            } else {
+                // 白名单已更新，丢弃旧的 pid→pkg 解析缓存，让后续事件重新识别；
+                // 已绑定的任务和命中计数保留，避免重复全量扫描的开销。
+                es.cache.invalidate_pid_cache();
             }
         } else {
             let ps = proc_state.get_or_insert_with(ProcScanState::new);
