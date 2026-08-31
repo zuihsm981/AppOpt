@@ -67,6 +67,10 @@ fn target_scan(lines: &[String], pkg: &str) -> Target {
         if p.is_empty() || p.starts_with('#') || p.starts_with("//") {
             continue;
         }
+        // 统一配置中的刷新率字段不是 CPU 规则，编辑 CPU 规则时必须跳过。
+        if crate::config::is_refresh_config_line(p) {
+            continue;
+        }
 
         if in_block {
             if close_like(p) {
