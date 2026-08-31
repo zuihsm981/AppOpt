@@ -85,70 +85,64 @@ fn fnmatch_c(pattern: &CString, string: &str) -> bool {
 /// CPU 规则扫描仍按原有 cfg.pkgs 匹配；默认 launcher 的 PID 映射只在
 /// `ebpf_mode::full_scan` 中额外建立，不在此处扩大 CPU 规则匹配范围。
 
-/// 通过内核 comm 匹配配置包名。长 comm(≥15字节, 可能被 16 字节上限截断)时,
-/// 通过 /proc/<pid>/cmdline 读取完整命令匹配白名单, 避免前缀/后缀误杀。
-pub fn comm_to_pkg(pid: i32, comm: &str, cfg: &AppConfig) -> Option<String> {
+/// 低成本 comm 匹配。
+/// 返回 None 时不代表一定不是目标包，调用方仍可按需查询 cmdline。
+pub(crate) fn comm_fast_to_pkg(comm: &str, cfg: &AppConfig) -> Option<String> {
+    // 未截断的完整包名。
     if cfg.pkgs.contains(comm) {
         return Some(comm.to_string());
     }
-    if comm.len() >= 15 {
-        // 优先用 cmdline 完整命令匹配 (comm 截断后前缀/后缀可能匹配到错误包)
-        // 支持子进程: com.bilibili.app.in:download → com.bilibili.app.in
-        if let Some(cmd) = read_cmdline(pid) {
-            for pkg in &cfg.pkgs {
-                if cmd == pkg.as_str() || cmd.starts_with(&format!("{}:", pkg)) {
-                    return Some(pkg.clone());
-                }
-            }
-        }
-        for pkg in &cfg.pkgs {
-            if pkg.starts_with(comm) {
-                return Some(pkg.clone());
-            }
-        }
-        for pkg in &cfg.pkgs {
-            if pkg.ends_with(comm) {
-                return Some(pkg.clone());
-            }
-        }
-    }
-    // 8 字节键滑动 + 变长前缀比较 (与内核 KPM whitelist_matched 完全一致):
-    // 键 = 包名前 8 / 末 8 字节 (不足 8 时按实际长度, 等价于遇 \0 停止);
-    // 窗口位置 pos 0..=8 (comm 上限 16, 16-8=8), 每个窗口对键做前缀比较。
-    // 覆盖短包名 (如 "com.via" 前缀 7 字节可匹配 comm="com.via:thread")
-    // 与子进程 comm 截断片段 (如 comm="bilibili.app.in:ijk" 含 末 8 字节键 "i.app.in")。
-    if !comm.is_empty() {
-        let cb = comm.as_bytes();
-        for pos in 0..=8usize {
-            if pos >= cb.len() {
-                break;
-            }
-            for pkg in &cfg.pkgs {
-                let pb = pkg.as_bytes();
-                let prefix8 = &pb[..pb.len().min(8)];
-                if cb[pos..].starts_with(prefix8) {
-                    return Some(pkg.clone());
-                }
-                if pb.len() > 8 {
-                    let suffix8 = &pb[pb.len() - 8..];
-                    if cb[pos..].starts_with(suffix8) {
-                        return Some(pkg.clone());
-                    }
-                }
-            }
-        }
-    }
-    // comm 含 ':' 是子进程特征 (如 "bilibili.app.in:ijk"): 取 ':' 前部分,
-    // 若它是某个包名的子串则匹配 (覆盖 comm 截断导致 8 字节键不命中的情况)。
+
+    // 完整包名子进程，例如 pkg:remote；只按冒号前的完整包名匹配。
     if let Some(idx) = comm.find(':') {
         let base = &comm[..idx];
-        if base.len() >= 3 {
-            for pkg in &cfg.pkgs {
-                if pkg.contains(base) {
-                    return Some(pkg.clone());
-                }
-            }
+        if cfg.pkgs.contains(base) {
+            return Some(base.to_string());
         }
     }
     None
+}
+
+/// 仅用于 cmdline 不可读时的安全截断回退。
+/// 必须只有一个包名拥有该明确前缀，避免同一截断 comm 对应多个包。
+fn comm_prefix_fallback(comm: &str, cfg: &AppConfig) -> Option<String> {
+    if comm.len() < 15 {
+        return None;
+    }
+    let mut found: Option<&String> = None;
+    for pkg in &cfg.pkgs {
+        if !pkg.starts_with(comm) {
+            continue;
+        }
+        if found.is_some() {
+            return None; // 前缀歧义，不猜测
+        }
+        found = Some(pkg);
+    }
+    found.cloned()
+}
+
+/// 通过 comm 识别配置包名。
+///
+/// 每个未知 PID 最多执行一次 cmdline 读取（由 ProcCache 缓存结果）；
+/// cmdline 可读时以完整包名为唯一权威，comm 只在 cmdline 不可读时按
+/// 明确的 15 字节截断前缀回退。不再使用 8 字节滑动键，避免
+/// air.tv.douyu.android 的 ".android" 键误命中 com.android.* 进程。
+pub fn comm_to_pkg(pid: i32, comm: &str, cfg: &AppConfig) -> Option<String> {
+    let fast = comm_fast_to_pkg(comm, cfg);
+
+    // 即使 comm 看起来像包名，也优先用进程 cmdline 校验，防止伪造/误命名。
+    if let Some(cmd) = read_cmdline(pid) {
+        for pkg in &cfg.pkgs {
+            if cmd == pkg.as_str()
+                || cmd.strip_prefix(pkg.as_str()).is_some_and(|rest| rest.starts_with(':'))
+            {
+                return Some(pkg.clone());
+            }
+        }
+        return None;
+    }
+
+    // 进程已退出或 cmdline 不可读时，仅保留安全的完整 comm/截断前缀回退。
+    fast.or_else(|| comm_prefix_fallback(comm, cfg))
 }
