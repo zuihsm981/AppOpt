@@ -7,13 +7,23 @@ use crate::cpuset::{CpuSet, CpuTopology};
 use crate::rule_match::{comm_to_pkg, thread_affinity};
 
 /// 全局共享 pid→pkg 索引：由 ProcCache 的增删方法统一维护，
-/// 供刷新率模块在 Binder 回调热路径 O(1) 查包名（替代原 packages.list 文件 I/O）。
-/// 触发分离：CPU 模块只写，刷新率模块只读，互不通知。
-pub static PID_PKG: LazyLock<Mutex<HashMap<i32, String>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+/// 供刷新率模块按 pid 查包名（替代 packages.list 文件 I/O）。
+pub static PID_PKG: LazyLock<Mutex<HashMap<i32, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// 供刷新率模块查询 pid→pkg（只读共享索引）
+/// 供刷新率模块查询 pid→pkg。这里只读共享索引，不在刷新率热路径补扫 /proc。
 pub fn pkg_lookup_pid(pid: i32) -> Option<String> {
     PID_PKG.lock().unwrap().get(&pid).cloned()
+}
+
+pub fn pkg_track_pid(pid: i32, pkg: &str) {
+    if pid > 0 && !pkg.is_empty() {
+        PID_PKG.lock().unwrap().insert(pid, pkg.to_string());
+    }
+}
+
+pub fn pkg_untrack_pid(pid: i32) {
+    PID_PKG.lock().unwrap().remove(&pid);
 }
 
 pub struct TaskEntry {
@@ -31,9 +41,7 @@ pub struct ProcCache {
 
 impl ProcCache {
     pub fn new() -> Self {
-        Self {
-            tasks: HashMap::new(),
-        }
+        Self { tasks: HashMap::new() }
     }
 
     pub fn clear(&mut self) {
@@ -42,7 +50,12 @@ impl ProcCache {
     }
 
     pub fn task_del(&mut self, tid: i32) {
-        self.tasks.remove(&tid);
+        let pid = self.tasks.remove(&tid).map(|entry| entry.pid);
+        if let Some(pid) = pid
+            && !self.tasks.values().any(|entry| entry.pid == pid)
+        {
+            pkg_untrack_pid(pid);
+        }
     }
 
     /// comm 匹配包名，线程名时回退主线程条目
@@ -63,6 +76,8 @@ impl ProcCache {
     where
         F: FnOnce(i32, &CpuSet, &str) -> bool,
     {
+        // CPU 规则路径也负责维护共享 pid→pkg 索引。
+        pkg_track_pid(pid, pkg);
         let thread_name = if cfg.has_thread_rules.contains(pkg) { comm } else { "" };
         let Some(result) = thread_affinity(pkg, thread_name, cfg) else {
             return false;
@@ -88,26 +103,24 @@ impl ProcCache {
                 is_thread_rule: result.is_thread_rule,
             },
         );
-        // 同步维护共享 pid→pkg 索引
-        PID_PKG.lock().unwrap().insert(pid, pkg.to_string());
         true
     }
 
-    /// 遍历 tasks 重新应用亲和性，清理已退出的条目（内部处理，不返回列表）
-pub fn affinity_sync(&mut self, topo: &CpuTopology) {
-    let dead_tids: Vec<i32> = self
-        .tasks
-        .iter()
-        .filter_map(|(tid, e)| {
-            if affinity_set(*tid, &e.cpus, &e.cpuset_dir, topo) {
-                Some(*tid)
-            } else {
-                None
-            }
-        })
-        .collect();
-     for tid in dead_tids {
-        self.task_del(tid);
-     }
- }
+    /// 遍历 tasks 重新应用亲和性，清理已退出的条目
+    pub fn affinity_sync(&mut self, topo: &CpuTopology) {
+        let dead_tids: Vec<i32> = self
+            .tasks
+            .iter()
+            .filter_map(|(tid, e)| {
+                if affinity_set(*tid, &e.cpus, &e.cpuset_dir, topo) {
+                    Some(*tid)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for tid in dead_tids {
+            self.task_del(tid);
+        }
+    }
 }
