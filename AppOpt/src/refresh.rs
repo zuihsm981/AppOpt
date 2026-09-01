@@ -4,6 +4,7 @@ use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{mpsc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 const MODE_120: i32 = 0;
 const MODE_60: i32 = 1;
