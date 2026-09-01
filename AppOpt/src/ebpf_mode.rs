@@ -182,8 +182,6 @@ pub struct EbpfState {
     pub wakeup_fd: c_int,
     /// 事件到达通知 fd (eventfd): reader 收到事件后写入, 唤醒主循环 epoll
     pub kpm_wake_fd: c_int,
-    /// KPM 内核主动通知 eventfd (零轮询, 唯一通知机制, 无回退)
-    pub notify_fd: c_int,
     pub comm_capacity: u32,
 }
 
@@ -201,11 +199,6 @@ impl Drop for EbpfState {
         }
         if self.wakeup_fd >= 0 {
             unsafe { libc::close(self.wakeup_fd); }
-        }
-        // notify_fd 由本模块创建并注册到内核; 关闭即释放 eventfd (内核 ctx 引用
-        // 由 KPM 模块在 reset/卸载时 eventfd_ctx_put 释放)
-        if self.notify_fd >= 0 {
-            unsafe { libc::close(self.notify_fd); }
         }
         // kpm_wake_fd 由主循环创建并管理生命周期, Drop 不关闭
         self.kpm_wake_fd = -1;
@@ -275,28 +268,10 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
         return None;
     }
 
-    // 创建 KPM 内核主动通知 eventfd (零轮询): 内核在环形缓冲空->非空时 signal。
-    // eventfd 为唯一通知机制, 无轮询回退: 创建或 set_eventfd 失败即整体失败,
-    // ebpf_init 返回 None, 由调用方回退 /proc 轮询。
-    let notify_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-    if notify_fd < 0 {
-        unsafe { libc::close(wakeup_fd); }
-        return None;
-    }
-    let cmd = format!("set_eventfd {}", notify_fd);
-    if handle.cmd(&cmd) < 0 {
-        unsafe {
-            libc::close(notify_fd);
-            libc::close(wakeup_fd);
-        }
-        return None;
-    }
-
-    // reader 线程: 收到内核 notify_fd 主动通知后 drain 事件,
-    // 收到事件后写 kpm_wake_fd 唤醒主循环
+    // reader 线程通过 supercall drain 轮询事件, 收到事件后写 kpm_wake_fd 唤醒主循环
     let reader_key = kpm_key();
     let reader_thread = thread::spawn(move || {
-        kpm_reader(reader_key, tx, wakeup_fd, kpm_wake_fd, notify_fd);
+        kpm_reader(reader_key, tx, wakeup_fd, kpm_wake_fd);
     });
 
     /* 先设置白名单再激活: start 注册 tracepoint 后立即开始过滤事件,
@@ -327,27 +302,17 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
         cache: ProcCache::new(),
         wakeup_fd,
         kpm_wake_fd,
-        notify_fd,
         comm_capacity: capacity,
     })
 }
 
-fn kpm_reader(
-    key: CString,
-    tx: mpsc::Sender<EbpfProcEvent>,
-    wakeup_fd: c_int,
-    kpm_wake_fd: c_int,
-    notify_fd: c_int,
-) {
+fn kpm_reader(key: CString, tx: mpsc::Sender<EbpfProcEvent>, wakeup_fd: c_int, kpm_wake_fd: c_int) {
     let name = CString::new("KpmReader").unwrap();
     unsafe {
         libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
     }
 
-    // 纯内核主动通知模式 (零轮询): epoll 无限阻塞, 仅内核 signal 才唤醒。
-    // 无轮询回退。
-
-    // epoll: wakeup_fd (退出信号) + notify_fd (内核主动通知)
+    // epoll: 仅监听 wakeup_fd (退出信号); 事件处理由主循环 drain mpsc 完成
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epfd < 0 {
         return;
@@ -359,47 +324,30 @@ fn kpm_reader(
         unsafe { libc::close(epfd) };
         return;
     }
-    let mut notify_ev: libc::epoll_event = unsafe { std::mem::zeroed() };
-    notify_ev.events = libc::EPOLLIN as u32;
-    notify_ev.u64 = 2;
-    if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, notify_fd, &mut notify_ev) } < 0 {
-        unsafe { libc::close(epfd) };
-        return;
-    }
 
-    let mut events: [libc::epoll_event; 2] = unsafe { std::mem::zeroed() };
+    let mut events: [libc::epoll_event; 1] = unsafe { std::mem::zeroed() };
     // 单次 drain 缓冲: 8KB, 约 292 个事件
     let mut buf = vec![0u8; 8192];
 
     loop {
-        // 无限阻塞, 零唤醒: 仅内核 signal (eventfd) 或 wakeup_fd 才返回
-        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 2, -1) };
+        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 1, 100) };
         if n < 0 {
             if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
             break;
         }
-
-        let mut do_drain = false;
+        // 处理 wakeup 就绪 (退出信号)
         for i in 0..n {
             let e = &events[i as usize];
             if e.u64 == 1 {
                 // wakeup: 退出
                 unsafe { libc::close(epfd) };
                 return;
-            } else if e.u64 == 2 {
-                // notify_fd 就绪: 读 8 字节清空 eventfd 计数, 然后 drain
-                let mut cnt = [0u8; 8];
-                let _ = unsafe { libc::read(notify_fd, cnt.as_mut_ptr() as *mut libc::c_void, 8) };
-                do_drain = true;
             }
         }
-        if !do_drain {
-            continue;
-        }
 
-        // drain, 直到暂时无事件 (事件全部转发给主循环处理)
+        // 轮询 drain, 直到暂时无事件 (事件全部转发给主循环处理)
         loop {
             let args = CString::new("drain").unwrap_or_default();
             let got = unsafe {
