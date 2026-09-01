@@ -391,7 +391,7 @@ fn kpm_reader(
             } else if e.u64 == 2 {
                 // notify_fd 就绪: 读 8 字节清空 eventfd 计数, 然后 drain
                 let mut cnt = [0u8; 8];
-                let _ = unsafe { libc::read(notify_fd, cnt.as_mut_ptr(), 8) };
+                let _ = unsafe { libc::read(notify_fd, cnt.as_mut_ptr() as *mut libc::c_void, 8) };
                 do_drain = true;
             }
         }
