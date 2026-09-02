@@ -404,7 +404,12 @@ fn kpm_reader(
             continue;
         }
 
-        // 通知驱动的 drain: 收到通知才开始取事件, 取空后自动停止回阻塞
+        // 通知驱动的 drain: 收到通知才开始取事件, 取空后自动停止回阻塞。
+        // 注意: 内核 drain 会把 want 截断到整事件 (want -= want % EVENT_SIZE),
+        // 当 ring 内事件超过 buf 大小时, 返回值会略小于 buf.len() 但 ring 并非取空!
+        // 因此不能以 "bytes < buf.len()" 作为取空判断 —— 那会让事件滞留 ring,
+        // 且滞留事件不再触发新通知, 导致线程事件永久丢失 (轮询靠 100ms 周期兜底
+        // 掩盖了它, 通知驱动暴露了它)。这里只在 drain 返回 <=0 (ring 真空) 时停止。
         loop {
             let args = CString::new("drain").unwrap_or_default();
             let got = unsafe {
@@ -431,10 +436,7 @@ fn kpm_reader(
                 let _ = unsafe { libc::write(kpm_wake_fd, &val as *const u64 as *const _, 8) };
                 off += ev_sz;
             }
-            // 若一次就取满, 可能还有更多, 继续; 否则已取空, 自动停止
-            if bytes < buf.len() {
-                break;
-            }
+            // 继续下一轮 drain, 直到返回 <=0 (ring 真正取空)
         }
     }
     unsafe { libc::close(epfd) };
