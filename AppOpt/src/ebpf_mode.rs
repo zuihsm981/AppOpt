@@ -7,21 +7,15 @@
 //!   - tracepoint sched_process_fork/exec/exit + task_rename
 //!   - 内联挂钩 input_handle_event (1s 节流)
 //!   - 白名单(包名前/末 8 字节键, comm 8 字节滑动匹配)、APPLIED tid 表、256KB 事件环形缓冲
-//!   - 事件写入环形缓冲后在"空→非空"边界 eventfd_signal() 通知用户态 (事件驱动)
 //! 用户态通过 ctl0 命令配置/读取, 事件结构 EbpfProcEvent 与内核 appopt_proc_event_t
 //! 布局完全一致 (28B), event_dispatch/affinity 逻辑与原先保持一致。
-//!
-//! 事件传输路径 (纯事件驱动, 无轮询):
-//!   内核探针写入 ring → 空→非空 边界 eventfd_signal(notify_fd)
-//!     → 主循环 epoll 唤醒 (EV_KPM) → read_eventfd 清零 → consume_events()
-//!       消费共享环形缓冲 → event_dispatch 逐条处理 → 回到 epoll_wait 阻塞
-//! 不再有 reader 线程 / 100ms epoll 轮询 / ctl0 数据拷贝；通知信号本身即唤醒源。
 
 use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs;
 use std::os::raw::{c_char, c_int};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc;
+use std::thread;
 
 use crate::apply_affinity::{proc_walk, task_tids, tid_comm};
 use crate::cache::ProcCache;
@@ -54,10 +48,6 @@ const SUPERCALL_HELLO_MAGIC: i64 = 0x11581158;
 
 /// KPM 模块名 (与 appopt_kpm.c KPM_NAME 一致)
 const KPM_MODULE: &[u8] = b"appopt-kpm\0";
-const EVENT_MAP_SIZE: usize = 266_240; // round_up(16 + 256 KiB, 4096)
-const EVENT_HEADER_SIZE: usize = 16;
-const EVENT_RING_SIZE: usize = 256 * 1024;
-const EVENT_SIZE: usize = std::mem::size_of::<EbpfProcEvent>();
 
 /// KernelPatch superkey (可由环境变量 APPOPT_KPM_KEY 覆盖; 空则用 "su" 探测)
 fn kpm_key() -> CString {
@@ -124,10 +114,11 @@ impl KpmHandle {
         Self { key: kpm_key() }
     }
 
-    /// 确认模块已加载；ping 只返回状态码，不读取 ctl0 输出缓冲。
+    /// 确认模块已加载: ping 成功即视为已加载
     fn ping(&self) -> bool {
         let args = CString::new("ping").unwrap_or_default();
-        kpm_ctl0(&self.key, &args, &mut []) >= 0
+        let mut out = [0u8; 16];
+        kpm_ctl0(&self.key, &args, &mut out) >= 0 && out[0] == b'p'
     }
 
     /// 确认模块已加载 (由 APatch 管理器加载; AppOpt 不自动部署/加载)
@@ -162,23 +153,11 @@ impl KpmHandle {
     }
 
     /// 注册/更新事件通知 eventfd 到内核 (fd=-1 解除)。
-    /// 内核在事件写入 mmap 环形缓冲后 eventfd_signal 唤醒主循环 epoll。
+    /// 内核在事件写入环形缓冲后（空→非空边界）eventfd_signal 唤醒 reader，
+    /// reader 收到通知才启动 drain（通知驱动，无空转轮询）。
     pub fn set_eventfd(&self, fd: i32) -> bool {
         let s = format!("set_eventfd {}", fd);
         self.cmd(&s) >= 0
-    }
-
-    /// 清空共享事件环形缓冲。事件数据不再通过 ctl0 返回。
-    fn clear_events(&self) -> bool {
-        self.cmd("clear_events") >= 0
-    }
-
-    /// 请求内核创建匿名事件文件并返回其 fd 号。
-    /// 内核在 init 阶段用 anon_inode_getfile 建好 file，ctl0 的 create_shm
-    /// 只做非睡眠的 fd_install（RCU 临界区安全），把 fd 装入本进程 fd 表。
-    fn create_shm(&self) -> Option<c_int> {
-        let rc = self.cmd("create_shm");
-        (rc > 0).then_some(rc as c_int)
     }
 
     /// 设置白名单 (包名集合), 返回 true 表示失败需要回退
@@ -202,41 +181,42 @@ fn comm_str(comm: &[u8; 16]) -> &str {
     std::str::from_utf8(&comm[..end]).unwrap_or("").trim()
 }
 
-#[repr(C)]
-struct EventMap {
-    head: AtomicU32,
-    tail: AtomicU32,
-    generation: u32,
-    reserved: u32,
-    events: [u8; EVENT_RING_SIZE],
-}
-
 pub struct EbpfState {
+    pub event_rx: mpsc::Receiver<EbpfProcEvent>,
+    pub reader_thread: Option<thread::JoinHandle<()>>,
     /// 原 aya Ebpf 替换为 KPM 传输句柄; 字段名保持 bpf 以兼容 main.rs
     pub bpf: KpmHandle,
     pub cache: ProcCache,
-    /// 内核 eventfd 通知 fd，由主循环创建并注册 epoll
+    pub wakeup_fd: c_int,
+    /// 事件到达通知 fd (eventfd): 内核写入事件后 signal, 唤醒 reader 启动 drain
     pub notify_fd: c_int,
+    /// 事件到达通知 fd (eventfd): reader 收到事件后写入, 唤醒主循环 epoll
+    pub kpm_wake_fd: c_int,
     pub comm_capacity: u32,
-    /// 匿名事件文件 fd（内核经 ctl0 create_shm 装入本进程 fd 表）；映射生命周期与状态绑定
-    event_device_fd: c_int,
-    /// mmap 共享事件区；事件数据直接从这里读取，不经过 ctl0
-    event_map: *mut EventMap,
 }
 
 impl Drop for EbpfState {
     fn drop(&mut self) {
-        // 先解除 eventfd，再取消映射并关闭设备 fd；ctl0 不再传输事件数据。
-        let _ = self.bpf.set_eventfd(-1);
-        if !self.event_map.is_null() {
-            unsafe { libc::munmap(self.event_map as *mut libc::c_void, EVENT_MAP_SIZE); }
-            self.event_map = std::ptr::null_mut();
+        // 解除内核 notify_ctx 引用 (KPM 模块持有我们 eventfd 的 ctx)
+        self.bpf.set_eventfd(-1);
+        // 写 eventfd 唤醒 reader 线程后 join
+        if self.wakeup_fd >= 0 {
+            let val: u64 = 1;
+            unsafe {
+                libc::write(self.wakeup_fd, &val as *const u64 as *const _, 8);
+            }
         }
-        if self.event_device_fd >= 0 {
-            unsafe { libc::close(self.event_device_fd); }
-            self.event_device_fd = -1;
+        if let Some(handle) = self.reader_thread.take() {
+            let _ = handle.join();
         }
-        self.notify_fd = -1;
+        if self.wakeup_fd >= 0 {
+            unsafe { libc::close(self.wakeup_fd); }
+        }
+        if self.notify_fd >= 0 {
+            unsafe { libc::close(self.notify_fd); }
+        }
+        // kpm_wake_fd 由主循环创建并管理生命周期, Drop 不关闭
+        self.kpm_wake_fd = -1;
     }
 }
 
@@ -274,12 +254,10 @@ fn find_zygote_tids() -> Vec<i32> {
     tids
 }
 
-/// 初始化 KPM 事件驱动: 确保模块加载, 注册事件通知 fd 到内核
+/// 初始化 KPM 事件驱动: 确保模块加载, 启动 reader 线程
 /// 失败返回 None, 由调用方回退 /proc 轮询。
-/// notify_fd 由主循环创建并注册 epoll: 内核写入事件后 eventfd_signal 唤醒
-/// 主循环, 主循环随后 consume_events() 消费共享环形缓冲 (纯事件驱动, 无轮询、
-/// 无 reader 线程、无 ctl0 用户态拷贝)。
-pub fn ebpf_init(notify_fd: c_int) -> Option<EbpfState> {
+/// kpm_wake_fd 由主循环创建并注册 epoll, reader 收到事件后写入以唤醒主循环。
+pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
     let key = kpm_key();
     if !kp_ready(&key) {
         return None;
@@ -293,42 +271,37 @@ pub fn ebpf_init(notify_fd: c_int) -> Option<EbpfState> {
     // 配置 input 节流 (与 eBPF 默认 1s 一致)
     handle.cmd("input_ms 1000");
 
-    /* 请求内核创建匿名事件文件并 mmap 共享事件区。mmap 在用户态普通进程
-     * 上下文执行；ctl0 只做 fd 安装，不再传输事件数据或 copy_to_user。 */
-    let event_device_fd = handle.create_shm()?;
-    let mapped = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            EVENT_MAP_SIZE,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED,
-            event_device_fd,
-            0,
-        )
-    };
-    if mapped == libc::MAP_FAILED {
-        unsafe { libc::close(event_device_fd); }
-        return None;
-    }
-    let event_map = mapped as *mut EventMap;
-
-    /* 先注册通知 fd，再清空模块常驻/重启后的存量事件。这样即使旧会话
-     * 在清空期间产生事件，也会留下 eventfd 唤醒；清空后新事件可正常走
-     * 空→非空通知边界。 */
-    if !handle.set_eventfd(notify_fd) || !handle.clear_events() {
-        let _ = handle.set_eventfd(-1);
-        unsafe {
-            libc::munmap(mapped, EVENT_MAP_SIZE);
-            libc::close(event_device_fd);
-        }
-        return None;
-    }
-
     let pkgs_len = crate::lock_ignore_poison(&CURRENT_CONFIG)
         .as_ref()
         .map(|cfg| cfg.pkgs.len())
         .unwrap_or(0);
     let capacity = (pkgs_len * 2).max(512).next_power_of_two() as u32;
+
+    let (tx, rx) = mpsc::channel::<EbpfProcEvent>();
+    let wakeup_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if wakeup_fd < 0 {
+        return None;
+    }
+    // 事件通知 eventfd: 内核写入事件后 signal, 唤醒 reader 启动 drain
+    let notify_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if notify_fd < 0 {
+        unsafe { libc::close(wakeup_fd); }
+        return None;
+    }
+    // 注册通知通道 (事件写入环形缓冲后由内核 signal 唤醒 reader; 通知驱动 drain)
+    if !handle.set_eventfd(notify_fd) {
+        unsafe {
+            libc::close(wakeup_fd);
+            libc::close(notify_fd);
+        }
+        return None;
+    }
+
+    // reader 线程: 收到内核事件通知后启动 drain 取空, 处理完自动停止回阻塞
+    let reader_key = kpm_key();
+    let reader_thread = thread::spawn(move || {
+        kpm_reader(reader_key, tx, wakeup_fd, notify_fd, kpm_wake_fd);
+    });
 
     /* 先设置白名单再激活: start 注册 tracepoint 后立即开始过滤事件,
      * 若白名单为空则所有新进程事件被丢弃, 导致直接打开应用不设置亲和性 */
@@ -352,75 +325,115 @@ pub fn ebpf_init(notify_fd: c_int) -> Option<EbpfState> {
 
 
     Some(EbpfState {
+        event_rx: rx,
+        reader_thread: Some(reader_thread),
         bpf: handle,
         cache: ProcCache::new(),
+        wakeup_fd,
         notify_fd,
+        kpm_wake_fd,
         comm_capacity: capacity,
-        event_device_fd,
-        event_map,
     })
 }
 
-impl EbpfState {
-    /// 事件驱动消费 mmap 共享环形缓冲。内核只负责发布 tail 和 eventfd 通知，
-    /// 用户态读取稳定的 tail，处理所有已发布事件，最后 release-store head。
-    /// ctl0 不再参与事件数据传输，因此不会在 RCU 临界区触发用户页缺页。
-    pub fn consume_events(&mut self, cfg: &AppConfig) -> Option<bool> {
-        if self.event_map.is_null() {
-            return None;
-        }
-        let map_ptr = self.event_map;
-        let mut head = unsafe { (*map_ptr).head.load(Ordering::Acquire) };
-        let mut need_sync = false;
+fn kpm_reader(
+    key: CString,
+    tx: mpsc::Sender<EbpfProcEvent>,
+    wakeup_fd: c_int,
+    notify_fd: c_int,
+    kpm_wake_fd: c_int,
+) {
+    let name = CString::new("KpmReader").unwrap();
+    unsafe {
+        libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
+    }
 
-        loop {
-            /* 读取本轮已发布的 tail；生产者可能在消费期间继续追加事件，
-             * 因此发布 head 后必须重新读取 tail，避免“非空期间不重复 signal”
-             * 导致追加事件永远没有下一次唤醒。 */
-            let tail = unsafe { (*map_ptr).tail.load(Ordering::Acquire) };
-            while head != tail {
-                let pos = head as usize;
-                let first = EVENT_SIZE.min(EVENT_RING_SIZE - pos);
-                let mut raw = [0u8; EVENT_SIZE];
-                unsafe {
-                    /* 事件可能跨越环尾，分两段读取；这是 mmap 直接消费，
-                     * 不经过 ctl0，也不会触发 ctl0 的用户页缺页路径。 */
-                    std::ptr::copy_nonoverlapping(
-                        (map_ptr as *const u8).add(EVENT_HEADER_SIZE + pos),
-                        raw.as_mut_ptr(),
-                        first,
-                    );
-                    if first < EVENT_SIZE {
-                        std::ptr::copy_nonoverlapping(
-                            (map_ptr as *const u8).add(EVENT_HEADER_SIZE),
-                            raw.as_mut_ptr().add(first),
-                            EVENT_SIZE - first,
-                        );
-                    }
-                }
-                let event: EbpfProcEvent = unsafe {
-                    std::ptr::read_unaligned(raw.as_ptr() as *const EbpfProcEvent)
-                };
-                if event.event_type == EBPF_EVENT_FORK
-                    || event.event_type == EBPF_EVENT_EXEC
-                    || event.event_type == EBPF_EVENT_RENAME
-                {
-                    need_sync = true;
-                }
-                event_dispatch(&event, cfg, self);
-                head = (head + EVENT_SIZE as u32) & (EVENT_RING_SIZE as u32 - 1);
+    // epoll: 监听 wakeup_fd (退出信号, u64=1) + notify_fd (内核事件通知, u64=2)
+    let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+    if epfd < 0 {
+        return;
+    }
+    let mut ev: libc::epoll_event = unsafe { std::mem::zeroed() };
+    ev.events = libc::EPOLLIN as u32;
+    ev.u64 = 1;
+    if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, wakeup_fd, &mut ev) } < 0 {
+        unsafe { libc::close(epfd) };
+        return;
+    }
+    ev.u64 = 2;
+    if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, notify_fd, &mut ev) } < 0 {
+        unsafe { libc::close(epfd) };
+        return;
+    }
+
+    let mut events: [libc::epoll_event; 2] = unsafe { std::mem::zeroed() };
+    // 单次 drain 缓冲: 8KB, 约 292 个事件
+    let mut buf = vec![0u8; 8192];
+
+    loop {
+        // 事件驱动: 永久阻塞等待; 无事件时零空转 (不再 100ms 轮询)
+        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 2, -1) };
+        if n < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
             }
+            break;
+        }
+        let mut need_drain = false;
+        for i in 0..n as usize {
+            match events[i].u64 {
+                1 => {
+                    // wakeup: 退出
+                    unsafe { libc::close(epfd) };
+                    return;
+                }
+                2 => {
+                    // 内核事件通知: 清 eventfd 计数后启动 drain
+                    let mut val: u64 = 0;
+                    unsafe { libc::read(notify_fd, &mut val as *mut _ as *mut _, 8); }
+                    need_drain = true;
+                }
+                _ => {}
+            }
+        }
+        if !need_drain {
+            continue;
+        }
 
-            /* release-store head 后，生产者才可以回收这段 ring 空间。
-             * 若 tail 在本轮快照后前进，继续处理；若此时再次为空，
-             * 后续生产者从空状态写入时会产生新的 eventfd 通知。 */
-            unsafe { (*map_ptr).head.store(head, Ordering::Release); }
-            if unsafe { (*map_ptr).tail.load(Ordering::Acquire) } == head {
+        // 通知驱动的 drain: 收到通知才开始取事件, 取空后自动停止回阻塞
+        loop {
+            let args = CString::new("drain").unwrap_or_default();
+            let got = unsafe {
+                let (ptr, len) = (buf.as_mut_ptr(), buf.len());
+                supercall(key.as_ptr(), SUPERCALL_KPM_CONTROL,
+                          KPM_MODULE.as_ptr() as *const c_char,
+                          args.as_ptr(), ptr, len)
+            };
+            if got <= 0 {
+                break;
+            }
+            let bytes = got as usize;
+            let ev_sz = std::mem::size_of::<EbpfProcEvent>();
+            let mut off = 0;
+            while off + ev_sz <= bytes {
+                let event: EbpfProcEvent =
+                    unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off) as *const EbpfProcEvent) };
+                if tx.send(event).is_err() {
+                    unsafe { libc::close(epfd) };
+                    return;
+                }
+                // 唤醒主循环处理该事件
+                let val: u64 = 1;
+                let _ = unsafe { libc::write(kpm_wake_fd, &val as *const u64 as *const _, 8) };
+                off += ev_sz;
+            }
+            // 若一次就取满, 可能还有更多, 继续; 否则已取空, 自动停止
+            if bytes < buf.len() {
                 break;
             }
         }
-        Some(need_sync)
     }
+    unsafe { libc::close(epfd) };
 }
 
 /// 配置白名单; 返回 true 表示需重载 (KPM 白名单容量固定 16384, 不会触发)
