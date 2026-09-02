@@ -408,18 +408,18 @@ fn kpm_reader(
 
     loop {
         /* 事件驱动主路径：内核每事件 signal → 立即 drain（低延迟）。
-         * 心跳兜底：epoll_wait 1s 超时也 drain 一次。
-         * 根治"信号丢失 → 永久阻塞 → 线程丢失"：即使通知链路因竞态漏唤醒,
-         * reader 也最多 1s 后主动 drain, 事件不会永久滞留; 与轮询 drain 的
-         * 完整性一致, 同时正常时无事件则阻塞等待 (无空转轮询开销)。 */
-        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 2, 1000) };
+         * 心跳兜底 = 100ms，与轮询 drain 的周期完全一致（实测关键）：
+         * 1s 心跳会让"信号丢失/洪峰"窗口比轮询大 10 倍，ring(256KB) 更容易
+         * 写满丢弃新事件 (cnt_dropped) → 线程 FORK/RENAME 永久丢失。
+         * 100ms 兜底保证最坏滞留窗口与轮询相同，同时正常时事件驱动零空转。 */
+        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 2, 100) };
         if n < 0 {
             if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
             break;
         }
-        // n==0 表示 1s 心跳超时: 兜底 drain, 有滞留事件则取走
+        // n==0 表示 100ms 心跳超时: 兜底 drain, 有滞留事件则取走
         let mut need_drain = n == 0;
         for i in 0..n as usize {
             match events[i].u64 {
