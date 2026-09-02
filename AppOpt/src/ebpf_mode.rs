@@ -135,15 +135,17 @@ impl KpmHandle {
         self.cmd(&s);
     }
 
-    /// 激活 KPM: 注册 tracepoint(start) + 武装 input kprobe(按需 input_on/off)。
-    /// 是否武装 input 由全局刷新率配置决定: 仅当 active != idle (需切换) 才 input_on。
+    /// 激活 KPM: 注册 tracepoint(start) + 按配置决定 input kprobe 挂载与发射。
+    /// active != idle → input_on + 发射开; active == idle → input_off (卸载 kprobe)。
+    /// 依赖 CURRENT_CONFIG 已就绪 (main 中 load_config 先于 ebpf_init)。
     pub fn activate(&self) {
         self.cmd("start");
         let need_input = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG)
             .as_ref()
             .map(|c| c.refresh_active != c.refresh_idle)
             .unwrap_or(true);
-        self.input_arm(need_input);
+        let _ = self.set_input_kprobe(need_input);
+        let _ = self.set_input_events(need_input);
     }
 
     fn applied_del(&self, tid: i32) {
@@ -171,10 +173,22 @@ impl KpmHandle {
         self.cmd(&s)
     }
 
-    /// 内核 input kprobe 开关: on=true 武装 (input_on), on=false 解除 (input_off)。
-    /// 由 refresh 模块联动: 仅当"活跃刷新率 != 空闲刷新率"(需要 INPUT 唤醒) 时
-    /// 保持 input_on; 两者相同则刷新率无需切换, 关掉 input 避免无谓事件。
-    pub fn input_arm(&self, on: bool) -> bool {
+    /// 设置内核 INPUT 事件发射开关 (不改变 kprobe 挂载状态)。
+    /// enabled=true → 发 INPUT 事件; false → 内核 input_kprobe_pre 直接跳过
+    /// (active==idle 时刷新率无需切换, 关掉可省事件)。同步 ctl0, 无异步。
+    pub fn set_input_events(&self, enabled: bool) -> bool {
+        let s = if enabled {
+            "set_input_events 1".to_string()
+        } else {
+            "set_input_events 0".to_string()
+        };
+        self.cmd(&s) >= 0
+    }
+
+    /// 挂载/卸载 input kprobe (input_on/input_off)。
+    /// INPUT 事件为低优先级 (event_emit_locked 可丢弃), 卸载 kprobe 不会影响
+    /// 亲和性事件流; active==idle 时卸载以省 kprobe 开销。
+    pub fn set_input_kprobe(&self, on: bool) -> bool {
         self.cmd(if on { "input_on" } else { "input_off" }) >= 0
     }
 
@@ -199,12 +213,16 @@ fn comm_str(comm: &[u8; 16]) -> &str {
     std::str::from_utf8(&comm[..end]).unwrap_or("").trim()
 }
 
-/// 供 refresh 模块联动: 按 timer_enabled (active != idle) 决定内核 input kprobe 开关。
-/// 独立创建 KpmHandle (key 来自环境变量, 全局一致), 跨线程安全;
-/// KPM 未就绪/命令失败时静默 (仅返回 false)。
-pub fn sync_input_enabled(enabled: bool) {
+/// 按"刷新率是否需要切换"(active != idle) 联动内核 INPUT:
+/// - active != idle: 挂载 input kprobe + 发射开 (触摸唤醒)
+/// - active == idle: 卸载 input kprobe + 发射关 (省 kprobe 开销与事件)
+/// 仅由 refresh 模块在配置加载/变化时调用 (低频), 不在 fg 切换热路径调用。
+/// INPUT 为低优先级事件 (内核 event_emit_locked 可丢弃), 卸载/挂载 kprobe
+/// 不会影响亲和性事件流 (FORK/EXEC/RENAME), 不丢线程。
+pub fn sync_input_events(enabled: bool) {
     let handle = KpmHandle::new();
-    let _ = handle.input_arm(enabled);
+    let _ = handle.set_input_kprobe(enabled);
+    let _ = handle.set_input_events(enabled);
 }
 
 pub struct EbpfState {
