@@ -448,7 +448,6 @@ fn kpm_reader(
         // 本批处理完成: 上报亲和性事件数给内核对账 (不写文件日志)。
         handle.ack_events(aff_count);
     }
-    }
     unsafe { libc::close(epfd) };
 }
 
