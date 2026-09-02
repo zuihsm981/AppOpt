@@ -371,15 +371,19 @@ fn kpm_reader(
     let mut buf = vec![0u8; 8192];
 
     loop {
-        // 事件驱动: 永久阻塞等待; 无事件时零空转 (不再 100ms 轮询)
-        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 2, -1) };
+        /* 事件驱动: 阻塞等待内核通知 (有相关事件才 signal)。
+         * 同时保留 1s 超时兜底: 若通知链路因任何竞态漏唤醒, 超时后也执行一次
+         * drain, 保证滞留事件最多 1 秒内被取走, 杜绝线程事件永久遗漏。
+         * (正常时无事件则 epoll 阻塞, 1s 心跳仅 drain 一次空 ring, 开销可忽略) */
+        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 2, 1000) };
         if n < 0 {
             if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
             break;
         }
-        let mut need_drain = false;
+        // n==0 表示 1s 心跳超时: 兜底 drain, 有滞留事件则取走
+        let mut need_drain = n == 0;
         for i in 0..n as usize {
             match events[i].u64 {
                 1 => {
