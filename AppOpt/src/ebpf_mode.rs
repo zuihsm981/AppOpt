@@ -165,14 +165,6 @@ impl KpmHandle {
         self.cmd(&s) >= 0
     }
 
-    /// 上报本批已处理完成的亲和性事件数 (FORK/EXEC/RENAME)。
-    /// 内核返回: 1 = 对账不符已触发自愈 (重新 signal, 需要再次 drain);
-    ///          0 = 正常 (本批已全部确认)。
-    pub fn ack_events(&self, n: u32) -> i64 {
-        let s = format!("ack_events {}", n);
-        self.cmd(&s)
-    }
-
     /// 设置内核 INPUT 事件发射开关 (不改变 kprobe 挂载状态)。
     /// enabled=true → 发 INPUT 事件; false → 内核 input_kprobe_pre 直接跳过
     /// (active==idle 时刷新率无需切换, 关掉可省事件)。同步 ctl0, 无异步。
@@ -391,7 +383,6 @@ fn kpm_reader(
     unsafe {
         libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
     }
-    let handle = KpmHandle { key: key.clone() };
 
     // epoll: 监听 wakeup_fd (退出信号, u64=1) + notify_fd (内核事件通知, u64=2)
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
@@ -416,15 +407,20 @@ fn kpm_reader(
     let mut buf = vec![0u8; 8192];
 
     loop {
-        // 通知驱动第一版: 永久阻塞等待内核通知; 无事件时零空转
-        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 2, -1) };
+        /* 事件驱动主路径：内核每事件 signal → 立即 drain（低延迟）。
+         * 心跳兜底：epoll_wait 1s 超时也 drain 一次。
+         * 根治"信号丢失 → 永久阻塞 → 线程丢失"：即使通知链路因竞态漏唤醒,
+         * reader 也最多 1s 后主动 drain, 事件不会永久滞留; 与轮询 drain 的
+         * 完整性一致, 同时正常时无事件则阻塞等待 (无空转轮询开销)。 */
+        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 2, 1000) };
         if n < 0 {
             if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
             break;
         }
-        let mut need_drain = false;
+        // n==0 表示 1s 心跳超时: 兜底 drain, 有滞留事件则取走
+        let mut need_drain = n == 0;
         for i in 0..n as usize {
             match events[i].u64 {
                 1 => {
@@ -447,7 +443,6 @@ fn kpm_reader(
 
         // 通知驱动的 drain: 收到通知才取事件, 取空后自动停止回阻塞。
         // 只在 drain 返回 <=0 (ring 真空) 时停止, 避免事件滞留 ring。
-        let mut aff_count: u32 = 0;
         loop {
             let args = CString::new("drain").unwrap_or_default();
             let got = unsafe {
@@ -465,12 +460,6 @@ fn kpm_reader(
             while off + ev_sz <= bytes {
                 let event: EbpfProcEvent =
                     unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off) as *const EbpfProcEvent) };
-                if event.event_type == EBPF_EVENT_FORK
-                    || event.event_type == EBPF_EVENT_EXEC
-                    || event.event_type == EBPF_EVENT_RENAME
-                {
-                    aff_count += 1;
-                }
                 if tx.send(event).is_err() {
                     unsafe { libc::close(epfd) };
                     return;
@@ -481,8 +470,6 @@ fn kpm_reader(
                 off += ev_sz;
             }
         }
-        // 本批处理完成: 上报亲和性事件数给内核对账 (不写文件日志)。
-        handle.ack_events(aff_count);
     }
     unsafe { libc::close(epfd) };
 }
