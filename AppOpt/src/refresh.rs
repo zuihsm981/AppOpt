@@ -97,15 +97,10 @@ fn load_global_config(state: &mut RefreshState) {
     state.current_idle = state.idle_mode;
     state.current_timeout = state.timeout_seconds;
     state.timer_enabled = state.current_idle != state.current_active;
-    sync_input_arming(state);
-}
-
-/// 按当前 timer_enabled (active != idle) 联动内核 input kprobe:
-/// 仅当刷新率需要切换 (active != idle) 时保持 input_on (触摸唤醒);
-/// 两者相同 (active == idle) 时无需切换, input_off 避免无谓 INPUT 事件。
-/// 在 KPM 未就绪时调用无副作用 (命令失败仅返回 false, 静默)。
-fn sync_input_arming(state: &RefreshState) {
-    crate::ebpf_mode::sync_input_enabled(state.timer_enabled);
+    // 联动内核 INPUT 发射开关: 仅"需要切换"时保持开。
+    // 只在配置加载/变化时调用 (本函数仅被 refresh_init 初始化 与 check_config
+    // 配置变化触发), 不在 fg 切换热路径调用; 不影响进程事件流。
+    crate::ebpf_mode::sync_input_events(state.timer_enabled);
 }
 
 /// 从共享 CURRENT_CONFIG 读取按应用刷新率配置（统一加载）
@@ -162,7 +157,6 @@ fn apply_app_config(state: &mut RefreshState, pkg: &str) {
         state.current_idle = state.idle_mode;
     }
     state.timer_enabled = state.current_idle != state.current_active;
-    sync_input_arming(state);
 }
 
 fn timerfd_set(fd: i32, seconds: i32) {
