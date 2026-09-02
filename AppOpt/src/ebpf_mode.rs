@@ -378,6 +378,28 @@ fn kpm_reader(
     let mut events: [libc::epoll_event; 2] = unsafe { std::mem::zeroed() };
     // 单次 drain 缓冲: 8KB, 约 292 个事件
     let mut buf = vec![0u8; 8192];
+    // 上一批是否已完成 ack (用于识别内核对账触发的自愈通知)
+    let mut last_batch_acked = false;
+    // 自愈日志文件: 追加写入 /data/local/tmp/appopt_selfheal.log
+    const SELFHEAL_LOG: &str = "/data/local/tmp/appopt_selfheal.log";
+    let log_selfheal = |signal: u64| {
+        use std::io::Write;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(SELFHEAL_LOG)
+        {
+            let _ = writeln!(
+                f,
+                "[{}] KPM 自愈触发: 内核对账不符, 重新取走滞留事件 (signal={})",
+                ts, signal
+            );
+        }
+    };
 
     loop {
         // 通知驱动第一版: 永久阻塞等待内核通知; 无事件时零空转
@@ -401,6 +423,10 @@ fn kpm_reader(
                     let mut val: u64 = 0;
                     unsafe { libc::read(notify_fd, &mut val as *mut _ as *mut _, 8); }
                     need_drain = true;
+                    // 上一批已 ack 完成后再次收到通知 = 内核对账不符触发的自愈
+                    if last_batch_acked {
+                        log_selfheal(val);
+                    }
                 }
                 _ => {}
             }
@@ -449,6 +475,7 @@ fn kpm_reader(
         // 若数量不符 (有事件滞留 ring 未被取走), 内核会再次 signal,
         // 下一轮 epoll_wait 立即返回并重新 drain 取走处理 (自愈闭环)。
         let _ = handle.ack_events(aff_count);
+        last_batch_acked = true;
     }
     unsafe { libc::close(epfd) };
 }
