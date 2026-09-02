@@ -160,6 +160,14 @@ impl KpmHandle {
         self.cmd(&s) >= 0
     }
 
+    /// 上报本批已处理完成的亲和性事件数 (FORK/EXEC/RENAME)。
+    /// 内核对比 cnt_aff_acked 与 cnt_aff_emitted: 若数量不符 (有事件滞留 ring
+    /// 未被取走处理), 内核会再次 eventfd_signal, reader 重新 drain 取走处理。
+    pub fn ack_events(&self, n: u32) -> bool {
+        let s = format!("ack_events {}", n);
+        self.cmd(&s) >= 0
+    }
+
     /// 设置白名单 (包名集合), 返回 true 表示失败需要回退
     fn set_whitelist(&self, pkgs: &HashSet<String>) -> bool {
         let mut s = String::from("set_whitelist ");
@@ -347,6 +355,7 @@ fn kpm_reader(
     unsafe {
         libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
     }
+    let handle = KpmHandle { key: key.clone() };
 
     // epoll: 监听 wakeup_fd (退出信号, u64=1) + notify_fd (内核事件通知, u64=2)
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
@@ -371,19 +380,15 @@ fn kpm_reader(
     let mut buf = vec![0u8; 8192];
 
     loop {
-        /* 事件驱动: 阻塞等待内核通知 (有相关事件才 signal)。
-         * 同时保留 1s 超时兜底: 若通知链路因任何竞态漏唤醒, 超时后也执行一次
-         * drain, 保证滞留事件最多 1 秒内被取走, 杜绝线程事件永久遗漏。
-         * (正常时无事件则 epoll 阻塞, 1s 心跳仅 drain 一次空 ring, 开销可忽略) */
-        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 2, 1000) };
+        // 通知驱动第一版: 永久阻塞等待内核通知; 无事件时零空转
+        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 2, -1) };
         if n < 0 {
             if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
             break;
         }
-        // n==0 表示 1s 心跳超时: 兜底 drain, 有滞留事件则取走
-        let mut need_drain = n == 0;
+        let mut need_drain = false;
         for i in 0..n as usize {
             match events[i].u64 {
                 1 => {
@@ -404,12 +409,9 @@ fn kpm_reader(
             continue;
         }
 
-        // 通知驱动的 drain: 收到通知才开始取事件, 取空后自动停止回阻塞。
-        // 注意: 内核 drain 会把 want 截断到整事件 (want -= want % EVENT_SIZE),
-        // 当 ring 内事件超过 buf 大小时, 返回值会略小于 buf.len() 但 ring 并非取空!
-        // 因此不能以 "bytes < buf.len()" 作为取空判断 —— 那会让事件滞留 ring,
-        // 且滞留事件不再触发新通知, 导致线程事件永久丢失 (轮询靠 100ms 周期兜底
-        // 掩盖了它, 通知驱动暴露了它)。这里只在 drain 返回 <=0 (ring 真空) 时停止。
+        // 通知驱动的 drain: 收到通知才取事件, 取空后自动停止回阻塞。
+        // 只在 drain 返回 <=0 (ring 真空) 时停止, 避免事件滞留 ring。
+        let mut aff_count: u32 = 0;
         loop {
             let args = CString::new("drain").unwrap_or_default();
             let got = unsafe {
@@ -427,6 +429,12 @@ fn kpm_reader(
             while off + ev_sz <= bytes {
                 let event: EbpfProcEvent =
                     unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off) as *const EbpfProcEvent) };
+                if event.event_type == EBPF_EVENT_FORK
+                    || event.event_type == EBPF_EVENT_EXEC
+                    || event.event_type == EBPF_EVENT_RENAME
+                {
+                    aff_count += 1;
+                }
                 if tx.send(event).is_err() {
                     unsafe { libc::close(epfd) };
                     return;
@@ -436,8 +444,11 @@ fn kpm_reader(
                 let _ = unsafe { libc::write(kpm_wake_fd, &val as *const u64 as *const _, 8) };
                 off += ev_sz;
             }
-            // 继续下一轮 drain, 直到返回 <=0 (ring 真正取空)
         }
+        // 本批处理完成: 上报亲和性事件数给内核对账。
+        // 若数量不符 (有事件滞留 ring 未被取走), 内核会再次 signal,
+        // 下一轮 epoll_wait 立即返回并重新 drain 取走处理 (自愈闭环)。
+        let _ = handle.ack_events(aff_count);
     }
     unsafe { libc::close(epfd) };
 }
