@@ -113,8 +113,6 @@ impl KpmHandle {
     pub fn new() -> Self {
         Self { key: kpm_key() }
     }
-
-    /// 确认模块已加载: ping 成功即视为已加载
     fn ping(&self) -> bool {
         let args = CString::new("ping").unwrap_or_default();
         let mut out = [0u8; 16];
@@ -137,10 +135,15 @@ impl KpmHandle {
         self.cmd(&s);
     }
 
-    /// AppOpt 初始化完成后激活 KPM: 注册 tracepoint(start) + 武装 input kprobe(input_on)
+    /// 激活 KPM: 注册 tracepoint(start) + 武装 input kprobe(按需 input_on/off)。
+    /// 是否武装 input 由全局刷新率配置决定: 仅当 active != idle (需切换) 才 input_on。
     pub fn activate(&self) {
         self.cmd("start");
-        self.cmd("input_on");
+        let need_input = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG)
+            .as_ref()
+            .map(|c| c.refresh_active != c.refresh_idle)
+            .unwrap_or(true);
+        self.input_arm(need_input);
     }
 
     fn applied_del(&self, tid: i32) {
@@ -168,6 +171,13 @@ impl KpmHandle {
         self.cmd(&s)
     }
 
+    /// 内核 input kprobe 开关: on=true 武装 (input_on), on=false 解除 (input_off)。
+    /// 由 refresh 模块联动: 仅当"活跃刷新率 != 空闲刷新率"(需要 INPUT 唤醒) 时
+    /// 保持 input_on; 两者相同则刷新率无需切换, 关掉 input 避免无谓事件。
+    pub fn input_arm(&self, on: bool) -> bool {
+        self.cmd(if on { "input_on" } else { "input_off" }) >= 0
+    }
+
     /// 设置白名单 (包名集合), 返回 true 表示失败需要回退
     fn set_whitelist(&self, pkgs: &HashSet<String>) -> bool {
         let mut s = String::from("set_whitelist ");
@@ -187,6 +197,14 @@ impl KpmHandle {
 fn comm_str(comm: &[u8; 16]) -> &str {
     let end = comm.iter().position(|&b| b == 0).unwrap_or(16);
     std::str::from_utf8(&comm[..end]).unwrap_or("").trim()
+}
+
+/// 供 refresh 模块联动: 按 timer_enabled (active != idle) 决定内核 input kprobe 开关。
+/// 独立创建 KpmHandle (key 来自环境变量, 全局一致), 跨线程安全;
+/// KPM 未就绪/命令失败时静默 (仅返回 false)。
+pub fn sync_input_enabled(enabled: bool) {
+    let handle = KpmHandle::new();
+    let _ = handle.input_arm(enabled);
 }
 
 pub struct EbpfState {
