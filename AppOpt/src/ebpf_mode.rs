@@ -161,11 +161,11 @@ impl KpmHandle {
     }
 
     /// 上报本批已处理完成的亲和性事件数 (FORK/EXEC/RENAME)。
-    /// 内核对比 cnt_aff_acked 与 cnt_aff_emitted: 若数量不符 (有事件滞留 ring
-    /// 未被取走处理), 内核会再次 eventfd_signal, reader 重新 drain 取走处理。
-    pub fn ack_events(&self, n: u32) -> bool {
+    /// 内核返回: 1 = 对账不符已触发自愈 (重新 signal, 需要再次 drain);
+    ///          0 = 正常 (本批已全部确认)。
+    pub fn ack_events(&self, n: u32) -> i64 {
         let s = format!("ack_events {}", n);
-        self.cmd(&s) >= 0
+        self.cmd(&s)
     }
 
     /// 设置白名单 (包名集合), 返回 true 表示失败需要回退
@@ -378,11 +378,9 @@ fn kpm_reader(
     let mut events: [libc::epoll_event; 2] = unsafe { std::mem::zeroed() };
     // 单次 drain 缓冲: 8KB, 约 292 个事件
     let mut buf = vec![0u8; 8192];
-    // 上一批是否已完成 ack (用于识别内核对账触发的自愈通知)
-    let mut last_batch_acked = false;
     // 自愈日志文件: 追加写入 /data/local/tmp/appopt_selfheal.log
     const SELFHEAL_LOG: &str = "/data/local/tmp/appopt_selfheal.log";
-    let log_selfheal = |signal: u64| {
+    let log_selfheal = || {
         use std::io::Write;
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -395,8 +393,8 @@ fn kpm_reader(
         {
             let _ = writeln!(
                 f,
-                "[{}] KPM 自愈触发: 内核对账不符, 重新取走滞留事件 (signal={})",
-                ts, signal
+                "[{}] KPM 自愈触发: 内核对账不符, 重新取走滞留事件",
+                ts
             );
         }
     };
@@ -423,10 +421,6 @@ fn kpm_reader(
                     let mut val: u64 = 0;
                     unsafe { libc::read(notify_fd, &mut val as *mut _ as *mut _, 8); }
                     need_drain = true;
-                    // 上一批已 ack 完成后再次收到通知 = 内核对账不符触发的自愈
-                    if last_batch_acked {
-                        log_selfheal(val);
-                    }
                 }
                 _ => {}
             }
@@ -472,10 +466,12 @@ fn kpm_reader(
             }
         }
         // 本批处理完成: 上报亲和性事件数给内核对账。
-        // 若数量不符 (有事件滞留 ring 未被取走), 内核会再次 signal,
+        // 内核返回 1 = 对账不符 (有滞留事件未被取走), 已再次 signal,
         // 下一轮 epoll_wait 立即返回并重新 drain 取走处理 (自愈闭环)。
-        let _ = handle.ack_events(aff_count);
-        last_batch_acked = true;
+        // 仅在确认真实自愈时写本地日志, 避免把普通事件误判为自愈。
+        if handle.ack_events(aff_count) == 1 {
+            log_selfheal();
+        }
     }
     unsafe { libc::close(epfd) };
 }
