@@ -18,7 +18,7 @@ use std::env;
 use std::fs;
 use std::process;
 use std::sync::atomic::Ordering;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::config::{
@@ -27,8 +27,7 @@ use crate::config::{
 };
 use crate::cpuset::{init_cpu_topo, set_base_cpuset};
 use crate::ebpf_mode::{
-    full_scan, event_dispatch, comm_map_init, EBPF_EVENT_FORK, EBPF_EVENT_EXEC,
-    EBPF_EVENT_RENAME, ebpf_init, EbpfState,
+    full_scan, comm_map_init, ebpf_init, EbpfState,
 };
 use crate::proc_mode::{cache_sync, ProcScanState};
 use crate::web::{
@@ -282,7 +281,8 @@ fn main() {
         }
     }
 
-    // KPM 事件唤醒 eventfd: reader 收到事件后写入, 主循环 epoll 唤醒
+    // KPM 事件通知 eventfd: 内核写入事件后 eventfd_signal, 主循环 epoll 唤醒
+    // (事件驱动, 由 ebpf_init 注册给内核; 唤醒后 consume_events 消费 mmap 缓冲)
     let kpm_wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     epoll_add(epfd, kpm_wake_fd, EV_KPM);
     // 模式切换 eventfd: web 端修改 MODE_FORCE 后写入
@@ -344,38 +344,16 @@ fn main() {
                 EV_KPM => {
                     read_eventfd(kpm_wake_fd);
                     if let Some(es) = ebpf_state.as_mut() {
-                        // 本批事件中是否含 FORK/EXEC/RENAME (需要立即同步亲和性)
-                        let mut need_sync = false;
-                        loop {
-                            match es.event_rx.try_recv() {
-                                Ok(event) => {
-                                    if event.event_type == EBPF_EVENT_FORK
-                                        || event.event_type == EBPF_EVENT_EXEC
-                                        || event.event_type == EBPF_EVENT_RENAME
-                                    {
-                                        need_sync = true;
-                                    }
-                                    let Some(cfg) =
-                                        lock_ignore_poison(&CURRENT_CONFIG).clone()
-                                    else {
-                                        continue;
-                                    };
-                                    event_dispatch(&event, &cfg, es);
-                                }
-                                Err(mpsc::TryRecvError::Empty) => break,
-                                Err(mpsc::TryRecvError::Disconnected) => {
-                                    kpm_died = true;
-                                    break;
-                                }
-                            }
-                        }
-                        // 收到 FORK/EXEC/RENAME: 立即执行 affinity_sync (仅设置 CPU 亲和性),
-                        // 不依赖定时器/IDLE; 无此类事件时仅增量更新 cache
-                        if need_sync {
-                            let Some(cfg) = lock_ignore_poison(&CURRENT_CONFIG).clone() else {
-                                continue;
-                            };
-                            es.cache.affinity_sync(&cfg.topo);
+                        // 事件驱动: 内核写入事件后 eventfd_signal 唤醒, 这里一次取空
+                        // 环形缓冲并逐条派发 (无 reader 线程, 无轮询 drain)
+                        let Some(cfg) = cfg.as_deref() else { continue; };
+                        match es.consume_events(cfg) {
+                            // 本批含 FORK/EXEC/RENAME: 立即执行 affinity_sync (仅设置
+                            // CPU 亲和性), 不依赖定时器/IDLE; 无此类事件时仅增量更新 cache
+                            Some(true) => es.cache.affinity_sync(&cfg.topo),
+                            Some(false) => {}
+                            // KPM 通道异常 (supercall 失败): 回退 /proc 轮询
+                            None => kpm_died = true,
                         }
                     }
                 }
