@@ -378,26 +378,6 @@ fn kpm_reader(
     let mut events: [libc::epoll_event; 2] = unsafe { std::mem::zeroed() };
     // 单次 drain 缓冲: 8KB, 约 292 个事件
     let mut buf = vec![0u8; 8192];
-    // 自愈日志文件: 追加写入 /data/local/tmp/appopt_selfheal.log
-    const SELFHEAL_LOG: &str = "/data/local/tmp/appopt_selfheal.log";
-    let log_selfheal = || {
-        use std::io::Write;
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(SELFHEAL_LOG)
-        {
-            let _ = writeln!(
-                f,
-                "[{}] KPM 自愈触发: 内核对账不符, 重新取走滞留事件",
-                ts
-            );
-        }
-    };
 
     loop {
         // 通知驱动第一版: 永久阻塞等待内核通知; 无事件时零空转
@@ -465,13 +445,9 @@ fn kpm_reader(
                 off += ev_sz;
             }
         }
-        // 本批处理完成: 上报亲和性事件数给内核对账。
-        // 内核返回 1 = 对账不符 (有滞留事件未被取走), 已再次 signal,
-        // 下一轮 epoll_wait 立即返回并重新 drain 取走处理 (自愈闭环)。
-        // 仅在确认真实自愈时写本地日志, 避免把普通事件误判为自愈。
-        if handle.ack_events(aff_count) == 1 {
-            log_selfheal();
-        }
+        // 本批处理完成: 上报亲和性事件数给内核对账 (不写文件日志)。
+        handle.ack_events(aff_count);
+    }
     }
     unsafe { libc::close(epfd) };
 }
