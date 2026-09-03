@@ -10,7 +10,6 @@
 //! 用户态通过 ctl0 命令配置/读取, 事件结构 EbpfProcEvent 与内核 appopt_proc_event_t
 //! 布局完全一致 (28B), event_dispatch/affinity 逻辑与原先保持一致。
 
-use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs;
 use std::os::raw::{c_char, c_int};
@@ -18,7 +17,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use crate::apply_affinity::{proc_walk, task_tids, tid_comm};
-use crate::rule_match::PkgMatch;
+use crate::rule_match::thread_affinity;
 use crate::cache::ProcCache;
 use crate::config::{AppConfig, CURRENT_CONFIG};
 use crate::cpuset::CpuSet;
@@ -197,22 +196,39 @@ impl KpmHandle {
         self.cmd(&s) >= 0
     }
 
-    /// 通知内核扫描目标 pid 对应应用（含 pkg:xxx 子进程）全部线程并重设亲和性。
-    /// 内核在 workqueue 遍历 task 链表, 以该 pid 的 leader comm 为唯一目标前缀
-    /// (子进程同前缀), 对命中线程 set_cpus_allowed_ptr(bits)。
-    pub fn verify_pkg(&self, pid: i32, bits: u64) -> bool {
-        let s = format!("verify_pkg {} {:x}", pid, bits);
-        self.cmd(&s) >= 0
+    /// 通知内核识别 pid 对应包并扫描其（含 pkg:xxx 子进程）全部线程设置亲和性。
+    /// 识别由内核完成 (find_task_by_vpid 读 leader comm, 永远可读, 无 /proc 瞬时
+    /// 不可读问题); 返回内核识别的包名 (供登记 PID_PKG / 刷新率)。
+    pub fn verify_pkg(&self, pid: i32) -> Option<String> {
+        let s = format!("verify_pkg {}", pid);
+        let c = CString::new(s).unwrap_or_default();
+        let mut out = [0u8; 32];
+        let rc = kpm_ctl0(&self.key, &c, &mut out);
+        if rc <= 0 {
+            return None;
+        }
+        let len = out.iter().position(|&b| b == 0).unwrap_or(out.len());
+        let pkg = String::from_utf8_lossy(&out[..len]).to_string();
+        if pkg.is_empty() {
+            None
+        } else {
+            Some(pkg)
+        }
     }
 
-    /// 设置白名单 (包名集合), 返回 true 表示失败需要回退
-    fn set_whitelist(&self, pkgs: &HashSet<String>) -> bool {
+    /// 设置白名单 (包名:bits 列表, bits=该包包级亲和性, 0=仅刷新率无 CPU 规则),
+    /// 返回 true 表示失败需要回退
+    fn set_whitelist(&self, pkgs: &[(String, u64)]) -> bool {
         let mut s = String::from("set_whitelist ");
-        for (i, p) in pkgs.iter().enumerate() {
+        for (i, (p, bits)) in pkgs.iter().enumerate() {
             if i > 0 {
                 s.push(',');
             }
             s.push_str(p);
+            if *bits != 0 {
+                s.push(':');
+                s.push_str(&format!("{:x}", bits));
+            }
         }
         let c = CString::new(s).unwrap_or_default();
         let mut out = [0u8; 16];
@@ -227,25 +243,19 @@ impl KpmHandle {
 /// 时调用（低频，仅前台切换时一次）。识别 pid 所属包的包级亲和性 bits，
 /// 通知内核扫描该包全部进程/线程（含 pkg:xxx 子进程）并重设亲和性。
 /// 热启动（PID_PKG 已登记）不调用 → 避免无谓内核扫描。
-pub fn notify_verify_pkg(pid: i32) {
-    let Some(cfg) = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone() else {
-        return;
-    };
-    let comm = crate::apply_affinity::tid_comm(pid).unwrap_or_default();
-    let PkgMatch::Hit(pkg) = crate::rule_match::comm_to_pkg(pid, &comm, &cfg) else {
-        return;
-    };
-    // ★ 登记共享 PID_PKG: refresh 模块靠 pkg_lookup_pid 获取包名。
-    // 重构后亲和性改由内核扫描 (verify) 设置, 不依赖 FORK/EXEC/RENAME 事件,
-    // 因此 PID_PKG 必须在此填充, 否则 try_apply_fg 查不到包名、
-    // REFRESH_PENDING_PID 也等不到 PkgTracked 通知 → 刷新率永不生效。
-    crate::cache::pkg_track_pid(pid, &pkg);
-    // 纯包名规则取包级亲和性; 线程规则不在此覆盖 (由事件路径处理)
-    let Some(res) = crate::rule_match::thread_affinity(&pkg, "", &cfg) else {
-        return;
-    };
+/// IProcessObserver 冷启动前台回调触发: 让内核识别 pid 对应包并设置亲和性。
+/// 内核返回包名后登记共享 PID_PKG (refresh 模块靠 pkg_lookup_pid 获取包名;
+/// pkg_track_pid 还会触发 PkgTracked → try_apply_fg 应用刷新率)。
+/// 返回是否识别成功 (true=已登记)。
+pub fn notify_verify_pkg(pid: i32) -> bool {
     let handle = KpmHandle::new();
-    let _ = handle.verify_pkg(pid, res.cpus.bits[0]);
+    match handle.verify_pkg(pid) {
+        Some(pkg) => {
+            crate::cache::pkg_track_pid(pid, &pkg);
+            true
+        }
+        None => false,
+    }
 }
 
 pub struct EbpfState {
@@ -401,13 +411,23 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
 
     /* 先设置白名单再激活: start 注册 tracepoint 后立即开始过滤事件,
      * 若白名单为空则所有新进程事件被丢弃, 导致直接打开应用不设置亲和性 */
-    let mut pkgs = crate::lock_ignore_poison(&CURRENT_CONFIG)
+    let mut pkgs: Vec<(String, u64)> = crate::lock_ignore_poison(&CURRENT_CONFIG)
         .as_ref()
-        .map(|cfg| cfg.target_pkgs.clone())
+        .map(|cfg| {
+            cfg.target_pkgs
+                .iter()
+                .map(|pkg| {
+                    let bits = thread_affinity(pkg, "", cfg)
+                        .map(|r| r.cpus.bits[0])
+                        .unwrap_or(0);
+                    (pkg.clone(), bits)
+                })
+                .collect()
+        })
         .unwrap_or_default();
     // 桌面是刷新率模块的默认白名单成员，不依赖 CPU 规则存在与否。
-    pkgs.insert(crate::config::DEFAULT_REFRESH_PACKAGE.to_string());
-    pkgs.insert(crate::config::DEFAULT_REFRESH_COMM.to_string());
+    pkgs.push((crate::config::DEFAULT_REFRESH_PACKAGE.to_string(), 0));
+    pkgs.push((crate::config::DEFAULT_REFRESH_COMM.to_string(), 0));
     handle.set_whitelist(&pkgs);
     handle.activate();
 
@@ -536,10 +556,17 @@ fn kpm_reader(
 }
 
 /// 配置白名单; 返回 true 表示需重载 (KPM 白名单容量固定 16384, 不会触发)
-pub fn comm_map_init(bpf: &mut KpmHandle, pkgs: &HashSet<String>, _comm_capacity: u32) -> bool {
-    let mut refresh_pkgs = pkgs.clone();
-    refresh_pkgs.insert(crate::config::DEFAULT_REFRESH_PACKAGE.to_string());
-    refresh_pkgs.insert(crate::config::DEFAULT_REFRESH_COMM.to_string());
+pub fn comm_map_init(bpf: &mut KpmHandle, cfg: &AppConfig, _comm_capacity: u32) -> bool {
+    // 白名单带 bits: 每个目标包计算包级亲和性 (纯包名规则; 无线程规则包 bits=0)
+    let mut refresh_pkgs: Vec<(String, u64)> = Vec::new();
+    for pkg in &cfg.target_pkgs {
+        let bits = thread_affinity(pkg, "", cfg)
+            .map(|r| r.cpus.bits[0])
+            .unwrap_or(0);
+        refresh_pkgs.push((pkg.clone(), bits));
+    }
+    refresh_pkgs.push((crate::config::DEFAULT_REFRESH_PACKAGE.to_string(), 0));
+    refresh_pkgs.push((crate::config::DEFAULT_REFRESH_COMM.to_string(), 0));
     if !bpf.set_whitelist(&refresh_pkgs) {
         return true;
     }

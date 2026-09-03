@@ -273,7 +273,7 @@ fn main() {
     ) {
         let Some(cfg) = cfg else { return };
         if let Some(es) = ebpf_state.as_mut() {
-            let r = comm_map_init(&mut es.bpf, &cfg.target_pkgs, es.comm_capacity);
+            let r = comm_map_init(&mut es.bpf, cfg, es.comm_capacity);
             if !r {
                 full_scan(cfg, es);
             } else {
@@ -314,7 +314,7 @@ fn main() {
         if let Some(mut es) = ebpf_init(kpm_wake_fd) {
             let cfg = lock_ignore_poison(&CURRENT_CONFIG).clone();
             if let Some(cfg) = cfg {
-                if !comm_map_init(&mut es.bpf, &cfg.target_pkgs, es.comm_capacity) {
+                if !comm_map_init(&mut es.bpf, cfg, es.comm_capacity) {
                     full_scan(&cfg, &mut es);
                 }
             }
@@ -397,7 +397,7 @@ fn main() {
                         // 自动/强制 KPM: 尝试初始化
                         if let Some(mut es) = ebpf_init(kpm_wake_fd) {
                             if let Some(cfg) = cfg.as_ref() {
-                                if !comm_map_init(&mut es.bpf, &cfg.target_pkgs, es.comm_capacity) {
+                                if !comm_map_init(&mut es.bpf, cfg, es.comm_capacity) {
                                     full_scan(cfg, &mut es);
                                 }
                             }
