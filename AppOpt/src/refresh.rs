@@ -254,11 +254,14 @@ fn handle_fg_change(state: &mut RefreshState, pid: i32) {
         try_apply_fg(state, pid);
         return;
     }
-    // 冷启动：PID_PKG 尚无该 pid（新进程前台切换）。触发内核扫描该应用
-    // 全部进程/线程（含 pkg:xxx 子进程）并设置亲和性；同时登记等待 pid，
-    // 待 pkg_track_pid 写入后由 PkgTracked 事件驱动应用刷新率。
-    crate::ebpf_mode::notify_verify_pkg(pid);
+    // 冷启动：PID_PKG 尚无该 pid（新进程前台切换）。★必须先登记等待 pid
+    // 再触发 notify_verify_pkg: notify 内部 pkg_track_pid → notify_pkg_tracked
+    // 会检查 REFRESH_PENDING_PID == pid, 若先 notify 后登记则通知丢失,
+    // 刷新率只能等下次切换 (热启动) 才生效。
     REFRESH_PENDING_PID.store(pid, Ordering::Release);
+    // 触发内核扫描该应用全部进程/线程（含 pkg:xxx 子进程）并设置亲和性；
+    // notify_verify_pkg 成功后 pkg_track_pid → PkgTracked 事件驱动应用刷新率。
+    crate::ebpf_mode::notify_verify_pkg(pid);
 }
 
 /// input 事件触发：用户活动
