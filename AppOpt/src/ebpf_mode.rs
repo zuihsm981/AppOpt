@@ -231,9 +231,16 @@ impl KpmHandle {
                 s.push_str(&format!("{:x}", bits));
             }
         }
+        crate::debug_log::debug_log(&format!(
+            "set_whitelist cmd: len={} pkgs={:?}",
+            s.len(),
+            pkgs.iter().map(|(p, b)| format!("{}:{}", p, b)).collect::<Vec<_>>()
+        ));
         let c = CString::new(s).unwrap_or_default();
         let mut out = [0u8; 16];
-        kpm_ctl0(&self.key, &c, &mut out) >= 0
+        let rc = kpm_ctl0(&self.key, &c, &mut out);
+        crate::debug_log::debug_log(&format!("set_whitelist ctl0: rc={}", rc));
+        rc >= 0
     }
 }
 
@@ -594,9 +601,16 @@ pub fn comm_map_init(bpf: &mut KpmHandle, cfg: &AppConfig, _comm_capacity: u32) 
     }
     refresh_pkgs.push((crate::config::DEFAULT_REFRESH_PACKAGE.to_string(), 0));
     refresh_pkgs.push((crate::config::DEFAULT_REFRESH_COMM.to_string(), 0));
+    crate::debug_log::debug_log(&format!(
+        "comm_map_init: target_pkgs={} entries={:?}",
+        cfg.target_pkgs.len(),
+        cfg.target_pkgs.iter().collect::<Vec<_>>()
+    ));
     if !bpf.set_whitelist(&refresh_pkgs) {
+        crate::debug_log::debug_log("comm_map_init: set_whitelist FAILED");
         return true;
     }
+    crate::debug_log::debug_log("comm_map_init: set_whitelist OK");
     false
 }
 
