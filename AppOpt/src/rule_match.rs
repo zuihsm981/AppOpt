@@ -105,7 +105,7 @@ pub(crate) fn comm_fast_to_pkg(comm: &str, cfg: &AppConfig) -> Option<String> {
 
 /// 仅用于 cmdline 不可读时的安全截断回退。
 /// 必须只有一个包名拥有该明确前缀，避免同一截断 comm 对应多个包。
-fn comm_prefix_fallback(comm: &str, cfg: &AppConfig) -> Option<String> {
+pub(crate) fn comm_prefix_fallback(comm: &str, cfg: &AppConfig) -> Option<String> {
     if comm.len() < 15 {
         return None;
     }

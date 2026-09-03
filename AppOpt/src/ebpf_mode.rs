@@ -249,9 +249,27 @@ impl KpmHandle {
 pub fn notify_verify_pkg(pid: i32) -> bool {
     let handle = KpmHandle::new();
     match handle.verify_pkg(pid) {
-        Some(pkg) => {
-            crate::cache::pkg_track_pid(pid, &pkg);
-            true
+        Some(comm) => {
+            // 内核返回的是 leader comm（≤15 字节截断名），不是完整包名。
+            // 必须映射回完整包名再登记 PID_PKG，否则 try_apply_fg 用截断名
+            // 匹配 app_configs / DEFAULT_REFRESH_PACKAGE 永远失败：
+            //   launcher: comm=droid.launcher3 vs 配置 com.android.launcher3
+            //   应用:     comm=air.tv.douyu.an vs 配置 air.tv.douyu.android
+            let cfg = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
+            let full_pkg = cfg.as_ref().and_then(|cfg| {
+                if comm == crate::config::DEFAULT_REFRESH_COMM {
+                    Some(crate::config::DEFAULT_REFRESH_PACKAGE.to_string())
+                } else {
+                    crate::rule_match::comm_prefix_fallback(&comm, cfg)
+                }
+            });
+            match full_pkg {
+                Some(pkg) => {
+                    crate::cache::pkg_track_pid(pid, &pkg);
+                    true
+                }
+                None => false,
+            }
         }
         None => false,
     }
