@@ -675,6 +675,12 @@ fn event_apply(
     })
 }
 
+/// 周期重放全部 pending (由主循环 EV_PROC 周期触发)。
+/// 时间驱动: cmdline 一旦可读即识别并补做亲和性, 不依赖后续 Hit 事件。
+pub fn replay_pending(cache: &mut ProcCache, bpf: &KpmHandle, cfg: &AppConfig) -> usize {
+    cache.replay_pending_all(cfg, |t, c, d| affinity_apply(t, c, d, cfg, bpf))
+}
+
 /// 周期重钉已由内核 sched_setaffinity 拦截接管 (KPM 模式); /proc 回退模式仍用 affinity_sync
 
 /// 启动或配置更新时全量扫描 /proc

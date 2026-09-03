@@ -236,6 +236,34 @@ impl ProcCache {
         }
     }
 
+    /// 周期重放全部 pending: 对每个暂存 pid 尝试用 cmdline 识别 (时间驱动, 不依赖
+    /// 后续 Hit 事件)。cmdline 一旦可读即识别 pkg 并重放该 pid 的 pending 线程事件;
+    /// 确认非目标则清 pending; 仍不可读则保留等下个周期。返回重放成功数。
+    pub fn replay_pending_all<F>(&mut self, cfg: &AppConfig, apply_fn: F) -> usize
+    where
+        F: Fn(i32, &CpuSet, &str) -> bool,
+    {
+        let pids: Vec<i32> = self.pending_events.keys().copied().collect();
+        let mut total = 0;
+        for pid in pids {
+            // 识别 pid 归属 (此刻 app 已启动, cmdline 通常已就绪; comm 传空以 cmdline 为权威)
+            let pkg = match comm_to_pkg(pid, "", cfg) {
+                PkgMatch::Hit(pkg) => pkg,
+                PkgMatch::Miss => {
+                    // cmdline 可读且确认非目标: 清 pending + 负缓存
+                    self.pending_events.remove(&pid);
+                    self.negative_pids.insert(pid, String::new());
+                    continue;
+                }
+                PkgMatch::Unknown => continue, // cmdline 仍不可读, 等下个周期
+            };
+            self.pid_pkgs.insert(pid, pkg.clone());
+            pkg_track_pid(pid, &pkg);
+            total += self.replay_pending(pid, &pkg, cfg, &apply_fn);
+        }
+        total
+    }
+
     /// 计算并应用线程亲和性，保护已有线程规则绑定防止降级
     pub fn task_apply<F>(
         &mut self,

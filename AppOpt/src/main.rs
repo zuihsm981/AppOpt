@@ -253,6 +253,14 @@ fn main() {
         let it = libc::itimerspec { it_interval: ts, it_value: ts };
         unsafe { libc::timerfd_settime(tfd, 0, &it, std::ptr::null_mut()) };
     }
+    fn arm_periodic_ms(tfd: i32, ms: i64) {
+        let ts = libc::timespec {
+            tv_sec: ms / 1000,
+            tv_nsec: (ms % 1000) * 1_000_000,
+        };
+        let it = libc::itimerspec { it_interval: ts, it_value: ts };
+        unsafe { libc::timerfd_settime(tfd, 0, &it, std::ptr::null_mut()) };
+    }
     fn disarm_timerfd(tfd: i32) {
         let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         let it = libc::itimerspec { it_interval: zero, it_value: zero };
@@ -314,10 +322,12 @@ fn main() {
             ebpf_state = Some(es);
         }
     }
-    // /proc 模式: 周期 timerfd 立即启动; KPM 模式: 保持 disarm
+    // /proc 模式: 周期 timerfd 立即启动; KPM 模式: 短周期 pending 重放 (200ms)
     if ebpf_state.is_none() {
         let interval = CHECK_INTERVAL.load(Ordering::Relaxed).max(1);
         arm_periodic(proc_timer_fd, interval as i64);
+    } else {
+        arm_periodic_ms(proc_timer_fd, 200);
     }
 
     let mut events = [unsafe { std::mem::zeroed::<libc::epoll_event>() }; 8];
@@ -419,6 +429,15 @@ fn main() {
                 }
                 EV_PROC => {
                     read_eventfd(proc_timer_fd);
+                    // KPM 模式: 周期重放 pending (时间驱动, 不依赖事件时序)。
+                    // 事件驱动太快会在 cmdline 就绪前消费事件, 周期重放确保
+                    // HeapTaskDaemon 等极早期线程在 cmdline 可读后被补做亲和性。
+                    if let Some(es) = ebpf_state.as_mut() {
+                        if let Some(cfg) = cfg.as_ref() {
+                            crate::ebpf_mode::replay_pending(&mut es.cache, &es.bpf, cfg);
+                        }
+                        continue;
+                    }
                     // /proc 回退模式周期同步
                     if ebpf_state.is_none() {
                         let Some(cfg) = cfg.as_ref() else { continue };
@@ -443,12 +462,12 @@ fn main() {
             ps.force_affinity = true;
         }
 
-        // 周期 timerfd 与模式联动: /proc 模式启动, KPM 模式停止
+        // 周期 timerfd 与模式联动: /proc 模式长周期扫描, KPM 模式 200ms 重放 pending
         let interval = CHECK_INTERVAL.load(Ordering::Relaxed).max(1);
         if ebpf_state.is_none() {
             arm_periodic(proc_timer_fd, interval as i64);
         } else {
-            disarm_timerfd(proc_timer_fd);
+            arm_periodic_ms(proc_timer_fd, 200);
         }
 
         // web 状态统计: 事件驱动更新 (收到事件时刷新, 不再定时轮询)
