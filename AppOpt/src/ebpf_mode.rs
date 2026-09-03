@@ -419,9 +419,11 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
         return None;
     }
 
-    // reader 线程: 直读共享内存取事件, 处理完自动停止回阻塞
+    // reader 线程: 直读共享内存取事件, 处理完自动停止回阻塞。
+    // 原始指针非 Send, 跨线程传 usize 地址, 线程内还原。
+    let shm_addr = shm_ptr as usize;
     let reader_thread = thread::spawn(move || {
-        kpm_reader(tx, wakeup_fd, notify_fd, kpm_wake_fd, shm_ptr as *mut u8);
+        kpm_reader(tx, wakeup_fd, notify_fd, kpm_wake_fd, shm_addr as *mut u8);
     });
 
     /* 先设置白名单再激活: start 注册 tracepoint 后立即开始过滤事件,
