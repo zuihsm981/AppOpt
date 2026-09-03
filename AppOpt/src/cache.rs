@@ -4,7 +4,7 @@ use std::sync::{LazyLock, Mutex};
 use crate::apply_affinity::affinity_set;
 use crate::config::AppConfig;
 use crate::cpuset::{CpuSet, CpuTopology};
-use crate::rule_match::{comm_to_pkg, PkgMatch, thread_affinity};
+use crate::rule_match::thread_affinity;
 
 /// 全局共享 pid→pkg 索引：由 ProcCache 的增删方法统一维护，
 /// 供刷新率模块按 pid 查包名（替代 packages.list 文件 I/O）。
@@ -42,16 +42,10 @@ pub struct ProcCache {
     pub tasks: HashMap<i32, TaskEntry>,
     /// 事件热路径使用的本地 pid→pkg 缓存，避免每个线程事件锁全局 PID_PKG。
     pid_pkgs: HashMap<i32, String>,
-    /// 最近确认不是目标包的 pid→comm，避免内核粗过滤产生的重复事件反复读 /proc。
-    negative_pids: HashMap<i32, String>,
     /// pid→缓存任务数，避免每次线程退出都扫描全部 tasks。
     pid_task_counts: HashMap<i32, usize>,
     /// tid→pkg 的计数，供 Web 统计直接取唯一包名，避免每次请求扫描全部任务。
     hit_pkgs: HashMap<String, usize>,
-    /// 事件到达时 pid 尚不可识别（cmdline 瞬时不可读）→ 暂存 (tid, comm)。
-    /// 之后该 pid 被识别（任何 Hit）时由 replay_pending 重放补做亲和性，
-    /// 解决 HeapTaskDaemon 等极早期线程被"过早消费"永久丢失的问题。
-    pending_events: HashMap<i32, Vec<(i32, String)>>,
 }
 
 impl ProcCache {
@@ -59,17 +53,13 @@ impl ProcCache {
         Self {
             tasks: HashMap::new(),
             pid_pkgs: HashMap::new(),
-            negative_pids: HashMap::new(),
             pid_task_counts: HashMap::new(),
             hit_pkgs: HashMap::new(),
-            pending_events: HashMap::new(),
         }
     }
 
     fn forget_pid(&mut self, pid: i32) {
         self.pid_pkgs.remove(&pid);
-        self.negative_pids.remove(&pid);
-        self.pending_events.remove(&pid);
         pkg_untrack_pid(pid);
     }
 
@@ -115,16 +105,13 @@ impl ProcCache {
     /// 仅需在新白名单下重新识别进程包名，无需重建已绑定的任务。
     pub fn invalidate_pid_cache(&mut self) {
         self.pid_pkgs.clear();
-        self.negative_pids.clear();
     }
 
     pub fn clear(&mut self) {
         self.tasks.clear();
         self.pid_pkgs.clear();
-        self.negative_pids.clear();
         self.pid_task_counts.clear();
         self.hit_pkgs.clear();
-        self.pending_events.clear();
         PID_PKG.lock().unwrap().clear();
     }
 
@@ -133,135 +120,6 @@ impl ProcCache {
         let Some(entry) = self.tasks.remove(&tid) else { return };
         self.hit_pkg_del(&entry.pkg);
         self.drop_pid_ref(entry.pid);
-    }
-
-    /// 清理一个进程的缓存任务。EXEC 后必须清理旧包名，避免 PID 复用/换包导致误命中。
-    pub fn pid_exec(&mut self, pid: i32) {
-        let tids: Vec<i32> = self
-            .tasks
-            .iter()
-            .filter_map(|(&tid, entry)| (entry.pid == pid).then_some(tid))
-            .collect();
-        for tid in tids {
-            self.task_del(tid);
-        }
-        self.forget_pid(pid);
-    }
-
-    /// comm 匹配包名。
-    ///
-    /// KPM 事件路径中同一进程的多个线程会反复触发此函数；成功应用过的进程
-    /// 直接复用本地 pid→pkg 缓存，避免全局 Mutex 和 /proc/<pid>/cmdline 访问。
-    /// 首次识别后同时缓存正/负结果：目标 PID 命中 pid_pkgs，非目标 PID 命中
-    /// negative_pids，之后同一 PID 的后续线程事件不再重复读 /proc/<pid>/cmdline。
-    /// EXEC / 进程退出 / 配置变更会清除对应缓存，避免 PID 复用或换包误判。
-    ///
-    /// 关键: cmdline 瞬时不可读 (Unknown) 时把 (tid, comm) 记入 pending_events,
-    /// 由后续该 pid 被识别 (Hit) 后的 replay_pending 重放补做亲和性 —— 解决
-    /// HeapTaskDaemon 等极早期线程事件"在 pid 可识别前被消费、之后不再重试"
-    /// 而永久丢失的问题 (等价于"等 pid 就绪再处理", 但无需内核缓冲/binder 闸门)。
-    pub fn pkg_lookup_comm(
-        &mut self,
-        tid: i32,
-        pid: i32,
-        comm: &str,
-        cfg: &AppConfig,
-    ) -> Option<String> {
-        // 正缓存: 已确认是目标包
-        if let Some(pkg) = self.pid_pkgs.get(&pid).cloned() {
-            if cfg.target_pkgs.contains(&pkg) {
-                return Some(pkg);
-            }
-            // 配置已变化但旧映射尚未被全量扫描清理时，立即丢弃旧值。
-            self.forget_pid(pid);
-        }
-        // 负缓存: 同一 PID + 同一 comm 之前确认非目标，直接跳过 cmdline 读取。
-        if let Some(prev) = self.negative_pids.get(&pid) {
-            if prev == comm {
-                return None;
-            }
-        }
-        // 解析（只对未知 PID 读一次 cmdline）
-        match comm_to_pkg(pid, comm, cfg) {
-            PkgMatch::Hit(pkg) => {
-                self.pid_pkgs.insert(pid, pkg.clone());
-                // 立即登记共享 PID_PKG（供刷新率模块按 pid 查包名）。
-                // 不能只等 task_apply 成功：只配置刷新率、没有 CPU 亲和性规则
-                // 的应用 thread_affinity 会返回 None 而 task_apply 失败，
-                // 若不在此登记，刷新率前台回调将永远查不到该应用的包名。
-                pkg_track_pid(pid, &pkg);
-                Some(pkg)
-            }
-            PkgMatch::Miss => {
-                // cmdline 可读且确认非目标 → 写负缓存, 后续同 pid 同 comm 不再读 cmdline
-                self.negative_pids.insert(pid, comm.to_string());
-                None
-            }
-            PkgMatch::Unknown => {
-                // cmdline 瞬时不可读: 不写负缓存, 但事件已消费——暂存待重放,
-                // 避免 HeapTaskDaemon 这类极早期线程被永久丢失。
-                self.pending_events
-                    .entry(pid)
-                    .or_default()
-                    .push((tid, comm.to_string()));
-                None
-            }
-        }
-        .or_else(|| self.tasks.get(&pid).map(|e| e.pkg.clone()))
-    }
-
-    /// 重放某 pid 之前暂存的所有 pending 线程事件 (pid 已识别为目标包时调用)。
-    /// 返回重放成功数; 取空后再次调用为 no-op。
-    pub fn replay_pending<F>(&mut self, pid: i32, pkg: &str, cfg: &AppConfig, apply_fn: F) -> usize
-    where
-        F: Fn(i32, &CpuSet, &str) -> bool,
-    {
-        let Some(events) = self.pending_events.remove(&pid) else {
-            return 0;
-        };
-        let mut n = 0;
-        for (tid, comm) in events {
-            if self.task_apply(tid, pid, pkg, &comm, cfg, &apply_fn) {
-                n += 1;
-            }
-        }
-        n
-    }
-
-    /// 该 pid 已无任何缓存任务时清理其全部缓存 (含 pending), 防残留。
-    pub fn purge_dead_pid(&mut self, pid: i32) {
-        let alive = self.tasks.values().any(|e| e.pid == pid);
-        if !alive {
-            self.forget_pid(pid);
-        }
-    }
-
-    /// 周期重放全部 pending: 对每个暂存 pid 尝试用 cmdline 识别 (时间驱动, 不依赖
-    /// 后续 Hit 事件)。cmdline 一旦可读即识别 pkg 并重放该 pid 的 pending 线程事件;
-    /// 确认非目标则清 pending; 仍不可读则保留等下个周期。返回重放成功数。
-    pub fn replay_pending_all<F>(&mut self, cfg: &AppConfig, apply_fn: F) -> usize
-    where
-        F: Fn(i32, &CpuSet, &str) -> bool,
-    {
-        let pids: Vec<i32> = self.pending_events.keys().copied().collect();
-        let mut total = 0;
-        for pid in pids {
-            // 识别 pid 归属 (此刻 app 已启动, cmdline 通常已就绪; comm 传空以 cmdline 为权威)
-            let pkg = match comm_to_pkg(pid, "", cfg) {
-                PkgMatch::Hit(pkg) => pkg,
-                PkgMatch::Miss => {
-                    // cmdline 可读且确认非目标: 清 pending + 负缓存
-                    self.pending_events.remove(&pid);
-                    self.negative_pids.insert(pid, String::new());
-                    continue;
-                }
-                PkgMatch::Unknown => continue, // cmdline 仍不可读, 等下个周期
-            };
-            self.pid_pkgs.insert(pid, pkg.clone());
-            pkg_track_pid(pid, &pkg);
-            total += self.replay_pending(pid, &pkg, cfg, &apply_fn);
-        }
-        total
     }
 
     /// 计算并应用线程亲和性，保护已有线程规则绑定防止降级

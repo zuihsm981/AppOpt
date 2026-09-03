@@ -97,10 +97,6 @@ fn load_global_config(state: &mut RefreshState) {
     state.current_idle = state.idle_mode;
     state.current_timeout = state.timeout_seconds;
     state.timer_enabled = state.current_idle != state.current_active;
-    // 联动内核 INPUT 发射开关: 仅"需要切换"时保持开。
-    // 只在配置加载/变化时调用 (本函数仅被 refresh_init 初始化 与 check_config
-    // 配置变化触发), 不在 fg 切换热路径调用; 不影响进程事件流。
-    crate::ebpf_mode::sync_input_events(state.timer_enabled);
 }
 
 /// 从共享 CURRENT_CONFIG 读取按应用刷新率配置（统一加载）
@@ -252,13 +248,16 @@ fn try_apply_fg(state: &mut RefreshState, pid: i32) -> bool {
 /// 此时登记 REFRESH_PENDING_PID；cache 层 pkg_track_pid 命中该 pid 时通过
 /// mpsc 事件通知刷新率线程立即应用（事件驱动，无轮询、无超时兜底）。
 fn handle_fg_change(state: &mut RefreshState, pid: i32) {
-    // PID_PKG 已有该 pid → 直接决定（应用刷新率，或按白名单丢弃），不登记。
+    // PID_PKG 已有该 pid → 热启动: 直接决定（应用刷新率，或按白名单丢弃），
+    // 不登记、不触发内核扫描（亲和性此前已设置, 避免无谓内核遍历）。
     if crate::cache::pkg_lookup_pid(pid).is_some() {
         try_apply_fg(state, pid);
         return;
     }
-    // 冷启动竞态：PID_PKG 尚无该 pid（KPM 事件链未处理完）。登记等待 pid，
-    // 待 pkg_track_pid 写入后由 PkgTracked 事件驱动应用。
+    // 冷启动：PID_PKG 尚无该 pid（新进程前台切换）。触发内核扫描该应用
+    // 全部进程/线程（含 pkg:xxx 子进程）并设置亲和性；同时登记等待 pid，
+    // 待 pkg_track_pid 写入后由 PkgTracked 事件驱动应用刷新率。
+    crate::ebpf_mode::notify_verify_pkg(pid);
     REFRESH_PENDING_PID.store(pid, Ordering::Release);
 }
 

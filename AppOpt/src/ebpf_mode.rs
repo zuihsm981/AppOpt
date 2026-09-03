@@ -18,6 +18,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use crate::apply_affinity::{proc_walk, task_tids, tid_comm};
+use crate::rule_match::PkgMatch;
 use crate::cache::ProcCache;
 use crate::config::{AppConfig, CURRENT_CONFIG};
 use crate::cpuset::CpuSet;
@@ -32,9 +33,6 @@ pub struct EbpfProcEvent {
     pub event_type: u32,
 }
 
-pub const EBPF_EVENT_FORK: u32 = 1;
-pub const EBPF_EVENT_EXEC: u32 = 2;
-pub const EBPF_EVENT_RENAME: u32 = 3;
 pub const EBPF_EVENT_EXIT: u32 = 4;
 pub const EBPF_EVENT_INPUT: u32 = 5;
 
@@ -174,16 +172,12 @@ impl KpmHandle {
     }
 
     /// 激活 KPM: 注册 tracepoint(start) + 按配置决定 input kprobe 挂载与发射。
-    /// active != idle → input_on + 发射开; active == idle → input_off (卸载 kprobe)。
+    /// input kprobe 随 hooks 生命周期常开。
     /// 依赖 CURRENT_CONFIG 已就绪 (main 中 load_config 先于 ebpf_init)。
+    /// 激活 KPM: 注册 tracepoint (exit) + sched_setaffinity kprobe + input kprobe。
+    /// input kprobe 随 hooks 生命周期常开: INPUT 事件用于刷新率唤醒 (1s 节流)。
     pub fn activate(&self) {
         self.cmd("start");
-        let need_input = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG)
-            .as_ref()
-            .map(|c| c.refresh_active != c.refresh_idle)
-            .unwrap_or(true);
-        let _ = self.set_input_kprobe(need_input);
-        let _ = self.set_input_events(need_input);
     }
 
     fn applied_del(&self, tid: i32) {
@@ -203,23 +197,12 @@ impl KpmHandle {
         self.cmd(&s) >= 0
     }
 
-    /// 设置内核 INPUT 事件发射开关 (不改变 kprobe 挂载状态)。
-    /// enabled=true → 发 INPUT 事件; false → 内核 input_kprobe_pre 直接跳过
-    /// (active==idle 时刷新率无需切换, 关掉可省事件)。同步 ctl0, 无异步。
-    pub fn set_input_events(&self, enabled: bool) -> bool {
-        let s = if enabled {
-            "set_input_events 1".to_string()
-        } else {
-            "set_input_events 0".to_string()
-        };
+    /// 通知内核扫描目标 pid 对应应用（含 pkg:xxx 子进程）全部线程并重设亲和性。
+    /// 内核在 workqueue 遍历 task 链表, 以该 pid 的 leader comm 为唯一目标前缀
+    /// (子进程同前缀), 对命中线程 set_cpus_allowed_ptr(bits)。
+    pub fn verify_pkg(&self, pid: i32, bits: u64) -> bool {
+        let s = format!("verify_pkg {} {:x}", pid, bits);
         self.cmd(&s) >= 0
-    }
-
-    /// 挂载/卸载 input kprobe (input_on/input_off)。
-    /// INPUT 事件为低优先级 (event_emit_locked 可丢弃), 卸载 kprobe 不会影响
-    /// 亲和性事件流; active==idle 时卸载以省 kprobe 开销。
-    pub fn set_input_kprobe(&self, on: bool) -> bool {
-        self.cmd(if on { "input_on" } else { "input_off" }) >= 0
     }
 
     /// 设置白名单 (包名集合), 返回 true 表示失败需要回退
@@ -238,21 +221,31 @@ impl KpmHandle {
 }
 
 /// 将内核 comm 截断于首个 NUL 并 trim 尾部空白
-fn comm_str(comm: &[u8; 16]) -> &str {
-    let end = comm.iter().position(|&b| b == 0).unwrap_or(16);
-    std::str::from_utf8(&comm[..end]).unwrap_or("").trim()
-}
 
-/// 按"刷新率是否需要切换"(active != idle) 联动内核 INPUT:
-/// - active != idle: 挂载 input kprobe + 发射开 (触摸唤醒)
-/// - active == idle: 卸载 input kprobe + 发射关 (省 kprobe 开销与事件)
-/// 仅由 refresh 模块在配置加载/变化时调用 (低频), 不在 fg 切换热路径调用。
-/// INPUT 为低优先级事件 (内核 event_emit_locked 可丢弃), 卸载/挂载 kprobe
-/// 不会影响亲和性事件流 (FORK/EXEC/RENAME), 不丢线程。
-pub fn sync_input_events(enabled: bool) {
+
+/// IProcessObserver 冷启动前台回调触发：由 refresh 线程在 PID_PKG 尚未登记该 pid
+/// 时调用（低频，仅前台切换时一次）。识别 pid 所属包的包级亲和性 bits，
+/// 通知内核扫描该包全部进程/线程（含 pkg:xxx 子进程）并重设亲和性。
+/// 热启动（PID_PKG 已登记）不调用 → 避免无谓内核扫描。
+pub fn notify_verify_pkg(pid: i32) {
+    let Some(cfg) = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone() else {
+        return;
+    };
+    let comm = crate::apply_affinity::tid_comm(pid).unwrap_or_default();
+    let PkgMatch::Hit(pkg) = crate::rule_match::comm_to_pkg(pid, &comm, &cfg) else {
+        return;
+    };
+    // ★ 登记共享 PID_PKG: refresh 模块靠 pkg_lookup_pid 获取包名。
+    // 重构后亲和性改由内核扫描 (verify) 设置, 不依赖 FORK/EXEC/RENAME 事件,
+    // 因此 PID_PKG 必须在此填充, 否则 try_apply_fg 查不到包名、
+    // REFRESH_PENDING_PID 也等不到 PkgTracked 通知 → 刷新率永不生效。
+    crate::cache::pkg_track_pid(pid, &pkg);
+    // 纯包名规则取包级亲和性; 线程规则不在此覆盖 (由事件路径处理)
+    let Some(res) = crate::rule_match::thread_affinity(&pkg, "", &cfg) else {
+        return;
+    };
     let handle = KpmHandle::new();
-    let _ = handle.set_input_kprobe(enabled);
-    let _ = handle.set_input_events(enabled);
+    let _ = handle.verify_pkg(pid, res.cpus.bits[0]);
 }
 
 pub struct EbpfState {
@@ -320,27 +313,7 @@ pub fn kpm_probe() -> bool {
 
 /// 查找 Zygote 相关进程的所有线程 tid
 /// (cmdline 匹配 zygote/app_process/usap 前缀, 覆盖 zygote/zygote64/app_process32/app_process64/usap)
-fn find_zygote_tids() -> Vec<i32> {
-    let mut tids = Vec::new();
-    if let Ok(entries) = fs::read_dir("/proc") {
-        for entry in entries.flatten() {
-            let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else { continue };
-            let Ok(cmdline) = fs::read(format!("/proc/{}/cmdline", pid)) else { continue };
-            let s = String::from_utf8_lossy(&cmdline);
-            if !(s.starts_with("zygote") || s.starts_with("app_process") || s.starts_with("usap")) {
-                continue;
-            }
-            if let Ok(task_dir) = fs::read_dir(format!("/proc/{}/task", pid)) {
-                for t in task_dir.flatten() {
-                    if let Ok(tid) = t.file_name().to_string_lossy().parse::<i32>() {
-                        tids.push(tid);
-                    }
-                }
-            }
-        }
-    }
-    tids
-}
+
 
 /// 初始化 KPM 事件驱动: 确保模块加载, 启动 reader 线程
 /// 失败返回 None, 由调用方回退 /proc 轮询。
@@ -437,15 +410,6 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
     pkgs.insert(crate::config::DEFAULT_REFRESH_COMM.to_string());
     handle.set_whitelist(&pkgs);
     handle.activate();
-
-    /* 把 Zygote 加入 APPLIED 表 (bits=0): Zygote fork 出的子进程
-     * (如 com.bilibili.app.in:ijkservice) 会在 FORK 探针中被占位,
-     * RENAME 时 tracked=true 直接通过, 无需依赖 whitelist_matched。
-     * bits=0 不影响 Zygote 自身 (sched_setaffinity kprobe 见 bits=0 不干预)。 */
-    for tid in find_zygote_tids() {
-        handle.applied_set(tid, 0);
-    }
-
 
     Some(EbpfState {
         event_rx: rx,
@@ -612,39 +576,14 @@ fn affinity_apply(
 pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfState) {
     let tid = event.tid;
     let pid = event.pid;
-    let comm = comm_str(&event.comm);
 
     match event.event_type {
         EBPF_EVENT_EXIT => {
-            // task_del 会在该 PID 的最后一个线程退出后再移除共享索引；
-            // 不能在单个线程退出时无条件删除 PID→包名映射。
+            // 线程退出: 清理 cache 与内核 APPLIED 表。
+            // 亲和性事件 (FORK/EXEC/RENAME) 已移除, 由 IProcessObserver 冷启动
+            // verify_pkg (内核扫描设置) 驱动; 这里只保留退出清理与 INPUT。
             state.cache.task_del(tid);
-            // 该 pid 已无任何缓存任务时清理 pending 等残留 (防泄漏)
-            state.cache.purge_dead_pid(pid);
             applied_del(&state.bpf, tid);
-        }
-
-        EBPF_EVENT_EXEC => {
-            // EXEC 可能复用同一个 pid，先清掉旧进程的任务和 PID_PKG 映射，
-            // 再用新的 cmdline/comm 重新识别，避免沿用旧包名。
-            state.cache.pid_exec(pid);
-            if !event_apply(&mut state.cache, &state.bpf, tid, pid, comm, cfg) {
-                applied_del(&state.bpf, tid);
-            }
-        }
-
-        EBPF_EVENT_FORK => {
-            // 子线程继承父线程亲和性: FORK 事件必然触发, 比 RENAME 可靠。
-            // RENAME 可能因内核过滤 / pid 识别失败而永不送达, 导致线程
-            // (HeapTaskDaemon 等极早期线程) 无法进入 task_apply → 亲和性丢失。
-            // 在 FORK 时就调用 event_apply: 纯包名规则下 thread_affinity 包级
-            // fallback 直接命中, applied_set 写入真实 bits; pid 未识别时入 pending
-            // 由周期重放补做。RENAME 到达时再校正线程规则精确值。
-            event_apply(&mut state.cache, &state.bpf, tid, pid, comm, cfg);
-        }
-
-        EBPF_EVENT_RENAME => {
-            event_apply(&mut state.cache, &state.bpf, tid, pid, comm, cfg);
         }
 
         EBPF_EVENT_INPUT => {
@@ -653,37 +592,6 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
 
         _ => {}
     }
-}
-
-/// 统一事件处理 pkg_lookup_comm 到 task_apply
-fn event_apply(
-    cache: &mut ProcCache,
-    bpf: &KpmHandle,
-    tid: i32,
-    pid: i32,
-    comm: &str,
-    cfg: &AppConfig,
-) -> bool {
-    let pkg_result = cache.pkg_lookup_comm(tid, pid, comm, cfg);
-    let Some(pkg) = pkg_result else {
-        return false;
-    };
-
-    // pid 已识别 (Hit): 先重放该 pid 之前因 cmdline 瞬时不可读而暂存的
-    // pending 线程事件 (HeapTaskDaemon 等), 再处理当前事件。
-    cache.replay_pending(pid, &pkg, cfg, |t, c, d| {
-        affinity_apply(t, c, d, cfg, bpf)
-    });
-
-    cache.task_apply(tid, pid, &pkg, comm, cfg, |t, c, d| {
-        affinity_apply(t, c, d, cfg, bpf)
-    })
-}
-
-/// 周期重放全部 pending (由主循环 EV_PROC 周期触发)。
-/// 时间驱动: cmdline 一旦可读即识别并补做亲和性, 不依赖后续 Hit 事件。
-pub fn replay_pending(cache: &mut ProcCache, bpf: &KpmHandle, cfg: &AppConfig) -> usize {
-    cache.replay_pending_all(cfg, |t, c, d| affinity_apply(t, c, d, cfg, bpf))
 }
 
 /// 周期重钉已由内核 sched_setaffinity 拦截接管 (KPM 模式); /proc 回退模式仍用 affinity_sync
@@ -710,13 +618,9 @@ pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
     }
 
     applied_clear(&state.bpf);
-    /* full_scan 清空了 APPLIED 表, Zygote 的 tid 也随之丢失。
-     * 必须重新把 Zygote 加入 APPLIED (bits=0), 否则之后 Zygote fork 的
-     * 子进程无法被 FORK 探针占位, RENAME 事件被过滤, 子进程匹配不到。 */
-    for tid in find_zygote_tids() {
-        state.bpf.applied_set(tid, 0);
-    }
-
+    /* APPLIED 表随后由 proc_walk → task_apply → affinity_apply 填充真实 bits;
+     * 不再需要 Zygote 占位 (bits=0): FORK/RENAME 探针已移除, 亲和性由
+     * IProcessObserver 冷启动 verify_pkg 内核扫描设置, 不依赖占位链。 */
     proc_walk(cfg, |_| true, |pid, pkg, has_thread_rules| {
         let Some(tids) = task_tids(pid) else { return };
         for tid in tids {

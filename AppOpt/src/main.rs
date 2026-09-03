@@ -27,8 +27,7 @@ use crate::config::{
 };
 use crate::cpuset::{init_cpu_topo, set_base_cpuset};
 use crate::ebpf_mode::{
-    full_scan, event_dispatch, comm_map_init, EBPF_EVENT_FORK, EBPF_EVENT_EXEC,
-    EBPF_EVENT_RENAME, ebpf_init, EbpfState,
+    full_scan, event_dispatch, comm_map_init, ebpf_init, EbpfState,
 };
 use crate::proc_mode::{cache_sync, ProcScanState};
 use crate::web::{
@@ -354,17 +353,12 @@ fn main() {
                 EV_KPM => {
                     read_eventfd(kpm_wake_fd);
                     if let Some(es) = ebpf_state.as_mut() {
-                        // 本批事件中是否含 FORK/EXEC/RENAME (需要立即同步亲和性)
-                        let mut need_sync = false;
+                        // 亲和性事件 (FORK/EXEC/RENAME) 已移除, 由 IProcessObserver
+                        // 冷启动 verify_pkg 内核扫描设置; 事件流只剩 EXIT (cache 清理)
+                        // 与 INPUT (刷新率)。这里只排空事件并逐条分发。
                         loop {
                             match es.event_rx.try_recv() {
                                 Ok(event) => {
-                                    if event.event_type == EBPF_EVENT_FORK
-                                        || event.event_type == EBPF_EVENT_EXEC
-                                        || event.event_type == EBPF_EVENT_RENAME
-                                    {
-                                        need_sync = true;
-                                    }
                                     let Some(cfg) =
                                         lock_ignore_poison(&CURRENT_CONFIG).clone()
                                     else {
@@ -378,14 +372,6 @@ fn main() {
                                     break;
                                 }
                             }
-                        }
-                        // 收到 FORK/EXEC/RENAME: 立即执行 affinity_sync (仅设置 CPU 亲和性),
-                        // 不依赖定时器/IDLE; 无此类事件时仅增量更新 cache
-                        if need_sync {
-                            let Some(cfg) = lock_ignore_poison(&CURRENT_CONFIG).clone() else {
-                                continue;
-                            };
-                            es.cache.affinity_sync(&cfg.topo);
                         }
                     }
                 }
@@ -429,15 +415,6 @@ fn main() {
                 }
                 EV_PROC => {
                     read_eventfd(proc_timer_fd);
-                    // KPM 模式: 周期重放 pending (时间驱动, 不依赖事件时序)。
-                    // 事件驱动太快会在 cmdline 就绪前消费事件, 周期重放确保
-                    // HeapTaskDaemon 等极早期线程在 cmdline 可读后被补做亲和性。
-                    if let Some(es) = ebpf_state.as_mut() {
-                        if let Some(cfg) = cfg.as_ref() {
-                            crate::ebpf_mode::replay_pending(&mut es.cache, &es.bpf, cfg);
-                        }
-                        continue;
-                    }
                     // /proc 回退模式周期同步
                     if ebpf_state.is_none() {
                         let Some(cfg) = cfg.as_ref() else { continue };
@@ -462,12 +439,12 @@ fn main() {
             ps.force_affinity = true;
         }
 
-        // 周期 timerfd 与模式联动: /proc 模式长周期扫描, KPM 模式 200ms 重放 pending
+        // 周期 timerfd 与模式联动: /proc 模式启动, KPM 模式停止
         let interval = CHECK_INTERVAL.load(Ordering::Relaxed).max(1);
         if ebpf_state.is_none() {
             arm_periodic(proc_timer_fd, interval as i64);
         } else {
-            arm_periodic_ms(proc_timer_fd, 200);
+            disarm_timerfd(proc_timer_fd);
         }
 
         // web 状态统计: 事件驱动更新 (收到事件时刷新, 不再定时轮询)

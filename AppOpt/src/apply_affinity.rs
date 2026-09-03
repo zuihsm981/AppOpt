@@ -3,7 +3,7 @@ use std::os::unix::fs::FileExt;
 
 use crate::{MAX_PKG_LEN, MAX_THREAD_LEN};
 use crate::config::AppConfig;
-use crate::cpuset::{base_cpuset, CpuSet, CpuTopology};
+use crate::cpuset::{CpuSet, CpuTopology};
 use crate::rule_match::{comm_to_pkg, PkgMatch};
 
 /// 栈上构建 /proc/{pid}/{suffix} 路径读取文件
@@ -51,28 +51,17 @@ pub(crate) fn task_tids(pid: i32) -> Option<Vec<i32>> {
     )
 }
 
-/// 对单线程设置 CPU 亲和性：先写入 cpuset（加入受限 cpuset 目录），
-/// 再设置 sched_setaffinity。返回 true 表示 ESRCH 线程已退出。
+/// 对单线程设置 CPU 亲和性 (仅 sched_setaffinity; 不再写入 cpuset)。
+/// 返回 true 表示 ESRCH 线程已退出。
 /// 亲和性已正确则跳过 sched_setaffinity (避免重复 syscall)。
 pub fn affinity_set(
     tid: i32,
     cpus: &CpuSet,
-    cpuset_dir: &str,
-    topo: &CpuTopology,
+    _cpuset_dir: &str,
+    _topo: &CpuTopology,
 ) -> bool {
-    // 1. cpuset: 把 tid 写入 cpuset 的 tasks，将线程纳入受限 cpuset
-    //    （cpuset 施加比 sched_setaffinity 更硬的 CPU 集合约束）。
-    //    cpuset_dir 为空表示未启用/未创建该目录，跳过。
-    //    ★ 顺序关键: sched_setaffinity 的 mask 必须属于 cpuset 允许范围。
-    //    cpuset 失败仅视为暂未生效, 不阻断亲和性 (由下次 affinity_sync 重试)。
-    if !cpuset_dir.is_empty() && topo.cpuset_enabled {
-        let path = format!("{}/{}/tasks", base_cpuset(), cpuset_dir);
-        // 写入任务号（十进制）即把任务迁移到该 cpuset；重复迁移幂等。
-        let _ = fs::write(&path, tid.to_string());
-    }
-
-    // 2. 亲和性: 在 cpuset 允许范围内设置 sched_setaffinity
     let affinity_ok = CpuSet::get_affinity(tid).is_some_and(|curr| curr == *cpus);
+    // 只设置 CPU 亲和性 (已正确则跳过)
     if !affinity_ok {
         if let Err(e) = cpus.set_affinity(tid) {
             return e.raw_os_error() == Some(libc::ESRCH);
