@@ -619,6 +619,8 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
             // task_del 会在该 PID 的最后一个线程退出后再移除共享索引；
             // 不能在单个线程退出时无条件删除 PID→包名映射。
             state.cache.task_del(tid);
+            // 该 pid 已无任何缓存任务时清理 pending 等残留 (防泄漏)
+            state.cache.purge_dead_pid(pid);
             applied_del(&state.bpf, tid);
         }
 
@@ -657,10 +659,16 @@ fn event_apply(
     comm: &str,
     cfg: &AppConfig,
 ) -> bool {
-    let pkg_result = cache.pkg_lookup_comm(pid, comm, cfg);
+    let pkg_result = cache.pkg_lookup_comm(tid, pid, comm, cfg);
     let Some(pkg) = pkg_result else {
         return false;
     };
+
+    // pid 已识别 (Hit): 先重放该 pid 之前因 cmdline 瞬时不可读而暂存的
+    // pending 线程事件 (HeapTaskDaemon 等), 再处理当前事件。
+    cache.replay_pending(pid, &pkg, cfg, |t, c, d| {
+        affinity_apply(t, c, d, cfg, bpf)
+    });
 
     cache.task_apply(tid, pid, &pkg, comm, cfg, |t, c, d| {
         affinity_apply(t, c, d, cfg, bpf)

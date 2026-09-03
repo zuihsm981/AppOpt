@@ -48,6 +48,10 @@ pub struct ProcCache {
     pid_task_counts: HashMap<i32, usize>,
     /// tid→pkg 的计数，供 Web 统计直接取唯一包名，避免每次请求扫描全部任务。
     hit_pkgs: HashMap<String, usize>,
+    /// 事件到达时 pid 尚不可识别（cmdline 瞬时不可读）→ 暂存 (tid, comm)。
+    /// 之后该 pid 被识别（任何 Hit）时由 replay_pending 重放补做亲和性，
+    /// 解决 HeapTaskDaemon 等极早期线程被"过早消费"永久丢失的问题。
+    pending_events: HashMap<i32, Vec<(i32, String)>>,
 }
 
 impl ProcCache {
@@ -58,12 +62,14 @@ impl ProcCache {
             negative_pids: HashMap::new(),
             pid_task_counts: HashMap::new(),
             hit_pkgs: HashMap::new(),
+            pending_events: HashMap::new(),
         }
     }
 
     fn forget_pid(&mut self, pid: i32) {
         self.pid_pkgs.remove(&pid);
         self.negative_pids.remove(&pid);
+        self.pending_events.remove(&pid);
         pkg_untrack_pid(pid);
     }
 
@@ -118,6 +124,7 @@ impl ProcCache {
         self.negative_pids.clear();
         self.pid_task_counts.clear();
         self.hit_pkgs.clear();
+        self.pending_events.clear();
         PID_PKG.lock().unwrap().clear();
     }
 
@@ -148,7 +155,18 @@ impl ProcCache {
     /// 首次识别后同时缓存正/负结果：目标 PID 命中 pid_pkgs，非目标 PID 命中
     /// negative_pids，之后同一 PID 的后续线程事件不再重复读 /proc/<pid>/cmdline。
     /// EXEC / 进程退出 / 配置变更会清除对应缓存，避免 PID 复用或换包误判。
-    pub fn pkg_lookup_comm(&mut self, pid: i32, comm: &str, cfg: &AppConfig) -> Option<String> {
+    ///
+    /// 关键: cmdline 瞬时不可读 (Unknown) 时把 (tid, comm) 记入 pending_events,
+    /// 由后续该 pid 被识别 (Hit) 后的 replay_pending 重放补做亲和性 —— 解决
+    /// HeapTaskDaemon 等极早期线程事件"在 pid 可识别前被消费、之后不再重试"
+    /// 而永久丢失的问题 (等价于"等 pid 就绪再处理", 但无需内核缓冲/binder 闸门)。
+    pub fn pkg_lookup_comm(
+        &mut self,
+        tid: i32,
+        pid: i32,
+        comm: &str,
+        cfg: &AppConfig,
+    ) -> Option<String> {
         // 正缓存: 已确认是目标包
         if let Some(pkg) = self.pid_pkgs.get(&pid).cloned() {
             if cfg.target_pkgs.contains(&pkg) {
@@ -180,12 +198,42 @@ impl ProcCache {
                 None
             }
             PkgMatch::Unknown => {
-                // cmdline 瞬时不可读, 不写负缓存: 之后进程启动完成的事件/扫描可重试,
-                // 避免 HeapTaskDaemon 这类极早期线程被永久误挡。
+                // cmdline 瞬时不可读: 不写负缓存, 但事件已消费——暂存待重放,
+                // 避免 HeapTaskDaemon 这类极早期线程被永久丢失。
+                self.pending_events
+                    .entry(pid)
+                    .or_default()
+                    .push((tid, comm.to_string()));
                 None
             }
         }
         .or_else(|| self.tasks.get(&pid).map(|e| e.pkg.clone()))
+    }
+
+    /// 重放某 pid 之前暂存的所有 pending 线程事件 (pid 已识别为目标包时调用)。
+    /// 返回重放成功数; 取空后再次调用为 no-op。
+    pub fn replay_pending<F>(&mut self, pid: i32, pkg: &str, cfg: &AppConfig, apply_fn: F) -> usize
+    where
+        F: Fn(i32, &CpuSet, &str) -> bool,
+    {
+        let Some(events) = self.pending_events.remove(&pid) else {
+            return 0;
+        };
+        let mut n = 0;
+        for (tid, comm) in events {
+            if self.task_apply(tid, pid, pkg, &comm, cfg, &apply_fn) {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// 该 pid 已无任何缓存任务时清理其全部缓存 (含 pending), 防残留。
+    pub fn purge_dead_pid(&mut self, pid: i32) {
+        let alive = self.tasks.values().any(|e| e.pid == pid);
+        if !alive {
+            self.forget_pid(pid);
+        }
     }
 
     /// 计算并应用线程亲和性，保护已有线程规则绑定防止降级
