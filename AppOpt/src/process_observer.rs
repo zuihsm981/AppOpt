@@ -12,11 +12,16 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use libc::{c_char, c_int, dlopen, dlsym, RTLD_LAZY};
 
 // ── 硬编码事务码 ──
+// 注册: IActivityManager.registerProcessObserver 的事务码 (AIDL 顺序, 各版本稳定)
 const TX_REGISTER_PROCESS_OBSERVER: u32 = 0x0d;
-const TX_ON_PROCESS_STARTED: u32 = 0x01;
-const TX_ON_FG_ACTIVITIES_CHANGED: u32 = 0x02;
-const TX_ON_FG_SERVICES_CHANGED: u32 = 0x03;
-const TX_ON_PROCESS_DIED: u32 = 0x04;
+// 回调: IProcessObserver.Stub 的 onTransact code, 按 AIDL 声明顺序从
+// IBinder.FIRST_CALL_TRANSACTION(=1) 递增。注意顺序不可颠倒:
+//   onForegroundActivitiesChanged 必须 = 1, 否则前台回调被误匹配到
+//   PROCESS_STARTED 分支而丢失 (web 永远显示 launcher3 / 亲和性失效)。
+const TX_ON_FG_ACTIVITIES_CHANGED: u32 = 0x01;
+const TX_ON_FG_SERVICES_CHANGED: u32 = 0x02;
+const TX_ON_PROCESS_DIED: u32 = 0x03;
+const TX_ON_PROCESS_STARTED: u32 = 0x04; // Android 12+ 新增, 追加在末尾
 
 // ── FFI 函数指针类型 ──
 type FnGetService = unsafe extern "C" fn(*const c_char) -> *mut c_void;
