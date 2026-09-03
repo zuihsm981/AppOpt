@@ -6,6 +6,7 @@ mod apply_affinity;
 mod cache;
 mod config;
 mod cpuset;
+mod debug_log;
 mod ebpf_mode;
 mod proc_mode;
 mod process_observer;
@@ -84,6 +85,10 @@ fn print_help(prog_name: &str) {
 fn main() {
     let args: Vec<String> = env::args().collect();
     let prog_name = &args[0];
+
+    // 调试日志初始化 (追加 /data/local/tmp/appopt_debug.log, 线程安全)
+    crate::debug_log::init_debug_log();
+    crate::debug_log::debug_log("=== AppOpt start ===");
 
     // 参数解析先行，-v/-h/错误用法在设置加载前退出，不产生文件副作用
     let (mut cli_cfg, mut cli_interval, mut cli_cpuset, mut cli_web) =

@@ -31,7 +31,9 @@ pub fn notify_pkg_tracked(pid: i32) {
     if pid <= 0 {
         return;
     }
-    if REFRESH_PENDING_PID.load(Ordering::Acquire) != pid {
+    let pending = REFRESH_PENDING_PID.load(Ordering::Acquire);
+    crate::debug_log::debug_log(&format!("notify_pkg_tracked: pid={} pending={}", pid, pending));
+    if pending != pid {
         return; // 非等待中的 pid，零成本过滤，不打扰刷新率线程
     }
     let guard = REFRESH_TX.lock().unwrap();
@@ -209,17 +211,27 @@ fn switch_to_idle(state: &mut RefreshState) {
 /// 把刷新率应用到前台 pid（先查 PID_PKG 包名，再白名单准入）。
 /// 供 fg 回调与 pending 重试共用；返回是否成功应用。
 fn try_apply_fg(state: &mut RefreshState, pid: i32) -> bool {
+    crate::debug_log::debug_log(&format!("try_apply_fg: pid={}", pid));
     // 防线一：从共享 pid→pkg 索引获取包名
     let Some(pkg) = crate::cache::pkg_lookup_pid(pid) else {
+        crate::debug_log::debug_log("try_apply_fg: PID_PKG miss");
         return false;
     };
+    crate::debug_log::debug_log(&format!("try_apply_fg: pkg={}", pkg));
     if pkg.is_empty() || pkg == state.last_applied_pkg {
+        crate::debug_log::debug_log(&format!("try_apply_fg: skip (last={})", state.last_applied_pkg));
         return true; // 已应用过，无需重复
     }
 
     // 防线二：白名单准入检查（唯一真正的过滤器）
     let is_launcher = pkg == crate::config::DEFAULT_REFRESH_PACKAGE;
     let is_managed = state.app_configs.contains_key(&pkg);
+    crate::debug_log::debug_log(&format!(
+        "try_apply_fg: is_launcher={} is_managed={} app_configs={}",
+        is_launcher,
+        is_managed,
+        state.app_configs.len()
+    ));
     if !is_launcher && !is_managed {
         return false; // 系统设置、状态栏、弹窗、未配置应用全部丢弃
     }
@@ -248,19 +260,24 @@ fn try_apply_fg(state: &mut RefreshState, pid: i32) -> bool {
 /// 此时登记 REFRESH_PENDING_PID；cache 层 pkg_track_pid 命中该 pid 时通过
 /// mpsc 事件通知刷新率线程立即应用（事件驱动，无轮询、无超时兜底）。
 fn handle_fg_change(state: &mut RefreshState, pid: i32) {
+    crate::debug_log::debug_log(&format!("handle_fg_change: pid={}", pid));
     // PID_PKG 已有该 pid → 热启动: 直接决定（应用刷新率，或按白名单丢弃），
     // 不登记、不触发内核扫描（亲和性此前已设置, 避免无谓内核遍历）。
-    if crate::cache::pkg_lookup_pid(pid).is_some() {
+    if let Some(pkg) = crate::cache::pkg_lookup_pid(pid) {
+        crate::debug_log::debug_log(&format!("handle_fg_change: hot pkg={}", pkg));
         try_apply_fg(state, pid);
         return;
     }
+    crate::debug_log::debug_log("handle_fg_change: cold (PID_PKG miss)");
     // 冷启动：PID_PKG 尚无该 pid（新进程前台切换）。先登记等待 pid，
     // 再触发内核识别: notify 内部 pkg_track_pid → notify_pkg_tracked 会检查
     // REFRESH_PENDING_PID == pid 才发 PkgTracked 事件驱动刷新率。
     REFRESH_PENDING_PID.store(pid, Ordering::Release);
     // 触发内核识别 pid 对应包并设置亲和性 (识别在内核完成, 无 /proc 瞬时
     // 不可读问题); 成功返回包名后登记 PID_PKG → PkgTracked 驱动刷新率。
-    if !crate::ebpf_mode::notify_verify_pkg(pid) {
+    let ok = crate::ebpf_mode::notify_verify_pkg(pid);
+    crate::debug_log::debug_log(&format!("handle_fg_change: notify_verify_pkg={}", ok));
+    if !ok {
         // 内核未识别 (非目标包): 清 pending, 避免悬挂等待。
         REFRESH_PENDING_PID.store(0, Ordering::Release);
     }
@@ -450,6 +467,10 @@ pub fn refresh_init() {
                                 // cache 层 pkg_track_pid 命中待解析前台 pid 的通知。
                                 // 事件驱动：收到即应用并清除等待标记。
                                 RefreshEvent::PkgTracked(pid) => {
+                                    crate::debug_log::debug_log(&format!(
+                                        "refresh loop: PkgTracked pid={}",
+                                        pid
+                                    ));
                                     if REFRESH_PENDING_PID.load(Ordering::Acquire) == pid {
                                         REFRESH_PENDING_PID.store(0, Ordering::Release);
                                     }
@@ -477,7 +498,10 @@ pub fn refresh_init() {
                         };
                         if n == 4 {
                             let pid = i32::from_ne_bytes([fg_buf[0], fg_buf[1], fg_buf[2], fg_buf[3]]);
+                            crate::debug_log::debug_log(&format!("refresh loop: fg recv pid={}", pid));
                             handle_fg_change(&mut state, pid);
+                        } else {
+                            crate::debug_log::debug_log(&format!("refresh loop: fg recv n={}", n));
                         }
                     }
                     _ => {}

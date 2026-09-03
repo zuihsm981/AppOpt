@@ -14,14 +14,17 @@ use libc::{c_char, c_int, dlopen, dlsym, RTLD_LAZY};
 // ── 硬编码事务码 ──
 // 注册: IActivityManager.registerProcessObserver 的事务码 (AIDL 顺序, 各版本稳定)
 const TX_REGISTER_PROCESS_OBSERVER: u32 = 0x0d;
-// 回调: IProcessObserver.Stub 的 onTransact code, 按 AIDL 声明顺序从
-// IBinder.FIRST_CALL_TRANSACTION(=1) 递增。注意顺序不可颠倒:
-//   onForegroundActivitiesChanged 必须 = 1, 否则前台回调被误匹配到
-//   PROCESS_STARTED 分支而丢失 (web 永远显示 launcher3 / 亲和性失效)。
-const TX_ON_FG_ACTIVITIES_CHANGED: u32 = 0x01;
-const TX_ON_FG_SERVICES_CHANGED: u32 = 0x02;
-const TX_ON_PROCESS_DIED: u32 = 0x03;
-const TX_ON_PROCESS_STARTED: u32 = 0x04; // Android 12+ 新增, 追加在末尾
+// 回调: IProcessObserver.Stub 的 onTransact code —— 必须以设备实际 smali 为准:
+//   反编译 android.app.IProcessObserver 确认:
+//     TRANSACTION_onProcessStarted = 0x1
+//     TRANSACTION_onForegroundActivitiesChanged = 0x2
+//     TRANSACTION_onForegroundServicesChanged = 0x3
+//     TRANSACTION_onProcessDied = 0x4
+//   (非 AIDL 声明顺序递增! onProcessStarted 在最前 = 0x1, 前台回调 = 0x2)
+const TX_ON_PROCESS_STARTED: u32 = 0x01;
+const TX_ON_FG_ACTIVITIES_CHANGED: u32 = 0x02;
+const TX_ON_FG_SERVICES_CHANGED: u32 = 0x03;
+const TX_ON_PROCESS_DIED: u32 = 0x04;
 
 // ── FFI 函数指针类型 ──
 type FnGetService = unsafe extern "C" fn(*const c_char) -> *mut c_void;
@@ -147,6 +150,7 @@ extern "C" fn on_transact(
 
     match code {
         TX_ON_PROCESS_STARTED => {
+            crate::debug_log::debug_log("binder on_transact: PROCESS_STARTED");
             // oneway 事务，无需读取数据
             STATUS_OK
         }
@@ -160,6 +164,7 @@ extern "C" fn on_transact(
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut fg_val) };
 
             let fg = fg_val != 0;
+            crate::debug_log::debug_log(&format!("binder ACTIVITIES: pid={} uid={} fg={}", pid, _uid, fg));
 
             if fg && pid > 0 {
                 // 触发分离：Binder 回调只传 pid（4 字节），包名由刷新率模块从共享
@@ -167,9 +172,10 @@ extern "C" fn on_transact(
                 // 系统界面/未配置应用的白名单过滤在 refresh 侧完成（两道防线）。
                 let fd = FG_SEND_FD.load(Ordering::Acquire);
                 if fd >= 0 {
-                    let _ = unsafe {
+                    let n = unsafe {
                         libc::send(fd, &pid as *const i32 as *const libc::c_void, 4, 0)
                     };
+                    crate::debug_log::debug_log(&format!("binder send pid={} n={}", pid, n));
                 }
             }
             STATUS_OK
@@ -231,25 +237,27 @@ fn get_sf_class() -> *mut c_void {
 pub fn init_observer(send_fd: i32) -> bool {
     FG_SEND_FD.store(send_fd, Ordering::Release);
 
-    let ndk = match ndk() { Some(n) => n, None => return false };
+    let ndk = match ndk() { Some(n) => n, None => { crate::debug_log::debug_log("init_observer: ndk symbols missing"); return false; } };
     let class = get_observer_class();
-    if class.is_null() { return false; }
+    if class.is_null() { crate::debug_log::debug_log("init_observer: observer class null"); return false; }
 
     let observer = unsafe { (ndk.binder_new)(class, std::ptr::null_mut()) };
-    if observer.is_null() { return false; }
+    if observer.is_null() { crate::debug_log::debug_log("init_observer: binder_new null"); return false; }
 
     let am = unsafe { (ndk.get_service)(b"activity\0".as_ptr() as *const c_char) };
-    if am.is_null() { return false; }
+    if am.is_null() { crate::debug_log::debug_log("init_observer: get_service(activity) null"); return false; }
 
     let am_class = get_am_class();
-    if am_class.is_null() { return false; }
+    if am_class.is_null() { crate::debug_log::debug_log("init_observer: am class null"); return false; }
     if !unsafe { (ndk.associate_class)(am, am_class as *const c_void) } {
+        crate::debug_log::debug_log("init_observer: associate_class fail");
         return false;
     }
 
     let mut in_parcel: *mut c_void = std::ptr::null_mut();
     let prep_status = unsafe { (ndk.prepare_tx)(am, &mut in_parcel) };
     if prep_status != STATUS_OK || in_parcel.is_null() {
+        crate::debug_log::debug_log("init_observer: prepare_tx fail");
         return false;
     }
 
@@ -257,6 +265,7 @@ pub fn init_observer(send_fd: i32) -> bool {
 
     let mut out_parcel: *mut c_void = std::ptr::null_mut();
     let status = unsafe { (ndk.transact)(am, TX_REGISTER_PROCESS_OBSERVER, &mut in_parcel, &mut out_parcel, 0) };
+    crate::debug_log::debug_log(&format!("init_observer: transact status={}", status));
 
     // 读取 reply 异常码以排空 parcel（不再输出日志）
     if status == STATUS_OK && !out_parcel.is_null() {

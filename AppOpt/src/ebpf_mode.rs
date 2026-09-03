@@ -203,11 +203,13 @@ impl KpmHandle {
         let c = CString::new(s).unwrap_or_default();
         let mut out = [0u8; 32];
         let rc = kpm_ctl0(&self.key, &c, &mut out);
+        crate::debug_log::debug_log(&format!("verify_pkg ctl0: pid={} rc={}", pid, rc));
         if rc <= 0 {
             return None;
         }
         let len = out.iter().position(|&b| b == 0).unwrap_or(out.len());
         let pkg = String::from_utf8_lossy(&out[..len]).to_string();
+        crate::debug_log::debug_log(&format!("verify_pkg ctl0: pkg={:?}", pkg));
         if pkg.is_empty() {
             None
         } else {
@@ -250,6 +252,7 @@ pub fn notify_verify_pkg(pid: i32) -> bool {
     let handle = KpmHandle::new();
     match handle.verify_pkg(pid) {
         Some(comm) => {
+            crate::debug_log::debug_log(&format!("notify_verify_pkg: kernel comm={}", comm));
             // 内核返回的是 leader comm（≤15 字节截断名），不是完整包名。
             // 必须映射回完整包名再登记 PID_PKG，否则 try_apply_fg 用截断名
             // 匹配 app_configs / DEFAULT_REFRESH_PACKAGE 永远失败：
@@ -263,6 +266,10 @@ pub fn notify_verify_pkg(pid: i32) -> bool {
                     crate::rule_match::comm_prefix_fallback(&comm, cfg)
                 }
             });
+            crate::debug_log::debug_log(&format!(
+                "notify_verify_pkg: full_pkg={:?}",
+                full_pkg
+            ));
             match full_pkg {
                 Some(pkg) => {
                     crate::cache::pkg_track_pid(pid, &pkg);
@@ -271,7 +278,10 @@ pub fn notify_verify_pkg(pid: i32) -> bool {
                 None => false,
             }
         }
-        None => false,
+        None => {
+            crate::debug_log::debug_log("notify_verify_pkg: kernel returned None");
+            false
+        }
     }
 }
 
