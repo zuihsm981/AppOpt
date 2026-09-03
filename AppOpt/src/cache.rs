@@ -4,7 +4,7 @@ use std::sync::{LazyLock, Mutex};
 use crate::apply_affinity::affinity_set;
 use crate::config::AppConfig;
 use crate::cpuset::{CpuSet, CpuTopology};
-use crate::rule_match::{comm_to_pkg, thread_affinity};
+use crate::rule_match::{comm_to_pkg, PkgMatch, thread_affinity};
 
 /// 全局共享 pid→pkg 索引：由 ProcCache 的增删方法统一维护，
 /// 供刷新率模块按 pid 查包名（替代 packages.list 文件 I/O）。
@@ -164,18 +164,28 @@ impl ProcCache {
             }
         }
         // 解析（只对未知 PID 读一次 cmdline）
-        let pkg = comm_to_pkg(pid, comm, cfg);
-        if let Some(pkg) = &pkg {
-            self.pid_pkgs.insert(pid, pkg.clone());
-            // 立即登记共享 PID_PKG（供刷新率模块按 pid 查包名）。
-            // 不能只等 task_apply 成功：只配置刷新率、没有 CPU 亲和性规则
-            // 的应用 thread_affinity 会返回 None 而 task_apply 失败，
-            // 若不在此登记，刷新率前台回调将永远查不到该应用的包名。
-            pkg_track_pid(pid, pkg);
-        } else {
-            self.negative_pids.insert(pid, comm.to_string());
+        match comm_to_pkg(pid, comm, cfg) {
+            PkgMatch::Hit(pkg) => {
+                self.pid_pkgs.insert(pid, pkg.clone());
+                // 立即登记共享 PID_PKG（供刷新率模块按 pid 查包名）。
+                // 不能只等 task_apply 成功：只配置刷新率、没有 CPU 亲和性规则
+                // 的应用 thread_affinity 会返回 None 而 task_apply 失败，
+                // 若不在此登记，刷新率前台回调将永远查不到该应用的包名。
+                pkg_track_pid(pid, &pkg);
+                Some(pkg)
+            }
+            PkgMatch::Miss => {
+                // cmdline 可读且确认非目标 → 写负缓存, 后续同 pid 同 comm 不再读 cmdline
+                self.negative_pids.insert(pid, comm.to_string());
+                None
+            }
+            PkgMatch::Unknown => {
+                // cmdline 瞬时不可读, 不写负缓存: 之后进程启动完成的事件/扫描可重试,
+                // 避免 HeapTaskDaemon 这类极早期线程被永久误挡。
+                None
+            }
         }
-        pkg.or_else(|| self.tasks.get(&pid).map(|e| e.pkg.clone()))
+        .or_else(|| self.tasks.get(&pid).map(|e| e.pkg.clone()))
     }
 
     /// 计算并应用线程亲和性，保护已有线程规则绑定防止降级
