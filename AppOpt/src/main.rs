@@ -314,7 +314,7 @@ fn main() {
         if let Some(mut es) = ebpf_init(kpm_wake_fd) {
             let cfg = lock_ignore_poison(&CURRENT_CONFIG).clone();
             if let Some(cfg) = cfg {
-                if !comm_map_init(&mut es.bpf, cfg, es.comm_capacity) {
+                if !comm_map_init(&mut es.bpf, &cfg, es.comm_capacity) {
                     full_scan(&cfg, &mut es);
                 }
             }

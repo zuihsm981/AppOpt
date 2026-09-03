@@ -11,7 +11,6 @@
 //! 布局完全一致 (28B), event_dispatch/affinity 逻辑与原先保持一致。
 
 use std::ffi::CString;
-use std::fs;
 use std::os::raw::{c_char, c_int};
 use std::sync::mpsc;
 use std::thread;
@@ -600,9 +599,8 @@ fn affinity_apply(
 }
 
 /// 事件派发, 按 event_type 增量处理 FORK/RENAME/EXEC/EXIT (与 aya 版一致)
-pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfState) {
+pub fn event_dispatch(event: &EbpfProcEvent, _cfg: &AppConfig, state: &mut EbpfState) {
     let tid = event.tid;
-    let pid = event.pid;
 
     match event.event_type {
         EBPF_EVENT_EXIT => {
