@@ -634,8 +634,13 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
         }
 
         EBPF_EVENT_FORK => {
-            // 子线程继承父线程亲和性与 cpuset
-            // 内核态已插入 APPLIED 表占位, RENAME 时触发完整处理
+            // 子线程继承父线程亲和性: FORK 事件必然触发, 比 RENAME 可靠。
+            // RENAME 可能因内核过滤 / pid 识别失败而永不送达, 导致线程
+            // (HeapTaskDaemon 等极早期线程) 无法进入 task_apply → 亲和性丢失。
+            // 在 FORK 时就调用 event_apply: 纯包名规则下 thread_affinity 包级
+            // fallback 直接命中, applied_set 写入真实 bits; pid 未识别时入 pending
+            // 由周期重放补做。RENAME 到达时再校正线程规则精确值。
+            event_apply(&mut state.cache, &state.bpf, tid, pid, comm, cfg);
         }
 
         EBPF_EVENT_RENAME => {
