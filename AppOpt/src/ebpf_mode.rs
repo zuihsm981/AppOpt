@@ -38,6 +38,28 @@ pub const EBPF_EVENT_RENAME: u32 = 3;
 pub const EBPF_EVENT_EXIT: u32 = 4;
 pub const EBPF_EVENT_INPUT: u32 = 5;
 
+/* ================= mmap 共享 event ring ABI (与 appopt_kpm.h 一致) =================
+ * 共享区布局: [4KB header | 1MiB ring]
+ *   head: 用户态已处理游标 (用户 release 写, 内核 acquire 读)
+ *   tail: 内核已写入游标 (内核 release 写, 用户 acquire 读)
+ * 事件写入共享内存即对用户可见, 不再依赖 ctl0 drain / 信号完备性。 */
+pub const SHM_HEADER_SIZE: usize = 4096;
+pub const SHM_RING_SIZE: usize = 1024 * 1024;
+pub const SHM_TOTAL_SIZE: usize = SHM_HEADER_SIZE + SHM_RING_SIZE;
+pub const SHM_RING_MASK: u32 = (SHM_RING_SIZE - 1) as u32;
+pub const SHM_EVENT_SIZE: u32 = std::mem::size_of::<EbpfProcEvent>() as u32; // 28
+pub const SHM_MAGIC: u32 = 0x41505000;
+
+/// 共享 header (与内核 appopt_shm_header_t 布局一致)
+#[repr(C)]
+pub struct ShmHeader {
+    pub head: u32,
+    pub tail: u32,
+    pub magic: u32,
+    pub flags: u32,
+    pub reserved: [u32; 1020],
+}
+
 /* ================= KernelPatch SuperCall 传输 ================= */
 
 /// SuperCall 复用 syscall 45 (__NR_truncate)
@@ -128,6 +150,22 @@ impl KpmHandle {
     fn cmd(&self, args: &str) -> i64 {
         let c = CString::new(args).unwrap_or_default();
         kpm_ctl0(&self.key, &c, &mut [])
+    }
+
+    /// 获取共享 event ring fd (内核 anon_inode file 已装到当前进程 fd 表)。
+    /// 用户态拿到后 mmap(fd) 即获得共享 ring 直读 (head/tail/事件)。
+    pub fn create_shm(&self) -> Option<c_int> {
+        let c = CString::new("create_shm").unwrap_or_default();
+        let mut out = [0u8; 4];
+        let rc = kpm_ctl0(&self.key, &c, &mut out);
+        if rc < 4 {
+            return None;
+        }
+        let fd = i32::from_ne_bytes([out[0], out[1], out[2], out[3]]);
+        if fd < 0 {
+            return None;
+        }
+        Some(fd)
     }
 
     fn applied_set(&self, tid: i32, bits: u64) {
@@ -228,6 +266,9 @@ pub struct EbpfState {
     pub notify_fd: c_int,
     /// 事件到达通知 fd (eventfd): reader 收到事件后写入, 唤醒主循环 epoll
     pub kpm_wake_fd: c_int,
+    /// mmap 共享 event ring (reader 直读, Drop 时 munmap)
+    pub shm_ptr: *mut u8,
+    pub shm_fd: c_int,
     pub comm_capacity: u32,
 }
 
@@ -250,6 +291,17 @@ impl Drop for EbpfState {
         }
         if self.notify_fd >= 0 {
             unsafe { libc::close(self.notify_fd); }
+        }
+        // 释放 mmap 共享 ring + close shm fd
+        if !self.shm_ptr.is_null() {
+            unsafe {
+                libc::munmap(self.shm_ptr as *mut _, SHM_TOTAL_SIZE);
+            }
+            self.shm_ptr = std::ptr::null_mut();
+        }
+        if self.shm_fd >= 0 {
+            unsafe { libc::close(self.shm_fd); }
+            self.shm_fd = -1;
         }
         // kpm_wake_fd 由主循环创建并管理生命周期, Drop 不关闭
         self.kpm_wake_fd = -1;
@@ -324,7 +376,7 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
         unsafe { libc::close(wakeup_fd); }
         return None;
     }
-    // 注册通知通道 (事件写入环形缓冲后由内核 signal 唤醒 reader; 通知驱动 drain)
+    // 注册通知通道 (事件写入共享 ring 后由内核 signal 唤醒 reader, 仅加速)
     if !handle.set_eventfd(notify_fd) {
         unsafe {
             libc::close(wakeup_fd);
@@ -333,10 +385,43 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
         return None;
     }
 
-    // reader 线程: 收到内核事件通知后启动 drain 取空, 处理完自动停止回阻塞
-    let reader_key = kpm_key();
+    /* 获取共享 event ring fd + mmap 直读 (核心可靠性: 事件写入共享内存即可见,
+     * 不依赖 ctl0 drain/信号完备性; notify 只做低延迟加速唤醒)。 */
+    let shm_fd = handle.create_shm()?;
+    let shm_ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            SHM_TOTAL_SIZE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            shm_fd,
+            0,
+        )
+    };
+    if shm_ptr == libc::MAP_FAILED {
+        unsafe {
+            libc::close(shm_fd);
+            libc::close(wakeup_fd);
+            libc::close(notify_fd);
+        }
+        return None;
+    }
+    // 校验共享区 magic (内核 vmalloc_user + anon_inode 映射成功)
+    let hdr = shm_ptr as *const ShmHeader;
+    let magic = unsafe { (*hdr).magic };
+    if magic != SHM_MAGIC {
+        unsafe {
+            libc::munmap(shm_ptr, SHM_TOTAL_SIZE);
+            libc::close(shm_fd);
+            libc::close(wakeup_fd);
+            libc::close(notify_fd);
+        }
+        return None;
+    }
+
+    // reader 线程: 直读共享内存取事件, 处理完自动停止回阻塞
     let reader_thread = thread::spawn(move || {
-        kpm_reader(reader_key, tx, wakeup_fd, notify_fd, kpm_wake_fd);
+        kpm_reader(tx, wakeup_fd, notify_fd, kpm_wake_fd, shm_ptr as *mut u8);
     });
 
     /* 先设置白名单再激活: start 注册 tracepoint 后立即开始过滤事件,
@@ -368,16 +453,20 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
         wakeup_fd,
         notify_fd,
         kpm_wake_fd,
+        shm_ptr: shm_ptr as *mut u8,
+        shm_fd,
         comm_capacity: capacity,
     })
 }
 
+/* mmap 共享 ring 直读: 事件写入共享内存即对用户可见 (head/tail acquire/release),
+ * 不依赖 ctl0 drain / 信号完备性。通知仅加速唤醒, 100ms 心跳兜底读共享区。 */
 fn kpm_reader(
-    key: CString,
     tx: mpsc::Sender<EbpfProcEvent>,
     wakeup_fd: c_int,
     notify_fd: c_int,
     kpm_wake_fd: c_int,
+    shm: *mut u8,
 ) {
     let name = CString::new("KpmReader").unwrap();
     unsafe {
@@ -403,15 +492,17 @@ fn kpm_reader(
     }
 
     let mut events: [libc::epoll_event; 2] = unsafe { std::mem::zeroed() };
-    // 单次 drain 缓冲: 8KB, 约 292 个事件
-    let mut buf = vec![0u8; 8192];
+    // 事件环形数据区 (共享 header 之后)
+    let ring = unsafe { shm.add(SHM_HEADER_SIZE) };
+    // head@0 / tail@4: 用 AtomicU32 (Acquire/Release) 与内核 stlr/ldar 严格配对
+    let head_atomic = shm as *const std::sync::atomic::AtomicU32;
+    let tail_atomic = unsafe { (shm as *const std::sync::atomic::AtomicU32).add(1) };
 
     loop {
-        /* 事件驱动主路径：内核每事件 signal → 立即 drain（低延迟）。
-         * 心跳兜底 = 100ms，与轮询 drain 的周期完全一致（实测关键）：
-         * 1s 心跳会让"信号丢失/洪峰"窗口比轮询大 10 倍，ring(256KB) 更容易
-         * 写满丢弃新事件 (cnt_dropped) → 线程 FORK/RENAME 永久丢失。
-         * 100ms 兜底保证最坏滞留窗口与轮询相同，同时正常时事件驱动零空转。 */
+        /* 事件驱动主路径: notify (内核每事件 signal) 立即醒来 → 直读共享内存;
+         * 心跳兜底 100ms: 即使通知遗漏, 也主动读共享 tail 消费, 事件不滞留。
+         * 共享内存可见性即可靠性本身 (写入即可见), 心跳只是防止"漏唤醒后
+         * 永久阻塞"的最终保险, 与轮询 drain 的开销不同: 无 syscall/无 copy。 */
         let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 2, 100) };
         if n < 0 {
             if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
@@ -419,8 +510,8 @@ fn kpm_reader(
             }
             break;
         }
-        // n==0 表示 100ms 心跳超时: 兜底 drain, 有滞留事件则取走
-        let mut need_drain = n == 0;
+        // n==0 表示 100ms 心跳超时: 兜底读共享区
+        let mut need_read = n == 0;
         for i in 0..n as usize {
             match events[i].u64 {
                 1 => {
@@ -429,37 +520,39 @@ fn kpm_reader(
                     return;
                 }
                 2 => {
-                    // 内核事件通知: 清 eventfd 计数后启动 drain
+                    // 内核事件通知: 清 eventfd 计数后直读共享区
                     let mut val: u64 = 0;
                     unsafe { libc::read(notify_fd, &mut val as *mut _ as *mut _, 8); }
-                    need_drain = true;
+                    need_read = true;
                 }
                 _ => {}
             }
         }
-        if !need_drain {
+        if !need_read {
             continue;
         }
 
-        // 通知驱动的 drain: 收到通知才取事件, 取空后自动停止回阻塞。
-        // 只在 drain 返回 <=0 (ring 真空) 时停止, 避免事件滞留 ring。
+        // 直读共享 ring: acquire 读 tail, 消费 [head, tail) 全部事件, release 推进 head。
+        // 循环直到共享区真空 (tail==head), 不遗漏任何事件。
         loop {
-            let args = CString::new("drain").unwrap_or_default();
-            let got = unsafe {
-                let (ptr, len) = (buf.as_mut_ptr(), buf.len());
-                supercall(key.as_ptr(), SUPERCALL_KPM_CONTROL,
-                          KPM_MODULE.as_ptr() as *const c_char,
-                          args.as_ptr(), ptr, len)
-            };
-            if got <= 0 {
+            use std::sync::atomic::Ordering;
+            let tail = unsafe { &*tail_atomic }.load(Ordering::Acquire);
+            let head = unsafe { &*head_atomic }.load(Ordering::Relaxed);
+            if head == tail {
                 break;
             }
-            let bytes = got as usize;
-            let ev_sz = std::mem::size_of::<EbpfProcEvent>();
-            let mut off = 0;
-            while off + ev_sz <= bytes {
+            let ev_sz = SHM_EVENT_SIZE;
+            let mut head = head;
+            while head != tail {
+                // 读取一个事件 (28B); 环形可能回绕, 分段拷贝到栈上
+                let mut raw = [0u8; 32];
+                let dst = raw.as_mut_ptr();
+                for i in 0..ev_sz {
+                    let idx = (head.wrapping_add(i)) & SHM_RING_MASK;
+                    unsafe { *dst.add(i as usize) = *ring.add(idx as usize); }
+                }
                 let event: EbpfProcEvent =
-                    unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off) as *const EbpfProcEvent) };
+                    unsafe { core::ptr::read_unaligned(dst as *const EbpfProcEvent) };
                 if tx.send(event).is_err() {
                     unsafe { libc::close(epfd) };
                     return;
@@ -467,8 +560,10 @@ fn kpm_reader(
                 // 唤醒主循环处理该事件
                 let val: u64 = 1;
                 let _ = unsafe { libc::write(kpm_wake_fd, &val as *const u64 as *const _, 8) };
-                off += ev_sz;
+                head = head.wrapping_add(ev_sz) & SHM_RING_MASK;
             }
+            // release 推进 head (通知内核空间已释放; 与内核 smp_load_acquire 配对)
+            unsafe { &*head_atomic }.store(head, Ordering::Release);
         }
     }
     unsafe { libc::close(epfd) };
