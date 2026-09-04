@@ -338,6 +338,8 @@ fn main() {
 
     // KPM 模式 EV_PROC tick 计数: 200ms × 10 = 2s 周期 affinity_sync 兜底
     let mut kpm_tick: u32 = 0;
+    // 模式跟踪: 仅模式切换时重置 proc_timer_fd (每轮重置会饿死 EV_PROC)
+    let mut prev_kpm_mode = false;
 
     let mut events = [unsafe { std::mem::zeroed::<libc::epoll_event>() }; 8];
 
@@ -495,14 +497,21 @@ fn main() {
             ps.force_affinity = true;
         }
 
-        // 周期 timerfd 与模式联动: /proc 模式用检查间隔; KPM 模式保持 200ms
-        // 短周期 (pending_rename 线程名重查: pthread_setname_np 不触发
-        // task_rename tracepoint, FORK 后需定时重读 comm 匹配线程规则)。
+        // 周期 timerfd 与模式联动: 仅在模式切换时重置, 不每轮重置!
+        // timerfd_settime 会重置倒计时 — 若每轮 epoll 唤醒后都重设 200ms,
+        // 事件间隔 < 200ms 时 (INPUT/FORK/EXIT 随时到来) EV_PROC 永不触发,
+        // pending_rename 重查失效 → Zygote fork 主线程 (cmdline 未就绪,
+        // Miss 登记 pending) 永不识别 → 主进程亲和性永不设置。
+        // 用 prev_kpm_mode 检测模式变化, 稳态下不再触碰 timerfd。
         let interval = CHECK_INTERVAL.load(Ordering::Relaxed).max(1);
-        if ebpf_state.is_none() {
-            arm_periodic(proc_timer_fd, interval as i64);
-        } else {
-            arm_periodic_ms(proc_timer_fd, 200);
+        let kpm_mode_now = ebpf_state.is_some();
+        if kpm_mode_now != prev_kpm_mode {
+            prev_kpm_mode = kpm_mode_now;
+            if kpm_mode_now {
+                arm_periodic_ms(proc_timer_fd, 200);
+            } else {
+                arm_periodic(proc_timer_fd, interval as i64);
+            }
         }
 
         // web 状态统计: 事件驱动更新 (收到事件时刷新, 不再定时轮询)
