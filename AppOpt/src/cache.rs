@@ -117,6 +117,11 @@ impl ProcCache {
     }
 
     /// 删除任务并做 O(1) 簿记；若该 PID 没有其它缓存任务则清掉缓存映射。
+    /// 该 tid 是否已被 cache 管理 (EXIT 事件过滤: 无关 tid 零成本跳过)
+    pub fn contains(&self, tid: i32) -> bool {
+        self.tasks.contains_key(&tid)
+    }
+
     pub fn task_del(&mut self, tid: i32) {
         let Some(entry) = self.tasks.remove(&tid) else { return };
         self.hit_pkg_del(&entry.pkg);

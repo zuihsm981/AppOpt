@@ -640,8 +640,12 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
 
         EBPF_EVENT_EXIT => {
             // 线程退出: 清理 cache 与内核 APPLIED 表。
-            state.cache.task_del(tid);
-            applied_del(&state.bpf, tid);
+            // 内核 EXIT 无条件上报 (防漏报导致 web 命中残留), 无关 tid
+            // (cache 中不存在) 直接跳过, 不发 applied_del supercall。
+            if state.cache.contains(tid) {
+                state.cache.task_del(tid);
+                applied_del(&state.bpf, tid);
+            }
         }
 
         EBPF_EVENT_INPUT => {
