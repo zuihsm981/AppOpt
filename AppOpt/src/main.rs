@@ -31,6 +31,7 @@ use crate::ebpf_mode::{
     full_scan, event_dispatch, comm_map_init, ebpf_init, EbpfState,
 };
 use crate::proc_mode::{cache_sync, ProcScanState};
+use crate::rule_match::PkgMatch;
 use crate::web::{
     cache_stats, settings_load, settings_save, web_start, WebStats,
     WEB_ENABLED, WEB_STATS, MODE_FORCE, MODE_SWITCH_FD, SETTINGS_FILE,
