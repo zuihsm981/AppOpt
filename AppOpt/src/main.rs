@@ -458,9 +458,9 @@ fn main() {
                         }
                         let Some(cfg) = cfg.as_ref() else { continue };
                         if has_pending {
-                            let pending: Vec<(i32, (i32, String))> =
+                            let pending: Vec<(i32, (i32, String, u8))> =
                                 es.cache.pending_rename.drain().collect();
-                            for (tid, (pid, pkg)) in pending {
+                            for (tid, (pid, pkg, mut retries)) in pending {
                                 let Some(comm) = crate::apply_affinity::tid_comm(tid) else {
                                     // 线程已退出: sync 兜底清理, 此处跳过
                                     crate::debug_log::debug_log(&format!(
@@ -476,10 +476,20 @@ fn main() {
                                         tid, pid, comm,
                                         match &m { PkgMatch::Hit(p) => format!("Hit({})", p), PkgMatch::Miss => "Miss".into(), PkgMatch::Unknown => "Unknown".into() }
                                     ));
-                                    if let PkgMatch::Hit(pkg) = m {
-                                        es.cache.task_apply(tid, pid, &pkg, &comm, cfg, |tid, cpus, cpuset_dir| {
-                                            crate::ebpf_mode::event_affinity_apply(tid, cpus, cpuset_dir, cfg, &es.bpf)
-                                        });
+                                    match m {
+                                        PkgMatch::Hit(pkg) => {
+                                            es.cache.task_apply(tid, pid, &pkg, &comm, cfg, |tid, cpus, cpuset_dir| {
+                                                crate::ebpf_mode::event_affinity_apply(tid, cpus, cpuset_dir, cfg, &es.bpf)
+                                            });
+                                        }
+                                        // cmdline 仍未就绪 (setArgV0 延迟 >200ms):
+                                        // 重新登记 pending, 200ms 后再查 (上限 25 次 ≈ 5s)
+                                        PkgMatch::Miss | PkgMatch::Unknown => {
+                                            if retries < 25 {
+                                                retries += 1;
+                                                es.cache.pending_rename.insert(tid, (pid, String::new(), retries));
+                                            }
+                                        }
                                     }
                                 } else {
                                     // 线程名未确定场景: 重读线程名匹配线程规则

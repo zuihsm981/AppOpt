@@ -653,7 +653,7 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
                     // FORK 时线程名未确定且该包有线程规则 → 登记待重查,
                     // 200ms 定时器重读 /proc comm 后重新匹配线程规则。
                     if event.event_type == EBPF_EVENT_FORK && has_thread_rules && !thread_matched {
-                        state.cache.pending_rename.insert(tid, (pid, pkg.clone()));
+                        state.cache.pending_rename.insert(tid, (pid, pkg.clone(), 0));
                     }
                 }
                 // Zygote fork 主线程: cmdline 仍是 zygote64 (setArgV0 未执行),
@@ -665,7 +665,7 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
                             "dispatch pending (cmdline not ready) tid={} pid={}",
                             tid, pid
                         ));
-                        state.cache.pending_rename.insert(tid, (pid, String::new()));
+                        state.cache.pending_rename.insert(tid, (pid, String::new(), 0));
                     }
                 }
             }
