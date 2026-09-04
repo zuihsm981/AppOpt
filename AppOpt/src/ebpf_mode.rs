@@ -631,20 +631,30 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
             // comm_to_pkg 以 /proc/{pid}/cmdline 为权威 (Android 进程 comm 可能
             // 与包名不同, 如 com.bilibili.app.in 的 comm 是 bilibili.app.in),
             // 命中目标包才 task_apply 并立即设置亲和性。
-            if let PkgMatch::Hit(pkg) = crate::rule_match::comm_to_pkg(pid, &comm, cfg) {
-                let has_thread_rules = cfg.has_thread_rules.contains(&pkg);
-                // 本次 comm 是否命中线程规则 (FORK 时通常是 "Thread-N" 占位,
-                // pthread_setname_np 走 prctl 直接写 comm, 不触发 task_rename)
-                let thread_matched = has_thread_rules
-                    && crate::rule_match::thread_affinity(&pkg, &comm, cfg)
-                        .is_some_and(|r| r.is_thread_rule);
-                state.cache.task_apply(tid, pid, &pkg, &comm, cfg, |tid, cpus, cpuset_dir| {
-                    event_affinity_apply(tid, cpus, cpuset_dir, cfg, &state.bpf)
-                });
-                // FORK 时线程名未确定且该包有线程规则 → 登记待重查,
-                // 200ms 定时器重读 /proc comm 后重新匹配线程规则。
-                if event.event_type == EBPF_EVENT_FORK && has_thread_rules && !thread_matched {
-                    state.cache.pending_rename.insert(tid, (pid, pkg.clone()));
+            match crate::rule_match::comm_to_pkg(pid, &comm, cfg) {
+                PkgMatch::Hit(pkg) => {
+                    let has_thread_rules = cfg.has_thread_rules.contains(&pkg);
+                    // 本次 comm 是否命中线程规则 (FORK 时通常是 "Thread-N" 占位,
+                    // pthread_setname_np 走 prctl 直接写 comm, 不触发 task_rename)
+                    let thread_matched = has_thread_rules
+                        && crate::rule_match::thread_affinity(&pkg, &comm, cfg)
+                            .is_some_and(|r| r.is_thread_rule);
+                    state.cache.task_apply(tid, pid, &pkg, &comm, cfg, |tid, cpus, cpuset_dir| {
+                        event_affinity_apply(tid, cpus, cpuset_dir, cfg, &state.bpf)
+                    });
+                    // FORK 时线程名未确定且该包有线程规则 → 登记待重查,
+                    // 200ms 定时器重读 /proc comm 后重新匹配线程规则。
+                    if event.event_type == EBPF_EVENT_FORK && has_thread_rules && !thread_matched {
+                        state.cache.pending_rename.insert(tid, (pid, pkg.clone()));
+                    }
+                }
+                // Zygote fork 主线程: cmdline 仍是 zygote64 (setArgV0 未执行),
+                // Miss/Unknown 均登记待重查 — 200ms 后 cmdline 已变为包名,
+                // 重查时 comm_to_pkg 命中并应用包级规则。
+                PkgMatch::Miss | PkgMatch::Unknown => {
+                    if event.event_type == EBPF_EVENT_FORK {
+                        state.cache.pending_rename.insert(tid, (pid, String::new()));
+                    }
                 }
             }
         }

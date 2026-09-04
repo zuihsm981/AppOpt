@@ -265,6 +265,7 @@ fn main() {
         let it = libc::itimerspec { it_interval: ts, it_value: ts };
         unsafe { libc::timerfd_settime(tfd, 0, &it, std::ptr::null_mut()) };
     }
+    #[allow(dead_code)]
     fn disarm_timerfd(tfd: i32) {
         let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         let it = libc::itimerspec { it_interval: zero, it_value: zero };
@@ -431,11 +432,15 @@ fn main() {
                             ps.force_affinity = false;
                         }
                     } else if let Some(es) = ebpf_state.as_mut() {
-                        // KPM 模式: 200ms 定时重查 FORK 时未匹配线程规则的线程。
-                        // pthread_setname_np (prctl PR_SET_NAME) 直接写 task->comm,
-                        // 不触发 task_rename tracepoint, 线程名在 FORK 后几毫秒
-                        // 才确定; 此刻重读 /proc comm 已能拿到真实线程名
-                        // (如 HeapTaskDaemon), 重新 task_apply 匹配线程规则。
+                        // KPM 模式: 200ms 定时重查 FORK 时未就绪的线程。
+                        // 两类场景:
+                        //  1. 线程名未确定 (pthread_setname_np 走 prctl 直接写
+                        //     task->comm, 不触发 task_rename tracepoint): 重读
+                        //     /proc comm 拿真实线程名 (如 HeapTaskDaemon) 重新
+                        //     匹配线程规则。
+                        //  2. Zygote fork 主线程时 cmdline 仍是 zygote64
+                        //     (setArgV0 未执行): 重查时 cmdline 已变包名,
+                        //     重新 comm_to_pkg 识别并应用包级规则。
                         if es.cache.pending_rename.is_empty() {
                             continue;
                         }
@@ -447,9 +452,21 @@ fn main() {
                                 // 线程已退出: EXIT 事件稍后清理, 此处跳过
                                 continue;
                             };
-                            es.cache.task_apply(tid, pid, &pkg, &comm, cfg, |tid, cpus, cpuset_dir| {
-                                crate::ebpf_mode::event_affinity_apply(tid, cpus, cpuset_dir, cfg, &es.bpf)
-                            });
+                            if pkg.is_empty() {
+                                // 场景 2: 重新识别包名 (cmdline 此刻已就绪)
+                                if let PkgMatch::Hit(pkg) =
+                                    crate::rule_match::comm_to_pkg(pid, &comm, cfg)
+                                {
+                                    es.cache.task_apply(tid, pid, &pkg, &comm, cfg, |tid, cpus, cpuset_dir| {
+                                        crate::ebpf_mode::event_affinity_apply(tid, cpus, cpuset_dir, cfg, &es.bpf)
+                                    });
+                                }
+                            } else {
+                                // 场景 1: 已知包名, 重读线程名匹配线程规则
+                                es.cache.task_apply(tid, pid, &pkg, &comm, cfg, |tid, cpus, cpuset_dir| {
+                                    crate::ebpf_mode::event_affinity_apply(tid, cpus, cpuset_dir, cfg, &es.bpf)
+                                });
+                            }
                         }
                     }
                 }
@@ -466,12 +483,14 @@ fn main() {
             ps.force_affinity = true;
         }
 
-        // 周期 timerfd 与模式联动: /proc 模式启动, KPM 模式停止
+        // 周期 timerfd 与模式联动: /proc 模式用检查间隔; KPM 模式保持 200ms
+        // 短周期 (pending_rename 线程名重查: pthread_setname_np 不触发
+        // task_rename tracepoint, FORK 后需定时重读 comm 匹配线程规则)。
         let interval = CHECK_INTERVAL.load(Ordering::Relaxed).max(1);
         if ebpf_state.is_none() {
             arm_periodic(proc_timer_fd, interval as i64);
         } else {
-            disarm_timerfd(proc_timer_fd);
+            arm_periodic_ms(proc_timer_fd, 200);
         }
 
         // web 状态统计: 事件驱动更新 (收到事件时刷新, 不再定时轮询)
