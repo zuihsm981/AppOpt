@@ -16,12 +16,6 @@ pub fn pkg_lookup_pid(pid: i32) -> Option<String> {
     PID_PKG.lock().unwrap().get(&pid).cloned()
 }
 
-/// 事件热路径快速查询: pid→pkg 已识别则直接返回, 避免重复读 cmdline。
-/// 供 comm_to_pkg 在读 /proc 前先查 (同进程多线程事件只读一次 cmdline)。
-pub fn pid_pkg_fast_lookup(pid: i32) -> Option<String> {
-    PID_PKG.lock().unwrap().get(&pid).cloned()
-}
-
 pub fn pkg_track_pid(pid: i32, pkg: &str) {
     if pid > 0 && !pkg.is_empty() {
         crate::debug_log::debug_log(&format!("pkg_track_pid: pid={} pkg={}", pid, pkg));
@@ -53,12 +47,10 @@ pub struct ProcCache {
     pid_task_counts: HashMap<i32, usize>,
     /// tid→pkg 的计数，供 Web 统计直接取唯一包名，避免每次请求扫描全部任务。
     hit_pkgs: HashMap<String, usize>,
-    /// FORK 时线程名/cmdline 尚未确定的待重查线程: tid → (pid, pkg, 重试次数)。
-    /// - pkg 非空: 线程名未确定 (pthread_setname_np 走 prctl 不触发 task_rename)
-    /// - pkg 为空: cmdline 未就绪 (Zygote fork 主线程, setArgV0 未执行;
-    ///   bilibili 实测 setArgV0 可延迟 >200ms, 单次重查不够, 需多次重试)
-    /// 由 200ms 定时器重读 /proc 后重新匹配; Miss/Unknown 重新登记直到上限。
-    pub pending_rename: HashMap<i32, (i32, String, u8)>,
+    /// FORK 时线程名尚未确定 (pthread_setname_np 不触发 task_rename tracepoint,
+    /// prctl(PR_SET_NAME) 直接写 task->comm) 的待重查线程: tid → (pid, pkg)。
+    /// 由周期定时器 (200ms) 重读 /proc/<pid>/task/<tid>/comm 后重新匹配线程规则。
+    pub pending_rename: HashMap<i32, (i32, String)>,
 }
 
 impl ProcCache {

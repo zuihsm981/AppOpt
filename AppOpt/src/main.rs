@@ -336,11 +336,6 @@ fn main() {
         arm_periodic_ms(proc_timer_fd, 200);
     }
 
-    // KPM 模式 EV_PROC tick 计数: 200ms × 10 = 2s 周期 affinity_sync 兜底
-    let mut kpm_tick: u32 = 0;
-    // 模式跟踪: 仅模式切换时重置 proc_timer_fd (每轮重置会饿死 EV_PROC)
-    let mut prev_kpm_mode = false;
-
     let mut events = [unsafe { std::mem::zeroed::<libc::epoll_event>() }; 8];
 
     loop {
@@ -438,74 +433,41 @@ fn main() {
                             ps.force_affinity = false;
                         }
                     } else if let Some(es) = ebpf_state.as_mut() {
-                        // KPM 模式: 200ms 定时器双职责。
-                        //  1. pending_rename 重查 (FORK 时线程名/cmdline 未就绪):
-                        //     pthread_setname_np 走 prctl 不触发 task_rename;
-                        //     Zygote fork 主线程时 cmdline 仍是 zygote64。
-                        //  2. 每 10 tick (2s) 轻量 affinity_sync 兜底: EXIT 探针
-                        //     恢复 APPLIED 过滤后, "线程在 applied_set 前退出"
-                        //     的漏报残留由 sync 的 ESRCH 清理 (get_affinity
-                        //     失败 → task_del), 不依赖 EXIT 事件。
-                        let has_pending = !es.cache.pending_rename.is_empty();
-                        kpm_tick += 1;
-                        let do_sync = kpm_tick >= 10;
-                        crate::debug_log::debug_log(&format!(
-                            "EV_PROC tick={} pending={} do_sync={}",
-                            kpm_tick, es.cache.pending_rename.len(), do_sync
-                        ));
-                        if !has_pending && !do_sync {
+                        // KPM 模式: 200ms 定时重查 FORK 时未就绪的线程。
+                        // 两类场景:
+                        //  1. 线程名未确定 (pthread_setname_np 走 prctl 直接写
+                        //     task->comm, 不触发 task_rename tracepoint): 重读
+                        //     /proc comm 拿真实线程名 (如 HeapTaskDaemon) 重新
+                        //     匹配线程规则。
+                        //  2. Zygote fork 主线程时 cmdline 仍是 zygote64
+                        //     (setArgV0 未执行): 重查时 cmdline 已变包名,
+                        //     重新 comm_to_pkg 识别并应用包级规则。
+                        if es.cache.pending_rename.is_empty() {
                             continue;
                         }
                         let Some(cfg) = cfg.as_ref() else { continue };
-                        if has_pending {
-                            let pending: Vec<(i32, (i32, String, u8))> =
-                                es.cache.pending_rename.drain().collect();
-                            for (tid, (pid, pkg, mut retries)) in pending {
-                                let Some(comm) = crate::apply_affinity::tid_comm(tid) else {
-                                    // 线程已退出: sync 兜底清理, 此处跳过
-                                    crate::debug_log::debug_log(&format!(
-                                        "EV_PROC pending tid={} gone", tid
-                                    ));
-                                    continue;
-                                };
-                                if pkg.is_empty() {
-                                    // cmdline 未就绪场景: 重新识别包名
-                                    let m = crate::rule_match::comm_to_pkg(pid, &comm, cfg);
-                                    crate::debug_log::debug_log(&format!(
-                                        "EV_PROC recheck tid={} pid={} comm={} match={:?}",
-                                        tid, pid, comm,
-                                        match &m { PkgMatch::Hit(p) => format!("Hit({})", p), PkgMatch::Miss => "Miss".into(), PkgMatch::Unknown => "Unknown".into() }
-                                    ));
-                                    match m {
-                                        PkgMatch::Hit(pkg) => {
-                                            es.cache.task_apply(tid, pid, &pkg, &comm, cfg, |tid, cpus, cpuset_dir| {
-                                                crate::ebpf_mode::event_affinity_apply(tid, cpus, cpuset_dir, cfg, &es.bpf)
-                                            });
-                                        }
-                                        // cmdline 仍未就绪 (setArgV0 延迟 >200ms):
-                                        // 重新登记 pending, 200ms 后再查 (上限 25 次 ≈ 5s)
-                                        PkgMatch::Miss | PkgMatch::Unknown => {
-                                            if retries < 25 {
-                                                retries += 1;
-                                                es.cache.pending_rename.insert(tid, (pid, String::new(), retries));
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    // 线程名未确定场景: 重读线程名匹配线程规则
-                                    crate::debug_log::debug_log(&format!(
-                                        "EV_PROC rename tid={} pid={} pkg={} comm={}",
-                                        tid, pid, pkg, comm
-                                    ));
+                        let pending: Vec<(i32, (i32, String))> =
+                            es.cache.pending_rename.drain().collect();
+                        for (tid, (pid, pkg)) in pending {
+                            let Some(comm) = crate::apply_affinity::tid_comm(tid) else {
+                                // 线程已退出: EXIT 事件稍后清理, 此处跳过
+                                continue;
+                            };
+                            if pkg.is_empty() {
+                                // cmdline 未就绪场景: 重新识别包名
+                                if let PkgMatch::Hit(pkg) =
+                                    crate::rule_match::comm_to_pkg(pid, &comm, cfg)
+                                {
                                     es.cache.task_apply(tid, pid, &pkg, &comm, cfg, |tid, cpus, cpuset_dir| {
                                         crate::ebpf_mode::event_affinity_apply(tid, cpus, cpuset_dir, cfg, &es.bpf)
                                     });
                                 }
+                            } else {
+                                // 线程名未确定场景: 重读线程名匹配线程规则
+                                es.cache.task_apply(tid, pid, &pkg, &comm, cfg, |tid, cpus, cpuset_dir| {
+                                    crate::ebpf_mode::event_affinity_apply(tid, cpus, cpuset_dir, cfg, &es.bpf)
+                                });
                             }
-                        }
-                        if do_sync {
-                            kpm_tick = 0;
-                            es.cache.affinity_sync(&cfg.topo);
                         }
                     }
                 }
@@ -522,21 +484,14 @@ fn main() {
             ps.force_affinity = true;
         }
 
-        // 周期 timerfd 与模式联动: 仅在模式切换时重置, 不每轮重置!
-        // timerfd_settime 会重置倒计时 — 若每轮 epoll 唤醒后都重设 200ms,
-        // 事件间隔 < 200ms 时 (INPUT/FORK/EXIT 随时到来) EV_PROC 永不触发,
-        // pending_rename 重查失效 → Zygote fork 主线程 (cmdline 未就绪,
-        // Miss 登记 pending) 永不识别 → 主进程亲和性永不设置。
-        // 用 prev_kpm_mode 检测模式变化, 稳态下不再触碰 timerfd。
+        // 周期 timerfd 与模式联动: /proc 模式用检查间隔; KPM 模式保持 200ms
+        // 短周期 (pending_rename 线程名重查: pthread_setname_np 不触发
+        // task_rename tracepoint, FORK 后需定时重读 comm 匹配线程规则)。
         let interval = CHECK_INTERVAL.load(Ordering::Relaxed).max(1);
-        let kpm_mode_now = ebpf_state.is_some();
-        if kpm_mode_now != prev_kpm_mode {
-            prev_kpm_mode = kpm_mode_now;
-            if kpm_mode_now {
-                arm_periodic_ms(proc_timer_fd, 200);
-            } else {
-                arm_periodic(proc_timer_fd, interval as i64);
-            }
+        if ebpf_state.is_none() {
+            arm_periodic(proc_timer_fd, interval as i64);
+        } else {
+            arm_periodic_ms(proc_timer_fd, 200);
         }
 
         // web 状态统计: 事件驱动更新 (收到事件时刷新, 不再定时轮询)

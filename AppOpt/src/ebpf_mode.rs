@@ -628,14 +628,10 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
             if comm.is_empty() {
                 return;
             }
-            let m = crate::rule_match::comm_to_pkg(pid, &comm, cfg);
-            crate::debug_log::debug_log(&format!(
-                "dispatch {} tid={} pid={} comm={} match={:?}",
-                if event.event_type == EBPF_EVENT_FORK { "FORK" } else { "RENAME" },
-                tid, pid, comm,
-                match &m { PkgMatch::Hit(p) => format!("Hit({})", p), PkgMatch::Miss => "Miss".into(), PkgMatch::Unknown => "Unknown".into() }
-            ));
-            match m {
+            // comm_to_pkg 以 /proc/{pid}/cmdline 为权威 (Android 进程 comm 可能
+            // 与包名不同, 如 com.bilibili.app.in 的 comm 是 bilibili.app.in),
+            // 命中目标包才 task_apply 并立即设置亲和性。
+            match crate::rule_match::comm_to_pkg(pid, &comm, cfg) {
                 PkgMatch::Hit(pkg) => {
                     let has_thread_rules = cfg.has_thread_rules.contains(&pkg);
                     // 本次 comm 是否命中线程规则 (FORK 时通常是 "Thread-N" 占位,
@@ -643,17 +639,13 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
                     let thread_matched = has_thread_rules
                         && crate::rule_match::thread_affinity(&pkg, &comm, cfg)
                             .is_some_and(|r| r.is_thread_rule);
-                    let ok = state.cache.task_apply(tid, pid, &pkg, &comm, cfg, |tid, cpus, cpuset_dir| {
+                    state.cache.task_apply(tid, pid, &pkg, &comm, cfg, |tid, cpus, cpuset_dir| {
                         event_affinity_apply(tid, cpus, cpuset_dir, cfg, &state.bpf)
                     });
-                    crate::debug_log::debug_log(&format!(
-                        "dispatch Hit tid={} pkg={} thread_matched={} applied={}",
-                        tid, pkg, thread_matched, ok
-                    ));
                     // FORK 时线程名未确定且该包有线程规则 → 登记待重查,
                     // 200ms 定时器重读 /proc comm 后重新匹配线程规则。
                     if event.event_type == EBPF_EVENT_FORK && has_thread_rules && !thread_matched {
-                        state.cache.pending_rename.insert(tid, (pid, pkg.clone(), 0));
+                        state.cache.pending_rename.insert(tid, (pid, pkg.clone()));
                     }
                 }
                 // Zygote fork 主线程: cmdline 仍是 zygote64 (setArgV0 未执行),
@@ -661,11 +653,7 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
                 // 重查时 comm_to_pkg 命中并应用包级规则。
                 PkgMatch::Miss | PkgMatch::Unknown => {
                     if event.event_type == EBPF_EVENT_FORK {
-                        crate::debug_log::debug_log(&format!(
-                            "dispatch pending (cmdline not ready) tid={} pid={}",
-                            tid, pid
-                        ));
-                        state.cache.pending_rename.insert(tid, (pid, String::new(), 0));
+                        state.cache.pending_rename.insert(tid, (pid, String::new()));
                     }
                 }
             }

@@ -140,12 +140,6 @@ pub enum PkgMatch {
 /// 明确的 15 字节截断前缀回退。不再使用 8 字节滑动键，避免
 /// air.tv.douyu.android 的 ".android" 键误命中 com.android.* 进程。
 pub fn comm_to_pkg(pid: i32, comm: &str, cfg: &AppConfig) -> PkgMatch {
-    // 开销优化: 同进程多线程事件 (FORK/RENAME) 的 pid→pkg 已在 ProcCache
-    // pid_pkgs 缓存, 直接命中, 避免每线程事件重复读 /proc/<pid>/cmdline。
-    // 缓存由 task_apply 维护 (配置重载时 invalidate_pid_cache 清空)。
-    if let Some(pkg) = crate::cache::pid_pkg_fast_lookup(pid) {
-        return PkgMatch::Hit(pkg);
-    }
     // cmdline 可读: 以 cmdline 为权威（即使 comm 像包名也校验，防伪造/误命名）
     if let Some(cmd) = read_cmdline(pid) {
         for pkg in &cfg.target_pkgs {
