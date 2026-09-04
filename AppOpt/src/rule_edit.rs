@@ -338,7 +338,7 @@ pub fn rule_upsert(path: &str, pkg: &str, thread: &str, cpus: &str) -> RuleEdit 
     } else {
         /* 无块无包行 (仅 refresh_app 配置的应用首次添加线程规则):
          * 插入到该包 refresh_app 行之后 (保持按包分组), 而非文件末尾。 */
-        let at = lines.len();
+        let mut at = lines.len();
         for (i, raw) in lines.iter().enumerate() {
             let p = raw.trim();
             if p.starts_with("refresh_app,") {
