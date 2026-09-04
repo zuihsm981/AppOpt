@@ -449,6 +449,10 @@ fn main() {
                         let has_pending = !es.cache.pending_rename.is_empty();
                         kpm_tick += 1;
                         let do_sync = kpm_tick >= 10;
+                        crate::debug_log::debug_log(&format!(
+                            "EV_PROC tick={} pending={} do_sync={}",
+                            kpm_tick, es.cache.pending_rename.len(), do_sync
+                        ));
                         if !has_pending && !do_sync {
                             continue;
                         }
@@ -459,19 +463,30 @@ fn main() {
                             for (tid, (pid, pkg)) in pending {
                                 let Some(comm) = crate::apply_affinity::tid_comm(tid) else {
                                     // 线程已退出: sync 兜底清理, 此处跳过
+                                    crate::debug_log::debug_log(&format!(
+                                        "EV_PROC pending tid={} gone", tid
+                                    ));
                                     continue;
                                 };
                                 if pkg.is_empty() {
                                     // cmdline 未就绪场景: 重新识别包名
-                                    if let PkgMatch::Hit(pkg) =
-                                        crate::rule_match::comm_to_pkg(pid, &comm, cfg)
-                                    {
+                                    let m = crate::rule_match::comm_to_pkg(pid, &comm, cfg);
+                                    crate::debug_log::debug_log(&format!(
+                                        "EV_PROC recheck tid={} pid={} comm={} match={:?}",
+                                        tid, pid, comm,
+                                        match &m { PkgMatch::Hit(p) => format!("Hit({})", p), PkgMatch::Miss => "Miss".into(), PkgMatch::Unknown => "Unknown".into() }
+                                    ));
+                                    if let PkgMatch::Hit(pkg) = m {
                                         es.cache.task_apply(tid, pid, &pkg, &comm, cfg, |tid, cpus, cpuset_dir| {
                                             crate::ebpf_mode::event_affinity_apply(tid, cpus, cpuset_dir, cfg, &es.bpf)
                                         });
                                     }
                                 } else {
                                     // 线程名未确定场景: 重读线程名匹配线程规则
+                                    crate::debug_log::debug_log(&format!(
+                                        "EV_PROC rename tid={} pid={} pkg={} comm={}",
+                                        tid, pid, pkg, comm
+                                    ));
                                     es.cache.task_apply(tid, pid, &pkg, &comm, cfg, |tid, cpus, cpuset_dir| {
                                         crate::ebpf_mode::event_affinity_apply(tid, cpus, cpuset_dir, cfg, &es.bpf)
                                     });
