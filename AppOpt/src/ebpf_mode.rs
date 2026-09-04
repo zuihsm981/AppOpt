@@ -16,7 +16,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use crate::apply_affinity::{proc_walk, task_tids, tid_comm};
-use crate::rule_match::thread_affinity;
+use crate::rule_match::{PkgMatch, thread_affinity};
 use crate::cache::ProcCache;
 use crate::config::{AppConfig, CURRENT_CONFIG};
 use crate::cpuset::CpuSet;
@@ -31,6 +31,8 @@ pub struct EbpfProcEvent {
     pub event_type: u32,
 }
 
+pub const EBPF_EVENT_FORK: u32 = 1;
+pub const EBPF_EVENT_RENAME: u32 = 3;
 pub const EBPF_EVENT_EXIT: u32 = 4;
 pub const EBPF_EVENT_INPUT: u32 = 5;
 
@@ -198,26 +200,6 @@ impl KpmHandle {
     /// 通知内核识别 pid 对应包并扫描其（含 pkg:xxx 子进程）全部线程设置亲和性。
     /// 识别由内核完成 (find_task_by_vpid 读 leader comm, 永远可读, 无 /proc 瞬时
     /// 不可读问题); 返回内核识别的包名 (供登记 PID_PKG / 刷新率)。
-    pub fn verify_pkg(&self, pid: i32) -> Option<String> {
-        let s = format!("verify_pkg {}", pid);
-        let c = CString::new(s).unwrap_or_default();
-        let mut out = [0u8; 32];
-        let rc = kpm_ctl0(&self.key, &c, &mut out);
-        crate::debug_log::debug_log(&format!("verify_pkg ctl0: pid={} rc={}", pid, rc));
-        if rc <= 0 {
-            return None;
-        }
-        let len = out.iter().position(|&b| b == 0).unwrap_or(out.len());
-        let pkg = String::from_utf8_lossy(&out[..len]).to_string();
-        crate::debug_log::debug_log(&format!("verify_pkg ctl0: pkg={:?}", pkg));
-        if pkg.is_empty() {
-            None
-        } else {
-            Some(pkg)
-        }
-    }
-
-    /// 设置白名单 (包名:bits 列表, bits=该包包级亲和性, 0=仅刷新率无 CPU 规则),
     /// 返回 true 表示失败需要回退
     fn set_whitelist(&self, pkgs: &[(String, u64)]) -> bool {
         let mut s = String::from("set_whitelist ");
@@ -255,41 +237,26 @@ impl KpmHandle {
 /// 内核返回包名后登记共享 PID_PKG (refresh 模块靠 pkg_lookup_pid 获取包名;
 /// pkg_track_pid 还会触发 PkgTracked → try_apply_fg 应用刷新率)。
 /// 返回是否识别成功 (true=已登记)。
+/// IProcessObserver 冷启动前台回调: 识别 pid 对应包名并登记 PID_PKG。
+/// 亲和性由事件驱动 (FORK/RENAME) + full_scan 覆盖, 无需内核 verify 扫描。
+/// 返回是否识别成功 (true=已登记, PkgTracked 将驱动刷新率)。
 pub fn notify_verify_pkg(pid: i32) -> bool {
-    let handle = KpmHandle::new();
-    match handle.verify_pkg(pid) {
-        Some(comm) => {
-            crate::debug_log::debug_log(&format!("notify_verify_pkg: kernel comm={}", comm));
-            // 内核返回的是 leader comm（≤15 字节截断名），不是完整包名。
-            // 必须映射回完整包名再登记 PID_PKG，否则 try_apply_fg 用截断名
-            // 匹配 app_configs / DEFAULT_REFRESH_PACKAGE 永远失败：
-            //   launcher: comm=droid.launcher3 vs 配置 com.android.launcher3
-            //   应用:     comm=air.tv.douyu.an vs 配置 air.tv.douyu.android
-            let cfg = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
-            let full_pkg = cfg.as_ref().and_then(|cfg| {
-                if comm == crate::config::DEFAULT_REFRESH_COMM {
-                    Some(crate::config::DEFAULT_REFRESH_PACKAGE.to_string())
-                } else {
-                    crate::rule_match::comm_prefix_fallback(&comm, cfg)
-                }
-            });
-            crate::debug_log::debug_log(&format!(
-                "notify_verify_pkg: full_pkg={:?}",
-                full_pkg
-            ));
-            match full_pkg {
-                Some(pkg) => {
-                    crate::cache::pkg_track_pid(pid, &pkg);
-                    true
-                }
-                None => false,
-            }
-        }
-        None => {
-            crate::debug_log::debug_log("notify_verify_pkg: kernel returned None");
-            false
-        }
-    }
+    let cfg = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
+    let Some(cfg) = cfg else { return false };
+
+    // IProcessObserver 前台回调时机进程已完整启动, /proc/{pid}/cmdline 一定可读,
+    // 且内容是完整包名 (com.bilibili.app.in), 与 target_pkgs 精确匹配。
+    // 不用内核 comm (Android 进程 comm 可能与包名不同, 如 bilibili.app.in)。
+    let comm = crate::apply_affinity::tid_comm(pid).unwrap_or_default();
+    let PkgMatch::Hit(pkg) = crate::rule_match::comm_to_pkg(pid, &comm, &cfg) else {
+        crate::debug_log::debug_log(&format!("notify_verify_pkg: pkg miss pid={}", pid));
+        return false;
+    };
+
+    // 登记共享 PID_PKG: refresh 模块靠 pkg_lookup_pid 获取包名,
+    // pkg_track_pid → PkgTracked → try_apply_fg 应用刷新率。
+    crate::cache::pkg_track_pid(pid, &pkg);
+    true
 }
 
 pub struct EbpfState {
@@ -626,29 +593,53 @@ fn applied_clear(bpf: &KpmHandle) {
     bpf.applied_clear();
 }
 
-/// 事件驱动路径: 只更新 APPLIED 表 (供 sched_setaffinity kprobe 拦截),
-/// 不立即设置亲和性/放置 cpuset。实际设置由主循环定期 affinity_sync
-/// 在应用完全启动、任务稳定后统一执行 (先 cpuset 后亲和性)。
+/// 事件驱动路径: 立即设置 CPU 亲和性 (不依赖周期 affinity_sync, KPM 模式下
+/// 没有周期同步), 并更新 APPLIED 表供 sched_setaffinity kprobe 拦截覆盖。
 fn affinity_apply(
     tid: i32,
     cpus: &CpuSet,
-    _cpuset_dir: &str,
-    _cfg: &AppConfig,
+    cpuset_dir: &str,
+    cfg: &AppConfig,
     bpf: &KpmHandle,
 ) -> bool {
-    applied_set(bpf, tid, cpus);
-    false
+    let dead = crate::apply_affinity::affinity_set(tid, cpus, cpuset_dir, &cfg.topo);
+    if !dead {
+        applied_set(bpf, tid, cpus);
+    }
+    dead
 }
 
-/// 事件派发, 按 event_type 增量处理 FORK/RENAME/EXEC/EXIT (与 aya 版一致)
-pub fn event_dispatch(event: &EbpfProcEvent, _cfg: &AppConfig, state: &mut EbpfState) {
+/// 事件派发, 按 event_type 增量处理 FORK/RENAME/EXIT/INPUT。
+/// FORK 全量跟踪 + RENAME 关联包名: 内核无条件上报, 用户态用 cmdline 权威
+/// 识别包名后 task_apply → affinity_apply 立即设置亲和性 + 更新 APPLIED 表。
+/// EXIT 清理 cache 与 APPLIED; INPUT 唤醒刷新率。
+fn comm_cstr(comm: &[u8; 16]) -> String {
+    let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
+    String::from_utf8_lossy(&comm[..end]).to_string()
+}
+
+pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfState) {
     let tid = event.tid;
+    let pid = event.pid;
 
     match event.event_type {
+        EBPF_EVENT_FORK | EBPF_EVENT_RENAME => {
+            let comm = comm_cstr(&event.comm);
+            if comm.is_empty() {
+                return;
+            }
+            // comm_to_pkg 以 /proc/{pid}/cmdline 为权威 (Android 进程 comm 可能
+            // 与包名不同, 如 com.bilibili.app.in 的 comm 是 bilibili.app.in),
+            // 命中目标包才 task_apply 并立即设置亲和性。
+            if let PkgMatch::Hit(pkg) = crate::rule_match::comm_to_pkg(pid, &comm, cfg) {
+                state.cache.task_apply(tid, pid, &pkg, &comm, cfg, |tid, cpus, cpuset_dir| {
+                    affinity_apply(tid, cpus, cpuset_dir, cfg, &state.bpf)
+                });
+            }
+        }
+
         EBPF_EVENT_EXIT => {
             // 线程退出: 清理 cache 与内核 APPLIED 表。
-            // 亲和性事件 (FORK/EXEC/RENAME) 已移除, 由 IProcessObserver 冷启动
-            // verify_pkg (内核扫描设置) 驱动; 这里只保留退出清理与 INPUT。
             state.cache.task_del(tid);
             applied_del(&state.bpf, tid);
         }
@@ -687,7 +678,7 @@ pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
     applied_clear(&state.bpf);
     /* APPLIED 表随后由 proc_walk → task_apply → affinity_apply 填充真实 bits;
      * 不再需要 Zygote 占位 (bits=0): FORK/RENAME 探针已移除, 亲和性由
-     * IProcessObserver 冷启动 verify_pkg 内核扫描设置, 不依赖占位链。 */
+     * FORK/RENAME 事件驱动 + full_scan 覆盖, 不依赖占位链。 */
     proc_walk(cfg, |_| true, |pid, pkg, has_thread_rules| {
         let Some(tids) = task_tids(pid) else { return };
         for tid in tids {

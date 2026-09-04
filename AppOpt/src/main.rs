@@ -358,9 +358,10 @@ fn main() {
                 EV_KPM => {
                     read_eventfd(kpm_wake_fd);
                     if let Some(es) = ebpf_state.as_mut() {
-                        // 亲和性事件 (FORK/EXEC/RENAME) 已移除, 由 IProcessObserver
-                        // 冷启动 verify_pkg 内核扫描设置; 事件流只剩 EXIT (cache 清理)
-                        // 与 INPUT (刷新率)。这里只排空事件并逐条分发。
+                        // 事件驱动亲和性: FORK 全量跟踪 + RENAME 关联包名 + EXIT 清理
+                        // (EXEC 已移除: Android 应用由 Zygote fork 产生, 从不 execve)。
+                        // 用户态收到事件后 comm_to_pkg (cmdline 权威) 识别包名,
+                        // task_apply → affinity_apply 立即设置亲和性; INPUT 唤醒刷新率。
                         loop {
                             match es.event_rx.try_recv() {
                                 Ok(event) => {
