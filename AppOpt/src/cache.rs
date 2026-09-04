@@ -47,6 +47,10 @@ pub struct ProcCache {
     pid_task_counts: HashMap<i32, usize>,
     /// tid→pkg 的计数，供 Web 统计直接取唯一包名，避免每次请求扫描全部任务。
     hit_pkgs: HashMap<String, usize>,
+    /// FORK 时线程名尚未确定 (pthread_setname_np 不触发 task_rename tracepoint,
+    /// prctl(PR_SET_NAME) 直接写 task->comm) 的待重查线程: tid → (pid, pkg)。
+    /// 由周期定时器 (200ms) 重读 /proc/<pid>/task/<tid>/comm 后重新匹配线程规则。
+    pub pending_rename: HashMap<i32, (i32, String)>,
 }
 
 impl ProcCache {
@@ -56,6 +60,7 @@ impl ProcCache {
             pid_pkgs: HashMap::new(),
             pid_task_counts: HashMap::new(),
             hit_pkgs: HashMap::new(),
+            pending_rename: HashMap::new(),
         }
     }
 
@@ -113,6 +118,7 @@ impl ProcCache {
         self.pid_pkgs.clear();
         self.pid_task_counts.clear();
         self.hit_pkgs.clear();
+        self.pending_rename.clear();
         PID_PKG.lock().unwrap().clear();
     }
 
@@ -123,6 +129,7 @@ impl ProcCache {
     }
 
     pub fn task_del(&mut self, tid: i32) {
+        self.pending_rename.remove(&tid);
         let Some(entry) = self.tasks.remove(&tid) else { return };
         self.hit_pkg_del(&entry.pkg);
         self.drop_pid_ref(entry.pid);

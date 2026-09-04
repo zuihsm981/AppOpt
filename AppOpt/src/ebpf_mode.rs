@@ -595,7 +595,7 @@ fn applied_clear(bpf: &KpmHandle) {
 
 /// 事件驱动路径: 立即设置 CPU 亲和性 (不依赖周期 affinity_sync, KPM 模式下
 /// 没有周期同步), 并更新 APPLIED 表供 sched_setaffinity kprobe 拦截覆盖。
-fn affinity_apply(
+pub fn event_affinity_apply(
     tid: i32,
     cpus: &CpuSet,
     cpuset_dir: &str,
@@ -632,9 +632,20 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
             // 与包名不同, 如 com.bilibili.app.in 的 comm 是 bilibili.app.in),
             // 命中目标包才 task_apply 并立即设置亲和性。
             if let PkgMatch::Hit(pkg) = crate::rule_match::comm_to_pkg(pid, &comm, cfg) {
+                let has_thread_rules = cfg.has_thread_rules.contains(&pkg);
+                // 本次 comm 是否命中线程规则 (FORK 时通常是 "Thread-N" 占位,
+                // pthread_setname_np 走 prctl 直接写 comm, 不触发 task_rename)
+                let thread_matched = has_thread_rules
+                    && crate::rule_match::thread_affinity(&pkg, &comm, cfg)
+                        .is_some_and(|r| r.is_thread_rule);
                 state.cache.task_apply(tid, pid, &pkg, &comm, cfg, |tid, cpus, cpuset_dir| {
-                    affinity_apply(tid, cpus, cpuset_dir, cfg, &state.bpf)
+                    event_affinity_apply(tid, cpus, cpuset_dir, cfg, &state.bpf)
                 });
+                // FORK 时线程名未确定且该包有线程规则 → 登记待重查,
+                // 200ms 定时器重读 /proc comm 后重新匹配线程规则。
+                if event.event_type == EBPF_EVENT_FORK && has_thread_rules && !thread_matched {
+                    state.cache.pending_rename.insert(tid, (pid, pkg.clone()));
+                }
             }
         }
 
@@ -692,7 +703,7 @@ pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
                 String::new()
             };
             state.cache.task_apply(tid, pid, pkg, &t_name, cfg, |tid, cpus, cpuset_dir| {
-                affinity_apply(tid, cpus, cpuset_dir, cfg, &state.bpf)
+                event_affinity_apply(tid, cpus, cpuset_dir, cfg, &state.bpf)
             });
         }
     });

@@ -430,6 +430,27 @@ fn main() {
                             ps.cache.affinity_sync(&cfg.topo);
                             ps.force_affinity = false;
                         }
+                    } else if let Some(es) = ebpf_state.as_mut() {
+                        // KPM 模式: 200ms 定时重查 FORK 时未匹配线程规则的线程。
+                        // pthread_setname_np (prctl PR_SET_NAME) 直接写 task->comm,
+                        // 不触发 task_rename tracepoint, 线程名在 FORK 后几毫秒
+                        // 才确定; 此刻重读 /proc comm 已能拿到真实线程名
+                        // (如 HeapTaskDaemon), 重新 task_apply 匹配线程规则。
+                        if es.cache.pending_rename.is_empty() {
+                            continue;
+                        }
+                        let Some(cfg) = cfg.as_ref() else { continue };
+                        let pending: Vec<(i32, (i32, String))> =
+                            es.cache.pending_rename.drain().collect();
+                        for (tid, (pid, pkg)) in pending {
+                            let Some(comm) = crate::apply_affinity::tid_comm(tid) else {
+                                // 线程已退出: EXIT 事件稍后清理, 此处跳过
+                                continue;
+                            };
+                            es.cache.task_apply(tid, pid, &pkg, &comm, cfg, |tid, cpus, cpuset_dir| {
+                                crate::ebpf_mode::event_affinity_apply(tid, cpus, cpuset_dir, cfg, &es.bpf)
+                            });
+                        }
                     }
                 }
                 _ => {}
