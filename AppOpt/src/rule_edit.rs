@@ -336,9 +336,24 @@ pub fn rule_upsert(path: &str, pkg: &str, thread: &str, cpus: &str) -> RuleEdit 
     } else if t.unterminated {
         return RuleEdit::Malformed;
     } else {
-        lines.push(bare_open_line(pkg));
-        lines.push(format!("\t{}={}", thread, cpus));
-        lines.push("}".to_string());
+        /* 无块无包行 (仅 refresh_app 配置的应用首次添加线程规则):
+         * 插入到该包 refresh_app 行之后 (保持按包分组), 而非文件末尾。 */
+        let at = lines.len();
+        for (i, raw) in lines.iter().enumerate() {
+            let p = raw.trim();
+            if p.starts_with("refresh_app,") {
+                let parts: Vec<&str> = p.split(',').map(str::trim).collect();
+                if parts.len() == 5 && parts[1] == pkg {
+                    at = i + 1;
+                    break;
+                }
+            }
+        }
+        let chunk: Vec<String> = std::iter::once(bare_open_line(pkg))
+            .chain(std::iter::once(format!("\t{}={}", thread, cpus)))
+            .chain(std::iter::once("}".to_string()))
+            .collect();
+        lines.splice(at..at, chunk);
     }
 
     file_write(path, &lines)
