@@ -16,6 +16,12 @@ pub fn pkg_lookup_pid(pid: i32) -> Option<String> {
     PID_PKG.lock().unwrap().get(&pid).cloned()
 }
 
+/// 事件热路径快速查询: pid→pkg 已识别则直接返回, 避免重复读 cmdline。
+/// 供 comm_to_pkg 在读 /proc 前先查 (同进程多线程事件只读一次 cmdline)。
+pub fn pid_pkg_fast_lookup(pid: i32) -> Option<String> {
+    PID_PKG.lock().unwrap().get(&pid).cloned()
+}
+
 pub fn pkg_track_pid(pid: i32, pkg: &str) {
     if pid > 0 && !pkg.is_empty() {
         crate::debug_log::debug_log(&format!("pkg_track_pid: pid={} pkg={}", pid, pkg));

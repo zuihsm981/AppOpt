@@ -336,6 +336,9 @@ fn main() {
         arm_periodic_ms(proc_timer_fd, 200);
     }
 
+    // KPM 模式 EV_PROC tick 计数: 200ms × 10 = 2s 周期 affinity_sync 兜底
+    let mut kpm_tick: u32 = 0;
+
     let mut events = [unsafe { std::mem::zeroed::<libc::epoll_event>() }; 8];
 
     loop {
@@ -433,41 +436,49 @@ fn main() {
                             ps.force_affinity = false;
                         }
                     } else if let Some(es) = ebpf_state.as_mut() {
-                        // KPM 模式: 200ms 定时重查 FORK 时未就绪的线程。
-                        // 两类场景:
-                        //  1. 线程名未确定 (pthread_setname_np 走 prctl 直接写
-                        //     task->comm, 不触发 task_rename tracepoint): 重读
-                        //     /proc comm 拿真实线程名 (如 HeapTaskDaemon) 重新
-                        //     匹配线程规则。
-                        //  2. Zygote fork 主线程时 cmdline 仍是 zygote64
-                        //     (setArgV0 未执行): 重查时 cmdline 已变包名,
-                        //     重新 comm_to_pkg 识别并应用包级规则。
-                        if es.cache.pending_rename.is_empty() {
+                        // KPM 模式: 200ms 定时器双职责。
+                        //  1. pending_rename 重查 (FORK 时线程名/cmdline 未就绪):
+                        //     pthread_setname_np 走 prctl 不触发 task_rename;
+                        //     Zygote fork 主线程时 cmdline 仍是 zygote64。
+                        //  2. 每 10 tick (2s) 轻量 affinity_sync 兜底: EXIT 探针
+                        //     恢复 APPLIED 过滤后, "线程在 applied_set 前退出"
+                        //     的漏报残留由 sync 的 ESRCH 清理 (get_affinity
+                        //     失败 → task_del), 不依赖 EXIT 事件。
+                        let has_pending = !es.cache.pending_rename.is_empty();
+                        kpm_tick += 1;
+                        let do_sync = kpm_tick >= 10;
+                        if !has_pending && !do_sync {
                             continue;
                         }
                         let Some(cfg) = cfg.as_ref() else { continue };
-                        let pending: Vec<(i32, (i32, String))> =
-                            es.cache.pending_rename.drain().collect();
-                        for (tid, (pid, pkg)) in pending {
-                            let Some(comm) = crate::apply_affinity::tid_comm(tid) else {
-                                // 线程已退出: EXIT 事件稍后清理, 此处跳过
-                                continue;
-                            };
-                            if pkg.is_empty() {
-                                // 场景 2: 重新识别包名 (cmdline 此刻已就绪)
-                                if let PkgMatch::Hit(pkg) =
-                                    crate::rule_match::comm_to_pkg(pid, &comm, cfg)
-                                {
+                        if has_pending {
+                            let pending: Vec<(i32, (i32, String))> =
+                                es.cache.pending_rename.drain().collect();
+                            for (tid, (pid, pkg)) in pending {
+                                let Some(comm) = crate::apply_affinity::tid_comm(tid) else {
+                                    // 线程已退出: sync 兜底清理, 此处跳过
+                                    continue;
+                                };
+                                if pkg.is_empty() {
+                                    // cmdline 未就绪场景: 重新识别包名
+                                    if let PkgMatch::Hit(pkg) =
+                                        crate::rule_match::comm_to_pkg(pid, &comm, cfg)
+                                    {
+                                        es.cache.task_apply(tid, pid, &pkg, &comm, cfg, |tid, cpus, cpuset_dir| {
+                                            crate::ebpf_mode::event_affinity_apply(tid, cpus, cpuset_dir, cfg, &es.bpf)
+                                        });
+                                    }
+                                } else {
+                                    // 线程名未确定场景: 重读线程名匹配线程规则
                                     es.cache.task_apply(tid, pid, &pkg, &comm, cfg, |tid, cpus, cpuset_dir| {
                                         crate::ebpf_mode::event_affinity_apply(tid, cpus, cpuset_dir, cfg, &es.bpf)
                                     });
                                 }
-                            } else {
-                                // 场景 1: 已知包名, 重读线程名匹配线程规则
-                                es.cache.task_apply(tid, pid, &pkg, &comm, cfg, |tid, cpus, cpuset_dir| {
-                                    crate::ebpf_mode::event_affinity_apply(tid, cpus, cpuset_dir, cfg, &es.bpf)
-                                });
                             }
+                        }
+                        if do_sync {
+                            kpm_tick = 0;
+                            es.cache.affinity_sync(&cfg.topo);
                         }
                     }
                 }
