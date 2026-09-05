@@ -315,6 +315,7 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
 
     let handle = KpmHandle { key };
     if !handle.verify_loaded() {
+        eprintln!("[AppOpt] KernelPatch 就绪但 appopt-kpm 模块未加载/未响应 ping");
         return None;
     }
 
@@ -327,23 +328,28 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
         .unwrap_or(0);
     let capacity = (pkgs_len * 2).max(512).next_power_of_two() as u32;
 
-    // ---- 建立事件传输通道: mmap 共享环 + eventfd 通知 (替代 drain 轮询) ----
-    // evt_fd: AppOpt 创建的 eventfd, 经 ctl0 shm_open 注册给内核; 内核探针
-    // 发布事件后 signal 之, reader 线程阻塞等待 (零周期轮询)。
+    // ---- 建立事件传输通道: mmap 共享环 + eventfd 通知 (仅此一种, 无 drain 回退) ----
     let evt_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     if evt_fd < 0 {
+        eprintln!(
+            "[AppOpt] eventfd 创建失败 errno={}",
+            std::io::Error::last_os_error()
+        );
         return None;
     }
     // ctl0 shm_open: 绑定 evt_fd(通知端) + 在当前进程安装可 mmap 的 anon fd
     let shm_fd = handle.shm_open(evt_fd);
     if shm_fd < 0 || shm_fd > i64::from(i32::MAX) {
+        eprintln!(
+            "[AppOpt] KPM ctl0 shm_open 失败 rc={} (模块需支持 mmap 共享环: shm_open)",
+            shm_fd
+        );
         unsafe { libc::close(evt_fd); }
         return None;
     }
     let shm_fd = shm_fd as c_int;
 
-    // 立即 mmap 并校验共享环头; 校验失败视为模块/客户端不匹配, 干净失败
-    // 让调用方回退 /proc (reader 线程不再负责映射, 避免启动后静默失联)。
+    // 立即 mmap 并校验共享环头; 校验失败视为模块/客户端不匹配
     let map_len = APPOPT_SHM_HDR_SIZE + APPOPT_EVENT_RING_SIZE as usize;
     let shm_base = unsafe {
         libc::mmap(
@@ -356,6 +362,10 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
         )
     };
     if shm_base == libc::MAP_FAILED {
+        eprintln!(
+            "[AppOpt] mmap 共享环失败 errno={}",
+            std::io::Error::last_os_error()
+        );
         unsafe { libc::close(evt_fd); }
         unsafe { libc::close(shm_fd); }
         return None;
@@ -369,6 +379,7 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
                 && (*hdr).ring_size == APPOPT_EVENT_RING_SIZE
         };
         if !ok {
+            eprintln!("[AppOpt] 共享环头校验失败: 内核模块与 AppOpt ABI 版本不匹配");
             unsafe { libc::munmap(shm_base, map_len); }
             unsafe { libc::close(evt_fd); }
             unsafe { libc::close(shm_fd); }
