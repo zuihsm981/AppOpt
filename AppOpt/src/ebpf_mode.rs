@@ -1,25 +1,19 @@
 //! eBPF 事件驱动模式 → KPM(Kernel Patch Module)事件驱动模式
 //!
-//! 原实现用 aya 加载 eBPF 程序并读 RingBuf; 现改为通过 KernelPatch SuperCall
-//! (syscall 45 = __NR_truncate) 与 appopt-kpm KPM 内核模块通信。
+//! 2025 改版 (binder 回调驱动, 移除 fork/rename/exit/exec 探针):
+//!   进程识别不再依赖内核探针事件; 改为通过 IProcessObserver binder 回调拿到
+//!   前台新 pid, 用户态 /proc/<pid>/cmdline 解析包名, 按规则分类后:
+//!     - CPU 规则应用 → ctl0 `pkg_pids <pid> <pkg>` 让内核用 pid 锚定进程
+//!       (find_task_by_vpid + 真实 comm, 白名单过滤) 返回该包所有进程+线程的
+//!       候选 tid 列表, 用户态逐 tid 计算规则写入 APPLIED 表并立即设亲和性;
+//!     - 刷新率应用 → 登记共享 PID_PKG 并通知刷新率模块。
+//!   内核共享环只承载 input 事件 (用户活动检测, eventfd 通知, SPSC)。
 //!
-//! 事件传输 (2025 改版): 不再让 reader 线程周期 supercall `drain` 轮询, 而是:
-//!   - ctl0 `shm_open <eventfd>` 让内核把 256KB 事件环 remap 为共享内存 fd,
-//!     并把 AppOpt 的 eventfd 注册为通知端;
-//!   - reader 线程 mmap 该 fd, 阻塞在 eventfd 上, 被内核探针 eventfd_signal
-//!     唤醒后直接从共享环消费事件 (SPSC, acquire/release 同步), 零轮询。
-//! 控制面 (白名单 / APPLIED 表 / start-stop) 仍走 ctl0 supercall。
-//!
-//! 内核侧等价逻辑在 AppOpt-kpm/appopt_kpm.c:
-//!   - tracepoint sched_process_fork/exec/exit + task_rename
-//!   - 内联挂钩 input_handle_event (1s 节流)
-//!   - 白名单(包名前 15 字节前缀匹配)、APPLIED tid 表、mmap 共享 256KB 事件环
-//! 事件结构 EbpfProcEvent 与内核 appopt_proc_event_t 布局完全一致 (28B),
-//! event_dispatch/affinity 逻辑与原先保持一致。
+//! 控制面 (白名单 / APPLIED 表 / pkg_pids / shm_open / start-stop) 走 ctl0 supercall。
+//! 内核侧等价逻辑在 AppOpt-kpm/appopt_kpm.c。
 
 use std::collections::HashSet;
 use std::ffi::CString;
-use std::fs;
 use std::os::raw::{c_char, c_int};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
@@ -30,7 +24,7 @@ use crate::cache::ProcCache;
 use crate::config::{AppConfig, CURRENT_CONFIG};
 use crate::cpuset::CpuSet;
 
-/// eBPF 进程事件, 布局需与内核态 appopt_proc_event_t 完全一致 (28B)
+/// eBPF/共享环 input 事件, 布局需与内核态 appopt_proc_event_t 完全一致 (28B)
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct EbpfProcEvent {
@@ -40,10 +34,6 @@ pub struct EbpfProcEvent {
     pub event_type: u32,
 }
 
-pub const EBPF_EVENT_FORK: u32 = 1;
-pub const EBPF_EVENT_EXEC: u32 = 2;
-pub const EBPF_EVENT_RENAME: u32 = 3;
-pub const EBPF_EVENT_EXIT: u32 = 4;
 pub const EBPF_EVENT_INPUT: u32 = 5;
 
 /* ================= mmap 共享内存事件环 (与内核 appopt_shm_t 布局一致) =================
@@ -186,7 +176,8 @@ impl KpmHandle {
         self.cmd("clear_applied");
     }
 
-    /// 设置白名单 (包名集合), 返回 true 表示失败需要回退
+    /// 设置白名单 (规则应用包名: CPU 规则包 ∪ 刷新率配置包), 供内核 pkg_pids
+    /// 做“规则应用”过滤; 返回 true 表示失败
     fn set_whitelist(&self, pkgs: &HashSet<String>) -> bool {
         let mut s = String::from("set_whitelist ");
         for (i, p) in pkgs.iter().enumerate() {
@@ -198,6 +189,25 @@ impl KpmHandle {
         let c = CString::new(s).unwrap_or_default();
         let mut out = [0u8; 16];
         kpm_ctl0(&self.key, &c, &mut out) >= 0
+    }
+
+    /// ctl0 `pkg_pids <pid> <pkg>`: 内核用 pid 锚定进程 (find_task_by_vpid + 真实
+    /// comm), 白名单过滤后返回该包所有进程 + 所有线程的候选 tid 列表 (含子进程
+    /// 线程)。失败/无候选时为空。
+    fn pkg_pids(&self, pid: i32, pkg: &str) -> Vec<i32> {
+        let s = format!("pkg_pids {} {}", pid, pkg);
+        let c = CString::new(s).unwrap_or_default();
+        let mut out = [0u8; 4096];
+        let rc = kpm_ctl0(&self.key, &c, &mut out);
+        if rc <= 0 {
+            return Vec::new();
+        }
+        let end = out.iter().position(|&b| b == 0).unwrap_or(out.len());
+        std::str::from_utf8(&out[..end])
+            .unwrap_or("")
+            .split_whitespace()
+            .filter_map(|t| t.parse::<i32>().ok())
+            .collect()
     }
 
     /// 建立 mmap 共享环 + eventfd 通知 (ctl0 `shm_open <eventfd_fd>`)。
@@ -216,12 +226,6 @@ impl KpmHandle {
     }
 }
 
-/// 将内核 comm 截断于首个 NUL 并 trim 尾部空白
-fn comm_str(comm: &[u8; 16]) -> &str {
-    let end = comm.iter().position(|&b| b == 0).unwrap_or(16);
-    std::str::from_utf8(&comm[..end]).unwrap_or("").trim()
-}
-
 pub struct EbpfState {
     pub event_rx: mpsc::Receiver<EbpfProcEvent>,
     pub reader_thread: Option<thread::JoinHandle<()>>,
@@ -236,7 +240,6 @@ pub struct EbpfState {
     pub evt_fd: c_int,
     /// ctl0 shm_open 返回的可 mmap 共享环 fd (内核 anon inode)
     pub shm_fd: c_int,
-    pub comm_capacity: u32,
 }
 
 impl Drop for EbpfState {
@@ -280,30 +283,6 @@ pub fn kpm_probe() -> bool {
     handle.ping()
 }
 
-/// 查找 Zygote 相关进程的所有线程 tid
-/// (cmdline 匹配 zygote/app_process/usap 前缀, 覆盖 zygote/zygote64/app_process32/app_process64/usap)
-fn find_zygote_tids() -> Vec<i32> {
-    let mut tids = Vec::new();
-    if let Ok(entries) = fs::read_dir("/proc") {
-        for entry in entries.flatten() {
-            let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else { continue };
-            let Ok(cmdline) = fs::read(format!("/proc/{}/cmdline", pid)) else { continue };
-            let s = String::from_utf8_lossy(&cmdline);
-            if !(s.starts_with("zygote") || s.starts_with("app_process") || s.starts_with("usap")) {
-                continue;
-            }
-            if let Ok(task_dir) = fs::read_dir(format!("/proc/{}/task", pid)) {
-                for t in task_dir.flatten() {
-                    if let Ok(tid) = t.file_name().to_string_lossy().parse::<i32>() {
-                        tids.push(tid);
-                    }
-                }
-            }
-        }
-    }
-    tids
-}
-
 /// 初始化 KPM 事件驱动: 确保模块加载, 启动 reader 线程
 /// 失败返回 None, 由调用方回退 /proc 轮询。
 /// kpm_wake_fd 由主循环创建并注册 epoll, reader 收到事件后写入以唤醒主循环。
@@ -320,12 +299,6 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
 
     // 配置 input 节流 (与 eBPF 默认 1s 一致)
     handle.cmd("input_ms 1000");
-
-    let pkgs_len = crate::lock_ignore_poison(&CURRENT_CONFIG)
-        .as_ref()
-        .map(|cfg| cfg.pkgs.len())
-        .unwrap_or(0);
-    let capacity = (pkgs_len * 2).max(512).next_power_of_two() as u32;
 
     // ---- 建立事件传输通道: mmap 共享环 + eventfd 通知 (仅此一种, 无 drain 回退) ----
     let evt_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
@@ -392,8 +365,8 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
         kpm_shm_reader(shm_ptr, map_len, evt_fd, tx, wakeup_fd, kpm_wake_fd);
     });
 
-    /* 先设置白名单再激活: start 注册 tracepoint 后立即开始过滤事件,
-     * 若白名单为空则所有新进程事件被丢弃, 导致直接打开应用不设置亲和性 */
+    /* 先设置白名单 (规则应用: CPU 规则包 ∪ 刷新率配置包 ∪ 桌面), 供内核
+     * pkg_pids 做“规则应用”过滤; 再激活 affinity/input 钩子。 */
     let mut pkgs = crate::lock_ignore_poison(&CURRENT_CONFIG)
         .as_ref()
         .map(|cfg| cfg.target_pkgs.clone())
@@ -404,14 +377,6 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
     handle.set_whitelist(&pkgs);
     handle.activate();
 
-    /* 把 Zygote 加入 APPLIED 表 (bits=0): Zygote fork 出的子进程
-     * (如 com.bilibili.app.in:ijkservice) 会在 FORK 探针中被占位,
-     * RENAME 时 tracked=true 直接通过, 无需依赖 whitelist_matched。
-     * bits=0 不影响 Zygote 自身 (sched_setaffinity kprobe 见 bits=0 不干预)。 */
-    for tid in find_zygote_tids() {
-        handle.applied_set(tid, 0);
-    }
-
     Some(EbpfState {
         event_rx: rx,
         reader_thread: Some(reader_thread),
@@ -421,7 +386,6 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
         kpm_wake_fd,
         evt_fd,
         shm_fd,
-        comm_capacity: capacity,
     })
 }
 
@@ -551,111 +515,125 @@ fn kpm_shm_reader(
     unsafe { libc::munmap(base, map_len); }
 }
 
-/// 配置白名单; 返回 true 表示需重载 (KPM 白名单容量固定 16384, 不会触发)
-pub fn comm_map_init(bpf: &mut KpmHandle, pkgs: &HashSet<String>, _comm_capacity: u32) -> bool {
-    let mut refresh_pkgs = pkgs.clone();
-    refresh_pkgs.insert(crate::config::DEFAULT_REFRESH_PACKAGE.to_string());
-    refresh_pkgs.insert(crate::config::DEFAULT_REFRESH_COMM.to_string());
-    if !bpf.set_whitelist(&refresh_pkgs) {
-        return true;
-    }
-    false
-}
+/* ================= binder 回调驱动的进程识别流程 =================
+ * 移除 fork/rename/exit/exec 探针后, 进程识别入口改为 IProcessObserver
+ * binder 回调 (process_observer.rs → main 循环):
+ *   1) 收到 pid
+ *   2) 已在 pid_pkg     -> 只通知刷新率模块
+ *   3) 已在 pid_pkg_no  -> 不做任何动作
+ *   4) 否则 /proc/<pid>/cmdline 解析包名, 检查是否为规则应用
+ *   5) CPU 规则应用 → 内核 pkg_pids(pid,包名) 生成候选 tid 列表; 刷新率应用 → 刷新率模块
+ *   6) 内核返回候选 tid 列表 (该包所有进程 + 所有线程, 含子进程线程)
+ *      交给用户态逐 tid 处理 (计算规则 + applied_set)
+ *   7) 非规则应用 -> 只登记 pid_pkg_no
+ *   8) 处理完成后把 pid(+候选) 登记到 pid_pkg
+ */
 
-fn applied_set(bpf: &KpmHandle, tid: i32, cpus: &CpuSet) {
-    bpf.applied_set(tid, cpus.bits[0]);
-}
-
-fn applied_del(bpf: &KpmHandle, tid: i32) {
-    bpf.applied_del(tid);
-}
-
-fn applied_clear(bpf: &KpmHandle) {
-    bpf.applied_clear();
-}
-
-/// 事件驱动路径: 只更新 APPLIED 表 (供 sched_setaffinity kprobe 拦截),
-/// 不立即设置亲和性/放置 cpuset。实际设置由主循环定期 affinity_sync
-/// 在应用完全启动、任务稳定后统一执行 (先 cpuset 后亲和性)。
-fn affinity_apply(
-    tid: i32,
-    cpus: &CpuSet,
-    _cpuset_dir: &str,
-    _cfg: &AppConfig,
-    bpf: &KpmHandle,
-) -> bool {
-    applied_set(bpf, tid, cpus);
-    false
-}
-
-/// 事件派发, 按 event_type 增量处理 FORK/RENAME/EXEC/EXIT (与 aya 版一致)
-pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfState) {
-    let tid = event.tid;
-    let pid = event.pid;
-    let comm = comm_str(&event.comm);
-
-    match event.event_type {
-        EBPF_EVENT_EXIT => {
-            // task_del 会在该 PID 的最后一个线程退出后再移除共享索引；
-            // 不能在单个线程退出时无条件删除 PID→包名映射。
-            state.cache.task_del(tid);
-            applied_del(&state.bpf, tid);
-        }
-
-        EBPF_EVENT_EXEC => {
-            // EXEC 可能复用同一个 pid，先清掉旧进程的任务和 PID_PKG 映射，
-            // 再用新的 cmdline/comm 重新识别，避免沿用旧包名。
-            state.cache.pid_exec(pid);
-            if !event_apply(&mut state.cache, &state.bpf, tid, pid, comm, cfg) {
-                applied_del(&state.bpf, tid);
-            }
-        }
-
-        EBPF_EVENT_FORK => {
-            // 子线程继承父线程亲和性与 cpuset
-            // 内核态已插入 APPLIED 表占位, RENAME 时触发完整处理
-        }
-
-        EBPF_EVENT_RENAME => {
-            event_apply(&mut state.cache, &state.bpf, tid, pid, comm, cfg);
-        }
-
-        EBPF_EVENT_INPUT => {
-            crate::refresh::refresh_on_event(EBPF_EVENT_INPUT, 0);
-        }
-
-        _ => {}
+/// 事件派发: 共享环只承载 input 事件 (用户活动检测)
+pub fn event_dispatch(event: &EbpfProcEvent, _cfg: &AppConfig, _state: &mut EbpfState) {
+    if event.event_type == EBPF_EVENT_INPUT {
+        crate::refresh::refresh_on_event(EBPF_EVENT_INPUT, 0);
     }
 }
 
-/// 统一事件处理 pkg_lookup_comm 到 task_apply
-fn event_apply(
-    cache: &mut ProcCache,
-    bpf: &KpmHandle,
-    tid: i32,
-    pid: i32,
-    comm: &str,
-    cfg: &AppConfig,
-) -> bool {
-    let pkg_result = cache.pkg_lookup_comm(pid, comm, cfg);
-    let Some(pkg) = pkg_result else {
-        return false;
+/// binder 回调: 前台新 pid → 8 步流程
+pub fn handle_binder_pid(state: &mut EbpfState, pid: i32, cfg: &AppConfig) {
+    if pid <= 0 {
+        return;
+    }
+    // 2) 已在 pid_pkg: 只发刷新率模块
+    if state.cache.pid_known(pid) {
+        crate::refresh::refresh_on_fg_pid(pid);
+        return;
+    }
+    // 3) 已在 pid_pkg_no: 不做任何动作
+    if state.cache.pid_negative(pid) {
+        return;
+    }
+    // 4) proc 解析包名
+    let comm = tid_comm(pid).unwrap_or_default();
+    let pkg = crate::rule_match::comm_to_pkg(pid, &comm, cfg).or_else(|| {
+        // 默认桌面不在 target_pkgs (无 CPU/刷新率专属规则), 但属于刷新率管理范围
+        crate::apply_affinity::read_cmdline(pid)
+            .filter(|c| c == crate::config::DEFAULT_REFRESH_PACKAGE)
+            .map(|_| crate::config::DEFAULT_REFRESH_PACKAGE.to_string())
+    });
+    let Some(pkg) = pkg else {
+        // 7) 非规则应用: 只登记 pid_pkg_no
+        state.cache.cache_negative(pid, comm.as_str());
+        return;
     };
-
-    cache.task_apply(tid, pid, &pkg, comm, cfg, |t, c, d| {
-        affinity_apply(t, c, d, cfg, bpf)
-    })
+    let is_cpu = cfg.pkgs.contains(&pkg);
+    let is_ref = cfg.app_refresh_configs.contains_key(&pkg)
+        || pkg == crate::config::DEFAULT_REFRESH_PACKAGE;
+    if !is_cpu && !is_ref {
+        // 7) 非规则应用
+        state.cache.cache_negative(pid, comm.as_str());
+        return;
+    }
+    // 5)+6) CPU 规则应用: 内核 pkg_pids(pid,包名) 锚定进程并返回候选 tid 列表 → 用户态逐 tid 处理
+    if is_cpu {
+        apply_cpu_pkg(state, pid, &pkg, cfg);
+    }
+    if is_ref {
+        // 5)+8) 刷新率应用: 登记 PID_PKG 并立即通知刷新率模块
+        state.cache.register_known(pid, &pkg);
+        crate::refresh::refresh_on_fg_pid(pid);
+    } else {
+        // 8) CPU 应用处理完成后登记 pid_pkg
+        state.cache.register_known(pid, &pkg);
+    }
 }
 
-/// 周期重钉已由内核 sched_setaffinity 拦截接管 (KPM 模式); /proc 回退模式仍用 affinity_sync
+/// binder 回调: 进程退出 → 清理该 pid 的缓存/APPLIED/PID_PKG (防 pid 复用)
+pub fn handle_binder_died(state: &mut EbpfState, pid: i32) {
+    if pid <= 0 {
+        return;
+    }
+    let tids = state.cache.tids_of_pid(pid);
+    for t in tids {
+        state.bpf.applied_del(t);
+    }
+    state.cache.pid_exec(pid);
+}
+
+/// 步骤 5/6: CPU 规则应用 — 内核 pkg_pids 返回该包所有进程 + 所有线程的
+/// 候选 tid 列表 (含子进程线程); 用户态逐 tid 计算规则写入 APPLIED 表并
+/// 立即设置亲和性; 处理完成后把 pid 和包名登记到 pid_pkg。
+fn apply_cpu_pkg(state: &mut EbpfState, pid: i32, pkg: &str, cfg: &AppConfig) {
+    // 6) 内核候选 tid 列表 (pid 锚定 + 白名单过滤, 含子进程的线程)
+    let mut cands = state.bpf.pkg_pids(pid, pkg);
+    if !cands.contains(&pid) {
+        cands.push(pid);
+    }
+    // 逐候选 tid 计算线程规则 (线程规则按 tid comm 匹配, 无则走包级 fallback)
+    let mut apply: Vec<(i32, CpuSet, String)> = Vec::new();
+    for tid in &cands {
+        let tname = if cfg.has_thread_rules.contains(pkg) {
+            tid_comm(*tid).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        if let Some(r) = crate::rule_match::thread_affinity(pkg, &tname, cfg) {
+            apply.push((*tid, r.cpus, r.cpuset_dir));
+        }
+    }
+    // 内核 APPLIED 表 (sched_setaffinity 拦截覆盖) + 立即设置亲和性
+    for (tid, cpus, _) in &apply {
+        state.bpf.applied_set(*tid, cpus.bits[0]);
+    }
+    for (tid, cpus, dir) in &apply {
+        let _ = crate::apply_affinity::affinity_set(*tid, cpus, dir, &cfg.topo);
+    }
+    // 8) 处理完成后把 pid 和包名登记到 pid_pkg (pid -> pkg)
+    state.cache.register_known(pid, pkg);
+}
 
 /// 启动或配置更新时全量扫描 /proc
 pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
     state.cache.clear();
 
-    // full_scan 时额外扫描当前已经存在的默认桌面进程。
-    // 当前系统中该进程的 comm 为 droid.launcher3；它不需要 CPU 规则，
-    // 但必须进入共享 PID_PKG，并绑定全局刷新率配置。
+    // 默认桌面: 不需要 CPU 规则, 但必须进入共享 PID_PKG, 并绑定全局刷新率配置。
     let mut launcher_found = false;
     if let Ok(entries) = std::fs::read_dir("/proc") {
         for entry in entries.flatten() {
@@ -670,14 +648,7 @@ pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
         crate::refresh::refresh_bind_default_launcher();
     }
 
-    applied_clear(&state.bpf);
-    /* full_scan 清空了 APPLIED 表, Zygote 的 tid 也随之丢失。
-     * 必须重新把 Zygote 加入 APPLIED (bits=0), 否则之后 Zygote fork 的
-     * 子进程无法被 FORK 探针占位, RENAME 事件被过滤, 子进程匹配不到。 */
-    for tid in find_zygote_tids() {
-        state.bpf.applied_set(tid, 0);
-    }
-
+    state.bpf.applied_clear();
     proc_walk(cfg, |_| true, |pid, pkg, has_thread_rules| {
         let Some(tids) = task_tids(pid) else { return };
         for tid in tids {
@@ -686,15 +657,14 @@ pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
             } else {
                 String::new()
             };
-            state.cache.task_apply(tid, pid, pkg, &t_name, cfg, |tid, cpus, cpuset_dir| {
-                affinity_apply(tid, cpus, cpuset_dir, cfg, &state.bpf)
+            state.cache.task_apply(tid, pid, pkg, &t_name, cfg, |tid, cpus, _cpuset_dir| {
+                state.bpf.applied_set(tid, cpus.bits[0]);
+                false
             });
         }
     });
 
-    /* full_scan 本身包含实际应用: 立即对 cache 内全部任务执行
-     * affinity_sync (仅设置 CPU 亲和性, 不做 cpuset 放置)。
-     * 依赖此点: 配置更新后无论是否有后续进程事件, 亲和性都会立即生效,
-     * 不依赖事件驱动定时; 调用方无需在 full_scan 后再调一次 affinity_sync。 */
+    /* full_scan 本身包含实际应用: 立即对 cache 内全部任务执行 affinity_sync
+     * (仅设置 CPU 亲和性)。依赖此点: 配置更新后亲和性立即生效。 */
     state.cache.affinity_sync(&cfg.topo);
 }

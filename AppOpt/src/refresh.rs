@@ -57,6 +57,9 @@ enum RefreshEvent {
     Input,
     /// full_scan 发现已存在的默认桌面后，要求刷新线程绑定全局配置。
     BindDefaultLauncher,
+    /// binder 回调流程 (ebpf_mode::handle_binder_pid) 送来的前台 pid:
+    /// 刷新线程查 PID_PKG 应用或登记 REFRESH_PENDING_PID 等待冷启动结果。
+    FgPid(i32),
     /// cache 层写入 PID_PKG 后通知：若该 pid 正是线程等待的前台 pid，立即应用刷新率。
     PkgTracked(i32),
 }
@@ -67,7 +70,7 @@ struct AppRefreshConfig {
     idle_mode: i32,
 }
 
-struct RefreshState {
+pub struct RefreshState {
     timeout_seconds: i32,
     active_mode: i32,
     idle_mode: i32,
@@ -243,7 +246,21 @@ fn try_apply_fg(state: &mut RefreshState, pid: i32) -> bool {
     true
 }
 
-/// IProcessObserver 回调触发：收到 pid 后先试应用刷新率。
+/// binder 回调流程 (ebpf_mode::handle_binder_pid) 收到前台 pid 后通知刷新率线程。
+/// 线程内先查共享 PID_PKG 直接应用; 冷启动竞态 (PID_PKG 尚未填充) 时登记
+/// REFRESH_PENDING_PID, 待 cache 层 pkg_track_pid 写入后由 PkgTracked 事件驱动。
+pub fn refresh_on_fg_pid(pid: i32) {
+    if pid <= 0 {
+        return;
+    }
+    let guard = REFRESH_TX.lock().unwrap();
+    if let Some(tx) = guard.as_ref() {
+        let _ = tx.send(RefreshEvent::FgPid(pid));
+        wake();
+    }
+}
+
+/// IProcessObserver 回调触发: 收到 pid 后先试应用刷新率。
 /// 冷启动竞态：新进程 fg 回调可能早于 KPM 事件处理完成、PID_PKG 尚未填充，
 /// 此时登记 REFRESH_PENDING_PID；cache 层 pkg_track_pid 命中该 pid 时通过
 /// mpsc 事件通知刷新率线程立即应用（事件驱动，无轮询、无超时兜底）。
@@ -322,34 +339,8 @@ pub fn refresh_init() {
     }
     WAKE_FD.store(wake_fd, Ordering::Release);
 
-    // IProcessObserver 回调用 socketpair(SOCK_DGRAM) 传递包名（字符串），不再传 uid
-    let mut fg_sv: [libc::c_int; 2] = [0, 0];
-    if unsafe {
-        libc::socketpair(
-            libc::AF_UNIX,
-            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-            0,
-            fg_sv.as_mut_ptr(),
-        )
-    } != 0
-    {
-        unsafe { libc::close(wake_fd); }
-        return;
-    }
-    let fg_recv_fd = fg_sv[0];
-    let fg_send_fd = fg_sv[1];
-
-    // 增大 socketpair 接收缓冲（默认可能只有几十 KB），减少 fg 事件堆积溢出
-    let rcvbuf: libc::c_int = 256 * 1024;
-    unsafe {
-        libc::setsockopt(
-            fg_recv_fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            &rcvbuf as *const libc::c_int as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-    }
+    // binder 回调 (IProcessObserver) socketpair 已移交主循环 (main.rs / ebpf_mode);
+    // 本线程通过 refresh_on_fg_pid → RefreshEvent::FgPid 接收前台 pid。
 
     let timer_fd = unsafe {
         libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC | libc::TFD_NONBLOCK)
@@ -388,8 +379,8 @@ pub fn refresh_init() {
     let active = state.current_active;
     set_refresh_rate(&mut state, active);
 
-    // 注册 IProcessObserver 回调（回调只传 pid，包名由共享 ProcCache 查询）
-    let _ = crate::process_observer::init_observer(fg_send_fd);
+    // 注册 IProcessObserver 回调已移交主循环 (binder 流程统一分发)。
+    // 刷新率线程只消费 refresh_on_fg_pid 送来的 FgPid 事件。
 
     let name = CString::new("RefreshRate").unwrap();
     thread::spawn(move || {
@@ -408,19 +399,12 @@ pub fn refresh_init() {
         ev.u64 = 1;
         unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, timer_fd, &mut ev); }
 
-        // fg socketpair 读端: IProcessObserver 回调通知 (u64=3)
-        ev.events = libc::EPOLLIN as u32;
-        ev.u64 = 3;
-        unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fg_recv_fd, &mut ev); }
-
-        let mut events: [libc::epoll_event; 3] = unsafe { std::mem::zeroed() };
-        // fg socketpair 接收缓冲（4 字节 pid i32）
-        let mut fg_buf = [0u8; 4];
+        let mut events: [libc::epoll_event; 2] = unsafe { std::mem::zeroed() };
 
         loop {
             // 事件驱动：阻塞等待事件；无轮询、无超时兜底。
             // 冷启动竞态由 cache 层 pkg_track_pid → PkgTracked 事件直接解决。
-            let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 3, -1) };
+            let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 2, -1) };
             if n < 0 {
                 if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                     continue;
@@ -439,6 +423,11 @@ pub fn refresh_init() {
                                 RefreshEvent::BindDefaultLauncher => {
                                     bind_default_launcher(&mut state)
                                 }
+                                // binder 回调流程送来的前台 pid: 查 PID_PKG 应用,
+                                // 冷启动竞态时登记 REFRESH_PENDING_PID 等待 PkgTracked。
+                                RefreshEvent::FgPid(pid) => {
+                                    handle_fg_change(&mut state, pid)
+                                }
                                 // cache 层 pkg_track_pid 命中待解析前台 pid 的通知。
                                 // 事件驱动：收到即应用并清除等待标记。
                                 RefreshEvent::PkgTracked(pid) => {
@@ -456,22 +445,6 @@ pub fn refresh_init() {
                         unsafe { libc::read(timer_fd, &mut val as *mut _ as *mut _, 8); }
                         switch_to_idle(&mut state);
                     }
-                    3 => {
-                        // IProcessObserver 回调: 读取 pid（socketpair datagram，4 字节 i32），
-                        // 包名由 handle_fg_change 从共享 ProcCache 查询
-                        let n = unsafe {
-                            libc::recv(
-                                fg_recv_fd,
-                                fg_buf.as_mut_ptr() as *mut libc::c_void,
-                                fg_buf.len(),
-                                0,
-                            )
-                        };
-                        if n == 4 {
-                            let pid = i32::from_ne_bytes([fg_buf[0], fg_buf[1], fg_buf[2], fg_buf[3]]);
-                            handle_fg_change(&mut state, pid);
-                        }
-                    }
                     _ => {}
                 }
             }
@@ -482,8 +455,6 @@ pub fn refresh_init() {
             libc::close(epfd);
             libc::close(wake_fd);
             libc::close(timer_fd);
-            libc::close(fg_recv_fd);
-            libc::close(fg_send_fd);
         }
     });
 }

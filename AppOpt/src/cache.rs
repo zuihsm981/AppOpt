@@ -112,6 +112,35 @@ impl ProcCache {
         self.negative_pids.clear();
     }
 
+    /// binder 流程第 2 步: 该 pid 是否已在 pid_pkg (规则应用正缓存)
+    pub fn pid_known(&self, pid: i32) -> bool {
+        self.pid_pkgs.contains_key(&pid)
+    }
+
+    /// binder 流程第 3 步: 该 pid 是否已在 pid_pkg_no (非规则应用负缓存)
+    pub fn pid_negative(&self, pid: i32) -> bool {
+        self.negative_pids.contains_key(&pid)
+    }
+
+    /// binder 流程第 7 步: 登记 pid_pkg_no (pid -> comm)
+    pub fn cache_negative(&mut self, pid: i32, comm: &str) {
+        self.negative_pids.insert(pid, comm.to_string());
+    }
+
+    /// binder 流程第 8 步: 处理完成后登记 pid_pkg (正缓存 + 共享 PID_PKG)
+    pub fn register_known(&mut self, pid: i32, pkg: &str) {
+        self.pid_pkgs.insert(pid, pkg.to_string());
+        pkg_track_pid(pid, pkg);
+    }
+
+    /// 某 pid 下当前缓存的全部 tid (供进程退出时清理 APPLIED)
+    pub fn tids_of_pid(&self, pid: i32) -> Vec<i32> {
+        self.tasks
+            .iter()
+            .filter_map(|(&tid, e)| (e.pid == pid).then_some(tid))
+            .collect()
+    }
+
     pub fn clear(&mut self) {
         self.tasks.clear();
         self.pid_pkgs.clear();
