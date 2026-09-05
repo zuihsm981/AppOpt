@@ -22,7 +22,6 @@ use std::thread;
 use crate::apply_affinity::{proc_walk, task_tids, tid_comm};
 use crate::cache::ProcCache;
 use crate::config::{AppConfig, CURRENT_CONFIG};
-use crate::cpuset::CpuSet;
 
 /// eBPF/共享环 input 事件, 布局需与内核态 appopt_proc_event_t 完全一致 (28B)
 #[repr(C)]
@@ -597,34 +596,29 @@ pub fn handle_binder_died(state: &mut EbpfState, pid: i32) {
     state.cache.pid_exec(pid);
 }
 
-/// 步骤 5/6: CPU 规则应用 — 内核 pkg_pids 返回该包所有进程 + 所有线程的
-/// 候选 tid 列表 (含子进程线程); 用户态逐 tid 计算规则写入 APPLIED 表并
-/// 立即设置亲和性; 处理完成后把 pid 和包名登记到 pid_pkg。
+/// 步骤 5/6: CPU 规则应用 — 内核 pkg_pids(pid,包名) 返回候选 tid 列表;
+/// 复用 cache.task_apply (与 full_scan/事件路径一致) 登记任务/命中计数/PID_PKG,
+/// 写入 APPLIED 表, 并立即设置亲和性; 处理完成后登记 pid→包名到 pid_pkg。
 fn apply_cpu_pkg(state: &mut EbpfState, pid: i32, pkg: &str, cfg: &AppConfig) {
-    // 6) 内核候选 tid 列表 (pid 锚定 + 白名单过滤, 含子进程的线程)
+    // 6) 内核候选 tid 列表 (pid 锚定, 白名单过滤; 进程主线程 + 全部线程)
     let mut cands = state.bpf.pkg_pids(pid, pkg);
     if !cands.contains(&pid) {
         cands.push(pid);
     }
-    // 逐候选 tid 计算线程规则 (线程规则按 tid comm 匹配, 无则走包级 fallback)
-    let mut apply: Vec<(i32, CpuSet, String)> = Vec::new();
+    // 逐候选 tid 走 task_apply: 线程规则按 tid comm, 无则包级 fallback
     for tid in &cands {
         let tname = if cfg.has_thread_rules.contains(pkg) {
             tid_comm(*tid).unwrap_or_default()
         } else {
             String::new()
         };
-        if let Some(r) = crate::rule_match::thread_affinity(pkg, &tname, cfg) {
-            apply.push((*tid, r.cpus, r.cpuset_dir));
-        }
+        state.cache.task_apply(*tid, pid, pkg, &tname, cfg, |t, cpus, _d| {
+            state.bpf.applied_set(t, cpus.bits[0]);
+            false
+        });
     }
-    // 内核 APPLIED 表 (sched_setaffinity 拦截覆盖) + 立即设置亲和性
-    for (tid, cpus, _) in &apply {
-        state.bpf.applied_set(*tid, cpus.bits[0]);
-    }
-    for (tid, cpus, dir) in &apply {
-        let _ = crate::apply_affinity::affinity_set(*tid, cpus, dir, &cfg.topo);
-    }
+    // 立即亲和性 (含新登记 tid)
+    state.cache.affinity_sync(&cfg.topo);
     // 8) 处理完成后把 pid 和包名登记到 pid_pkg (pid -> pkg)
     state.cache.register_known(pid, pkg);
 }
