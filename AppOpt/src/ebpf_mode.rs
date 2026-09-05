@@ -315,7 +315,6 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
 
     let handle = KpmHandle { key };
     if !handle.verify_loaded() {
-        eprintln!("[AppOpt] KernelPatch 就绪但 appopt-kpm 模块未加载/未响应 ping");
         return None;
     }
 
@@ -331,19 +330,11 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
     // ---- 建立事件传输通道: mmap 共享环 + eventfd 通知 (仅此一种, 无 drain 回退) ----
     let evt_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     if evt_fd < 0 {
-        eprintln!(
-            "[AppOpt] eventfd 创建失败 errno={}",
-            std::io::Error::last_os_error()
-        );
         return None;
     }
     // ctl0 shm_open: 绑定 evt_fd(通知端) + 在当前进程安装可 mmap 的 anon fd
     let shm_fd = handle.shm_open(evt_fd);
     if shm_fd < 0 || shm_fd > i64::from(i32::MAX) {
-        eprintln!(
-            "[AppOpt] KPM ctl0 shm_open 失败 rc={} (模块需支持 mmap 共享环: shm_open)",
-            shm_fd
-        );
         unsafe { libc::close(evt_fd); }
         return None;
     }
@@ -362,10 +353,6 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
         )
     };
     if shm_base == libc::MAP_FAILED {
-        eprintln!(
-            "[AppOpt] mmap 共享环失败 errno={}",
-            std::io::Error::last_os_error()
-        );
         unsafe { libc::close(evt_fd); }
         unsafe { libc::close(shm_fd); }
         return None;
@@ -379,14 +366,6 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
                 && (*hdr).ring_size == APPOPT_EVENT_RING_SIZE
         };
         if !ok {
-            let (magic, ver, ev, ring) = unsafe {
-                ((*hdr).magic, (*hdr).version, (*hdr).event_size, (*hdr).ring_size)
-            };
-            eprintln!(
-                "[AppOpt] 共享环头校验失败: 实际(magic={:#010x} ver={} ev={} ring={}) 期望(magic={:#010x} ver={} ev={} ring={})",
-                magic, ver, ev, ring,
-                APPOPT_SHM_MAGIC, APPOPT_SHM_VERSION, APPOPT_EVENT_SZ, APPOPT_EVENT_RING_SIZE
-            );
             unsafe { libc::munmap(shm_base, map_len); }
             unsafe { libc::close(evt_fd); }
             unsafe { libc::close(shm_fd); }
