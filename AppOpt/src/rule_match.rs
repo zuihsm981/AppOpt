@@ -105,7 +105,7 @@ pub(crate) fn comm_fast_to_pkg(comm: &str, cfg: &AppConfig) -> Option<String> {
 
 /// 仅用于 cmdline 不可读时的安全截断回退。
 /// 必须只有一个包名拥有该明确前缀，避免同一截断 comm 对应多个包。
-pub(crate) fn comm_prefix_fallback(comm: &str, cfg: &AppConfig) -> Option<String> {
+fn comm_prefix_fallback(comm: &str, cfg: &AppConfig) -> Option<String> {
     if comm.len() < 15 {
         return None;
     }
@@ -122,42 +122,27 @@ pub(crate) fn comm_prefix_fallback(comm: &str, cfg: &AppConfig) -> Option<String
     found.cloned()
 }
 
-/// 包名匹配结果三态：
-/// - Hit(pkg):     已确认目标包
-/// - Miss:         cmdline 可读且确认非目标（可安全写负缓存）
-/// - Unknown:      cmdline 不可读（进程刚启动瞬时状态），comm/前缀也未命中。
-///                 不写负缓存，后续事件/扫描可重试，避免永久误挡。
-pub enum PkgMatch {
-    Hit(String),
-    Miss,
-    Unknown,
-}
-
 /// 通过 comm 识别配置包名。
 ///
 /// 每个未知 PID 最多执行一次 cmdline 读取（由 ProcCache 缓存结果）；
 /// cmdline 可读时以完整包名为唯一权威，comm 只在 cmdline 不可读时按
 /// 明确的 15 字节截断前缀回退。不再使用 8 字节滑动键，避免
 /// air.tv.douyu.android 的 ".android" 键误命中 com.android.* 进程。
-pub fn comm_to_pkg(pid: i32, comm: &str, cfg: &AppConfig) -> PkgMatch {
-    // cmdline 可读: 以 cmdline 为权威（即使 comm 像包名也校验，防伪造/误命名）
+pub fn comm_to_pkg(pid: i32, comm: &str, cfg: &AppConfig) -> Option<String> {
+    let fast = comm_fast_to_pkg(comm, cfg);
+
+    // 即使 comm 看起来像包名，也优先用进程 cmdline 校验，防止伪造/误命名。
     if let Some(cmd) = read_cmdline(pid) {
         for pkg in &cfg.target_pkgs {
             if cmd == pkg.as_str()
                 || cmd.strip_prefix(pkg.as_str()).is_some_and(|rest| rest.starts_with(':'))
             {
-                return PkgMatch::Hit(pkg.clone());
+                return Some(pkg.clone());
             }
         }
-        // cmdline 明确可读且不是任何目标包 → 确认非目标
-        return PkgMatch::Miss;
+        return None;
     }
 
-    // cmdline 不可读（进程刚启动/瞬时状态）: 仅保留安全的完整 comm/截断前缀回退。
-    let fast = comm_fast_to_pkg(comm, cfg);
-    if let Some(pkg) = fast.or_else(|| comm_prefix_fallback(comm, cfg)) {
-        return PkgMatch::Hit(pkg);
-    }
-    // 未命中且无法确认 → 瞬时未知, 不写负缓存
-    PkgMatch::Unknown
+    // 进程已退出或 cmdline 不可读时，仅保留安全的完整 comm/截断前缀回退。
+    fast.or_else(|| comm_prefix_fallback(comm, cfg))
 }

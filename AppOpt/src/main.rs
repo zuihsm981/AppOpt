@@ -6,7 +6,6 @@ mod apply_affinity;
 mod cache;
 mod config;
 mod cpuset;
-mod debug_log;
 mod ebpf_mode;
 mod proc_mode;
 mod process_observer;
@@ -28,10 +27,10 @@ use crate::config::{
 };
 use crate::cpuset::{init_cpu_topo, set_base_cpuset};
 use crate::ebpf_mode::{
-    full_scan, event_dispatch, comm_map_init, ebpf_init, EbpfState,
+    full_scan, event_dispatch, comm_map_init, EBPF_EVENT_FORK, EBPF_EVENT_EXEC,
+    EBPF_EVENT_RENAME, ebpf_init, EbpfState,
 };
 use crate::proc_mode::{cache_sync, ProcScanState};
-use crate::rule_match::PkgMatch;
 use crate::web::{
     cache_stats, settings_load, settings_save, web_start, WebStats,
     WEB_ENABLED, WEB_STATS, MODE_FORCE, MODE_SWITCH_FD, SETTINGS_FILE,
@@ -86,10 +85,6 @@ fn print_help(prog_name: &str) {
 fn main() {
     let args: Vec<String> = env::args().collect();
     let prog_name = &args[0];
-
-    // 调试日志初始化 (追加 /data/local/tmp/appopt_debug.log, 线程安全)
-    crate::debug_log::init_debug_log();
-    crate::debug_log::debug_log("=== AppOpt start ===");
 
     // 参数解析先行，-v/-h/错误用法在设置加载前退出，不产生文件副作用
     let (mut cli_cfg, mut cli_interval, mut cli_cpuset, mut cli_web) =
@@ -258,15 +253,6 @@ fn main() {
         let it = libc::itimerspec { it_interval: ts, it_value: ts };
         unsafe { libc::timerfd_settime(tfd, 0, &it, std::ptr::null_mut()) };
     }
-    fn arm_periodic_ms(tfd: i32, ms: i64) {
-        let ts = libc::timespec {
-            tv_sec: ms / 1000,
-            tv_nsec: (ms % 1000) * 1_000_000,
-        };
-        let it = libc::itimerspec { it_interval: ts, it_value: ts };
-        unsafe { libc::timerfd_settime(tfd, 0, &it, std::ptr::null_mut()) };
-    }
-    #[allow(dead_code)]
     fn disarm_timerfd(tfd: i32) {
         let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         let it = libc::itimerspec { it_interval: zero, it_value: zero };
@@ -280,7 +266,7 @@ fn main() {
     ) {
         let Some(cfg) = cfg else { return };
         if let Some(es) = ebpf_state.as_mut() {
-            let r = comm_map_init(&mut es.bpf, cfg, es.comm_capacity);
+            let r = comm_map_init(&mut es.bpf, &cfg.target_pkgs, es.comm_capacity);
             if !r {
                 full_scan(cfg, es);
             } else {
@@ -321,19 +307,17 @@ fn main() {
         if let Some(mut es) = ebpf_init(kpm_wake_fd) {
             let cfg = lock_ignore_poison(&CURRENT_CONFIG).clone();
             if let Some(cfg) = cfg {
-                if !comm_map_init(&mut es.bpf, &cfg, es.comm_capacity) {
+                if !comm_map_init(&mut es.bpf, &cfg.target_pkgs, es.comm_capacity) {
                     full_scan(&cfg, &mut es);
                 }
             }
             ebpf_state = Some(es);
         }
     }
-    // /proc 模式: 周期 timerfd 立即启动; KPM 模式: 短周期 pending 重放 (200ms)
+    // /proc 模式: 周期 timerfd 立即启动; KPM 模式: 保持 disarm
     if ebpf_state.is_none() {
         let interval = CHECK_INTERVAL.load(Ordering::Relaxed).max(1);
         arm_periodic(proc_timer_fd, interval as i64);
-    } else {
-        arm_periodic_ms(proc_timer_fd, 200);
     }
 
     let mut events = [unsafe { std::mem::zeroed::<libc::epoll_event>() }; 8];
@@ -360,13 +344,17 @@ fn main() {
                 EV_KPM => {
                     read_eventfd(kpm_wake_fd);
                     if let Some(es) = ebpf_state.as_mut() {
-                        // 事件驱动亲和性: FORK 全量跟踪 + RENAME 关联包名 + EXIT 清理
-                        // (EXEC 已移除: Android 应用由 Zygote fork 产生, 从不 execve)。
-                        // 用户态收到事件后 comm_to_pkg (cmdline 权威) 识别包名,
-                        // task_apply → affinity_apply 立即设置亲和性; INPUT 唤醒刷新率。
+                        // 本批事件中是否含 FORK/EXEC/RENAME (需要立即同步亲和性)
+                        let mut need_sync = false;
                         loop {
                             match es.event_rx.try_recv() {
                                 Ok(event) => {
+                                    if event.event_type == EBPF_EVENT_FORK
+                                        || event.event_type == EBPF_EVENT_EXEC
+                                        || event.event_type == EBPF_EVENT_RENAME
+                                    {
+                                        need_sync = true;
+                                    }
                                     let Some(cfg) =
                                         lock_ignore_poison(&CURRENT_CONFIG).clone()
                                     else {
@@ -380,6 +368,14 @@ fn main() {
                                     break;
                                 }
                             }
+                        }
+                        // 收到 FORK/EXEC/RENAME: 立即执行 affinity_sync (仅设置 CPU 亲和性),
+                        // 不依赖定时器/IDLE; 无此类事件时仅增量更新 cache
+                        if need_sync {
+                            let Some(cfg) = lock_ignore_poison(&CURRENT_CONFIG).clone() else {
+                                continue;
+                            };
+                            es.cache.affinity_sync(&cfg.topo);
                         }
                     }
                 }
@@ -405,7 +401,7 @@ fn main() {
                         // 自动/强制 KPM: 尝试初始化
                         if let Some(mut es) = ebpf_init(kpm_wake_fd) {
                             if let Some(cfg) = cfg.as_ref() {
-                                if !comm_map_init(&mut es.bpf, cfg, es.comm_capacity) {
+                                if !comm_map_init(&mut es.bpf, &cfg.target_pkgs, es.comm_capacity) {
                                     full_scan(cfg, &mut es);
                                 }
                             }
@@ -432,43 +428,6 @@ fn main() {
                             ps.cache.affinity_sync(&cfg.topo);
                             ps.force_affinity = false;
                         }
-                    } else if let Some(es) = ebpf_state.as_mut() {
-                        // KPM 模式: 200ms 定时重查 FORK 时未就绪的线程。
-                        // 两类场景:
-                        //  1. 线程名未确定 (pthread_setname_np 走 prctl 直接写
-                        //     task->comm, 不触发 task_rename tracepoint): 重读
-                        //     /proc comm 拿真实线程名 (如 HeapTaskDaemon) 重新
-                        //     匹配线程规则。
-                        //  2. Zygote fork 主线程时 cmdline 仍是 zygote64
-                        //     (setArgV0 未执行): 重查时 cmdline 已变包名,
-                        //     重新 comm_to_pkg 识别并应用包级规则。
-                        if es.cache.pending_rename.is_empty() {
-                            continue;
-                        }
-                        let Some(cfg) = cfg.as_ref() else { continue };
-                        let pending: Vec<(i32, (i32, String))> =
-                            es.cache.pending_rename.drain().collect();
-                        for (tid, (pid, pkg)) in pending {
-                            let Some(comm) = crate::apply_affinity::tid_comm(tid) else {
-                                // 线程已退出: EXIT 事件稍后清理, 此处跳过
-                                continue;
-                            };
-                            if pkg.is_empty() {
-                                // cmdline 未就绪场景: 重新识别包名
-                                if let PkgMatch::Hit(pkg) =
-                                    crate::rule_match::comm_to_pkg(pid, &comm, cfg)
-                                {
-                                    es.cache.task_apply(tid, pid, &pkg, &comm, cfg, |tid, cpus, cpuset_dir| {
-                                        crate::ebpf_mode::event_affinity_apply(tid, cpus, cpuset_dir, cfg, &es.bpf)
-                                    });
-                                }
-                            } else {
-                                // 线程名未确定场景: 重读线程名匹配线程规则
-                                es.cache.task_apply(tid, pid, &pkg, &comm, cfg, |tid, cpus, cpuset_dir| {
-                                    crate::ebpf_mode::event_affinity_apply(tid, cpus, cpuset_dir, cfg, &es.bpf)
-                                });
-                            }
-                        }
                     }
                 }
                 _ => {}
@@ -484,14 +443,12 @@ fn main() {
             ps.force_affinity = true;
         }
 
-        // 周期 timerfd 与模式联动: /proc 模式用检查间隔; KPM 模式保持 200ms
-        // 短周期 (pending_rename 线程名重查: pthread_setname_np 不触发
-        // task_rename tracepoint, FORK 后需定时重读 comm 匹配线程规则)。
+        // 周期 timerfd 与模式联动: /proc 模式启动, KPM 模式停止
         let interval = CHECK_INTERVAL.load(Ordering::Relaxed).max(1);
         if ebpf_state.is_none() {
             arm_periodic(proc_timer_fd, interval as i64);
         } else {
-            arm_periodic_ms(proc_timer_fd, 200);
+            disarm_timerfd(proc_timer_fd);
         }
 
         // web 状态统计: 事件驱动更新 (收到事件时刷新, 不再定时轮询)
