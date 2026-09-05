@@ -178,7 +178,7 @@ impl KpmHandle {
 
     /// 设置白名单 (规则应用包名: CPU 规则包 ∪ 刷新率配置包), 供内核 pkg_pids
     /// 做“规则应用”过滤; 返回 true 表示失败
-    fn set_whitelist(&self, pkgs: &HashSet<String>) -> bool {
+    pub fn set_whitelist(&self, pkgs: &HashSet<String>) -> bool {
         let mut s = String::from("set_whitelist ");
         for (i, p) in pkgs.iter().enumerate() {
             if i > 0 {
