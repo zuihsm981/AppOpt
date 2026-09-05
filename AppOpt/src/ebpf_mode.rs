@@ -379,7 +379,14 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
                 && (*hdr).ring_size == APPOPT_EVENT_RING_SIZE
         };
         if !ok {
-            eprintln!("[AppOpt] 共享环头校验失败: 内核模块与 AppOpt ABI 版本不匹配");
+            let (magic, ver, ev, ring) = unsafe {
+                ((*hdr).magic, (*hdr).version, (*hdr).event_size, (*hdr).ring_size)
+            };
+            eprintln!(
+                "[AppOpt] 共享环头校验失败: 实际(magic={:#010x} ver={} ev={} ring={}) 期望(magic={:#010x} ver={} ev={} ring={})",
+                magic, ver, ev, ring,
+                APPOPT_SHM_MAGIC, APPOPT_SHM_VERSION, APPOPT_EVENT_SZ, APPOPT_EVENT_RING_SIZE
+            );
             unsafe { libc::munmap(shm_base, map_len); }
             unsafe { libc::close(evt_fd); }
             unsafe { libc::close(shm_fd); }
