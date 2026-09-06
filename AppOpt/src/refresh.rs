@@ -352,7 +352,7 @@ pub fn refresh_init() {
                                     bind_default_launcher(&mut state)
                                 }
                                 RefreshEvent::FgPkg(pkg) => {
-                                    try_apply_fg_pkg(&mut state, &pkg)
+                                    try_apply_fg_pkg(&mut state, &pkg);
                                 }
                             }
                         }

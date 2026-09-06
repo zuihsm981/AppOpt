@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 use crate::apply_affinity::affinity_set;
 use crate::config::AppConfig;

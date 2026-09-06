@@ -25,7 +25,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
 
 use crate::config::{
-    init_inotify, load_config,
+    init_inotify, load_config, AppConfig,
     CHECK_INTERVAL, CONFIG_FILE, CONFIG_WAKE_FD, CURRENT_CONFIG,
 };
 use crate::cpuset::{init_cpu_topo, set_base_cpuset};
