@@ -60,8 +60,6 @@ struct RefreshState {
     timer_enabled: bool,
     last_reset_time: Option<Instant>,
     current_package: String,
-    last_applied_pkg: String,
-    last_apply_time: Option<Instant>,
     last_input_time: Option<Instant>,
     timer_fd: i32,
 }
@@ -107,7 +105,6 @@ fn set_refresh_rate(state: &mut RefreshState, mode: i32) {
 
 fn bind_default_launcher(state: &mut RefreshState) {
     state.current_package = crate::config::DEFAULT_REFRESH_PACKAGE.to_string();
-    state.last_applied_pkg = state.current_package.clone();
     // 默认 launcher 永远使用全局 timeout/active/idle。
     apply_app_config(state, crate::config::DEFAULT_REFRESH_PACKAGE);
     set_refresh_rate(state, state.current_active);
@@ -186,53 +183,43 @@ fn switch_to_idle(state: &mut RefreshState) {
     state.last_reset_time = None;
 }
 
-/// 把刷新率应用到前台包名（白名单准入）。pkg 由 binder 回调 + /proc cmdline 解析。
-/// 返回是否成功应用。
+/// 前台应用切换处理: 完整规则矩阵。
+///   - 已配置应用       → 应用其专属配置;
+///   - 有配置 → 无配置(含 launcher) → 应用全局配置;
+///   - 无配置 → 无配置   → 不切刷新率。
+/// pkg 为归一化的基础包名 (pkg:child → pkg)。
 fn try_apply_fg_pkg(state: &mut RefreshState, pkg: &str) -> bool {
-    if pkg.is_empty() || pkg == state.last_applied_pkg {
-        return true; // 已应用过，无需重复
+    if pkg.is_empty() {
+        return false;
     }
-
-    // 白名单准入检查（唯一真正的过滤器）
     let is_launcher = pkg == crate::config::DEFAULT_REFRESH_PACKAGE;
     let is_managed = state.app_configs.contains_key(pkg);
+    // 无配置应用(含 launcher 等价): 仅当上一个是有配置应用才应用全局配置
     if !is_launcher && !is_managed {
-        return false; // 系统设置、状态栏、弹窗、未配置应用全部丢弃
+        let prev_configured = state.app_configs.contains_key(&state.current_package);
+        if !prev_configured {
+            return false; // 无配置 → 无配置: 不切
+        }
     }
-
-    // 判断切换前/后的应用是否已配置（决定是否应用全局活跃刷新率）
-    let prev_configured = state.app_configs.contains_key(&state.last_applied_pkg);
-    let cur_configured = is_launcher || is_managed;
-
-    let now = Instant::now();
     state.current_package = pkg.to_string();
-    state.last_applied_pkg = pkg.to_string();
-    state.last_apply_time = Some(now);
-
+    // 无配置/launcher → 全局配置; 已配置 → 专属配置
     apply_app_config(state, pkg);
-    // 未配置应用之间切换时不重新应用全局活跃刷新率；
-    // 仅当从已配置应用切换到未配置应用（或切到已配置应用）时才应用活跃刷新率
-    if prev_configured || cur_configured {
-        set_refresh_rate(state, state.current_active);
-    }
+    set_refresh_rate(state, state.current_active);
     reset_timer(state, true);
     true
 }
 
-/// binder 前台回调: 直接由 /proc cmdline 解析前台包名 (主进程或 pkg: 子进程),
-/// 无需共享 PID_PKG。launcher 或刷新率配置过的包才返回 Some。
-fn resolve_fg_pkg(state: &RefreshState, pid: i32) -> Option<String> {
+/// binder 前台回调: /proc cmdline 归一化为基础包名 (pkg:child → pkg)。
+/// 任何前台应用都归因 —— 无配置应用也需要参与"有配置→无配置应用全局"规则。
+fn resolve_fg_pkg(pid: i32) -> Option<String> {
     let cmd = crate::apply_affinity::read_cmdline(pid)?;
-    if cmd == crate::config::DEFAULT_REFRESH_PACKAGE {
-        return Some(crate::config::DEFAULT_REFRESH_PACKAGE.to_string());
+    if let Some(idx) = cmd.find(':') {
+        let base = cmd[..idx].trim();
+        if !base.is_empty() {
+            return Some(base.to_string());
+        }
     }
-    state
-        .app_configs
-        .keys()
-        .find(|pkg| {
-            cmd == **pkg || cmd.strip_prefix(pkg.as_str()).is_some_and(|r| r.starts_with(':'))
-        })
-        .cloned()
+    Some(cmd)
 }
 
 /// input 事件触发：用户活动
@@ -299,7 +286,7 @@ pub fn refresh_init() {
     }
     WAKE_FD.store(wake_fd, Ordering::Release);
 
-    // IProcessObserver 回调用 socketpair(SOCK_DGRAM) 传递包名（字符串），不再传 uid
+    // IProcessObserver 回调经 socketpair(SOCK_DGRAM) 传递 pid+uid (8 字节)
     let mut fg_sv: [libc::c_int; 2] = [0, 0];
     if unsafe {
         libc::socketpair(
@@ -352,8 +339,6 @@ pub fn refresh_init() {
         timer_enabled: true,
         last_reset_time: None,
         current_package: String::new(),
-        last_applied_pkg: String::new(),
-        last_apply_time: None,
         last_input_time: None,
         timer_fd,
     };
@@ -365,7 +350,7 @@ pub fn refresh_init() {
     let active = state.current_active;
     set_refresh_rate(&mut state, active);
 
-    // 注册 IProcessObserver 回调（回调只传 pid，包名由共享 ProcCache 查询）
+    // 注册 IProcessObserver 回调: 回调携带 pid+uid, 刷新率按 pid 直解包名
     let _ = crate::process_observer::init_observer(fg_send_fd);
 
     let name = CString::new("RefreshRate").unwrap();
@@ -391,7 +376,7 @@ pub fn refresh_init() {
         unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fg_recv_fd, &mut ev); }
 
         let mut events: [libc::epoll_event; 3] = unsafe { std::mem::zeroed() };
-        // fg socketpair 接收缓冲（4 字节 pid i32）
+        // fg socketpair 接收缓冲 (pid+uid, 8 字节)
         let mut fg_buf = [0u8; 8];
 
         loop {
@@ -426,8 +411,8 @@ pub fn refresh_init() {
                         switch_to_idle(&mut state);
                     }
                     3 => {
-                        // IProcessObserver 回调: 读取 pid（socketpair datagram，4 字节 i32），
-                        // binder 回调 pid + uid: 刷新率按 pid 直解包名, CPU 按 uid 枚举
+                        // IProcessObserver 回调: 读取 pid+uid (socketpair datagram, 8 字节);
+                        // 刷新率按 pid 直解包名, CPU 按 uid 枚举
                         let n = unsafe {
                             libc::recv(
                                 fg_recv_fd,
@@ -439,8 +424,8 @@ pub fn refresh_init() {
                         if n == 8 {
                             let pid = i32::from_ne_bytes([fg_buf[0], fg_buf[1], fg_buf[2], fg_buf[3]]);
                             let uid = i32::from_ne_bytes([fg_buf[4], fg_buf[5], fg_buf[6], fg_buf[7]]);
-                            // binder 回调 pid → /proc cmdline 直接解析包名 → 刷新率模块
-                            if let Some(pkg) = resolve_fg_pkg(&state, pid) {
+                            // binder 回调 pid → /proc cmdline 解析包名 → 刷新率模块
+                            if let Some(pkg) = resolve_fg_pkg(pid) {
                                 try_apply_fg_pkg(&mut state, &pkg);
                             }
                             // CPU 亲和性: 同一 binder 回调按 uid 枚举该应用全部进程
