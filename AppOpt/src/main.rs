@@ -4,6 +4,7 @@ compile_error!("AppOpt requires 64-bit target due to cpu_set_t binary layout ass
 
 mod apply_affinity;
 mod cache;
+mod cpu_affinity;
 mod config;
 mod cpuset;
 mod ebpf_mode;
@@ -27,8 +28,7 @@ use crate::config::{
 };
 use crate::cpuset::{init_cpu_topo, set_base_cpuset};
 use crate::ebpf_mode::{
-    full_scan, event_dispatch, comm_map_init, EBPF_EVENT_FORK, EBPF_EVENT_EXEC,
-    EBPF_EVENT_RENAME, ebpf_init, EbpfState,
+    full_scan, event_dispatch, comm_map_init, ebpf_init, EbpfState,
 };
 use crate::proc_mode::{cache_sync, ProcScanState};
 use crate::web::{
@@ -280,6 +280,8 @@ fn main() {
             ps.last_proc_count = 0;
             ps.force_affinity = true;
         }
+        // CPU 亲和性: 配置变更后全量应用一次
+        crate::cpu_affinity::apply_all_now();
     }
 
     // KPM 事件唤醒 eventfd: reader 收到事件后写入, 主循环 epoll 唤醒
@@ -312,6 +314,10 @@ fn main() {
                 }
             }
             ebpf_state = Some(es);
+            // CPU 亲和性: binder 前台回调驱动 (cpu_affinity.rs), 启动即全量应用一次
+            if crate::cpu_affinity::start() {
+                crate::cpu_affinity::apply_all_now();
+            }
         }
     }
     // /proc 模式: 周期 timerfd 立即启动; KPM 模式: 保持 disarm
@@ -344,17 +350,11 @@ fn main() {
                 EV_KPM => {
                     read_eventfd(kpm_wake_fd);
                     if let Some(es) = ebpf_state.as_mut() {
-                        // 本批事件中是否含 FORK/EXEC/RENAME (需要立即同步亲和性)
-                        let mut need_sync = false;
+                        // CPU 亲和性已由 binder 触发的 CpuAffinity 模块负责;
+                        // 事件流仅消费 input (刷新率活动检测)。
                         loop {
                             match es.event_rx.try_recv() {
                                 Ok(event) => {
-                                    if event.event_type == EBPF_EVENT_FORK
-                                        || event.event_type == EBPF_EVENT_EXEC
-                                        || event.event_type == EBPF_EVENT_RENAME
-                                    {
-                                        need_sync = true;
-                                    }
                                     let Some(cfg) =
                                         lock_ignore_poison(&CURRENT_CONFIG).clone()
                                     else {
@@ -368,14 +368,6 @@ fn main() {
                                     break;
                                 }
                             }
-                        }
-                        // 收到 FORK/EXEC/RENAME: 立即执行 affinity_sync (仅设置 CPU 亲和性),
-                        // 不依赖定时器/IDLE; 无此类事件时仅增量更新 cache
-                        if need_sync {
-                            let Some(cfg) = lock_ignore_poison(&CURRENT_CONFIG).clone() else {
-                                continue;
-                            };
-                            es.cache.affinity_sync(&cfg.topo);
                         }
                     }
                 }
@@ -406,6 +398,9 @@ fn main() {
                                 }
                             }
                             ebpf_state = Some(es);
+                            if crate::cpu_affinity::start() {
+                                crate::cpu_affinity::apply_all_now();
+                            }
                         }
                     } else {
                         // 已在 KPM 模式: 重新应用配置 (白名单可能变化)

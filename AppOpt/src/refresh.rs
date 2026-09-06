@@ -470,6 +470,10 @@ pub fn refresh_init() {
                         if n == 4 {
                             let pid = i32::from_ne_bytes([fg_buf[0], fg_buf[1], fg_buf[2], fg_buf[3]]);
                             handle_fg_change(&mut state, pid);
+                            // CPU 亲和性: 同一 binder 前台回调转发给 CpuAffinity 模块
+                            if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
+                                let _ = tx.send(pid);
+                            }
                         }
                     }
                     _ => {}
