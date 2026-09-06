@@ -280,6 +280,30 @@ pub fn kpm_probe() -> bool {
     handle.ping()
 }
 
+/// 查找 Zygote 相关进程的所有线程 tid
+/// (cmdline 匹配 zygote/app_process/usap 前缀, 覆盖 zygote/zygote64/app_process32/app_process64/usap)
+fn find_zygote_tids() -> Vec<i32> {
+    let mut tids = Vec::new();
+    if let Ok(entries) = fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else { continue };
+            let Ok(cmdline) = fs::read(format!("/proc/{}/cmdline", pid)) else { continue };
+            let s = String::from_utf8_lossy(&cmdline);
+            if !(s.starts_with("zygote") || s.starts_with("app_process") || s.starts_with("usap")) {
+                continue;
+            }
+            if let Ok(task_dir) = fs::read_dir(format!("/proc/{}/task", pid)) {
+                for t in task_dir.flatten() {
+                    if let Ok(tid) = t.file_name().to_string_lossy().parse::<i32>() {
+                        tids.push(tid);
+                    }
+                }
+            }
+        }
+    }
+    tids
+}
+
 /// 初始化 KPM 事件驱动: 确保模块加载, 启动 reader 线程
 /// 失败返回 None, 由调用方回退 /proc 轮询。
 /// kpm_wake_fd 由主循环创建并注册 epoll, reader 收到事件后写入以唤醒主循环。
@@ -380,9 +404,13 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
     handle.set_whitelist(&pkgs);
     handle.activate();
 
-    /* Zygote 不加入 APPLIED: 占位链条已删, Zygote 无需要跟踪位; 其 fork 事件
-     * pid 字段=zygote 无法归因 (继承线程由组带头事件触发 pid_sync_tasks 整表
-     * 核对覆盖), 保留只会让 Zygote 每次 fork 应用产生约 200 个垃圾事件。 */
+    /* 把 Zygote 加入 APPLIED 表 (bits=0): Zygote fork 出的子进程
+     * (如 com.bilibili.app.in:ijkservice) 会在 FORK 探针中被占位,
+     * RENAME 时 tracked=true 直接通过, 无需依赖 whitelist_matched。
+     * bits=0 不影响 Zygote 自身 (sched_setaffinity kprobe 见 bits=0 不干预)。 */
+    for tid in find_zygote_tids() {
+        handle.applied_set(tid, 0);
+    }
 
     Some(EbpfState {
         event_rx: rx,
@@ -598,10 +626,8 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
         }
 
         EBPF_EVENT_FORK => {
-            // 子线程/子进程立即按父进程包名解析并应用规则 (内核已同步标记
-            // tgid 为已管理, fork 事件可靠发出): 进 cache + 写 APPLIED bits,
-            // 之后 affinity_sync 实际钉核; 覆盖"永不改名"线程 (如 HeapTaskDaemon
-            // spawn 后立即更名或保持进程名) 这类 RENAME 不会覆盖的漏管。
+            // 子线程/子进程立即按父进程包名解析并应用规则: 进 cache + 写 APPLIED bits,
+            // 之后 affinity_sync 实际钉核。
             event_apply(&mut state.cache, &state.bpf, tid, pid, comm, cfg);
         }
 
@@ -664,9 +690,13 @@ pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
     }
 
     applied_clear(&state.bpf);
-    /* 不再重加 Zygote: 占位链条已删, Zygote 无需进 APPLIED; Zygote 继承线程
-     * (HeapTaskDaemon 等) 由组带头事件触发 pid_sync_tasks 整表核对覆盖, 避免
-     * Zygote 每次 fork 应用产生约 200 个 pid=zygote 的垃圾事件。 */
+    /* full_scan 清空了 APPLIED 表, Zygote 的 tid 也随之丢失。
+     * 必须重新把 Zygote 加入 APPLIED (bits=0), 否则之后 Zygote fork 的
+     * 子进程无法被 FORK 探针占位, RENAME 事件被过滤, 子进程匹配不到。 */
+    for tid in find_zygote_tids() {
+        state.bpf.applied_set(tid, 0);
+    }
+
     proc_walk(cfg, |_| true, |pid, pkg, has_thread_rules| {
         let Some(tids) = task_tids(pid) else { return };
         for tid in tids {
