@@ -158,8 +158,11 @@ impl ProcCache {
             self.forget_pid(pid);
         }
         // 负缓存: 同一 PID + 同一 comm 之前确认非目标，直接跳过 cmdline 读取。
+        // 含冒号的 comm (pkg:child 子进程形态, 如 oid:pushservice) 不适用负缓存:
+        // 归因完全依赖 cmdline, 首次事件可能早于 cmdline 就绪, 负缓存会永久
+        // 锁死该子进程; 此类 comm 恒走 cmdline 精确匹配。
         if let Some(prev) = self.negative_pids.get(&pid) {
-            if prev == comm {
+            if prev == comm && !comm.contains(':') {
                 return None;
             }
         }
@@ -172,7 +175,7 @@ impl ProcCache {
             // 的应用 thread_affinity 会返回 None 而 task_apply 失败，
             // 若不在此登记，刷新率前台回调将永远查不到该应用的包名。
             pkg_track_pid(pid, pkg);
-        } else {
+        } else if !comm.contains(':') {
             self.negative_pids.insert(pid, comm.to_string());
         }
         pkg.or_else(|| self.tasks.get(&pid).map(|e| e.pkg.clone()))
