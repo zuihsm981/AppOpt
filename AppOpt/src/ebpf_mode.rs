@@ -612,9 +612,10 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
         }
 
         EBPF_EVENT_FORK => {
-            // 子进程/子线程立即按父进程包名解析并应用规则, 进入 cache + 写 APPLIED bits;
-            // 否则从不改名的线程永远没有 RENAME 事件, 不会被 affinity_sync 主动钉核。
-            // (内核 FORK 探针已插入占位: 现改为继承父线程 bits, 双保险。)
+            // 子线程/子进程立即按父进程包名解析并应用规则 (内核已同步标记
+            // tgid 为已管理, fork 事件可靠发出): 进 cache + 写 APPLIED bits,
+            // 之后 affinity_sync 实际钉核; 覆盖"永不改名"线程 (如 HeapTaskDaemon
+            // spawn 后立即更名或保持进程名) 这类 RENAME 不会覆盖的漏管。
             event_apply(&mut state.cache, &state.bpf, tid, pid, comm, cfg);
         }
 
