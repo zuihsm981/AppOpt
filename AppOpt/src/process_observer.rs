@@ -2,9 +2,8 @@
 //! IProcessObserver binder 回调实现（dlopen 运行时加载 libbinder_ndk.so）
 //!
 //! 触发分离/数据共享（参考 优化.md）：
-//! Binder 回调只提取 pid，通过 socketpair(SOCK_DGRAM) 发送 pid（4 字节 i32），
-//! 不再依赖 /data/system/packages.list / UID 映射表。
-//! 刷新率模块从共享 ProcCache（PID_PKG）按 pid 查包名，热路径零文件 I/O。
+//! Binder 回调提取 pid+uid, 经 socketpair(SOCK_DGRAM) 发送 8 字节 (pid+uid);
+//! 主线程据此查 uid 静态表并分发 CPU(按 uid 枚举)/刷新率(按包)线程。
 
 use std::ffi::c_void;
 use std::sync::{OnceLock};
@@ -16,7 +15,6 @@ const TX_REGISTER_PROCESS_OBSERVER: u32 = 0x0d;
 const TX_ON_PROCESS_STARTED: u32 = 0x01;
 const TX_ON_FG_ACTIVITIES_CHANGED: u32 = 0x02;
 const TX_ON_FG_SERVICES_CHANGED: u32 = 0x03;
-const TX_ON_PROCESS_DIED: u32 = 0x04;
 
 // ── FFI 函数指针类型 ──
 type FnGetService = unsafe extern "C" fn(*const c_char) -> *mut c_void;
@@ -108,8 +106,7 @@ fn ndk() -> Option<&'static BinderNdk> {
 const STATUS_OK: c_int = 0;
 const STATUS_UNKNOWN_TRANSACTION: c_int = -29;
 
-// fg 事件通过 socketpair(SOCK_DGRAM) 传递 pid（4 字节 i32），
-// 刷新率模块从共享 ProcCache（PID_PKG）按 pid 查包名，热路径零文件 I/O
+// fg 事件经 socketpair(SOCK_DGRAM) 传递 pid+uid (8 字节); 主线程 EV_FG 分发
 static FG_SEND_FD: AtomicI32 = AtomicI32::new(-1);
 
 struct SendClass(*mut c_void);
@@ -175,9 +172,6 @@ extern "C" fn on_transact(
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _pid) };
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _uid) };
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _st) };
-            STATUS_OK
-        }
-        TX_ON_PROCESS_DIED => {
             STATUS_OK
         }
         _ => { STATUS_UNKNOWN_TRANSACTION }

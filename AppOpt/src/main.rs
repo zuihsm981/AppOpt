@@ -45,19 +45,6 @@ pub(crate) fn lock_ignore_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// [pkglist] 日志: 写 /data/local/tmp/appopt_pkglist.log (附加) + stderr
-fn pkg_log_line(msg: &str) {
-    use std::io::Write;
-    eprintln!("{}", msg);
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/data/local/tmp/appopt_pkglist.log")
-    {
-        let _ = writeln!(f, "{}", msg);
-    }
-}
-
 /// 从 packages.list 构建两张 uid→包名 静态表 (主线程持有):
 ///   cpu: 有 CPU 规则的应用; rfr: com.android.launcher3 + 有刷新率规则的应用。
 /// 前台回调只查这两张表, 不查 cmdline、不管 pid。
@@ -83,6 +70,14 @@ fn build_uid_tables(cfg: &AppConfig) -> (HashMap<i32, String>, HashMap<i32, Stri
             }
         }
     }
+    (cpu, rfr)
+}
+
+/// 规则应用集合 (cpu/rfr): 主线程检测“新增/删除规则应用”, 集合未变则跳过重建
+fn cfg_pkg_sets(cfg: &AppConfig) -> (HashSet<String>, HashSet<String>) {
+    let cpu: HashSet<String> = cfg.rules.iter().map(|r| r.pkg.clone()).collect();
+    let mut rfr: HashSet<String> = cfg.app_refresh_configs.keys().cloned().collect();
+    rfr.insert(crate::config::DEFAULT_REFRESH_PACKAGE.to_string());
     (cpu, rfr)
 }
 
@@ -259,7 +254,7 @@ fn main() {
     // 前台回调会被丢弃, 导致首次打开应用不生效。
     let cpu_ready = crate::cpu_affinity::start();
 
-    // 刷新率控制模块，独立线程运行，通过 eBPF 事件驱动
+    // 刷新率控制模块，独立线程运行 (binder 回调经主线程 uid 表 → FgPkg 消息驱动)
     refresh::refresh_init();
 
     // ===== 三线程: 主线程持有 IProcessObserver 回调 socket, 分发 cpuset/刷新率线程 =====
@@ -291,8 +286,12 @@ fn main() {
     let mut cpu_uid: HashMap<i32, String> = HashMap::new();
     let mut rfr_uid: HashMap<i32, String> = HashMap::new();
     let mut cpu_known: HashMap<i32, i32> = HashMap::new(); // uid → pid (CPU 冷热)
+    // 规则应用集合 (主线程对比用): 仅集合变化才重建 uid 表 (数值调整不重建)
+    let mut cpu_pkgs_set: HashSet<String> = HashSet::new();
+    let mut rfr_pkgs_set: HashSet<String> = HashSet::new();
     if let Some(cfg) = lock_ignore_poison(&CURRENT_CONFIG).clone() {
         (cpu_uid, rfr_uid) = build_uid_tables(&cfg);
+        (cpu_pkgs_set, rfr_pkgs_set) = cfg_pkg_sets(&cfg);
     }
 
     let prog_start = Instant::now();
@@ -341,7 +340,7 @@ fn main() {
         let it = libc::itimerspec { it_interval: zero, it_value: zero };
         unsafe { libc::timerfd_settime(tfd, 0, &it, std::ptr::null_mut()) };
     }
-    // 配置变更后应用到当前模式: KPM 重载白名单 + 全量扫描; /proc 标记全量重扫
+    // 配置变更后应用到当前模式: KPM 全量扫描 + uid 表重建(规则包集合门控); /proc 标记全量重扫
     fn apply_config(
         ebpf_state: &mut Option<EbpfState>,
         proc_state: &mut Option<ProcScanState>,
@@ -390,10 +389,7 @@ fn main() {
     unsafe {
         let ifd = libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK);
         if ifd < 0 {
-            pkg_log_line(&format!(
-                "[pkglist] inotify_init1 失败: {}",
-                std::io::Error::last_os_error()
-            ));
+            // inotify 不可用 (如 SELinux 拦截), 放弃监听 packages.list
         } else {
             let wd = libc::inotify_add_watch(
                 ifd,
@@ -404,13 +400,8 @@ fn main() {
                     | libc::IN_DELETE_SELF,
             );
             if wd < 0 {
-                pkg_log_line(&format!(
-                    "[pkglist] inotify_add_watch packages.list 失败: {} (SELinux/权限 受限?)",
-                    std::io::Error::last_os_error()
-                ));
                 libc::close(ifd);
             } else {
-                pkg_log_line(&format!("[pkglist] 监听 packages.list 成功 wd={}", wd));
                 epoll_add(epfd, ifd, EV_PKG);
                 pkg_inotify_fd = ifd;
             }
@@ -523,21 +514,11 @@ fn main() {
                                 )
                             };
                             if wd < 0 {
-                                pkg_log_line(&format!(
-                                    "[pkglist] rewatch 失败: {}",
-                                    std::io::Error::last_os_error()
-                                ));
-                            } else {
-                                pkg_log_line(&format!("[pkglist] rewatch ok wd={}", wd));
+                                /* rewatch 失败: 下次事件再尝试 */
                             }
                         }
                         if let Some(cfg) = cfg.as_ref() {
                             (cpu_uid, rfr_uid) = build_uid_tables(cfg);
-                            pkg_log_line(&format!(
-                                "[pkglist] 已重建 uid 表 (cpu={}, rfr={})",
-                                cpu_uid.len(),
-                                rfr_uid.len()
-                            ));
                         }
                     }
                 }
@@ -561,8 +542,10 @@ fn main() {
                                 cpu_known.insert(uid, pid);
                                 if cold {
                                     if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
-                                        let _ = tx
-                                            .send(crate::cpu_affinity::CpuMsg::ApplyPkg(pkg.clone()));
+                                        let _ = tx.send(crate::cpu_affinity::CpuMsg::ApplyPkg(
+                                            uid,
+                                            pkg.clone(),
+                                        ));
                                     }
                                 }
                             }
@@ -579,7 +562,12 @@ fn main() {
                         cfg = lock_ignore_poison(&CURRENT_CONFIG).clone();
                         apply_config(&mut ebpf_state, &mut proc_state, cfg.as_deref());
                         if let Some(cfg) = cfg.as_ref() {
-                            (cpu_uid, rfr_uid) = build_uid_tables(cfg);
+                            let (nc, nr) = cfg_pkg_sets(cfg);
+                            if nc != cpu_pkgs_set || nr != rfr_pkgs_set {
+                                (cpu_uid, rfr_uid) = build_uid_tables(cfg);
+                                cpu_pkgs_set = nc;
+                                rfr_pkgs_set = nr;
+                            }
                         }
                     }
                 }
@@ -606,10 +594,15 @@ fn main() {
                             }
                         }
                     } else {
-                        // 已在 KPM 模式: 重新应用配置 (白名单可能变化)
+                        // 已在 KPM 模式: 重新应用配置 (规则应用集合可能变化)
                         apply_config(&mut ebpf_state, &mut proc_state, cfg.as_deref());
                         if let Some(cfg) = cfg.as_ref() {
-                            (cpu_uid, rfr_uid) = build_uid_tables(cfg);
+                            let (nc, nr) = cfg_pkg_sets(cfg);
+                            if nc != cpu_pkgs_set || nr != rfr_pkgs_set {
+                                (cpu_uid, rfr_uid) = build_uid_tables(cfg);
+                                cpu_pkgs_set = nc;
+                                rfr_pkgs_set = nr;
+                            }
                         }
                     }
                 }
@@ -617,9 +610,14 @@ fn main() {
                     read_eventfd(config_wake_fd);
                     cfg = lock_ignore_poison(&CURRENT_CONFIG).clone();
                     apply_config(&mut ebpf_state, &mut proc_state, cfg.as_deref());
-                    if let Some(cfg) = cfg.as_ref() {
-                        (cpu_uid, rfr_uid) = build_uid_tables(cfg);
-                    }
+                        if let Some(cfg) = cfg.as_ref() {
+                            let (nc, nr) = cfg_pkg_sets(cfg);
+                            if nc != cpu_pkgs_set || nr != rfr_pkgs_set {
+                                (cpu_uid, rfr_uid) = build_uid_tables(cfg);
+                                cpu_pkgs_set = nc;
+                                rfr_pkgs_set = nr;
+                            }
+                        }
                 }
                 EV_PROC => {
                     read_eventfd(proc_timer_fd);

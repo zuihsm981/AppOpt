@@ -5,8 +5,6 @@ use crate::config::AppConfig;
 use crate::cpuset::{CpuSet, CpuTopology};
 use crate::rule_match::thread_affinity;
 
-/// 供刷新率模块查询 pid→pkg。这里只读共享索引，不在刷新率热路径补扫 /proc。
-
 pub struct TaskEntry {
     pub pid: i32,
     pub pkg: String,
@@ -15,7 +13,8 @@ pub struct TaskEntry {
     pub is_thread_rule: bool,
 }
 
-/// 双模式共用进程缓存，eBPF 事件驱动增量维护，proc 模式触发全量重建
+/// /proc 回退模式的进程缓存 (KPM 模式下 CPU 由 binder 驱动、刷新率由 uid 表驱动,
+/// 均不使用本缓存; 仅 /proc 回退与 web 统计在用)
 pub struct ProcCache {
     pub tasks: HashMap<i32, TaskEntry>,
     /// pid→缓存任务数，避免每次线程退出都扫描全部 tasks。

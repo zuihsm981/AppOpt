@@ -1,19 +1,20 @@
-//! eBPF 事件驱动模式 → KPM(Kernel Patch Module)事件驱动模式
+//! KPM 事件环模式 (KernelPatch KPM 内核模块, syscall 45 通信)
 //!
-//! 原实现用 aya 加载 eBPF 程序并读 RingBuf; 现改为通过 KernelPatch SuperCall
-//! (syscall 45 = __NR_truncate) 与 appopt-kpm KPM 内核模块通信。
+//! 事件环仅承载 input 事件 (刷新率活动检测): ctl0 `shm_open <eventfd>` 让内核
+//! 把 256KB 事件环 remap 为共享内存 fd 并把 AppOpt 的 eventfd 注册为通知端;
+//! reader 线程 mmap 该 fd, 阻塞在 eventfd 上, 被内核 input kprobe eventfd_signal
+//! 唤醒后直接从共享环消费 (SPSC, acquire/release 同步), 零轮询。
 //!
-//! 事件传输 (2025 改版): 不再让 reader 线程周期 supercall `drain` 轮询, 而是:
-//!   - ctl0 `shm_open <eventfd>` 让内核把 256KB 事件环 remap 为共享内存 fd,
-//!     并把 AppOpt 的 eventfd 注册为通知端;
-//!   - reader 线程 mmap 该 fd, 阻塞在 eventfd 上, 被内核探针 eventfd_signal
-//!     唤醒后直接从共享环消费事件 (SPSC, acquire/release 同步), 零轮询。
-//! 控制面 (白名单 / APPLIED 表 / start-stop) 仍走 ctl0 supercall。
+//! CPU 亲和性/刷新率不再由进程事件驱动: binder 前台回调 (pid+uid) 由主线程
+//! 经 uid 静态表分发到 cpuset(按 uid 枚举应用) 与刷新率线程 (见 main.rs EV_FG,
+//! cpu_affinity.rs, refresh.rs)。
 //!
-//! 内核侧等价逻辑在 AppOpt-kpm/appopt_kpm.c:
-//!   - tracepoint sched_process_fork/exec/exit + task_rename
-//!   - 内联挂钩 input_handle_event (1s 节流)
-//!   - 白名单(包名前 15 字节前缀匹配)、APPLIED tid 表、mmap 共享 256KB 事件环
+//! 控制面 (APPLIED 表 / start-stop / shm_open) 走 ctl0 supercall。
+//!
+//! 内核侧 (AppOpt-kpm/appopt_kpm.c):
+//!   - kprobe input_handle_event (1s 节流)
+//!   - kprobe sched_setaffinity (按 APPLIED bits 强制)
+//!   - APPLIED tid 表、mmap 共享 256KB 事件环
 //! 事件结构 EbpfProcEvent 与内核 appopt_proc_event_t 布局完全一致 (28B),
 //! event_dispatch/affinity 逻辑与原先保持一致。
 
@@ -37,14 +38,7 @@ pub struct EbpfProcEvent {
     pub event_type: u32,
 }
 
-#[allow(dead_code)]
-pub const EBPF_EVENT_FORK: u32 = 1;
-#[allow(dead_code)]
-pub const EBPF_EVENT_EXEC: u32 = 2;
-#[allow(dead_code)]
-pub const EBPF_EVENT_RENAME: u32 = 3;
-#[allow(dead_code)]
-pub const EBPF_EVENT_EXIT: u32 = 4;
+/// 事件环当前只流动 INPUT (CPU/刷新率由 binder 三线程驱动, 无进程事件)
 pub const EBPF_EVENT_INPUT: u32 = 5;
 
 /* ================= mmap 共享内存事件环 (与内核 appopt_shm_t 布局一致) =================
@@ -172,7 +166,7 @@ impl KpmHandle {
         self.cmd(&s);
     }
 
-    /// AppOpt 初始化完成后激活 KPM: 注册 tracepoint(start) + 武装 input kprobe(input_on)
+    /// AppOpt 初始化完成后激活 KPM: start 武装 sched_setaffinity kprobe + input_on 武装 input kprobe
     pub fn activate(&self) {
         self.cmd("start");
         self.cmd("input_on");
@@ -207,7 +201,7 @@ impl KpmHandle {
 pub struct EbpfState {
     pub event_rx: mpsc::Receiver<EbpfProcEvent>,
     pub reader_thread: Option<thread::JoinHandle<()>>,
-    /// 原 aya Ebpf 替换为 KPM 传输句柄; 字段名保持 bpf 以兼容 main.rs
+    /// KPM 传输句柄 (ctl0 supercall 通道); 字段名 bpf 沿用历史
     pub bpf: KpmHandle,
     pub cache: ProcCache,
     pub wakeup_fd: c_int,
@@ -483,7 +477,7 @@ fn kpm_shm_reader(
     unsafe { libc::munmap(base, map_len); }
 }
 
-/// 事件派发, 按 event_type 增量处理 FORK/RENAME/EXEC/EXIT (与 aya 版一致)
+/// 事件派发 (仅 input: 刷新率活动检测; CPU/刷新率由 binder 三线程驱动)
 pub fn event_dispatch(event: &EbpfProcEvent, _cfg: &AppConfig, _state: &mut EbpfState) {
     // CPU 亲和性已由 binder 触发的 CpuAffinity 模块负责 (cpu_affinity.rs):
     // 进程事件不再驱动任何 CPU 逻辑, 仅消费 input 事件 (刷新率活动检测)。

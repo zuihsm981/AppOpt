@@ -27,14 +27,14 @@ use std::time::Duration;
 use crate::config::AppConfig;
 use crate::ebpf_mode::KpmHandle;
 
-/// 前台回调后延迟枚举时长: 冷启动子进程 (pkg:child) 常在回调后 0.5~2s 内 spawn,
-/// 延迟 2s 后按 uid 枚举一次覆盖冷启动窗口 (主进程回调时已在, 无影响)。
-const ENUM_DELAY: Duration = Duration::from_secs(2);
+/// 前台回调后延迟枚举时长: 冷启动子进程 (pkg:child) 常在回调后 0.5~1s 内 spawn,
+/// 延迟 1s 后按 uid 枚举一次覆盖冷启动窗口 (主进程回调时已在, 无影响)。
+const ENUM_DELAY: Duration = Duration::from_secs(1);
 
 /// CPU worker 消息
 pub enum CpuMsg {
-    /// 主线程判定命中 CPU 表且为冷启动后, 下发包名 → 延迟应用亲和性
-    ApplyPkg(String),
+    /// 主线程判定命中 CPU 表且为冷启动后, 下发 (uid, 包名) → 延迟按 uid 枚举应用
+    ApplyPkg(i32, String),
     /// 全量应用 (启动 / 配置变更)
     ApplyAll,
 }
@@ -68,9 +68,29 @@ impl CpuAffinity {
         Self { bpf: KpmHandle::new(), managed: HashMap::new() }
     }
 
-    /// 全量应用 (启动 / 配置变更), 非周期; 不做 cleanup (清理只在触发枚举时进行)
+    /// 按 uid 枚举该应用全部进程 (主 + pkg: 子进程同 uid) → 应用全部线程。
+    /// uid 即应用身份: 精确、无 cmdline 归因竞态、多用户下不误捞其他实例。
+    fn on_uid(&mut self, uid: i32, pkg: &str, cfg: &AppConfig) {
+        if uid <= 0 {
+            return;
+        }
+        let mut pids: Vec<i32> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir("/proc") {
+            for e in entries.flatten() {
+                let Ok(p) = e.file_name().to_string_lossy().parse::<i32>() else { continue };
+                if p > 0 && proc_uid(p) == Some(uid) {
+                    pids.push(p);
+                }
+            }
+        }
+        self.apply_tids(&pids, pkg, cfg);
+    }
+
+    /// 全量应用 (启动 / 配置变更), 非周期; 单遍 /proc 收集 pkg→pids 后逐包
+    /// apply_tids (O(P), 避免 O(P²): 每包一次全表重扫); 不做 cleanup (触发时清理)
     pub fn apply_all(&mut self, cfg: &AppConfig) -> usize {
-        let mut seen: HashMap<String, i32> = HashMap::new(); // pkg -> 任一 pid
+        // 单遍 /proc: 每 pid 只读一次 cmdline → 归因 → 按包收集 pids
+        let mut by_pkg: HashMap<String, Vec<i32>> = HashMap::new();
         if let Ok(entries) = std::fs::read_dir("/proc") {
             for e in entries.flatten() {
                 let Ok(pid) = e.file_name().to_string_lossy().parse::<i32>() else { continue };
@@ -78,15 +98,17 @@ impl CpuAffinity {
                     continue;
                 }
                 if let Some(pkg) = resolve_pkg(pid, cfg) {
-                    seen.entry(pkg).or_insert(pid);
+                    by_pkg.entry(pkg).or_default().push(pid);
                 }
             }
         }
-        let keys: Vec<String> = seen.keys().cloned().collect();
-        for pkg in keys {
-            self.apply_pkg(&pkg, cfg);
+        let pkgs: Vec<String> = by_pkg.keys().cloned().collect();
+        for pkg in &pkgs {
+            if let Some(pids) = by_pkg.get(pkg) {
+                self.apply_tids(pids, pkg, cfg);
+            }
         }
-        seen.len()
+        by_pkg.len()
     }
 
     /// 应用一个包的全部进程 (主进程 + pkg: 子进程) 的全部线程
@@ -155,12 +177,13 @@ impl CpuAffinity {
                         self.apply_all(&cfg);
                     }
                 }
-                Ok(CpuMsg::ApplyPkg(pkg)) => {
-                    // 冷启动包名: 延迟 2s 覆盖冷启动子进程窗口后按包应用
+                Ok(CpuMsg::ApplyPkg(uid, pkg)) => {
+                    // 冷启动: 延迟 1s 覆盖子进程窗口后按 uid 枚举 (主+子进程同 uid,
+                    // 精确且避免 cmdline 归因竞态; 不误捞其他用户同包名实例)
                     thread::sleep(ENUM_DELAY);
                     let cfg = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
                     if let Some(cfg) = cfg {
-                        self.apply_pkg(&pkg, &cfg);
+                        self.on_uid(uid, &pkg, &cfg);
                     }
                     // 触发枚举时清理: 删已消失 tid 的 APPLIED 条目, 防 tid 回收后 kprobe 误抓
                     self.cleanup_dead();
@@ -188,6 +211,17 @@ pub fn start() -> bool {
     let cpu = CpuAffinity::new();
     thread::spawn(move || cpu.run(rx, Arc::new(AtomicBool::new(false))));
     true
+}
+
+/// /proc/<pid>/status 的有效 uid (Uid: 首值); 按 uid 枚举用
+fn proc_uid(pid: i32) -> Option<i32> {
+    let status = std::fs::read_to_string(format!("/proc/{}/status", pid)).ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            return rest.split_whitespace().next()?.parse().ok();
+        }
+    }
+    None
 }
 
 /// cmdline 归因: 目标包(精确) 或 目标包:子进程

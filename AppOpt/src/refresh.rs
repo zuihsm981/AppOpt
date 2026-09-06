@@ -114,7 +114,7 @@ fn bind_default_launcher(state: &mut RefreshState) {
 }
 
 fn apply_app_config(state: &mut RefreshState, pkg: &str) {
-    // com.android.launcher3 是默认桌面白名单成员，始终绑定全局刷新率配置；
+    // com.android.launcher3 是默认桌面, 始终绑定全局刷新率配置;
     // 即使配置文件中残留同名 refresh_app 行，也不能把桌面切到应用级覆盖值。
     if pkg != crate::config::DEFAULT_REFRESH_PACKAGE {
         if let Some(cfg) = state.app_configs.get(pkg) {
@@ -185,26 +185,13 @@ fn switch_to_idle(state: &mut RefreshState) {
     state.last_reset_time = None;
 }
 
-/// 前台应用切换处理: 完整规则矩阵。
-///   - 已配置应用       → 应用其专属配置;
-///   - 有配置 → 无配置(含 launcher) → 应用全局配置;
-///   - 无配置 → 无配置   → 不切刷新率。
-/// pkg 为归一化的基础包名 (pkg:child → pkg)。
+/// 刷新率应用: 仅 launcher 或已配置应用会到达此处 (主线程 rfr uid 表已过滤,
+/// 不存在"无配置 → 无配置"场景)。launcher(视为无配置) → 全局配置; 已配置 → 专属配置。
 fn try_apply_fg_pkg(state: &mut RefreshState, pkg: &str) -> bool {
     if pkg.is_empty() {
         return false;
     }
-    let is_launcher = pkg == crate::config::DEFAULT_REFRESH_PACKAGE;
-    let is_managed = state.app_configs.contains_key(pkg);
-    // 无配置应用(含 launcher 等价): 仅当上一个是有配置应用才应用全局配置
-    if !is_launcher && !is_managed {
-        let prev_configured = state.app_configs.contains_key(&state.current_package);
-        if !prev_configured {
-            return false; // 无配置 → 无配置: 不切
-        }
-    }
     state.current_package = pkg.to_string();
-    // 无配置/launcher → 全局配置; 已配置 → 专属配置
     apply_app_config(state, pkg);
     set_refresh_rate(state, state.current_active);
     reset_timer(state, true);
