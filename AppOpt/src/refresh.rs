@@ -22,24 +22,6 @@ static WAKE_FD: AtomicI32 = AtomicI32::new(-1);
 static REFRESH_STATUS: Mutex<Option<RefreshStatus>> = Mutex::new(None);
 static REFRESH_TX: Mutex<Option<mpsc::Sender<RefreshEvent>>> = Mutex::new(None);
 
-/// 刷新率线程正在等待解析的前台 pid（冷启动竞态）。
-/// cache.rs 在 pkg_track_pid 写入 PID_PKG 后按此值零成本过滤，命中才通知。
-static REFRESH_PENDING_PID: AtomicI32 = AtomicI32::new(0);
-
-/// 供 cache.rs 通知：若刷新率线程正在等待该 pid 的包名入库，则发事件唤醒。
-pub fn notify_pkg_tracked(pid: i32) {
-    if pid <= 0 {
-        return;
-    }
-    if REFRESH_PENDING_PID.load(Ordering::Acquire) != pid {
-        return; // 非等待中的 pid，零成本过滤，不打扰刷新率线程
-    }
-    let guard = REFRESH_TX.lock().unwrap();
-    if let Some(tx) = guard.as_ref() {
-        let _ = tx.send(RefreshEvent::PkgTracked(pid));
-        wake();
-    }
-}
 
 #[derive(Clone)]
 pub struct RefreshStatus {
@@ -57,8 +39,6 @@ enum RefreshEvent {
     Input,
     /// full_scan 发现已存在的默认桌面后，要求刷新线程绑定全局配置。
     BindDefaultLauncher,
-    /// cache 层写入 PID_PKG 后通知：若该 pid 正是线程等待的前台 pid，立即应用刷新率。
-    PkgTracked(i32),
 }
 
 struct AppRefreshConfig {
@@ -206,20 +186,16 @@ fn switch_to_idle(state: &mut RefreshState) {
     state.last_reset_time = None;
 }
 
-/// 把刷新率应用到前台 pid（先查 PID_PKG 包名，再白名单准入）。
-/// 供 fg 回调与 pending 重试共用；返回是否成功应用。
-fn try_apply_fg(state: &mut RefreshState, pid: i32) -> bool {
-    // 防线一：从共享 pid→pkg 索引获取包名
-    let Some(pkg) = crate::cache::pkg_lookup_pid(pid) else {
-        return false;
-    };
+/// 把刷新率应用到前台包名（白名单准入）。pkg 由 binder 回调 + /proc cmdline 解析。
+/// 返回是否成功应用。
+fn try_apply_fg_pkg(state: &mut RefreshState, pkg: &str) -> bool {
     if pkg.is_empty() || pkg == state.last_applied_pkg {
         return true; // 已应用过，无需重复
     }
 
-    // 防线二：白名单准入检查（唯一真正的过滤器）
+    // 白名单准入检查（唯一真正的过滤器）
     let is_launcher = pkg == crate::config::DEFAULT_REFRESH_PACKAGE;
-    let is_managed = state.app_configs.contains_key(&pkg);
+    let is_managed = state.app_configs.contains_key(pkg);
     if !is_launcher && !is_managed {
         return false; // 系统设置、状态栏、弹窗、未配置应用全部丢弃
     }
@@ -229,11 +205,11 @@ fn try_apply_fg(state: &mut RefreshState, pid: i32) -> bool {
     let cur_configured = is_launcher || is_managed;
 
     let now = Instant::now();
-    state.current_package = pkg.clone();
-    state.last_applied_pkg = pkg.clone();
+    state.current_package = pkg.to_string();
+    state.last_applied_pkg = pkg.to_string();
     state.last_apply_time = Some(now);
 
-    apply_app_config(state, &pkg);
+    apply_app_config(state, pkg);
     // 未配置应用之间切换时不重新应用全局活跃刷新率；
     // 仅当从已配置应用切换到未配置应用（或切到已配置应用）时才应用活跃刷新率
     if prev_configured || cur_configured {
@@ -243,19 +219,20 @@ fn try_apply_fg(state: &mut RefreshState, pid: i32) -> bool {
     true
 }
 
-/// IProcessObserver 回调触发：收到 pid 后先试应用刷新率。
-/// 冷启动竞态：新进程 fg 回调可能早于 KPM 事件处理完成、PID_PKG 尚未填充，
-/// 此时登记 REFRESH_PENDING_PID；cache 层 pkg_track_pid 命中该 pid 时通过
-/// mpsc 事件通知刷新率线程立即应用（事件驱动，无轮询、无超时兜底）。
-fn handle_fg_change(state: &mut RefreshState, pid: i32) {
-    // PID_PKG 已有该 pid → 直接决定（应用刷新率，或按白名单丢弃），不登记。
-    if crate::cache::pkg_lookup_pid(pid).is_some() {
-        try_apply_fg(state, pid);
-        return;
+/// binder 前台回调: 直接由 /proc cmdline 解析前台包名 (主进程或 pkg: 子进程),
+/// 无需共享 PID_PKG。launcher 或刷新率配置过的包才返回 Some。
+fn resolve_fg_pkg(state: &RefreshState, pid: i32) -> Option<String> {
+    let cmd = crate::apply_affinity::read_cmdline(pid)?;
+    if cmd == crate::config::DEFAULT_REFRESH_PACKAGE {
+        return Some(crate::config::DEFAULT_REFRESH_PACKAGE.to_string());
     }
-    // 冷启动竞态：PID_PKG 尚无该 pid（KPM 事件链未处理完）。登记等待 pid，
-    // 待 pkg_track_pid 写入后由 PkgTracked 事件驱动应用。
-    REFRESH_PENDING_PID.store(pid, Ordering::Release);
+    state
+        .app_configs
+        .keys()
+        .find(|pkg| {
+            cmd == **pkg || cmd.strip_prefix(pkg.as_str()).is_some_and(|r| r.starts_with(':'))
+        })
+        .cloned()
 }
 
 /// input 事件触发：用户活动
@@ -419,7 +396,7 @@ pub fn refresh_init() {
 
         loop {
             // 事件驱动：阻塞等待事件；无轮询、无超时兜底。
-            // 冷启动竞态由 cache 层 pkg_track_pid → PkgTracked 事件直接解决。
+            // 前台包名由 binder 回调 pid + /proc cmdline 直接解析, 无共享缓存依赖。
             let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 3, -1) };
             if n < 0 {
                 if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
@@ -439,14 +416,6 @@ pub fn refresh_init() {
                                 RefreshEvent::BindDefaultLauncher => {
                                     bind_default_launcher(&mut state)
                                 }
-                                // cache 层 pkg_track_pid 命中待解析前台 pid 的通知。
-                                // 事件驱动：收到即应用并清除等待标记。
-                                RefreshEvent::PkgTracked(pid) => {
-                                    if REFRESH_PENDING_PID.load(Ordering::Acquire) == pid {
-                                        REFRESH_PENDING_PID.store(0, Ordering::Release);
-                                    }
-                                    try_apply_fg(&mut state, pid);
-                                }
                             }
                         }
                         check_config(&mut state);
@@ -458,7 +427,7 @@ pub fn refresh_init() {
                     }
                     3 => {
                         // IProcessObserver 回调: 读取 pid（socketpair datagram，4 字节 i32），
-                        // 包名由 handle_fg_change 从共享 ProcCache 查询
+                        // binder 回调 pid + uid: 刷新率按 pid 直解包名, CPU 按 uid 枚举
                         let n = unsafe {
                             libc::recv(
                                 fg_recv_fd,
@@ -470,7 +439,10 @@ pub fn refresh_init() {
                         if n == 8 {
                             let pid = i32::from_ne_bytes([fg_buf[0], fg_buf[1], fg_buf[2], fg_buf[3]]);
                             let uid = i32::from_ne_bytes([fg_buf[4], fg_buf[5], fg_buf[6], fg_buf[7]]);
-                            handle_fg_change(&mut state, pid);
+                            // binder 回调 pid → /proc cmdline 直接解析包名 → 刷新率模块
+                            if let Some(pkg) = resolve_fg_pkg(&state, pid) {
+                                try_apply_fg_pkg(&mut state, &pkg);
+                            }
                             // CPU 亲和性: 同一 binder 回调按 uid 枚举该应用全部进程
                             if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
                                 let _ = tx.send(uid);

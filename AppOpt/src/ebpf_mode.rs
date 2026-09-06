@@ -501,7 +501,6 @@ pub fn full_scan(_cfg: &AppConfig, _state: &mut EbpfState) {
         for entry in entries.flatten() {
             let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else { continue };
             if tid_comm(pid).as_deref() == Some(crate::config::DEFAULT_REFRESH_COMM) {
-                crate::cache::pkg_track_pid(pid, crate::config::DEFAULT_REFRESH_PACKAGE);
                 launcher_found = true;
             }
         }

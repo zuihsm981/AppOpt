@@ -27,6 +27,10 @@ use std::time::Duration;
 use crate::config::AppConfig;
 use crate::ebpf_mode::KpmHandle;
 
+/// 前台回调后延迟枚举时长: 冷启动子进程 (pkg:child) 常在回调后 0.5~2s 内 spawn,
+/// 延迟 2s 后按 uid 枚举一次覆盖冷启动窗口 (主进程回调时已在, 无影响)。
+const ENUM_DELAY: Duration = Duration::from_secs(2);
+
 /// 全局投递通道: refresh 线程转发 fg uid (0 → 全量应用一次)
 static CPU_FG_TX: OnceLock<Mutex<mpsc::Sender<i32>>> = OnceLock::new();
 
@@ -81,11 +85,12 @@ impl CpuAffinity {
         }
         let pkg = pkg?;
         self.apply_tids(&pids, &pkg, cfg);
+        // 仅触发枚举时清理: 删除已消失 tid 的 APPLIED 条目, 防 tid 回收后 kprobe 误抓
         self.cleanup_dead();
         Some(pkg)
     }
 
-    /// 全量应用 (启动 / 配置变更), 非周期
+    /// 全量应用 (启动 / 配置变更), 非周期; 不做 cleanup (清理只在触发枚举时进行)
     pub fn apply_all(&mut self, cfg: &AppConfig) -> usize {
         let mut seen: HashMap<String, i32> = HashMap::new(); // pkg -> 任一 pid
         if let Ok(entries) = std::fs::read_dir("/proc") {
@@ -103,7 +108,6 @@ impl CpuAffinity {
         for pkg in keys {
             self.apply_pkg(&pkg, cfg);
         }
-        self.cleanup_dead();
         seen.len()
     }
 
@@ -174,6 +178,9 @@ impl CpuAffinity {
                     }
                 }
                 Ok(uid) if uid > 0 => {
+                    // 方案 A: 单次延迟枚举 —— 前台回调时冷启动子进程可能尚未 spawn,
+                    // 睡 2s 覆盖冷启动窗口后按 uid 全量枚举 (主+子进程+全部线程)。
+                    thread::sleep(ENUM_DELAY);
                     let cfg = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
                     if let Some(cfg) = cfg {
                         let _ = self.on_uid(uid, &cfg);
