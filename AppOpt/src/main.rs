@@ -28,7 +28,7 @@ use crate::config::{
 };
 use crate::cpuset::{init_cpu_topo, set_base_cpuset};
 use crate::ebpf_mode::{
-    full_scan, event_dispatch, comm_map_init, ebpf_init, EbpfState,
+    full_scan, event_dispatch, ebpf_init, EbpfState,
 };
 use crate::proc_mode::{cache_sync, ProcScanState};
 use crate::web::{
@@ -270,14 +270,7 @@ fn main() {
     ) {
         let Some(cfg) = cfg else { return };
         if let Some(es) = ebpf_state.as_mut() {
-            let r = comm_map_init(&mut es.bpf, &cfg.target_pkgs, es.comm_capacity);
-            if !r {
-                full_scan(cfg, es);
-            } else {
-                // 白名单已更新，丢弃旧的 pid→pkg 解析缓存，让后续事件重新识别；
-                // 已绑定的任务和命中计数保留，避免重复全量扫描的开销。
-                es.cache.invalidate_pid_cache();
-            }
+            full_scan(cfg, es);
         } else {
             let ps = proc_state.get_or_insert_with(ProcScanState::new);
             ps.scan_all_proc = true;
@@ -313,9 +306,7 @@ fn main() {
         if let Some(mut es) = ebpf_init(kpm_wake_fd) {
             let cfg = lock_ignore_poison(&CURRENT_CONFIG).clone();
             if let Some(cfg) = cfg {
-                if !comm_map_init(&mut es.bpf, &cfg.target_pkgs, es.comm_capacity) {
-                    full_scan(&cfg, &mut es);
-                }
+                full_scan(&cfg, &mut es);
             }
             ebpf_state = Some(es);
             // CPU 亲和性: binder 前台回调驱动 (cpu_affinity.rs), 启动即全量应用一次
@@ -397,9 +388,7 @@ fn main() {
                         // 自动/强制 KPM: 尝试初始化
                         if let Some(mut es) = ebpf_init(kpm_wake_fd) {
                             if let Some(cfg) = cfg.as_ref() {
-                                if !comm_map_init(&mut es.bpf, &cfg.target_pkgs, es.comm_capacity) {
-                                    full_scan(cfg, &mut es);
-                                }
+                                full_scan(cfg, &mut es);
                             }
                             ebpf_state = Some(es);
                             if cpu_ready {
