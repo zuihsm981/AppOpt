@@ -219,10 +219,10 @@ fn apply_fg(state: &mut RefreshState, _pid: i32, pkg: &str) {
     state.current_package = pkg.to_string();
     state.last_applied_pkg = pkg.to_string();
     state.last_apply_time = Some(now);
-    // 有配置应用 → 专属配置; 有配置 → 无配置 (含 launcher) → 全局配置
+    // 有配置应用 → 专属配置; 有配置 → 无配置 (含 launcher) → 全局配置。
+    // 只应用配置, 不额外启动计时器 (计时器由 input/初始化路径管理)。
     apply_app_config(state, pkg);
     set_refresh_rate(state, state.current_active);
-    reset_timer(state, true);
 }
 
 /// binder 回调收到前台 pid 后交给刷新率线程; 线程内自行解析包名并查规则。
