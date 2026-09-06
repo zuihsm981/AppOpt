@@ -2,9 +2,9 @@
 //! IProcessObserver binder 回调实现（dlopen 运行时加载 libbinder_ndk.so）
 //!
 //! 触发分离/数据共享（参考 优化.md）：
-//! Binder 回调只提取 pid，通过 socketpair(SOCK_DGRAM) 发送 pid（4 字节 i32）。
-//! 主循环 (main.rs) 接收 pid 后分成两条线程处理：
-//! proc 解析包名 → 按规则分类 → CPU 候选列表 / 刷新率模块 (收到 pid+包名)。
+//! Binder 回调只提取 pid，通过 socketpair(SOCK_DGRAM) 发送 pid（4 字节 i32），
+//! 不再依赖 /data/system/packages.list / UID 映射表。
+//! 刷新率模块从共享 ProcCache（PID_PKG）按 pid 查包名，热路径零文件 I/O。
 
 use std::ffi::c_void;
 use std::sync::{OnceLock};
@@ -108,9 +108,8 @@ fn ndk() -> Option<&'static BinderNdk> {
 const STATUS_OK: c_int = 0;
 const STATUS_UNKNOWN_TRANSACTION: c_int = -29;
 
-// fg 事件通过 socketpair(SOCK_DGRAM) 传递 pid（4 字节 i32）。
-// 包名由接收侧自行解析。
-// 热路径零文件 I/O。
+// fg 事件通过 socketpair(SOCK_DGRAM) 传递 pid（4 字节 i32），
+// 刷新率模块从共享 ProcCache（PID_PKG）按 pid 查包名，热路径零文件 I/O
 static FG_SEND_FD: AtomicI32 = AtomicI32::new(-1);
 
 struct SendClass(*mut c_void);
@@ -158,8 +157,9 @@ extern "C" fn on_transact(
             let fg = fg_val != 0;
 
             if fg && pid > 0 {
-                // 触发分离：Binder 回调只传 pid（4 字节），包名由接收侧
-                // (主循环 binder 流程) 自行解析。
+                // 触发分离：Binder 回调只传 pid（4 字节），包名由刷新率模块从共享
+                // ProcCache（PID_PKG）按 pid 查询，热路径零 packages.list 文件 I/O。
+                // 系统界面/未配置应用的白名单过滤在 refresh 侧完成（两道防线）。
                 let fd = FG_SEND_FD.load(Ordering::Acquire);
                 if fd >= 0 {
                     let _ = unsafe {

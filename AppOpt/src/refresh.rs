@@ -1,43 +1,44 @@
-//! 刷新率控制模块
-//!
-//! 简单路线:
-//!   主循环 (binder 回调) 把前台 pid 交给本模块 (refresh_on_fg_pid);
-//!   把前台应用送给本模块; 本模块收到 (pid, 包名) 后查规则 (app_configs /
-//!   默认桌面), 决定是否切换刷新率, 再按 timeout 计时切回 idle。
-//! 事件只经 mpsc 从其他线程送来, 刷新率线程独占 SurfaceFlinger 切换。
-
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{mpsc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const MODE_120: i32 = 0;
 const MODE_60: i32 = 1;
 const MODE_90: i32 = 2;
-
-/// input 事件类型码 (与 ebpf_mode::EBPF_EVENT_INPUT 一致)
-pub const EVENT_INPUT: u32 = 5;
 
 /// 刷新率配置与 CPU 规则共用 CONFIG_FILE 指向的主配置文件。
 fn config_path() -> String {
     crate::lock_ignore_poison(&crate::config::CONFIG_FILE).clone()
 }
 
+pub const EVENT_INPUT: u32 = 5;
+
 static REFRESH_FORCE_RELOAD: AtomicBool = AtomicBool::new(false);
 static WAKE_FD: AtomicI32 = AtomicI32::new(-1);
 static REFRESH_STATUS: Mutex<Option<RefreshStatus>> = Mutex::new(None);
 static REFRESH_TX: Mutex<Option<mpsc::Sender<RefreshEvent>>> = Mutex::new(None);
 
-/// 前台应用事件: (pid, 包名)。收到后查规则决定是否切换刷新率。
-enum RefreshEvent {
-    Input,
-    /// full_scan 发现已存在的默认桌面后，要求刷新线程绑定全局配置。
-    BindDefaultLauncher,
-    /// binder 回调送来的前台 pid: 本线程自行 /proc 解析包名后查规则。
-    FgPid(i32),
+/// 刷新率线程正在等待解析的前台 pid（冷启动竞态）。
+/// cache.rs 在 pkg_track_pid 写入 PID_PKG 后按此值零成本过滤，命中才通知。
+static REFRESH_PENDING_PID: AtomicI32 = AtomicI32::new(0);
+
+/// 供 cache.rs 通知：若刷新率线程正在等待该 pid 的包名入库，则发事件唤醒。
+pub fn notify_pkg_tracked(pid: i32) {
+    if pid <= 0 {
+        return;
+    }
+    if REFRESH_PENDING_PID.load(Ordering::Acquire) != pid {
+        return; // 非等待中的 pid，零成本过滤，不打扰刷新率线程
+    }
+    let guard = REFRESH_TX.lock().unwrap();
+    if let Some(tx) = guard.as_ref() {
+        let _ = tx.send(RefreshEvent::PkgTracked(pid));
+        wake();
+    }
 }
 
 #[derive(Clone)]
@@ -50,6 +51,14 @@ pub struct RefreshStatus {
     pub timeout: i32,
     pub active_mode: i32,
     pub idle_mode: i32,
+}
+
+enum RefreshEvent {
+    Input,
+    /// full_scan 发现已存在的默认桌面后，要求刷新线程绑定全局配置。
+    BindDefaultLauncher,
+    /// cache 层写入 PID_PKG 后通知：若该 pid 正是线程等待的前台 pid，立即应用刷新率。
+    PkgTracked(i32),
 }
 
 struct AppRefreshConfig {
@@ -72,6 +81,7 @@ struct RefreshState {
     last_reset_time: Option<Instant>,
     current_package: String,
     last_applied_pkg: String,
+    last_apply_time: Option<Instant>,
     last_input_time: Option<Instant>,
     timer_fd: i32,
 }
@@ -110,7 +120,7 @@ fn set_refresh_rate(state: &mut RefreshState, mode: i32) {
     if mode == state.current_applied_mode {
         return;
     }
-    // 只走 binder 直连 SurfaceFlinger
+    // 只走 binder 直连 SurfaceFlinger，不再回退到 service 子进程
     crate::process_observer::set_refresh_rate_binder(mode);
     state.current_applied_mode = mode;
 }
@@ -125,7 +135,8 @@ fn bind_default_launcher(state: &mut RefreshState) {
 }
 
 fn apply_app_config(state: &mut RefreshState, pkg: &str) {
-    // 默认桌面始终绑定全局刷新率配置；其余应用有专属配置用专属，否则用全局。
+    // com.android.launcher3 是默认桌面白名单成员，始终绑定全局刷新率配置；
+    // 即使配置文件中残留同名 refresh_app 行，也不能把桌面切到应用级覆盖值。
     if pkg != crate::config::DEFAULT_REFRESH_PACKAGE {
         if let Some(cfg) = state.app_configs.get(pkg) {
             state.current_timeout = cfg.timeout;
@@ -195,47 +206,60 @@ fn switch_to_idle(state: &mut RefreshState) {
     state.last_reset_time = None;
 }
 
-/// 刷新率模块收到 (pid, 包名) 后查规则, 决定是否切换刷新率。
-/// 规则:
-///   - com.android.launcher3 视为无配置应用;
-///   - 无配置应用之间切换 (含 launcher) → 不切换刷新率;
-///   - 从有配置应用切换到 launcher → 应用全局配置并切换;
-///   - 涉及有配置应用的切换 → 应用对应配置并切换。
-/// 刷新率模块收到 (pid, 包名) 后查规则应用。
-/// 规则:
-///   - com.android.launcher3 视为无配置应用;
-///   - 有配置应用 → 应用其专属配置并切换;
-///   - launcher / 无配置应用 → 保持全局配置 (速率不变 = "不切换"), 计时器照常运行。
-fn apply_fg(state: &mut RefreshState, _pid: i32, pkg: &str) {
+/// 把刷新率应用到前台 pid（先查 PID_PKG 包名，再白名单准入）。
+/// 供 fg 回调与 pending 重试共用；返回是否成功应用。
+fn try_apply_fg(state: &mut RefreshState, pid: i32) -> bool {
+    // 防线一：从共享 pid→pkg 索引获取包名
+    let Some(pkg) = crate::cache::pkg_lookup_pid(pid) else {
+        return false;
+    };
     if pkg.is_empty() || pkg == state.last_applied_pkg {
-        return; // 已应用过
+        return true; // 已应用过，无需重复
     }
-    // 无配置应用 (含 com.android.launcher3) 之间切换: 什么都不做
-    if !state.app_configs.contains_key(pkg) && !state.app_configs.contains_key(&state.last_applied_pkg) {
-        return;
+
+    // 防线二：白名单准入检查（唯一真正的过滤器）
+    let is_launcher = pkg == crate::config::DEFAULT_REFRESH_PACKAGE;
+    let is_managed = state.app_configs.contains_key(&pkg);
+    if !is_launcher && !is_managed {
+        return false; // 系统设置、状态栏、弹窗、未配置应用全部丢弃
     }
+
+    // 判断切换前/后的应用是否已配置（决定是否应用全局活跃刷新率）
+    let prev_configured = state.app_configs.contains_key(&state.last_applied_pkg);
+    let cur_configured = is_launcher || is_managed;
+
     let now = Instant::now();
-    state.current_package = pkg.to_string();
-    state.last_applied_pkg = pkg.to_string();
-    // 有配置应用 → 专属配置; 有配置 → 无配置 (含 launcher) → 全局配置。
-    // 只应用配置, 不额外启动计时器 (计时器由 input/初始化路径管理)。
-    apply_app_config(state, pkg);
-    set_refresh_rate(state, state.current_active);
+    state.current_package = pkg.clone();
+    state.last_applied_pkg = pkg.clone();
+    state.last_apply_time = Some(now);
+
+    apply_app_config(state, &pkg);
+    // 未配置应用之间切换时不重新应用全局活跃刷新率；
+    // 仅当从已配置应用切换到未配置应用（或切到已配置应用）时才应用活跃刷新率
+    if prev_configured || cur_configured {
+        set_refresh_rate(state, state.current_active);
+    }
+    reset_timer(state, true);
+    true
 }
 
-/// binder 回调收到前台 pid 后交给刷新率线程; 线程内自行解析包名并查规则。
-pub fn refresh_on_fg_pid(pid: i32) {
-    if pid <= 0 {
+/// IProcessObserver 回调触发：收到 pid 后先试应用刷新率。
+/// 冷启动竞态：新进程 fg 回调可能早于 KPM 事件处理完成、PID_PKG 尚未填充，
+/// 此时登记 REFRESH_PENDING_PID；cache 层 pkg_track_pid 命中该 pid 时通过
+/// mpsc 事件通知刷新率线程立即应用（事件驱动，无轮询、无超时兜底）。
+fn handle_fg_change(state: &mut RefreshState, pid: i32) {
+    // PID_PKG 已有该 pid → 直接决定（应用刷新率，或按白名单丢弃），不登记。
+    if crate::cache::pkg_lookup_pid(pid).is_some() {
+        try_apply_fg(state, pid);
         return;
     }
-    let guard = REFRESH_TX.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(tx) = guard.as_ref() {
-        let _ = tx.send(RefreshEvent::FgPid(pid));
-        wake();
-    }
+    // 冷启动竞态：PID_PKG 尚无该 pid（KPM 事件链未处理完）。登记等待 pid，
+    // 待 pkg_track_pid 写入后由 PkgTracked 事件驱动应用。
+    REFRESH_PENDING_PID.store(pid, Ordering::Release);
 }
 
-/// input 事件触发：用户活动。1 秒节流 + 计时器停止时切回活跃刷新率并重启计时器。
+/// input 事件触发：用户活动
+/// 1 秒节流 + 计时器停止时切回活跃刷新率并重启计时器
 fn handle_input(state: &mut RefreshState) {
     let now = Instant::now();
     if let Some(last) = state.last_input_time {
@@ -280,7 +304,7 @@ fn update_status(state: &RefreshState) {
         active_mode: state.current_active,
         idle_mode: state.current_idle,
     };
-    *REFRESH_STATUS.lock().unwrap_or_else(|e| e.into_inner()) = Some(status);
+    *REFRESH_STATUS.lock().unwrap() = Some(status);
 }
 
 fn wake() {
@@ -298,7 +322,35 @@ pub fn refresh_init() {
     }
     WAKE_FD.store(wake_fd, Ordering::Release);
 
-    // IProcessObserver 回调由主循环注册并统一分发前台 pid (refresh_on_fg_pid)。
+    // IProcessObserver 回调用 socketpair(SOCK_DGRAM) 传递包名（字符串），不再传 uid
+    let mut fg_sv: [libc::c_int; 2] = [0, 0];
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+            fg_sv.as_mut_ptr(),
+        )
+    } != 0
+    {
+        unsafe { libc::close(wake_fd); }
+        return;
+    }
+    let fg_recv_fd = fg_sv[0];
+    let fg_send_fd = fg_sv[1];
+
+    // 增大 socketpair 接收缓冲（默认可能只有几十 KB），减少 fg 事件堆积溢出
+    let rcvbuf: libc::c_int = 256 * 1024;
+    unsafe {
+        libc::setsockopt(
+            fg_recv_fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &rcvbuf as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+
     let timer_fd = unsafe {
         libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC | libc::TFD_NONBLOCK)
     };
@@ -308,7 +360,7 @@ pub fn refresh_init() {
     }
 
     let (tx, rx) = mpsc::channel::<RefreshEvent>();
-    *REFRESH_TX.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    *REFRESH_TX.lock().unwrap() = Some(tx);
 
     let mut state = RefreshState {
         timeout_seconds: 30,
@@ -324,6 +376,7 @@ pub fn refresh_init() {
         last_reset_time: None,
         current_package: String::new(),
         last_applied_pkg: String::new(),
+        last_apply_time: None,
         last_input_time: None,
         timer_fd,
     };
@@ -334,6 +387,9 @@ pub fn refresh_init() {
     // 初始化时先应用一次全局 active 刷新率；launcher 的全局绑定由 full_scan 事件完成。
     let active = state.current_active;
     set_refresh_rate(&mut state, active);
+
+    // 注册 IProcessObserver 回调（回调只传 pid，包名由共享 ProcCache 查询）
+    let _ = crate::process_observer::init_observer(fg_send_fd);
 
     let name = CString::new("RefreshRate").unwrap();
     thread::spawn(move || {
@@ -352,10 +408,19 @@ pub fn refresh_init() {
         ev.u64 = 1;
         unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, timer_fd, &mut ev); }
 
-        let mut events: [libc::epoll_event; 2] = unsafe { std::mem::zeroed() };
+        // fg socketpair 读端: IProcessObserver 回调通知 (u64=3)
+        ev.events = libc::EPOLLIN as u32;
+        ev.u64 = 3;
+        unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fg_recv_fd, &mut ev); }
+
+        let mut events: [libc::epoll_event; 3] = unsafe { std::mem::zeroed() };
+        // fg socketpair 接收缓冲（4 字节 pid i32）
+        let mut fg_buf = [0u8; 4];
 
         loop {
-            let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 2, -1) };
+            // 事件驱动：阻塞等待事件；无轮询、无超时兜底。
+            // 冷启动竞态由 cache 层 pkg_track_pid → PkgTracked 事件直接解决。
+            let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 3, -1) };
             if n < 0 {
                 if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                     continue;
@@ -374,19 +439,13 @@ pub fn refresh_init() {
                                 RefreshEvent::BindDefaultLauncher => {
                                     bind_default_launcher(&mut state)
                                 }
-                                // binder 回调送来的前台 pid: 自行解析包名后查规则
-                                RefreshEvent::FgPid(pid) => {
-                                    if let Some(cfg) =
-                                        crate::lock_ignore_poison(
-                                            &crate::config::CURRENT_CONFIG,
-                                        ).clone()
-                                    {
-                                        if let Some(pkg) =
-                                            crate::ebpf_mode::resolve_pkg(pid, &cfg)
-                                        {
-                                            apply_fg(&mut state, pid, &pkg);
-                                        }
+                                // cache 层 pkg_track_pid 命中待解析前台 pid 的通知。
+                                // 事件驱动：收到即应用并清除等待标记。
+                                RefreshEvent::PkgTracked(pid) => {
+                                    if REFRESH_PENDING_PID.load(Ordering::Acquire) == pid {
+                                        REFRESH_PENDING_PID.store(0, Ordering::Release);
                                     }
+                                    try_apply_fg(&mut state, pid);
                                 }
                             }
                         }
@@ -396,6 +455,22 @@ pub fn refresh_init() {
                         let mut val: u64 = 0;
                         unsafe { libc::read(timer_fd, &mut val as *mut _ as *mut _, 8); }
                         switch_to_idle(&mut state);
+                    }
+                    3 => {
+                        // IProcessObserver 回调: 读取 pid（socketpair datagram，4 字节 i32），
+                        // 包名由 handle_fg_change 从共享 ProcCache 查询
+                        let n = unsafe {
+                            libc::recv(
+                                fg_recv_fd,
+                                fg_buf.as_mut_ptr() as *mut libc::c_void,
+                                fg_buf.len(),
+                                0,
+                            )
+                        };
+                        if n == 4 {
+                            let pid = i32::from_ne_bytes([fg_buf[0], fg_buf[1], fg_buf[2], fg_buf[3]]);
+                            handle_fg_change(&mut state, pid);
+                        }
                     }
                     _ => {}
                 }
@@ -407,13 +482,15 @@ pub fn refresh_init() {
             libc::close(epfd);
             libc::close(wake_fd);
             libc::close(timer_fd);
+            libc::close(fg_recv_fd);
+            libc::close(fg_send_fd);
         }
     });
 }
 
 /// full_scan 发现默认 launcher PID 后，请求刷新线程绑定全局配置。
 pub fn refresh_bind_default_launcher() {
-    let guard = REFRESH_TX.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = REFRESH_TX.lock().unwrap();
     if let Some(tx) = guard.as_ref() {
         let _ = tx.send(RefreshEvent::BindDefaultLauncher);
         wake();
@@ -421,7 +498,7 @@ pub fn refresh_bind_default_launcher() {
 }
 
 pub fn refresh_on_event(event_type: u32, _pid: i32) {
-    let guard = REFRESH_TX.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = REFRESH_TX.lock().unwrap();
     if let Some(tx) = guard.as_ref() {
         let event = match event_type {
             EVENT_INPUT => RefreshEvent::Input,
@@ -448,6 +525,7 @@ pub fn refresh_get_config() -> (i32, String, String) {
 
 pub fn refresh_set_config(timeout: i32, active: &str, idle: &str) {
     // 原地编辑主配置文件：只替换刷新率字段，保留 CPU 规则、注释、空行和应用配置。
+    // 使用 refresh_ 前缀，确保不会与 CPU 规则语法混淆。
     let path = config_path();
     let content = fs::read_to_string(&path).unwrap_or_default();
     let mut found_timeout = false;
@@ -494,6 +572,7 @@ pub fn refresh_set_config(timeout: i32, active: &str, idle: &str) {
 }
 
 pub fn refresh_get_apps() -> Vec<(String, i32, String, String)> {
+    // 刷新率应用配置只从共享 CURRENT_CONFIG 返回，不再单独读取配置文件。
     let Some(cfg) = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone() else {
         return Vec::new();
     };
@@ -571,8 +650,5 @@ pub fn refresh_del_app(pkg: &str) -> bool {
 }
 
 pub fn refresh_get_status() -> Option<RefreshStatus> {
-    REFRESH_STATUS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
+    REFRESH_STATUS.lock().unwrap().clone()
 }

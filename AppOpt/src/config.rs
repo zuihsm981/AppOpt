@@ -47,7 +47,7 @@ pub struct AppConfig {
     /// CPU 亲和性规则覆盖的应用包名
     pub pkgs: HashSet<String>,
     /// 需要识别的目标包 = CPU 规则包 ∪ 刷新率配置包。
-    /// 只配置了刷新率（无 CPU 规则）的应用也必须被进程识别，
+    /// 只配置了刷新率（无 CPU 规则）的应用也必须被进程识别并登记 PID_PKG，
     /// 否则刷新率前台回调查不到包名、刷新率永不生效。
     pub target_pkgs: HashSet<String>,
     pub has_thread_rules: HashSet<String>,
@@ -455,7 +455,7 @@ pub fn load_config(
         .collect();
 
     // 需要识别的目标包 = CPU 规则包 ∪ 刷新率配置包。
-    // 只配置了刷新率（无 CPU 规则）的应用也必须被识别，
+    // 只配置了刷新率（无 CPU 规则）的应用也必须被识别并登记 PID_PKG，
     // 否则刷新率前台回调查不到包名、刷新率永不生效。
     let mut target_pkgs = pkgs.clone();
     for pkg in app_refresh_configs.keys() {

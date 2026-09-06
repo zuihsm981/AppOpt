@@ -26,9 +26,11 @@ use crate::config::{
     CHECK_INTERVAL, CONFIG_FILE, CONFIG_WAKE_FD, CURRENT_CONFIG,
 };
 use crate::cpuset::{init_cpu_topo, set_base_cpuset};
-use crate::ebpf_mode::{full_scan, event_dispatch, ebpf_init, EbpfState};
+use crate::ebpf_mode::{
+    full_scan, event_dispatch, comm_map_init, EBPF_EVENT_FORK, EBPF_EVENT_EXEC,
+    EBPF_EVENT_RENAME, ebpf_init, EbpfState,
+};
 use crate::proc_mode::{cache_sync, ProcScanState};
-use crate::process_observer::init_observer as observer_init;
 use crate::web::{
     cache_stats, settings_load, settings_save, web_start, WebStats,
     WEB_ENABLED, WEB_STATS, MODE_FORCE, MODE_SWITCH_FD, SETTINGS_FILE,
@@ -224,7 +226,6 @@ fn main() {
     const EV_MODE: u64 = 3;
     const EV_CONFIG: u64 = 4;
     const EV_PROC: u64 = 5;
-    const EV_BINDER: u64 = 6;
 
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epfd < 0 {
@@ -257,7 +258,7 @@ fn main() {
         let it = libc::itimerspec { it_interval: zero, it_value: zero };
         unsafe { libc::timerfd_settime(tfd, 0, &it, std::ptr::null_mut()) };
     }
-    // 配置变更后应用到当前模式: KPM 全量重扫; /proc 标记全量重扫
+    // 配置变更后应用到当前模式: KPM 重载白名单 + 全量扫描; /proc 标记全量重扫
     fn apply_config(
         ebpf_state: &mut Option<EbpfState>,
         proc_state: &mut Option<ProcScanState>,
@@ -265,12 +266,14 @@ fn main() {
     ) {
         let Some(cfg) = cfg else { return };
         if let Some(es) = ebpf_state.as_mut() {
-            // 规则变化: 重建白名单(pkg_pids 过滤依据) + 全量扫描重新识别
-            let mut wl = cfg.target_pkgs.clone();
-            wl.insert(crate::config::DEFAULT_REFRESH_PACKAGE.to_string());
-            wl.insert(crate::config::DEFAULT_REFRESH_COMM.to_string());
-            es.bpf.set_whitelist(&wl);
-            full_scan(cfg, es);
+            let r = comm_map_init(&mut es.bpf, &cfg.target_pkgs, es.comm_capacity);
+            if !r {
+                full_scan(cfg, es);
+            } else {
+                // 白名单已更新，丢弃旧的 pid→pkg 解析缓存，让后续事件重新识别；
+                // 已绑定的任务和命中计数保留，避免重复全量扫描的开销。
+                es.cache.invalidate_pid_cache();
+            }
         } else {
             let ps = proc_state.get_or_insert_with(ProcScanState::new);
             ps.scan_all_proc = true;
@@ -299,48 +302,14 @@ fn main() {
     };
     epoll_add(epfd, proc_timer_fd, EV_PROC);
 
-    // binder 回调 socketpair: IProcessObserver 把前台 pid 发给主循环 (4 字节 i32)
-    // (SOCK_DGRAM, 4 字节 pid i32: IProcessObserver 前台切换)
-    let mut fg_recv_fd: i32 = -1;
-    let mut fg_sv: [libc::c_int; 2] = [0, 0];
-    if unsafe {
-        libc::socketpair(
-            libc::AF_UNIX,
-            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-            0,
-            fg_sv.as_mut_ptr(),
-        )
-    } == 0
-    {
-        fg_recv_fd = fg_sv[0];
-        let fg_send_fd = fg_sv[1];
-        // 增大接收缓冲（默认可能只有几十 KB），减少 fg 事件堆积溢出
-        let rcvbuf: libc::c_int = 256 * 1024;
-        unsafe {
-            libc::setsockopt(
-                fg_recv_fd,
-                libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
-                &rcvbuf as *const libc::c_int as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
-        // 回调侧只注册进 binder 线程池; send 端 fd 由 observer 线程持有
-        observer_init(fg_send_fd);
-        epoll_add(epfd, fg_recv_fd, EV_BINDER);
-    }
-
-    // 初始 KPM 初始化 (强制 /proc 模式不尝试)
+    // 初始 eBPF 初始化 (强制 /proc 模式不尝试)
     if MODE_FORCE.load(Ordering::Relaxed) != 2 {
         if let Some(mut es) = ebpf_init(kpm_wake_fd) {
             let cfg = lock_ignore_poison(&CURRENT_CONFIG).clone();
             if let Some(cfg) = cfg {
-                // 注册规则应用白名单 (pkg_pids 过滤依据) + 全量扫描
-                let mut wl = cfg.target_pkgs.clone();
-                wl.insert(crate::config::DEFAULT_REFRESH_PACKAGE.to_string());
-                wl.insert(crate::config::DEFAULT_REFRESH_COMM.to_string());
-                es.bpf.set_whitelist(&wl);
-                full_scan(&cfg, &mut es);
+                if !comm_map_init(&mut es.bpf, &cfg.target_pkgs, es.comm_capacity) {
+                    full_scan(&cfg, &mut es);
+                }
             }
             ebpf_state = Some(es);
         }
@@ -375,10 +344,17 @@ fn main() {
                 EV_KPM => {
                     read_eventfd(kpm_wake_fd);
                     if let Some(es) = ebpf_state.as_mut() {
-                        // 共享环只承载 input 事件 (用户活动检测)
+                        // 本批事件中是否含 FORK/EXEC/RENAME (需要立即同步亲和性)
+                        let mut need_sync = false;
                         loop {
                             match es.event_rx.try_recv() {
                                 Ok(event) => {
+                                    if event.event_type == EBPF_EVENT_FORK
+                                        || event.event_type == EBPF_EVENT_EXEC
+                                        || event.event_type == EBPF_EVENT_RENAME
+                                    {
+                                        need_sync = true;
+                                    }
                                     let Some(cfg) =
                                         lock_ignore_poison(&CURRENT_CONFIG).clone()
                                     else {
@@ -393,30 +369,13 @@ fn main() {
                                 }
                             }
                         }
-                    }
-                }
-                EV_BINDER => {
-                    // binder 回调帧: 4 字节 pid (IProcessObserver 前台切换)
-                    let mut buf = [0u8; 4];
-                    loop {
-                        let n = unsafe {
-                            libc::recv(
-                                fg_recv_fd,
-                                buf.as_mut_ptr() as *mut libc::c_void,
-                                buf.len(),
-                                0,
-                            )
-                        };
-                        if n != 4 {
-                            break;
-                        }
-                        let pid = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                        // 分成两条独立线程:
-                        //   刷新率线程: 收 pid → 自行解析包名 → 查规则切换;
-                        //   CPU 线程 (KPM 模式): 收 pid → 解析包名 → CPU 规则 → 内核。
-                        crate::refresh::refresh_on_fg_pid(pid);
-                        if let Some(es) = ebpf_state.as_mut() {
-                            let _ = es.cpu_fg_tx.send(pid);
+                        // 收到 FORK/EXEC/RENAME: 立即执行 affinity_sync (仅设置 CPU 亲和性),
+                        // 不依赖定时器/IDLE; 无此类事件时仅增量更新 cache
+                        if need_sync {
+                            let Some(cfg) = lock_ignore_poison(&CURRENT_CONFIG).clone() else {
+                                continue;
+                            };
+                            es.cache.affinity_sync(&cfg.topo);
                         }
                     }
                 }
@@ -442,11 +401,9 @@ fn main() {
                         // 自动/强制 KPM: 尝试初始化
                         if let Some(mut es) = ebpf_init(kpm_wake_fd) {
                             if let Some(cfg) = cfg.as_ref() {
-                                let mut wl = cfg.target_pkgs.clone();
-                                wl.insert(crate::config::DEFAULT_REFRESH_PACKAGE.to_string());
-                                wl.insert(crate::config::DEFAULT_REFRESH_COMM.to_string());
-                                es.bpf.set_whitelist(&wl);
-                                full_scan(cfg, &mut es);
+                                if !comm_map_init(&mut es.bpf, &cfg.target_pkgs, es.comm_capacity) {
+                                    full_scan(cfg, &mut es);
+                                }
                             }
                             ebpf_state = Some(es);
                         }
