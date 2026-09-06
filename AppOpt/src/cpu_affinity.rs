@@ -139,9 +139,18 @@ impl CpuAffinity {
         unsafe {
             libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
         }
+        // 未归因 pid 的有界重试: 首次打开应用时 binder 回调可能早于 cmdline 就绪
+        // (冷启动竞态), on_fg 归因失败则挂起重试, 150ms × 20 ≈ 3s 后放弃。
+        let mut pending: Option<(i32, u32)> = None;
         while !stop.load(Ordering::Relaxed) {
-            match rx.recv_timeout(Duration::from_millis(300)) {
+            let timeout = if pending.is_some() {
+                Duration::from_millis(150)
+            } else {
+                Duration::from_millis(300)
+            };
+            match rx.recv_timeout(timeout) {
                 Ok(0) => {
+                    pending = None;
                     let cfg = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
                     if let Some(cfg) = cfg {
                         self.apply_all(&cfg);
@@ -150,11 +159,27 @@ impl CpuAffinity {
                 Ok(pid) if pid > 0 => {
                     let cfg = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
                     if let Some(cfg) = cfg {
-                        let _ = self.on_fg(pid, &cfg);
+                        if !self.on_fg(pid, &cfg) {
+                            pending = Some((pid, 0));
+                        } else {
+                            pending = None;
+                        }
                     }
                 }
                 Ok(_) => {}
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some((pid, tries)) = pending.take() {
+                        if tries < 20 {
+                            let cfg =
+                                crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
+                            if let Some(cfg) = cfg {
+                                if !self.on_fg(pid, &cfg) {
+                                    pending = Some((pid, tries + 1));
+                                }
+                            }
+                        }
+                    }
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
