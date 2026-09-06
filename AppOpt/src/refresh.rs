@@ -39,6 +39,8 @@ enum RefreshEvent {
     Input,
     /// full_scan 发现已存在的默认桌面后，要求刷新线程绑定全局配置。
     BindDefaultLauncher,
+    /// 主线程判定前台 uid 命中刷新率表后, 下发包名应用刷新率
+    FgPkg(String),
 }
 
 struct AppRefreshConfig {
@@ -209,19 +211,6 @@ fn try_apply_fg_pkg(state: &mut RefreshState, pkg: &str) -> bool {
     true
 }
 
-/// binder 前台回调: /proc cmdline 归一化为基础包名 (pkg:child → pkg)。
-/// 任何前台应用都归因 —— 无配置应用也需要参与"有配置→无配置应用全局"规则。
-fn resolve_fg_pkg(pid: i32) -> Option<String> {
-    let cmd = crate::apply_affinity::read_cmdline(pid)?;
-    if let Some(idx) = cmd.find(':') {
-        let base = cmd[..idx].trim();
-        if !base.is_empty() {
-            return Some(base.to_string());
-        }
-    }
-    Some(cmd)
-}
-
 /// input 事件触发：用户活动
 /// 1 秒节流 + 计时器停止时切回活跃刷新率并重启计时器
 fn handle_input(state: &mut RefreshState) {
@@ -286,35 +275,6 @@ pub fn refresh_init() {
     }
     WAKE_FD.store(wake_fd, Ordering::Release);
 
-    // IProcessObserver 回调经 socketpair(SOCK_DGRAM) 传递 pid+uid (8 字节)
-    let mut fg_sv: [libc::c_int; 2] = [0, 0];
-    if unsafe {
-        libc::socketpair(
-            libc::AF_UNIX,
-            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-            0,
-            fg_sv.as_mut_ptr(),
-        )
-    } != 0
-    {
-        unsafe { libc::close(wake_fd); }
-        return;
-    }
-    let fg_recv_fd = fg_sv[0];
-    let fg_send_fd = fg_sv[1];
-
-    // 增大 socketpair 接收缓冲（默认可能只有几十 KB），减少 fg 事件堆积溢出
-    let rcvbuf: libc::c_int = 256 * 1024;
-    unsafe {
-        libc::setsockopt(
-            fg_recv_fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            &rcvbuf as *const libc::c_int as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-    }
-
     let timer_fd = unsafe {
         libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC | libc::TFD_NONBLOCK)
     };
@@ -350,9 +310,6 @@ pub fn refresh_init() {
     let active = state.current_active;
     set_refresh_rate(&mut state, active);
 
-    // 注册 IProcessObserver 回调: 回调携带 pid+uid, 刷新率按 pid 直解包名
-    let _ = crate::process_observer::init_observer(fg_send_fd);
-
     let name = CString::new("RefreshRate").unwrap();
     thread::spawn(move || {
         unsafe { libc::pthread_setname_np(libc::pthread_self(), name.as_ptr()); }
@@ -370,14 +327,7 @@ pub fn refresh_init() {
         ev.u64 = 1;
         unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, timer_fd, &mut ev); }
 
-        // fg socketpair 读端: IProcessObserver 回调通知 (u64=3)
-        ev.events = libc::EPOLLIN as u32;
-        ev.u64 = 3;
-        unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fg_recv_fd, &mut ev); }
-
-        let mut events: [libc::epoll_event; 3] = unsafe { std::mem::zeroed() };
-        // fg socketpair 接收缓冲 (pid+uid, 8 字节)
-        let mut fg_buf = [0u8; 8];
+        let mut events: [libc::epoll_event; 2] = unsafe { std::mem::zeroed() };
 
         loop {
             // 事件驱动：阻塞等待事件；无轮询、无超时兜底。
@@ -401,6 +351,9 @@ pub fn refresh_init() {
                                 RefreshEvent::BindDefaultLauncher => {
                                     bind_default_launcher(&mut state)
                                 }
+                                RefreshEvent::FgPkg(pkg) => {
+                                    try_apply_fg_pkg(&mut state, &pkg)
+                                }
                             }
                         }
                         check_config(&mut state);
@@ -409,30 +362,6 @@ pub fn refresh_init() {
                         let mut val: u64 = 0;
                         unsafe { libc::read(timer_fd, &mut val as *mut _ as *mut _, 8); }
                         switch_to_idle(&mut state);
-                    }
-                    3 => {
-                        // IProcessObserver 回调: 读取 pid+uid (socketpair datagram, 8 字节);
-                        // 刷新率按 pid 直解包名, CPU 按 uid 枚举
-                        let n = unsafe {
-                            libc::recv(
-                                fg_recv_fd,
-                                fg_buf.as_mut_ptr() as *mut libc::c_void,
-                                fg_buf.len(),
-                                0,
-                            )
-                        };
-                        if n == 8 {
-                            let pid = i32::from_ne_bytes([fg_buf[0], fg_buf[1], fg_buf[2], fg_buf[3]]);
-                            let uid = i32::from_ne_bytes([fg_buf[4], fg_buf[5], fg_buf[6], fg_buf[7]]);
-                            // binder 回调 pid → /proc cmdline 解析包名 → 刷新率模块
-                            if let Some(pkg) = resolve_fg_pkg(pid) {
-                                try_apply_fg_pkg(&mut state, &pkg);
-                            }
-                            // CPU 亲和性: 同一 binder 回调按 uid 枚举该应用全部进程
-                            if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
-                                let _ = tx.send(uid);
-                            }
-                        }
                     }
                     _ => {}
                 }
@@ -444,10 +373,17 @@ pub fn refresh_init() {
             libc::close(epfd);
             libc::close(wake_fd);
             libc::close(timer_fd);
-            libc::close(fg_recv_fd);
-            libc::close(fg_send_fd);
         }
     });
+}
+
+/// 主线程命中刷新率 uid 表后, 下发前台包名 (三线程: 主 → 刷新率线程)。
+pub fn refresh_send_fg_pkg(pkg: String) {
+    let guard = REFRESH_TX.lock().unwrap();
+    if let Some(tx) = guard.as_ref() {
+        let _ = tx.send(RefreshEvent::FgPkg(pkg));
+        wake();
+    }
 }
 
 /// full_scan 发现默认 launcher PID 后，请求刷新线程绑定全局配置。

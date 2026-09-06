@@ -31,10 +31,18 @@ use crate::ebpf_mode::KpmHandle;
 /// 延迟 2s 后按 uid 枚举一次覆盖冷启动窗口 (主进程回调时已在, 无影响)。
 const ENUM_DELAY: Duration = Duration::from_secs(2);
 
-/// 全局投递通道: refresh 线程转发 fg uid (0 → 全量应用一次)
-static CPU_FG_TX: OnceLock<Mutex<mpsc::Sender<i32>>> = OnceLock::new();
+/// CPU worker 消息
+pub enum CpuMsg {
+    /// 主线程判定命中 CPU 表且为冷启动后, 下发包名 → 延迟应用亲和性
+    ApplyPkg(String),
+    /// 全量应用 (启动 / 配置变更)
+    ApplyAll,
+}
 
-pub fn cpu_fg_tx() -> Option<mpsc::Sender<i32>> {
+/// 全局投递通道: refresh 线程转发 fg uid + 冷/热标志
+static CPU_FG_TX: OnceLock<Mutex<mpsc::Sender<CpuMsg>>> = OnceLock::new();
+
+pub fn cpu_fg_tx() -> Option<mpsc::Sender<CpuMsg>> {
     CPU_FG_TX
         .get()
         .and_then(|m| m.lock().ok())
@@ -44,7 +52,7 @@ pub fn cpu_fg_tx() -> Option<mpsc::Sender<i32>> {
 /// 请求一次全量应用 (启动 / 配置变更), 不阻塞
 pub fn apply_all_now() {
     if let Some(tx) = cpu_fg_tx() {
-        let _ = tx.send(0);
+        let _ = tx.send(CpuMsg::ApplyAll);
     }
 }
 
@@ -58,36 +66,6 @@ pub struct CpuAffinity {
 impl CpuAffinity {
     pub fn new() -> Self {
         Self { bpf: KpmHandle::new(), managed: HashMap::new() }
-    }
-
-    /// binder 前台回调处理: 按 uid 枚举该应用全部进程 → 应用全部线程; 返回归因包名
-    pub fn on_uid(&mut self, uid: i32, cfg: &AppConfig) -> Option<String> {
-        if uid <= 0 {
-            return None;
-        }
-        // 第一遍: /proc 按 uid 过滤, 收集该应用全部进程 (主 + pkg: 子进程同 uid),
-        // 同时用第一个可读 cmdline 归因目标包。
-        let mut pids: Vec<i32> = Vec::new();
-        let mut pkg: Option<String> = None;
-        if let Ok(entries) = std::fs::read_dir("/proc") {
-            for e in entries.flatten() {
-                let Ok(p) = e.file_name().to_string_lossy().parse::<i32>() else { continue };
-                if p <= 0 || proc_uid(p) != Some(uid) {
-                    continue;
-                }
-                if pkg.is_none() {
-                    pkg = crate::apply_affinity::read_cmdline(p).and_then(|cmd| {
-                        cfg.target_pkgs.iter().find(|pk| same_pkg(&cmd, pk)).cloned()
-                    });
-                }
-                pids.push(p);
-            }
-        }
-        let pkg = pkg?;
-        self.apply_tids(&pids, &pkg, cfg);
-        // 仅触发枚举时清理: 删除已消失 tid 的 APPLIED 条目, 防 tid 回收后 kprobe 误抓
-        self.cleanup_dead();
-        Some(pkg)
     }
 
     /// 全量应用 (启动 / 配置变更), 非周期; 不做 cleanup (清理只在触发枚举时进行)
@@ -164,27 +142,28 @@ impl CpuAffinity {
     }
 
     /// 常驻线程入口 (纯事件驱动, 无重试/无周期)
-    pub fn run(mut self, rx: mpsc::Receiver<i32>, stop: Arc<AtomicBool>) {
+    pub fn run(mut self, rx: mpsc::Receiver<CpuMsg>, stop: Arc<AtomicBool>) {
         let name = CString::new("CpuAffinity").unwrap();
         unsafe {
             libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
         }
         while !stop.load(Ordering::Relaxed) {
             match rx.recv_timeout(Duration::from_millis(300)) {
-                Ok(0) => {
+                Ok(CpuMsg::ApplyAll) => {
                     let cfg = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
                     if let Some(cfg) = cfg {
                         self.apply_all(&cfg);
                     }
                 }
-                Ok(uid) if uid > 0 => {
-                    // 方案 A: 单次延迟枚举 —— 前台回调时冷启动子进程可能尚未 spawn,
-                    // 睡 2s 覆盖冷启动窗口后按 uid 全量枚举 (主+子进程+全部线程)。
+                Ok(CpuMsg::ApplyPkg(pkg)) => {
+                    // 冷启动包名: 延迟 2s 覆盖冷启动子进程窗口后按包应用
                     thread::sleep(ENUM_DELAY);
                     let cfg = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
                     if let Some(cfg) = cfg {
-                        let _ = self.on_uid(uid, &cfg);
+                        self.apply_pkg(&pkg, &cfg);
                     }
+                    // 触发枚举时清理: 删已消失 tid 的 APPLIED 条目, 防 tid 回收后 kprobe 误抓
+                    self.cleanup_dead();
                 }
                 Ok(_) => {}
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -205,22 +184,11 @@ pub fn start() -> bool {
     if !probe.verify_loaded() {
         return false;
     }
-    let (tx, rx) = mpsc::channel::<i32>();
+    let (tx, rx) = mpsc::channel::<CpuMsg>();
     let _ = CPU_FG_TX.set(Mutex::new(tx));
     let cpu = CpuAffinity::new();
     thread::spawn(move || cpu.run(rx, Arc::new(AtomicBool::new(false))));
     true
-}
-
-/// /proc/<pid>/status 的有效 uid (Uid: 首值)
-fn proc_uid(pid: i32) -> Option<i32> {
-    let status = std::fs::read_to_string(format!("/proc/{}/status", pid)).ok()?;
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("Uid:") {
-            return rest.split_whitespace().next()?.parse().ok();
-        }
-    }
-    None
 }
 
 /// cmdline 归因: 目标包(精确) 或 目标包:子进程

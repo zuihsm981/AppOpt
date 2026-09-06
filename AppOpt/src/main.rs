@@ -15,7 +15,9 @@ mod rule_edit;
 mod rule_match;
 mod web;
 
+use std::collections::{HashMap, HashSet};
 use std::env;
+use std::ffi::CString;
 use std::fs;
 use std::process;
 use std::sync::atomic::Ordering;
@@ -42,6 +44,48 @@ pub const MAX_THREAD_LEN: usize = 32;
 pub(crate) fn lock_ignore_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
+
+/// [pkglist] 日志: 写 /data/local/tmp/appopt_pkglist.log (附加) + stderr
+fn pkg_log_line(msg: &str) {
+    use std::io::Write;
+    eprintln!("{}", msg);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/data/local/tmp/appopt_pkglist.log")
+    {
+        let _ = writeln!(f, "{}", msg);
+    }
+}
+
+/// 从 packages.list 构建两张 uid→包名 静态表 (主线程持有):
+///   cpu: 有 CPU 规则的应用; rfr: com.android.launcher3 + 有刷新率规则的应用。
+/// 前台回调只查这两张表, 不查 cmdline、不管 pid。
+fn build_uid_tables(cfg: &AppConfig) -> (HashMap<i32, String>, HashMap<i32, String>) {
+    let mut cpu_pkgs: HashSet<&str> = HashSet::new();
+    for r in &cfg.rules {
+        cpu_pkgs.insert(r.pkg.as_str());
+    }
+    let mut cpu: HashMap<i32, String> = HashMap::new();
+    let mut rfr: HashMap<i32, String> = HashMap::new();
+    if let Ok(content) = std::fs::read_to_string("/data/system/packages.list") {
+        for line in content.lines() {
+            let mut it = line.split_whitespace();
+            let (Some(pkg), Some(uid_s)) = (it.next(), it.next()) else { continue };
+            let Ok(uid) = uid_s.parse::<i32>() else { continue };
+            if cpu_pkgs.contains(pkg) {
+                cpu.entry(uid).or_insert_with(|| pkg.to_string());
+            }
+            if pkg == crate::config::DEFAULT_REFRESH_PACKAGE
+                || cfg.app_refresh_configs.contains_key(pkg)
+            {
+                rfr.entry(uid).or_insert_with(|| pkg.to_string());
+            }
+        }
+    }
+    (cpu, rfr)
+}
+
 
 fn print_help(prog_name: &str) {
     println!("Usage: {} [OPTIONS]", prog_name);
@@ -218,6 +262,39 @@ fn main() {
     // 刷新率控制模块，独立线程运行，通过 eBPF 事件驱动
     refresh::refresh_init();
 
+    // ===== 三线程: 主线程持有 IProcessObserver 回调 socket, 分发 cpuset/刷新率线程 =====
+    let mut fg_sv: [libc::c_int; 2] = [0, 0];
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+            fg_sv.as_mut_ptr(),
+        )
+    } == 0
+    {
+        let rcvbuf: libc::c_int = 256 * 1024;
+        unsafe {
+            libc::setsockopt(
+                fg_sv[0],
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &rcvbuf as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+        crate::process_observer::init_observer(fg_sv[1]);
+    }
+    let fg_recv_fd = fg_sv[0];
+    let mut fg_buf = [0u8; 8];
+    // uid 静态表 (主线程): CPU 表 = 有 CPU 规则应用; 刷新率表 = launcher + 规则应用
+    let mut cpu_uid: HashMap<i32, String> = HashMap::new();
+    let mut rfr_uid: HashMap<i32, String> = HashMap::new();
+    let mut cpu_known: HashMap<i32, i32> = HashMap::new(); // uid → pid (CPU 冷热)
+    if let Some(cfg) = lock_ignore_poison(&CURRENT_CONFIG).clone() {
+        (cpu_uid, rfr_uid) = build_uid_tables(&cfg);
+    }
+
     let prog_start = Instant::now();
     let mut proc_state: Option<ProcScanState> = None;
     let mut ebpf_state: Option<EbpfState> = None;
@@ -230,6 +307,8 @@ fn main() {
     const EV_MODE: u64 = 3;
     const EV_CONFIG: u64 = 4;
     const EV_PROC: u64 = 5;
+    const EV_FG: u64 = 6; // binder 前台回调 (pid+uid), 主线程分发
+    const EV_PKG: u64 = 7; // packages.list inotify (安装/卸载/替换)
 
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epfd < 0 {
@@ -300,6 +379,43 @@ fn main() {
         libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC | libc::TFD_NONBLOCK)
     };
     epoll_add(epfd, proc_timer_fd, EV_PROC);
+    if fg_recv_fd > 0 {
+        epoll_add(epfd, fg_recv_fd, EV_FG);
+    }
+
+    // 监听 /data/system/packages.list: 应用安装/卸载/替换 → 重建 uid 表
+    // 用 inotify 而非 mtime (用户要求); 日志确认监听是否成功 (SELinux/权限可见)
+    let mut pkg_inotify_fd: i32 = -1;
+    let pkglist_path = CString::new("/data/system/packages.list").unwrap_or_default();
+    unsafe {
+        let ifd = libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK);
+        if ifd < 0 {
+            pkg_log_line(&format!(
+                "[pkglist] inotify_init1 失败: {}",
+                std::io::Error::last_os_error()
+            ));
+        } else {
+            let wd = libc::inotify_add_watch(
+                ifd,
+                pkglist_path.as_ptr(),
+                libc::IN_CLOSE_WRITE
+                    | libc::IN_MOVED_TO
+                    | libc::IN_MOVE_SELF
+                    | libc::IN_DELETE_SELF,
+            );
+            if wd < 0 {
+                pkg_log_line(&format!(
+                    "[pkglist] inotify_add_watch packages.list 失败: {} (SELinux/权限 受限?)",
+                    std::io::Error::last_os_error()
+                ));
+                libc::close(ifd);
+            } else {
+                pkg_log_line(&format!("[pkglist] 监听 packages.list 成功 wd={}", wd));
+                epoll_add(epfd, ifd, EV_PKG);
+                pkg_inotify_fd = ifd;
+            }
+        }
+    }
 
     // 初始 eBPF 初始化 (强制 /proc 模式不尝试)
     if MODE_FORCE.load(Ordering::Relaxed) != 2 {
@@ -366,11 +482,105 @@ fn main() {
                         }
                     }
                 }
+                EV_PKG => {
+                    // packages.list 变化 (安装/卸载/替换) → 重建 uid 表
+                    if pkg_inotify_fd > 0 {
+                        let mut buf = [0u8; 4096];
+                        let mut need_rewatch = false;
+                        loop {
+                            let len = unsafe {
+                                libc::read(
+                                    pkg_inotify_fd,
+                                    buf.as_mut_ptr() as *mut libc::c_void,
+                                    buf.len(),
+                                )
+                            };
+                            if len <= 0 {
+                                break;
+                            }
+                            let hdr = std::mem::size_of::<libc::inotify_event>();
+                            let mut off = 0usize;
+                            while off + hdr <= len as usize {
+                                let ev = unsafe {
+                                    &*(buf.as_ptr().add(off) as *const libc::inotify_event)
+                                };
+                                if ev.mask & (libc::IN_MOVE_SELF | libc::IN_DELETE_SELF) != 0 {
+                                    need_rewatch = true;
+                                }
+                                off += hdr + ev.len as usize;
+                            }
+                        }
+                        // atomic 替换 (rename) 后 inode 变化, 需重加 watch
+                        if need_rewatch {
+                            let wd = unsafe {
+                                libc::inotify_add_watch(
+                                    pkg_inotify_fd,
+                                    pkglist_path.as_ptr(),
+                                    libc::IN_CLOSE_WRITE
+                                        | libc::IN_MOVED_TO
+                                        | libc::IN_MOVE_SELF
+                                        | libc::IN_DELETE_SELF,
+                                )
+                            };
+                            if wd < 0 {
+                                pkg_log_line(&format!(
+                                    "[pkglist] rewatch 失败: {}",
+                                    std::io::Error::last_os_error()
+                                ));
+                            } else {
+                                pkg_log_line(&format!("[pkglist] rewatch ok wd={}", wd));
+                            }
+                        }
+                        if let Some(cfg) = cfg.as_ref() {
+                            (cpu_uid, rfr_uid) = build_uid_tables(cfg);
+                            pkg_log_line(&format!(
+                                "[pkglist] 已重建 uid 表 (cpu={}, rfr={})",
+                                cpu_uid.len(),
+                                rfr_uid.len()
+                            ));
+                        }
+                    }
+                }
+                EV_FG => {
+                    // binder 前台回调 (pid+uid): 主线程查两张 uid 表分发
+                    if fg_recv_fd > 0 {
+                        let nrecv = unsafe {
+                            libc::recv(
+                                fg_recv_fd,
+                                fg_buf.as_mut_ptr() as *mut libc::c_void,
+                                fg_buf.len(),
+                                0,
+                            )
+                        };
+                        if nrecv == 8 {
+                            let pid = i32::from_ne_bytes([fg_buf[0], fg_buf[1], fg_buf[2], fg_buf[3]]);
+                            let uid = i32::from_ne_bytes([fg_buf[4], fg_buf[5], fg_buf[6], fg_buf[7]]);
+                            // CPU: 表命中 且 冷(新 pid) → 发包名给 cpuset 线程; 热跳过
+                            if let Some(pkg) = cpu_uid.get(&uid) {
+                                let cold = cpu_known.get(&uid).map_or(true, |&p| p != pid);
+                                cpu_known.insert(uid, pid);
+                                if cold {
+                                    if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
+                                        let _ = tx
+                                            .send(crate::cpu_affinity::CpuMsg::ApplyPkg(pkg.clone()));
+                                    }
+                                }
+                            }
+                            // 刷新率: 表命中 → 发包名给刷新率线程
+                            if let Some(pkg) = rfr_uid.get(&uid) {
+                                crate::refresh::refresh_send_fg_pkg(pkg.clone());
+                            }
+                        }
+                    }
+                }
                 EV_INOTIFY => {
                     if crate::config::inotify_drain() {
                         // 配置已重载: 应用到当前模式
                         cfg = lock_ignore_poison(&CURRENT_CONFIG).clone();
                         apply_config(&mut ebpf_state, &mut proc_state, cfg.as_deref());
+                        if let Some(cfg) = cfg.as_ref() {
+                            (cpu_uid, rfr_uid) = build_uid_tables(cfg);
+                        }
                     }
                 }
                 EV_MODE => {
@@ -398,12 +608,18 @@ fn main() {
                     } else {
                         // 已在 KPM 模式: 重新应用配置 (白名单可能变化)
                         apply_config(&mut ebpf_state, &mut proc_state, cfg.as_deref());
+                        if let Some(cfg) = cfg.as_ref() {
+                            (cpu_uid, rfr_uid) = build_uid_tables(cfg);
+                        }
                     }
                 }
                 EV_CONFIG => {
                     read_eventfd(config_wake_fd);
                     cfg = lock_ignore_poison(&CURRENT_CONFIG).clone();
                     apply_config(&mut ebpf_state, &mut proc_state, cfg.as_deref());
+                    if let Some(cfg) = cfg.as_ref() {
+                        (cpu_uid, rfr_uid) = build_uid_tables(cfg);
+                    }
                 }
                 EV_PROC => {
                     read_eventfd(proc_timer_fd);
