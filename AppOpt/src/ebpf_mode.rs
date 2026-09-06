@@ -588,6 +588,16 @@ fn affinity_apply(
     false
 }
 
+/// 组带头线程事件 (EXEC/RENAME, tid==pid) 识别出目标包后, 枚举该 pid 全部
+/// 线程应用规则 —— 覆盖 zygote 继承线程 (HeapTaskDaemon/FinalizerDaemon 等)
+/// 的事件归因盲区: 它们被 zygote fork 克隆进应用, 事件 pid 字段=zygote,
+/// 事件链永远无法归因, 只有 /proc/<pid>/task 能完整枚举。
+fn sync_all_threads(cache: &mut ProcCache, bpf: &KpmHandle, pid: i32, cfg: &AppConfig) {
+    if let Some(pkg) = crate::cache::pkg_lookup_pid(pid) {
+        cache.pid_sync_tasks(pid, &pkg, cfg, |t, c, d| affinity_apply(t, c, d, cfg, bpf));
+    }
+}
+
 /// 事件派发, 按 event_type 增量处理 FORK/RENAME/EXEC/EXIT (与 aya 版一致)
 pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfState) {
     let tid = event.tid;
@@ -609,6 +619,10 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
             if !event_apply(&mut state.cache, &state.bpf, tid, pid, comm, cfg) {
                 applied_del(&state.bpf, tid);
             }
+            // 组带头: 整表核对该 pid 全部线程 (含 zygote 继承线程)
+            if tid == pid {
+                sync_all_threads(&mut state.cache, &state.bpf, pid, cfg);
+            }
         }
 
         EBPF_EVENT_FORK => {
@@ -621,6 +635,10 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
 
         EBPF_EVENT_RENAME => {
             event_apply(&mut state.cache, &state.bpf, tid, pid, comm, cfg);
+            // 组带头: 整表核对该 pid 全部线程 (含 zygote 继承线程)
+            if tid == pid {
+                sync_all_threads(&mut state.cache, &state.bpf, pid, cfg);
+            }
         }
 
         EBPF_EVENT_INPUT => {
