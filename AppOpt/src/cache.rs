@@ -240,6 +240,32 @@ impl ProcCache {
         true
     }
 
+    /// 按 pid 全线程核对: 枚举 /proc/<pid>/task 全部 tid 并逐一套用规则。
+    /// 关键: zygote 继承线程 (HeapTaskDaemon/FinalizerDaemon/...) 是 zygote fork
+    /// 时克隆进应用的, 其内核事件 pid 字段 = zygote, 事件链永远无法把它们
+    /// 归因到应用 pid; 只有 /proc/<应用 tgid>/task 能完整枚举它们。
+    pub fn pid_sync_tasks<F>(&mut self, pid: i32, pkg: &str, cfg: &AppConfig, apply_fn: F) -> bool
+    where
+        F: Fn(i32, &CpuSet, &str) -> bool,
+    {
+        if !cfg.target_pkgs.contains(pkg) {
+            return false;
+        }
+        let Some(tids) = crate::apply_affinity::task_tids(pid) else {
+            return false;
+        };
+        let has_thread_rules = cfg.has_thread_rules.contains(pkg);
+        for tid in tids {
+            let t_name = if has_thread_rules {
+                crate::apply_affinity::tid_comm(tid).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let _ = self.task_apply(tid, pid, pkg, &t_name, cfg, &apply_fn);
+        }
+        true
+    }
+
     /// 遍历 tasks 重新应用亲和性，清理已退出的条目
     pub fn affinity_sync(&mut self, topo: &CpuTopology) {
         let dead_tids: Vec<i32> = self
