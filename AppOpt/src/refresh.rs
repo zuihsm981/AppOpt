@@ -72,7 +72,6 @@ struct RefreshState {
     last_reset_time: Option<Instant>,
     current_package: String,
     last_applied_pkg: String,
-    last_apply_time: Option<Instant>,
     last_input_time: Option<Instant>,
     timer_fd: i32,
 }
@@ -218,7 +217,6 @@ fn apply_fg(state: &mut RefreshState, _pid: i32, pkg: &str) {
     let now = Instant::now();
     state.current_package = pkg.to_string();
     state.last_applied_pkg = pkg.to_string();
-    state.last_apply_time = Some(now);
     // 有配置应用 → 专属配置; 有配置 → 无配置 (含 launcher) → 全局配置。
     // 只应用配置, 不额外启动计时器 (计时器由 input/初始化路径管理)。
     apply_app_config(state, pkg);
@@ -326,7 +324,6 @@ pub fn refresh_init() {
         last_reset_time: None,
         current_package: String::new(),
         last_applied_pkg: String::new(),
-        last_apply_time: None,
         last_input_time: None,
         timer_fd,
     };

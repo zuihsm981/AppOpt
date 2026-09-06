@@ -167,11 +167,6 @@ impl KpmHandle {
         self.cmd("input_on");
     }
 
-    fn applied_del(&self, tid: i32) {
-        let s = format!("applied_del {}", tid);
-        self.cmd(&s);
-    }
-
     fn applied_clear(&self) {
         self.cmd("clear_applied");
     }
@@ -191,9 +186,8 @@ impl KpmHandle {
         kpm_ctl0(&self.key, &c, &mut out) >= 0
     }
 
-    /// ctl0 `pkg_pids <pid> <pkg>`: 内核用 pid 锚定进程 (find_task_by_vpid + 真实
-    /// comm), 白名单过滤后返回该包所有进程 + 所有线程的候选 tid 列表 (含子进程
-    /// 线程)。失败/无候选时为空。
+    /// ctl0 `pkg_pids <pid> <pkg>`: 内核在 ctl0 上下文 (RCU 保护, 仅 KP 官方偏移)
+    /// 遍历进程生成候选 tid 列表; 失败/无候选时为空。
     fn pkg_pids(&self, pid: i32, pkg: &str) -> Vec<i32> {
         let s = format!("pkg_pids {} {}", pid, pkg);
         let c = CString::new(s).unwrap_or_default();
@@ -563,7 +557,7 @@ pub fn event_dispatch(event: &EbpfProcEvent, _cfg: &AppConfig, _state: &mut Ebpf
 
 /// binder 回调: 前台新 pid → 8 步流程
 /// ================= binder CPU 线程 =================
-/// 单独线程处理前台 pid 的 CPU 亲和性:
+/// 单独线程处理前台 pid 的 CPU 亲和性 (所有内核操作走 ctl0 命令):
 ///   pid → /proc/<pid>/cmdline 解析包名
 ///   → 包名在 CPU 规则中 且 pid 未登记 → 发 pid 到内核 (pkg_pids 候选 tid 列表)
 ///   → 逐 tid 应用亲和性 + 登记 pid→包名 (同包名覆盖旧 pid, 一包名只保留一个 pid)
