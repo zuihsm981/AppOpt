@@ -211,6 +211,10 @@ fn main() {
         settings_save();
     }
 
+    // CPU 亲和性投递通道必须先于刷新率 observer 建立, 否则注册瞬间(或首个)
+    // 前台回调会被丢弃, 导致首次打开应用不生效。
+    let cpu_ready = crate::cpu_affinity::start();
+
     // 刷新率控制模块，独立线程运行，通过 eBPF 事件驱动
     refresh::refresh_init();
 
@@ -315,7 +319,7 @@ fn main() {
             }
             ebpf_state = Some(es);
             // CPU 亲和性: binder 前台回调驱动 (cpu_affinity.rs), 启动即全量应用一次
-            if crate::cpu_affinity::start() {
+            if cpu_ready {
                 crate::cpu_affinity::apply_all_now();
             }
         }
@@ -398,7 +402,7 @@ fn main() {
                                 }
                             }
                             ebpf_state = Some(es);
-                            if crate::cpu_affinity::start() {
+                            if cpu_ready {
                                 crate::cpu_affinity::apply_all_now();
                             }
                         }
