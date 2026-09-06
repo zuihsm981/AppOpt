@@ -17,7 +17,6 @@
 //! 事件结构 EbpfProcEvent 与内核 appopt_proc_event_t 布局完全一致 (28B),
 //! event_dispatch/affinity 逻辑与原先保持一致。
 
-use std::collections::HashSet;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -26,7 +25,7 @@ use std::thread;
 
 use crate::apply_affinity::tid_comm;
 use crate::cache::ProcCache;
-use crate::config::{AppConfig, CURRENT_CONFIG};
+use crate::config::AppConfig;
 
 /// eBPF 进程事件, 布局需与内核态 appopt_proc_event_t 完全一致 (28B)
 #[repr(C)]
@@ -188,20 +187,6 @@ impl KpmHandle {
         self.cmd("clear_applied");
     }
 
-    /// 设置白名单 (包名集合), 返回 true 表示失败需要回退
-    fn set_whitelist(&self, pkgs: &HashSet<String>) -> bool {
-        let mut s = String::from("set_whitelist ");
-        for (i, p) in pkgs.iter().enumerate() {
-            if i > 0 {
-                s.push(',');
-            }
-            s.push_str(p);
-        }
-        let c = CString::new(s).unwrap_or_default();
-        let mut out = [0u8; 16];
-        kpm_ctl0(&self.key, &c, &mut out) >= 0
-    }
-
     /// 建立 mmap 共享环 + eventfd 通知 (ctl0 `shm_open <eventfd_fd>`)。
     /// 成功返回内核在当前进程 fd 表安装的可 mmap anon inode fd (正数);
     /// 失败返回负错误码。须在 activate()/start 之前调用, 以免漏事件。
@@ -233,7 +218,6 @@ pub struct EbpfState {
     pub evt_fd: c_int,
     /// ctl0 shm_open 返回的可 mmap 共享环 fd (内核 anon inode)
     pub shm_fd: c_int,
-    pub comm_capacity: u32,
 }
 
 impl Drop for EbpfState {
@@ -293,12 +277,6 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
 
     // 配置 input 节流 (与 eBPF 默认 1s 一致)
     handle.cmd("input_ms 1000");
-
-    let pkgs_len = crate::lock_ignore_poison(&CURRENT_CONFIG)
-        .as_ref()
-        .map(|cfg| cfg.pkgs.len())
-        .unwrap_or(0);
-    let capacity = (pkgs_len * 2).max(512).next_power_of_two() as u32;
 
     // ---- 建立事件传输通道: mmap 共享环 + eventfd 通知 (仅此一种, 无 drain 回退) ----
     let evt_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
@@ -365,16 +343,6 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
         kpm_shm_reader(shm_ptr, map_len, evt_fd, tx, wakeup_fd, kpm_wake_fd);
     });
 
-    /* 先设置白名单再激活: start 注册 tracepoint 后立即开始过滤事件,
-     * 若白名单为空则所有新进程事件被丢弃, 导致直接打开应用不设置亲和性 */
-    let mut pkgs = crate::lock_ignore_poison(&CURRENT_CONFIG)
-        .as_ref()
-        .map(|cfg| cfg.target_pkgs.clone())
-        .unwrap_or_default();
-    // 桌面是刷新率模块的默认白名单成员，不依赖 CPU 规则存在与否。
-    pkgs.insert(crate::config::DEFAULT_REFRESH_PACKAGE.to_string());
-    pkgs.insert(crate::config::DEFAULT_REFRESH_COMM.to_string());
-    handle.set_whitelist(&pkgs);
     handle.activate();
 
     Some(EbpfState {
@@ -386,7 +354,6 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
         kpm_wake_fd,
         evt_fd,
         shm_fd,
-        comm_capacity: capacity,
     })
 }
 
@@ -514,17 +481,6 @@ fn kpm_shm_reader(
     }
     unsafe { libc::close(epfd); }
     unsafe { libc::munmap(base, map_len); }
-}
-
-/// 配置白名单; 返回 true 表示需重载 (KPM 白名单容量固定 16384, 不会触发)
-pub fn comm_map_init(bpf: &mut KpmHandle, pkgs: &HashSet<String>, _comm_capacity: u32) -> bool {
-    let mut refresh_pkgs = pkgs.clone();
-    refresh_pkgs.insert(crate::config::DEFAULT_REFRESH_PACKAGE.to_string());
-    refresh_pkgs.insert(crate::config::DEFAULT_REFRESH_COMM.to_string());
-    if !bpf.set_whitelist(&refresh_pkgs) {
-        return true;
-    }
-    false
 }
 
 /// 事件派发, 按 event_type 增量处理 FORK/RENAME/EXEC/EXIT (与 aya 版一致)
