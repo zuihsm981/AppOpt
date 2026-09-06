@@ -147,23 +147,24 @@ extern "C" fn on_transact(
         }
         TX_ON_FG_ACTIVITIES_CHANGED => {
             let mut pid = 0i32;
-            let mut _uid = 0i32;
+            let mut uid = 0i32;
             let mut fg_val = 0i32;
 
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut pid) };
-            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _uid) };
+            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut uid) };
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut fg_val) };
 
             let fg = fg_val != 0;
 
             if fg && pid > 0 {
-                // 触发分离：Binder 回调只传 pid（4 字节），包名由刷新率模块从共享
-                // ProcCache（PID_PKG）按 pid 查询，热路径零 packages.list 文件 I/O。
-                // 系统界面/未配置应用的白名单过滤在 refresh 侧完成（两道防线）。
+                // 触发分离：Binder 回调携带 pid + uid（8 字节）。
+                // 刷新率模块按 pid 解析包名; CPU 亲和性按 uid 枚举该应用全部进程
+                // (主进程 + pkg: 子进程共享 uid, 规避 pid 归因盲区)。
                 let fd = FG_SEND_FD.load(Ordering::Acquire);
                 if fd >= 0 {
+                    let pkt = [pid, uid];
                     let _ = unsafe {
-                        libc::send(fd, &pid as *const i32 as *const libc::c_void, 4, 0)
+                        libc::send(fd, pkt.as_ptr() as *const libc::c_void, 8, 0)
                     };
                 }
             }

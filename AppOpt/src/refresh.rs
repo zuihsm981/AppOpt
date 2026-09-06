@@ -415,7 +415,7 @@ pub fn refresh_init() {
 
         let mut events: [libc::epoll_event; 3] = unsafe { std::mem::zeroed() };
         // fg socketpair 接收缓冲（4 字节 pid i32）
-        let mut fg_buf = [0u8; 4];
+        let mut fg_buf = [0u8; 8];
 
         loop {
             // 事件驱动：阻塞等待事件；无轮询、无超时兜底。
@@ -467,12 +467,13 @@ pub fn refresh_init() {
                                 0,
                             )
                         };
-                        if n == 4 {
+                        if n == 8 {
                             let pid = i32::from_ne_bytes([fg_buf[0], fg_buf[1], fg_buf[2], fg_buf[3]]);
+                            let uid = i32::from_ne_bytes([fg_buf[4], fg_buf[5], fg_buf[6], fg_buf[7]]);
                             handle_fg_change(&mut state, pid);
-                            // CPU 亲和性: 同一 binder 前台回调转发给 CpuAffinity 模块
+                            // CPU 亲和性: 同一 binder 回调按 uid 枚举该应用全部进程
                             if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
-                                let _ = tx.send(pid);
+                                let _ = tx.send(uid);
                             }
                         }
                     }
