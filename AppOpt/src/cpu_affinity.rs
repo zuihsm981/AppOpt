@@ -30,7 +30,10 @@ use crate::ebpf_mode::KpmHandle;
 static CPU_FG_TX: OnceLock<Mutex<mpsc::Sender<i32>>> = OnceLock::new();
 
 pub fn cpu_fg_tx() -> Option<mpsc::Sender<i32>> {
-    CPU_FG_TX.get().and_then(|m| m.lock().ok()).cloned()
+    CPU_FG_TX
+        .get()
+        .and_then(|m| m.lock().ok())
+        .map(|g| g.clone())
 }
 
 /// 请求一次全量应用 (启动 / 配置变更), 不阻塞
@@ -62,7 +65,6 @@ impl CpuAffinity {
 
     /// 全量应用 (启动 / 配置变更), 非周期
     pub fn apply_all(&mut self, cfg: &AppConfig) -> usize {
-        let pkgs: Vec<String> = cfg.target_pkgs.iter().cloned().collect();
         let mut seen: HashMap<String, i32> = HashMap::new(); // pkg -> 任一 pid
         if let Ok(entries) = std::fs::read_dir("/proc") {
             for e in entries.flatten() {
@@ -141,11 +143,15 @@ impl CpuAffinity {
             match rx.recv_timeout(Duration::from_millis(300)) {
                 Ok(0) => {
                     let cfg = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
-                    self.apply_all(&cfg);
+                    if let Some(cfg) = cfg {
+                        self.apply_all(&cfg);
+                    }
                 }
                 Ok(pid) if pid > 0 => {
                     let cfg = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
-                    let _ = self.on_fg(pid, &cfg);
+                    if let Some(cfg) = cfg {
+                        let _ = self.on_fg(pid, &cfg);
+                    }
                 }
                 Ok(_) => {}
                 Err(mpsc::RecvTimeoutError::Timeout) => {}

@@ -19,7 +19,6 @@
 
 use std::collections::HashSet;
 use std::ffi::CString;
-use std::fs;
 use std::os::raw::{c_char, c_int};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
