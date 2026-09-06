@@ -2,11 +2,9 @@
 //! IProcessObserver binder 回调实现（dlopen 运行时加载 libbinder_ndk.so）
 //!
 //! 触发分离/数据共享（参考 优化.md）：
-//! Binder 回调只提取 pid，通过 socketpair(SOCK_DGRAM) 发送 **8 字节帧**
-//! [pid i32][kind i32]：kind=1 前台启动(fg)，kind=2 进程退出(died)。
-//! 主循环 (main.rs) 接收后走 binder 流程 (ebpf_mode::handle_binder_pid /
-//! handle_binder_died)：proc 解析包名 → 按规则分类 → 内核候选列表 / 刷新率模块；
-//! 刷新率模块从共享 ProcCache（PID_PKG）按 pid 查包名，热路径零文件 I/O。
+//! Binder 回调只提取 pid，通过 socketpair(SOCK_DGRAM) 发送 pid（4 字节 i32）。
+//! 主循环 (main.rs) 接收 pid 后分成两条线程处理：
+//! proc 解析包名 → 按规则分类 → CPU 候选列表 / 刷新率模块 (收到 pid+包名)。
 
 use std::ffi::c_void;
 use std::sync::{OnceLock};
@@ -110,22 +108,10 @@ fn ndk() -> Option<&'static BinderNdk> {
 const STATUS_OK: c_int = 0;
 const STATUS_UNKNOWN_TRANSACTION: c_int = -29;
 
-// fg/died 事件通过 socketpair(SOCK_DGRAM) 传递 **8 字节帧** [pid i32][kind i32]：
-//   kind=1 前台启动(fg), kind=2 进程退出(died)。
-// 刷新率模块从共享 ProcCache（PID_PKG）按 pid 查包名，热路径零文件 I/O。
+// fg 事件通过 socketpair(SOCK_DGRAM) 传递 pid（4 字节 i32）。
+// 包名由接收侧自行解析。
+// 热路径零文件 I/O。
 static FG_SEND_FD: AtomicI32 = AtomicI32::new(-1);
-
-/// 向主循环发送 [pid, kind] 8 字节帧 (SOCK_DGRAM)
-fn send_pid_frame(pid: i32, kind: i32) {
-    let fd = FG_SEND_FD.load(Ordering::Acquire);
-    if fd < 0 || pid <= 0 {
-        return;
-    }
-    let frame = [pid, kind];
-    unsafe {
-        let _ = libc::send(fd, frame.as_ptr() as *const libc::c_void, 8, 0);
-    }
-}
 
 struct SendClass(*mut c_void);
 unsafe impl Send for SendClass {}
@@ -172,9 +158,14 @@ extern "C" fn on_transact(
             let fg = fg_val != 0;
 
             if fg && pid > 0 {
-                // 触发分离：Binder 回调只传 pid（8 字节帧），包名由主循环
-                // binder 流程解析，刷新率模块从共享 ProcCache（PID_PKG）按 pid 查询。
-                send_pid_frame(pid, 1); // kind=1 前台启动
+                // 触发分离：Binder 回调只传 pid（4 字节），包名由接收侧
+                // (主循环 binder 流程) 自行解析。
+                let fd = FG_SEND_FD.load(Ordering::Acquire);
+                if fd >= 0 {
+                    let _ = unsafe {
+                        libc::send(fd, &pid as *const i32 as *const libc::c_void, 4, 0)
+                    };
+                }
             }
             STATUS_OK
         }
@@ -186,12 +177,6 @@ extern "C" fn on_transact(
             STATUS_OK
         }
         TX_ON_PROCESS_DIED => {
-            let mut pid = 0i32;
-            let mut _uid = 0i32;
-            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut pid) };
-            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _uid) };
-            // 进程退出: 通知主循环清理该 pid 的 pid_pkg/pid_pkg_no/APPLIED (防 pid 复用)
-            send_pid_frame(pid, 2); // kind=2 进程退出
             STATUS_OK
         }
         _ => { STATUS_UNKNOWN_TRANSACTION }

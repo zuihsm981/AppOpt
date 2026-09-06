@@ -6,13 +6,13 @@
 //!     - CPU 规则应用 → ctl0 `pkg_pids <pid> <pkg>` 让内核用 pid 锚定进程
 //!       (find_task_by_vpid + 真实 comm, 白名单过滤) 返回该包所有进程+线程的
 //!       候选 tid 列表, 用户态逐 tid 计算规则写入 APPLIED 表并立即设亲和性;
-//!     - 刷新率应用 → 登记共享 PID_PKG 并通知刷新率模块。
+//!     - 刷新率应用 → 前台 pid 交给刷新率模块自行解析处理。
 //!   内核共享环只承载 input 事件 (用户活动检测, eventfd 通知, SPSC)。
 //!
 //! 控制面 (白名单 / APPLIED 表 / pkg_pids / shm_open / start-stop) 走 ctl0 supercall。
 //! 内核侧等价逻辑在 AppOpt-kpm/appopt_kpm.c。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -128,6 +128,7 @@ fn kp_ready(key: &CString) -> bool {
 }
 
 /// KPM 传输句柄 (占用原 EbpfState.bpf 字段, 保持 main.rs 接口不变)
+#[derive(Clone)]
 pub struct KpmHandle {
     key: CString,
 }
@@ -239,6 +240,9 @@ pub struct EbpfState {
     pub evt_fd: c_int,
     /// ctl0 shm_open 返回的可 mmap 共享环 fd (内核 anon inode)
     pub shm_fd: c_int,
+    /// binder CPU 线程发送端: 前台 pid 送入 CPU 线程处理
+    pub cpu_fg_tx: mpsc::Sender<i32>,
+    pub cpu_fg_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Drop for EbpfState {
@@ -264,6 +268,12 @@ impl Drop for EbpfState {
         }
         if self.shm_fd >= 0 {
             unsafe { libc::close(self.shm_fd); }
+        }
+        // 关闭 CPU 线程发送端并 join
+        if let Some(handle) = self.cpu_fg_thread.take() {
+            let dummy = { let (t, _r) = mpsc::channel::<i32>(); t };
+            let _ = std::mem::replace(&mut self.cpu_fg_tx, dummy);
+            let _ = handle.join();
         }
         // kpm_wake_fd 由主循环创建并管理生命周期, Drop 不关闭
         self.kpm_wake_fd = -1;
@@ -376,6 +386,9 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
     handle.set_whitelist(&pkgs);
     handle.activate();
 
+    // binder CPU 线程: 独立处理前台 pid 的 CPU 亲和性
+    let (cpu_fg_tx, cpu_fg_thread) = CpuFgWorker::spawn(handle.clone());
+
     Some(EbpfState {
         event_rx: rx,
         reader_thread: Some(reader_thread),
@@ -385,6 +398,8 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
         kpm_wake_fd,
         evt_fd,
         shm_fd,
+        cpu_fg_tx,
+        cpu_fg_thread: Some(cpu_fg_thread),
     })
 }
 
@@ -528,6 +543,17 @@ fn kpm_shm_reader(
  *   8) 处理完成后把 pid(+候选) 登记到 pid_pkg
  */
 
+/// /proc/<pid>/cmdline → 规则包名 (KPM 与 /proc 回退模式共用)
+pub(crate) fn resolve_pkg(pid: i32, cfg: &AppConfig) -> Option<String> {
+    let comm = tid_comm(pid).unwrap_or_default();
+    crate::rule_match::comm_to_pkg(pid, &comm, cfg).or_else(|| {
+        // 默认桌面不在 target_pkgs (无 CPU/刷新率专属规则), 但属于刷新率管理范围
+        crate::apply_affinity::read_cmdline(pid)
+            .filter(|c| c == crate::config::DEFAULT_REFRESH_PACKAGE)
+            .map(|_| crate::config::DEFAULT_REFRESH_PACKAGE.to_string())
+    })
+}
+
 /// 事件派发: 共享环只承载 input 事件 (用户活动检测)
 pub fn event_dispatch(event: &EbpfProcEvent, _cfg: &AppConfig, _state: &mut EbpfState) {
     if event.event_type == EBPF_EVENT_INPUT {
@@ -536,104 +562,104 @@ pub fn event_dispatch(event: &EbpfProcEvent, _cfg: &AppConfig, _state: &mut Ebpf
 }
 
 /// binder 回调: 前台新 pid → 8 步流程
-pub fn handle_binder_pid(state: &mut EbpfState, pid: i32, cfg: &AppConfig) {
-    if pid <= 0 {
-        return;
-    }
-    // 2) 已在 pid_pkg: 只发刷新率模块
-    if state.cache.pid_known(pid) {
-        crate::refresh::refresh_on_fg_pid(pid);
-        return;
-    }
-    // 3) 已在 pid_pkg_no: 不做任何动作
-    if state.cache.pid_negative(pid) {
-        return;
-    }
-    // 4) proc 解析包名
-    let comm = tid_comm(pid).unwrap_or_default();
-    let pkg = crate::rule_match::comm_to_pkg(pid, &comm, cfg).or_else(|| {
-        // 默认桌面不在 target_pkgs (无 CPU/刷新率专属规则), 但属于刷新率管理范围
-        crate::apply_affinity::read_cmdline(pid)
-            .filter(|c| c == crate::config::DEFAULT_REFRESH_PACKAGE)
-            .map(|_| crate::config::DEFAULT_REFRESH_PACKAGE.to_string())
-    });
-    let Some(pkg) = pkg else {
-        // 7) 非规则应用: 只登记 pid_pkg_no
-        state.cache.cache_negative(pid, comm.as_str());
-        return;
-    };
-    let is_cpu = cfg.pkgs.contains(&pkg);
-    let is_ref = cfg.app_refresh_configs.contains_key(&pkg)
-        || pkg == crate::config::DEFAULT_REFRESH_PACKAGE;
-    if !is_cpu && !is_ref {
-        // 7) 非规则应用
-        state.cache.cache_negative(pid, comm.as_str());
-        return;
-    }
-    // 5)+6) CPU 规则应用: 内核 pkg_pids(pid,包名) 锚定进程并返回候选 tid 列表 → 用户态逐 tid 处理
-    if is_cpu {
-        apply_cpu_pkg(state, pid, &pkg, cfg);
-    }
-    if is_ref {
-        // 5)+8) 刷新率应用: 登记 PID_PKG 并立即通知刷新率模块
-        state.cache.register_known(pid, &pkg);
-        crate::refresh::refresh_on_fg_pid(pid);
-    } else {
-        // 8) CPU 应用处理完成后登记 pid_pkg
-        state.cache.register_known(pid, &pkg);
-    }
+/// ================= binder CPU 线程 =================
+/// 单独线程处理前台 pid 的 CPU 亲和性:
+///   pid → /proc/<pid>/cmdline 解析包名
+///   → 包名在 CPU 规则中 且 pid 未登记 → 发 pid 到内核 (pkg_pids 候选 tid 列表)
+///   → 逐 tid 应用亲和性 + 登记 pid→包名 (同包名覆盖旧 pid, 一包名只保留一个 pid)
+pub struct CpuFgWorker {
+    rx: mpsc::Receiver<i32>,
+    bpf: KpmHandle,
+    pid_pkg: HashMap<i32, String>,
 }
 
-/// binder 回调: 进程退出 → 清理该 pid 的缓存/APPLIED/PID_PKG (防 pid 复用)
-pub fn handle_binder_died(state: &mut EbpfState, pid: i32) {
-    if pid <= 0 {
-        return;
-    }
-    let tids = state.cache.tids_of_pid(pid);
-    for t in tids {
-        state.bpf.applied_del(t);
-    }
-    state.cache.pid_exec(pid);
-}
-
-/// 步骤 5/6: CPU 规则应用 — 内核 pkg_pids(pid,包名) 返回候选 tid 列表;
-/// 复用 cache.task_apply (与 full_scan/事件路径一致) 登记任务/命中计数/PID_PKG,
-/// 写入 APPLIED 表, 并立即设置亲和性; 处理完成后登记 pid→包名到 pid_pkg。
-fn apply_cpu_pkg(state: &mut EbpfState, pid: i32, pkg: &str, cfg: &AppConfig) {
-    // 6) 内核候选 tid 列表 (pid 锚定, 白名单过滤; 进程主线程 + 全部线程)
-    let mut cands = state.bpf.pkg_pids(pid, pkg);
-    if !cands.contains(&pid) {
-        cands.push(pid);
-    }
-    // 逐候选 tid 走 task_apply: 线程规则按 tid comm, 无则包级 fallback
-    for tid in &cands {
-        let tname = if cfg.has_thread_rules.contains(pkg) {
-            tid_comm(*tid).unwrap_or_default()
-        } else {
-            String::new()
+impl CpuFgWorker {
+    /// 生成 CPU 线程, 返回发送端与线程句柄
+    pub fn spawn(bpf: KpmHandle) -> (mpsc::Sender<i32>, thread::JoinHandle<()>) {
+        let (tx, rx) = mpsc::channel::<i32>();
+        let worker = CpuFgWorker {
+            rx,
+            bpf,
+            pid_pkg: HashMap::new(),
         };
-        state.cache.task_apply(*tid, pid, pkg, &tname, cfg, |t, cpus, _d| {
-            state.bpf.applied_set(t, cpus.bits[0]);
-            false
-        });
+        let handle = thread::spawn(move || worker.run());
+        (tx, handle)
     }
-    // 立即亲和性 (含新登记 tid)
-    state.cache.affinity_sync(&cfg.topo);
-    // 8) 处理完成后把 pid 和包名登记到 pid_pkg (pid -> pkg)
-    state.cache.register_known(pid, pkg);
+
+    fn run(mut self) {
+        let name = CString::new("CpuFgWorker").unwrap();
+        unsafe { libc::pthread_setname_np(libc::pthread_self(), name.as_ptr()); }
+        while let Ok(pid) = self.rx.recv() {
+            self.handle(pid);
+        }
+    }
+
+    fn handle(&mut self, pid: i32) {
+        if pid <= 0 {
+            return;
+        }
+        let Some(cfg) = crate::lock_ignore_poison(&CURRENT_CONFIG).clone() else {
+            return;
+        };
+        // /proc/<pid>/cmdline 解析包名
+        let Some(pkg) = resolve_pkg(pid, &cfg) else {
+            return;
+        };
+        // 包名必须在 CPU 规则中
+        if !cfg.pkgs.contains(&pkg) {
+            return;
+        }
+        // pid 已在 pid_pkg → 不做动作
+        if self.pid_pkg.contains_key(&pid) {
+            return;
+        }
+        // 只在规则中: 发送 pid 到内核态 (候选 tid 列表) 并应用亲和性
+        self.apply_cpu(pid, &pkg, &cfg);
+        // 登记 pid→包名; 同包名不同 pid 的旧条目覆盖移除 (一包名只保留一个 pid)
+        let old: Vec<i32> = self
+            .pid_pkg
+            .iter()
+            .filter(|(k, v)| **k != pid && v.as_str() == pkg)
+            .map(|(k, _)| *k)
+            .collect();
+        for o in old {
+            self.pid_pkg.remove(&o);
+        }
+        self.pid_pkg.insert(pid, pkg);
+    }
+
+    fn apply_cpu(&self, pid: i32, pkg: &str, cfg: &AppConfig) {
+        let mut cands = self.bpf.pkg_pids(pid, pkg);
+        if !cands.contains(&pid) {
+            cands.push(pid);
+        }
+        for tid in &cands {
+            let tname = if cfg.has_thread_rules.contains(pkg) {
+                tid_comm(*tid).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            if let Some(r) = crate::rule_match::thread_affinity(pkg, &tname, cfg) {
+                self.bpf.applied_set(*tid, r.cpus.bits[0]);
+                let _ = crate::apply_affinity::affinity_set(
+                    *tid, &r.cpus, &r.cpuset_dir, &cfg.topo,
+                );
+            }
+        }
+    }
 }
+
 
 /// 启动或配置更新时全量扫描 /proc
 pub fn full_scan(cfg: &AppConfig, state: &mut EbpfState) {
     state.cache.clear();
 
-    // 默认桌面: 不需要 CPU 规则, 但必须进入共享 PID_PKG, 并绑定全局刷新率配置。
+    // 默认桌面: 不需要 CPU 规则, 但必须绑定全局刷新率配置。
     let mut launcher_found = false;
     if let Ok(entries) = std::fs::read_dir("/proc") {
         for entry in entries.flatten() {
             let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else { continue };
             if tid_comm(pid).as_deref() == Some(crate::config::DEFAULT_REFRESH_COMM) {
-                crate::cache::pkg_track_pid(pid, crate::config::DEFAULT_REFRESH_PACKAGE);
                 launcher_found = true;
             }
         }

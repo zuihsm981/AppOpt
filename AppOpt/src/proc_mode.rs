@@ -19,7 +19,7 @@ impl ProcScanState {
             cache: ProcCache::new(),
             last_proc_count: 0,
             // 首次进入 /proc 模式必须全量扫描；否则当系统进程数较少时，
-            // launcher 可能从未进入 PID_PKG，前台刷新率回调无法绑定全局配置。
+            // launcher 可能从未被识别，前台刷新率回调无法绑定全局配置。
             scan_all_proc: true,
             tracked_pids: HashSet::new(),
             last_proc_total: 0,

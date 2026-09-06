@@ -26,9 +26,7 @@ use crate::config::{
     CHECK_INTERVAL, CONFIG_FILE, CONFIG_WAKE_FD, CURRENT_CONFIG,
 };
 use crate::cpuset::{init_cpu_topo, set_base_cpuset};
-use crate::ebpf_mode::{
-    full_scan, event_dispatch, handle_binder_pid, handle_binder_died, ebpf_init, EbpfState,
-};
+use crate::ebpf_mode::{full_scan, event_dispatch, ebpf_init, EbpfState};
 use crate::proc_mode::{cache_sync, ProcScanState};
 use crate::process_observer::init_observer as observer_init;
 use crate::web::{
@@ -301,8 +299,8 @@ fn main() {
     };
     epoll_add(epfd, proc_timer_fd, EV_PROC);
 
-    // binder 回调 socketpair: IProcessObserver 把前台 pid / 进程退出发给主循环
-    // (SOCK_DGRAM, 8 字节帧 [pid i32][kind i32]; kind=1 前台启动, kind=2 退出)
+    // binder 回调 socketpair: IProcessObserver 把前台 pid 发给主循环 (4 字节 i32)
+    // (SOCK_DGRAM, 4 字节 pid i32: IProcessObserver 前台切换)
     let mut fg_recv_fd: i32 = -1;
     let mut fg_sv: [libc::c_int; 2] = [0, 0];
     if unsafe {
@@ -398,8 +396,8 @@ fn main() {
                     }
                 }
                 EV_BINDER => {
-                    // binder 回调帧: 8 字节 [pid i32][kind i32]; kind=1 前台启动, 2 退出
-                    let mut buf = [0u8; 8];
+                    // binder 回调帧: 4 字节 pid (IProcessObserver 前台切换)
+                    let mut buf = [0u8; 4];
                     loop {
                         let n = unsafe {
                             libc::recv(
@@ -409,33 +407,16 @@ fn main() {
                                 0,
                             )
                         };
-                        if n != 8 {
+                        if n != 4 {
                             break;
                         }
                         let pid = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                        let kind = i32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]);
-                        match kind {
-                            2 => {
-                                // 进程退出: 清理 pid 缓存/APPLIED/PID_PKG (防 pid 复用);
-                                // /proc 回退模式由周期扫描兜底
-                                if let Some(es) = ebpf_state.as_mut() {
-                                    handle_binder_died(es, pid);
-                                }
-                            }
-                            _ => {
-                                // 前台启动: KPM 模式走完整 8 步 binder 流程;
-                                // /proc 回退模式只通知刷新率模块
-                                let Some(cfg) =
-                                    lock_ignore_poison(&CURRENT_CONFIG).clone()
-                                else {
-                                    continue;
-                                };
-                                if let Some(es) = ebpf_state.as_mut() {
-                                    handle_binder_pid(es, pid, &cfg);
-                                } else {
-                                    crate::refresh::refresh_on_fg_pid(pid);
-                                }
-                            }
+                        // 分成两条独立线程:
+                        //   刷新率线程: 收 pid → 自行解析包名 → 查规则切换;
+                        //   CPU 线程 (KPM 模式): 收 pid → 解析包名 → CPU 规则 → 内核。
+                        crate::refresh::refresh_on_fg_pid(pid);
+                        if let Some(es) = ebpf_state.as_mut() {
+                            let _ = es.cpu_fg_tx.send(pid);
                         }
                     }
                 }
