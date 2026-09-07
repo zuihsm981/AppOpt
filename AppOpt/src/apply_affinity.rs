@@ -2,9 +2,7 @@ use std::fs;
 use std::os::unix::fs::FileExt;
 
 use crate::{MAX_PKG_LEN, MAX_THREAD_LEN};
-use crate::config::AppConfig;
 use crate::cpuset::{CpuSet, CpuTopology};
-use crate::rule_match::comm_to_pkg;
 
 /// 栈上构建 /proc/{pid}/{suffix} 路径读取文件
 fn read_proc_file<'a>(pid: i32, suffix: &str, buf: &'a mut [u8]) -> Option<&'a [u8]> {
@@ -67,26 +65,4 @@ pub fn affinity_set(
         }
     }
     false
-}
-
-/// 遍历 /proc 匹配目标进程，返回 匹配数与总进程数
-pub(crate) fn proc_walk(
-    cfg: &AppConfig,
-    filter: impl Fn(i32) -> bool,
-    mut f: impl FnMut(i32, &str, bool),
-) -> (usize, i32) {
-    let Some(entries) = fs::read_dir("/proc").ok() else { return (0, 0) };
-    let mut count = 0;
-    let mut total: i32 = 0;
-    for entry in entries.flatten() {
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else { continue };
-        total += 1;
-        if !filter(pid) { continue; }
-        /* 用 comm_to_pkg 匹配: 完整包名/子进程走内存快速路径，截断 comm 才校验 cmdline */
-        let comm = tid_comm(pid).unwrap_or_default();
-        let Some(pkg) = comm_to_pkg(pid, &comm, cfg) else { continue };
-        f(pid, &pkg, cfg.has_thread_rules.contains(&pkg));
-        count += 1;
-    }
-    (count, total)
 }

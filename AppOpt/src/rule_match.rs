@@ -1,6 +1,5 @@
 use std::ffi::CString;
 
-use crate::apply_affinity::read_cmdline;
 use crate::MAX_THREAD_LEN;
 use crate::config::AppConfig;
 use crate::cpuset::{ensure_cpuset_dir, CpuSet};
@@ -82,67 +81,3 @@ fn fnmatch_c(pattern: &CString, string: &str) -> bool {
     unsafe { libc::fnmatch(pattern.as_ptr(), buf.as_ptr() as *const _, libc::FNM_NOESCAPE) == 0 }
 }
 
-/// 匹配集合为 cfg.target_pkgs（CPU 规则包 ∪ 刷新率配置包）；默认 launcher 的
-/// PID 映射在 full_scan 中额外建立，不在此处扩大 CPU 规则匹配范围。
-
-/// 低成本 comm 匹配。
-/// 返回 None 时不代表一定不是目标包，调用方仍可按需查询 cmdline。
-pub(crate) fn comm_fast_to_pkg(comm: &str, cfg: &AppConfig) -> Option<String> {
-    // 未截断的完整包名。
-    if cfg.target_pkgs.contains(comm) {
-        return Some(comm.to_string());
-    }
-
-    // 完整包名子进程，例如 pkg:remote；只按冒号前的完整包名匹配。
-    if let Some(idx) = comm.find(':') {
-        let base = &comm[..idx];
-        if cfg.target_pkgs.contains(base) {
-            return Some(base.to_string());
-        }
-    }
-    None
-}
-
-/// 仅用于 cmdline 不可读时的安全截断回退。
-/// 必须只有一个包名拥有该明确前缀，避免同一截断 comm 对应多个包。
-fn comm_prefix_fallback(comm: &str, cfg: &AppConfig) -> Option<String> {
-    if comm.len() < 15 {
-        return None;
-    }
-    let mut found: Option<&String> = None;
-    for pkg in &cfg.target_pkgs {
-        if !pkg.starts_with(comm) {
-            continue;
-        }
-        if found.is_some() {
-            return None; // 前缀歧义，不猜测
-        }
-        found = Some(pkg);
-    }
-    found.cloned()
-}
-
-/// 通过 comm 识别配置包名。
-///
-/// 每个未知 PID 最多执行一次 cmdline 读取（由 ProcCache 缓存结果）；
-/// cmdline 可读时以完整包名为唯一权威，comm 只在 cmdline 不可读时按
-/// 明确的 15 字节截断前缀回退。不再使用 8 字节滑动键，避免
-/// air.tv.douyu.android 的 ".android" 键误命中 com.android.* 进程。
-pub fn comm_to_pkg(pid: i32, comm: &str, cfg: &AppConfig) -> Option<String> {
-    let fast = comm_fast_to_pkg(comm, cfg);
-
-    // 即使 comm 看起来像包名，也优先用进程 cmdline 校验，防止伪造/误命名。
-    if let Some(cmd) = read_cmdline(pid) {
-        for pkg in &cfg.target_pkgs {
-            if cmd == pkg.as_str()
-                || cmd.strip_prefix(pkg.as_str()).is_some_and(|rest| rest.starts_with(':'))
-            {
-                return Some(pkg.clone());
-            }
-        }
-        return None;
-    }
-
-    // 进程已退出或 cmdline 不可读时，仅保留安全的完整 comm/截断前缀回退。
-    fast.or_else(|| comm_prefix_fallback(comm, cfg))
-}

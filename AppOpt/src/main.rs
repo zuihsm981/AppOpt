@@ -3,12 +3,10 @@
 compile_error!("AppOpt requires 64-bit target due to cpu_set_t binary layout assumptions");
 
 mod apply_affinity;
-mod cache;
 mod cpu_affinity;
 mod config;
 mod cpuset;
 mod ebpf_mode;
-mod proc_mode;
 mod process_observer;
 mod refresh;
 mod rule_edit;
@@ -22,7 +20,6 @@ use std::fs;
 use std::process;
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Instant;
 
 use crate::config::{
     init_inotify, load_config, AppConfig,
@@ -32,10 +29,8 @@ use crate::cpuset::{init_cpu_topo, set_base_cpuset};
 use crate::ebpf_mode::{
     full_scan, event_dispatch, ebpf_init, EbpfState,
 };
-use crate::proc_mode::{cache_sync, ProcScanState};
 use crate::web::{
-    cache_stats, settings_load, settings_save, web_start, WebStats,
-    WEB_ENABLED, WEB_STATS, MODE_FORCE, MODE_SWITCH_FD, SETTINGS_FILE,
+    settings_load, settings_save, web_start, SETTINGS_FILE,
 };
 
 pub const MAX_PKG_LEN: usize = 128;
@@ -226,7 +221,6 @@ fn main() {
         *guard = config_file.clone();
     }
     CHECK_INTERVAL.store(sleep_interval, Ordering::Release);
-    MODE_FORCE.store(st.mode, Ordering::Release);
 
     let mut tmp_mtime: i64 = -1;
     let initial_config = match load_config(&config_file, &topo, &mut tmp_mtime) {
@@ -299,19 +293,15 @@ fn main() {
         (cpu_pkgs_set, rfr_pkgs_set) = cfg_pkg_sets(&cfg);
     }
 
-    let prog_start = Instant::now();
     let _ = crate::web::START.get_or_init(|| std::time::Instant::now());
-    let mut proc_state: Option<ProcScanState> = None;
     let mut ebpf_state: Option<EbpfState> = None;
 
     // ================= 纯事件驱动主循环 =================
-    // 事件源: KPM 事件唤醒 eventfd / inotify / 模式切换 eventfd / 配置重载 eventfd
-    //          /proc 回退模式的周期 timerfd (仅 KPM 不可用时启用)
+    // 事件源: KPM 事件唤醒 eventfd / inotify / 配置重载 eventfd / binder 前台回调
+    //         / packages.list inotify (仅 KPM 模式)
     const EV_KPM: u64 = 1;
     const EV_INOTIFY: u64 = 2;
-    const EV_MODE: u64 = 3;
     const EV_CONFIG: u64 = 4;
-    const EV_PROC: u64 = 5;
     const EV_FG: u64 = 6; // binder 前台回调 (pid+uid), 主线程分发
     const EV_PKG: u64 = 7; // packages.list inotify (安装/卸载/替换)
 
@@ -336,21 +326,10 @@ fn main() {
         let mut buf = [0u8; 8];
         let _ = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, 8) };
     }
-    fn arm_periodic(tfd: i32, secs: i64) {
-        let ts = libc::timespec { tv_sec: secs, tv_nsec: 0 };
-        let it = libc::itimerspec { it_interval: ts, it_value: ts };
-        unsafe { libc::timerfd_settime(tfd, 0, &it, std::ptr::null_mut()) };
-    }
-    fn disarm_timerfd(tfd: i32) {
-        let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-        let it = libc::itimerspec { it_interval: zero, it_value: zero };
-        unsafe { libc::timerfd_settime(tfd, 0, &it, std::ptr::null_mut()) };
-    }
-    // 配置变更后应用到当前模式: KPM 全量扫描 + uid 表重建(规则包集合门控); /proc 标记全量重扫
+    // 配置变更后应用到当前模式 (仅 KPM): 全量扫描 + uid 表重建(规则包集合门控)
     fn apply_config(
         cpu_changed: bool,
         ebpf_state: &mut Option<EbpfState>,
-        proc_state: &mut Option<ProcScanState>,
         cfg: Option<&crate::config::AppConfig>,
     ) {
         let Some(cfg) = cfg else { return };
@@ -360,27 +339,16 @@ fn main() {
         }
         if let Some(es) = ebpf_state.as_mut() {
             kpm_full_apply(cfg, es);
-        } else {
-            force_proc_rescan(proc_state);
         }
     }
 
-    /// KPM 全量归因扫描 + 亲和性全量应用 (配置变更/模式切换共用)
+    /// KPM 全量归因扫描 + 亲和性全量应用 (配置变更/重连共用)
     fn kpm_full_apply(cfg: &crate::config::AppConfig, es: &mut EbpfState) {
         full_scan(cfg, es);
         crate::cpu_affinity::apply_all_now();
     }
 
-    /// /proc 模式强制重扫 + 亲和性全量应用 (配置变更/切 /proc 共用)
-    fn force_proc_rescan(proc_state: &mut Option<ProcScanState>) {
-        let ps = proc_state.get_or_insert_with(ProcScanState::new);
-        ps.scan_all_proc = true;
-        ps.last_proc_count = 0;
-        ps.force_affinity = true;
-        crate::cpu_affinity::apply_all_now();
-    }
-
-    /// uid 表重建: 按 cpu_changed/包集合变化决定 (reload_config 与 EV_MODE 共用)
+    /// uid 表重建: 按 cpu_changed/包集合变化决定 (reload_config 共用)
     fn rebuild_uid_if_needed(
         cpu_changed: bool,
         cfg: &crate::config::AppConfig,
@@ -400,10 +368,6 @@ fn main() {
     // KPM 事件唤醒 eventfd: reader 收到事件后写入, 主循环 epoll 唤醒
     let kpm_wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     epoll_add(epfd, kpm_wake_fd, EV_KPM);
-    // 模式切换 eventfd: web 端修改 MODE_FORCE 后写入
-    let mode_switch_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-    MODE_SWITCH_FD.store(mode_switch_fd, Ordering::Relaxed);
-    epoll_add(epfd, mode_switch_fd, EV_MODE);
     // 配置重载 eventfd: web 端写配置/规则后由 config_reload_now 写入
     let config_wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     CONFIG_WAKE_FD.store(config_wake_fd, Ordering::Relaxed);
@@ -411,11 +375,6 @@ fn main() {
     // inotify fd: 配置文件修改
     let inotify_fd = crate::config::INOTIFY_FD.load(Ordering::Acquire);
     epoll_add(epfd, inotify_fd, EV_INOTIFY);
-    // /proc 回退模式周期 timerfd
-    let proc_timer_fd = unsafe {
-        libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC | libc::TFD_NONBLOCK)
-    };
-    epoll_add(epfd, proc_timer_fd, EV_PROC);
     if fg_recv_fd > 0 {
         epoll_add(epfd, fg_recv_fd, EV_FG);
     }
@@ -446,25 +405,18 @@ fn main() {
         }
     }
 
-    // 初始 eBPF 初始化 (强制 /proc 模式不尝试)
-    if MODE_FORCE.load(Ordering::Relaxed) != 2 {
-        if let Some(mut es) = ebpf_init(kpm_wake_fd) {
-            let cfg = lock_ignore_poison(&CURRENT_CONFIG).clone();
-            if let Some(cfg) = cfg {
-                full_scan(&cfg, &mut es);
-            }
-            crate::web::KPM_ACTIVE.store(true, Ordering::Relaxed);
-            ebpf_state = Some(es);
-            // CPU 亲和性: binder 前台回调驱动 (cpu_affinity.rs), 启动即全量应用一次
-            if cpu_ready {
-                crate::cpu_affinity::apply_all_now();
-            }
+    // 初始 KPM 初始化 (仅 KPM 模式)
+    if let Some(mut es) = ebpf_init(kpm_wake_fd) {
+        let cfg = lock_ignore_poison(&CURRENT_CONFIG).clone();
+        if let Some(cfg) = cfg {
+            full_scan(&cfg, &mut es);
         }
-    }
-    // /proc 模式: 周期 timerfd 立即启动; KPM 模式: 保持 disarm
-    if ebpf_state.is_none() {
-        let interval = CHECK_INTERVAL.load(Ordering::Relaxed).max(1);
-        arm_periodic(proc_timer_fd, interval as i64);
+        crate::web::KPM_ACTIVE.store(true, Ordering::Relaxed);
+        ebpf_state = Some(es);
+        // CPU 亲和性: binder 前台回调驱动 (cpu_affinity.rs), 启动即全量应用一次
+        if cpu_ready {
+            crate::cpu_affinity::apply_all_now();
+        }
     }
 
     let mut events = [unsafe { std::mem::zeroed::<libc::epoll_event>() }; 8];
@@ -488,7 +440,6 @@ fn main() {
     // 配置事件 (EV_INOTIFY / EV_CONFIG) 公共处理: 重载配置 → 应用到当前模式 →
     // 仅“规则应用集合”变更时重建 uid 表 (调整数值不重建)
     let reload_config = |ebpf_state: &mut Option<EbpfState>,
-                         proc_state: &mut Option<ProcScanState>,
                          cfg: &mut Option<Arc<AppConfig>>,
                          cpu_uid: &mut HashMap<i32, String>,
                          rfr_uid: &mut HashMap<i32, String>,
@@ -496,7 +447,7 @@ fn main() {
                          rfr_pkgs_set: &mut HashSet<String>| {
         let cpu_changed = crate::config::take_cpu_rules_changed();
         *cfg = lock_ignore_poison(&CURRENT_CONFIG).clone();
-        apply_config(cpu_changed, ebpf_state, proc_state, cfg.as_deref());
+        apply_config(cpu_changed, ebpf_state, cfg.as_deref());
         if let Some(cfg) = cfg.as_ref() {
             rebuild_uid_if_needed(cpu_changed, cfg, cpu_uid, rfr_uid, cpu_pkgs_set, rfr_pkgs_set);
         }
@@ -621,7 +572,6 @@ fn main() {
                     if crate::config::inotify_drain() {
                         reload_config(
                             &mut ebpf_state,
-                            &mut proc_state,
                             &mut cfg,
                             &mut cpu_uid,
                             &mut rfr_uid,
@@ -630,41 +580,11 @@ fn main() {
                         );
                     }
                 }
-                EV_MODE => {
-                    read_eventfd(mode_switch_fd);
-                    let mode = MODE_FORCE.load(Ordering::Relaxed);
-                    if mode == 2 {
-                        // 强制 /proc: 卸载 eBPF
-                        if ebpf_state.take().is_some() {
-                            crate::web::KPM_ACTIVE.store(false, Ordering::Relaxed);
-                            force_proc_rescan(&mut proc_state);
-                        }
-                    } else if ebpf_state.is_none() {
-                        // 自动/强制 KPM: 尝试初始化
-                        if let Some(mut es) = ebpf_init(kpm_wake_fd) {
-                            if let Some(cfg) = cfg.as_ref() {
-                                full_scan(cfg, &mut es);
-                            }
-                            crate::web::KPM_ACTIVE.store(true, Ordering::Relaxed);
-                            ebpf_state = Some(es);
-                            if cpu_ready {
-                                crate::cpu_affinity::apply_all_now();
-                            }
-                        }
-                    } else {
-                        // 已在 KPM 模式: 重新应用配置 (规则应用集合可能变化)
-                        apply_config(true, &mut ebpf_state, &mut proc_state, cfg.as_deref());
-                        if let Some(cfg) = cfg.as_ref() {
-                            rebuild_uid_if_needed(true, cfg, &mut cpu_uid, &mut rfr_uid, &mut cpu_pkgs_set, &mut rfr_pkgs_set);
-                        }
-                    }
-                }
                 EV_CONFIG => {
                     read_eventfd(config_wake_fd);
                     // 配置变更 (eventfd 主动唤醒): 与 EV_INOTIFY 共用 reload_config
                     reload_config(
                         &mut ebpf_state,
-                        &mut proc_state,
                         &mut cfg,
                         &mut cpu_uid,
                         &mut rfr_uid,
@@ -672,62 +592,26 @@ fn main() {
                         &mut rfr_pkgs_set,
                     );
                 }
-                EV_PROC => {
-                    read_eventfd(proc_timer_fd);
-                    // /proc 回退模式周期同步
-                    if ebpf_state.is_none() {
-                        let Some(cfg) = cfg.as_ref() else { continue };
-                        let ps = proc_state.get_or_insert_with(ProcScanState::new);
-                        cache_sync(ps, cfg);
-                        if ps.force_affinity {
-                            ps.cache.affinity_sync(&cfg.topo);
-                            ps.force_affinity = false;
-                        }
-                    }
-                }
                 _ => {}
             }
         }
 
-        // KPM 通道断开: 回退 /proc 并启动周期 timerfd
+        // KPM 通道断开: 标记断开并尝试重新初始化 (仅 KPM 模式, 无 /proc 回退)
         if kpm_died {
             ebpf_state = None;
-            let ps = proc_state.get_or_insert_with(ProcScanState::new);
-            ps.scan_all_proc = true;
-            ps.last_proc_count = 0;
-            ps.force_affinity = true;
-        }
-
-        // 周期 timerfd 与模式联动: /proc 模式启动, KPM 模式停止
-        let interval = CHECK_INTERVAL.load(Ordering::Relaxed).max(1);
-        if ebpf_state.is_none() {
-            arm_periodic(proc_timer_fd, interval as i64);
-        } else {
-            disarm_timerfd(proc_timer_fd);
-        }
-
-        // web 统计: KPM 由前端 /api/status 实时计算 (cpu_stats), 不做事件刷新;
-        // /proc 模式保留周期 EV_PROC 快照
-        if !crate::web::KPM_ACTIVE.load(Ordering::Relaxed)
-            && WEB_ENABLED.load(Ordering::Relaxed)
-            && crate::web::web_active()
-        {
-            let (threads, hit_pkgs, hit_list) = match proc_state.as_ref() {
-                Some(ps) => cache_stats(&ps.cache),
-                None => (0, 0, Vec::new()),
-            };
-            if let Some(cfg) = cfg.as_ref() {
-                *lock_ignore_poison(&WEB_STATS) = Some(WebStats {
-                    rules: cfg.rules.len(),
-                    pkgs: cfg.pkgs.len(),
-                    hit_pkgs,
-                    hit_list,
-                    threads,
-                    kpm: false,
-                    uptime: prog_start.elapsed().as_secs(),
-                });
+            crate::web::KPM_ACTIVE.store(false, Ordering::Relaxed);
+            if let Some(mut es) = ebpf_init(kpm_wake_fd) {
+                if let Some(cfg) = cfg.as_ref() {
+                    full_scan(cfg, &mut es);
+                }
+                crate::web::KPM_ACTIVE.store(true, Ordering::Relaxed);
+                ebpf_state = Some(es);
+                if cpu_ready {
+                    crate::cpu_affinity::apply_all_now();
+                }
             }
         }
+
     }
 
     unsafe { libc::close(epfd) };

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::apply_affinity::{read_cmdline, task_tids};
-use crate::cache::ProcCache;
 use crate::config::{
     config_reload_now, spec_like,
     CHECK_INTERVAL, CONFIG_FILE, CURRENT_CONFIG, PARSE_FAILS,
@@ -24,22 +23,7 @@ use crate::{lock_ignore_poison, MAX_PKG_LEN, MAX_THREAD_LEN};
 pub const WEB_PORT: u16 = 8889;
 const INDEX_HTML: &str = include_str!("../web/index.html");
 
-pub static MODE_FORCE: AtomicU8 = AtomicU8::new(0);
 pub static WEB_ENABLED: AtomicBool = AtomicBool::new(false);
-
-/// 模式切换通知 fd (eventfd): web 端修改 MODE_FORCE 后写入, 唤醒主循环 epoll
-pub static MODE_SWITCH_FD: AtomicI32 = AtomicI32::new(-1);
-
-/// 通知主循环模式已变更 (事件驱动, 不轮询)
-pub fn notify_mode_switch() {
-    let fd = MODE_SWITCH_FD.load(Ordering::Relaxed);
-    if fd >= 0 {
-        let val: u64 = 1;
-        unsafe { libc::write(fd, &val as *const u64 as *const _, 8); }
-    }
-}
-
-pub static WEB_STATS: Mutex<Option<WebStats>> = Mutex::new(None);
 
 /// KPM 模式是否活跃 (main 在 ebpf_state 置位/卸载时更新)
 pub static KPM_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -61,25 +45,6 @@ pub fn web_active() -> bool {
         .lock()
         .unwrap()
         .is_some_and(|t| t.elapsed() < WEB_ACTIVE_WINDOW)
-}
-
-#[derive(Clone)]
-pub struct WebStats {
-    pub rules: usize,
-    pub pkgs: usize,
-    pub hit_pkgs: usize,
-    /// 当前命中(被管理)的具体包名列表, 供状态页点击展示
-    pub hit_list: Vec<String>,
-    pub threads: usize,
-    pub kpm: bool,
-    pub uptime: u64,
-}
-
-/// 缓存统计: 返回 (线程数, 命中包名数, 命中包名列表)。
-/// 命中包名由 ProcCache 增量维护，避免每次 Web 请求扫描全部线程。
-pub fn cache_stats(cache: &ProcCache) -> (usize, usize, Vec<String>) {
-    let hit_list = cache.hit_package_list();
-    (cache.tasks.len(), hit_list.len(), hit_list)
 }
 
 /// 启动 web 前端
@@ -300,18 +265,9 @@ fn spec_name(cpus: &CpuSet, topo: &CpuTopology) -> String {
 fn status_json() -> String {
     let cfg = current_cfg();
     let topo = cfg.as_ref().map(|c| &c.topo);
-    // 前端轮询即实时计算: KPM 直接读 CPU worker 发布的 CPU_STATS (应用退出后
-    // 由 worker 周期清理随之归零); /proc 模式用主循环周期快照 (EV_PROC 刷新)
-    let kpm = KPM_ACTIVE.load(Ordering::Relaxed);
-    let (threads, hit_pkgs, hit_list) = if kpm {
-        crate::cpu_affinity::cpu_stats()
-    } else {
-        let stats = lock_ignore_poison(&WEB_STATS).clone();
-        match stats.as_ref() {
-            Some(s) => (s.threads, s.hit_pkgs, s.hit_list.clone()),
-            None => (0, 0, Vec::new()),
-        }
-    };
+    // 仅 KPM 模式: 前端轮询即实时读 CPU worker 发布的 CPU_STATS
+    let connected = KPM_ACTIVE.load(Ordering::Relaxed);
+    let (threads, hit_pkgs, hit_list) = crate::cpu_affinity::cpu_stats();
     let (rules, pkgs) = match cfg.as_ref() {
         Some(c) => (c.rules.len(), c.pkgs.len()),
         None => (0, 0),
@@ -319,7 +275,8 @@ fn status_json() -> String {
     let uptime = START.get().map(|t| t.elapsed().as_secs()).unwrap_or(0);
     json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "mode": if kpm { "kpm" } else { "proc" },
+        "mode": "kpm",
+        "connected": connected,
         "uptime": uptime,
         "rules": rules,
         "pkgs": pkgs,
@@ -550,11 +507,10 @@ fn suggest_threads(pkg: &str, q: &str) -> Vec<(String, usize)> {
 }
 
 fn config_json() -> String {
-    let stats = lock_ignore_poison(&WEB_STATS).clone();
     let cfg = current_cfg();
     json!({
-        "mode": MODE_FORCE.load(Ordering::Relaxed),
-        "mode_active": if stats.is_some_and(|s| s.kpm) { "kpm" } else { "proc" },
+        "mode": 1,
+        "mode_active": "kpm",
         "kpm_available": kpm_probe(),
         "interval": CHECK_INTERVAL.load(Ordering::Relaxed).max(1),
         "cpuset_name": base_cpuset().rsplit('/').next().unwrap_or_default(),
@@ -566,14 +522,10 @@ fn config_json() -> String {
 
 fn config_set_api(req: &Request) -> (u16, String) {
     let v = match parse_json(req) { Ok(v) => v, Err(e) => return e };
-    let mode = v["mode"].as_u64();
     let interval = v["interval"].as_u64();
     let name = v["cpuset_name"].as_str();
     let path = v["config_file"].as_str();
 
-    if mode.is_some_and(|m| m > 2) {
-        return err_json(400, "无效的工作模式");
-    }
     if interval.is_some_and(|n| !(1..=3600).contains(&n)) {
         return err_json(400, "间隔需在 1-3600 秒之间");
     }
@@ -584,10 +536,6 @@ fn config_set_api(req: &Request) -> (u16, String) {
         return err_json(400, "无效的配置文件路径");
     }
 
-    if let Some(m) = mode {
-        MODE_FORCE.store(m as u8, Ordering::Relaxed);
-        notify_mode_switch();
-    }
     if let Some(n) = interval {
         CHECK_INTERVAL.store(n, Ordering::Relaxed);
     }
@@ -618,7 +566,6 @@ static SAVE_LOCK: Mutex<()> = Mutex::new(());
 #[derive(Clone)]
 pub struct Settings {
     pub web_enable: bool,
-    pub mode: u8,
     pub check_interval: u64,
     pub cpuset_name: String,
     pub config_file: String,
@@ -628,7 +575,6 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             web_enable: false,
-            mode: 0,
             check_interval: 2,
             cpuset_name: DEFAULT_CPUSET_NAME.to_string(),
             config_file: "./appopt.conf".to_string(),
@@ -649,7 +595,6 @@ impl Settings {
         let d = Settings::default();
         Self {
             web_enable: v["web_enable"].as_bool().unwrap_or(d.web_enable),
-            mode: v["mode"].as_u64().unwrap_or(d.mode as u64).min(2) as u8,
             check_interval: v["check_interval"]
                 .as_u64()
                 .unwrap_or(d.check_interval)
@@ -670,7 +615,6 @@ impl Settings {
     fn to_value(&self) -> Value {
         json!({
             "web_enable": self.web_enable,
-            "mode": self.mode,
             "check_interval": self.check_interval,
             "cpuset_name": self.cpuset_name,
             "config_file": self.config_file,
@@ -709,7 +653,6 @@ pub fn settings_load(path: &str) -> Settings {
 pub fn settings_save() {
     Settings {
         web_enable: WEB_ENABLED.load(Ordering::Relaxed),
-        mode: MODE_FORCE.load(Ordering::Relaxed),
         check_interval: CHECK_INTERVAL.load(Ordering::Relaxed).max(1),
         cpuset_name: base_cpuset().rsplit('/').next().unwrap_or_default().to_string(),
         config_file: lock_ignore_poison(&CONFIG_FILE).clone(),

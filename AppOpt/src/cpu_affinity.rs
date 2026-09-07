@@ -35,6 +35,8 @@ const ENUM_DELAY: Duration = Duration::from_secs(2);
 pub enum CpuMsg {
     /// 主线程判定冷启动后, 下发 (主 pid, uid, 包名) → 延迟按 uid 枚举应用
     ApplyPkg(i32, i32, String),
+    /// 规则应用主进程退出 (EXIT 事件): 清除该应用在 managed 的全部条目 → web 命中归零
+    EvictPid(i32),
     /// 全量应用 (启动 / 配置变更)
     ApplyAll,
 }
@@ -221,31 +223,12 @@ impl CpuAffinity {
         self.publish_stats();
     }
 
-    /// 删除已消失线程的 APPLIED 条目 (防 tid 回收后 kprobe 误抓)
-    fn cleanup_dead(&mut self) {
-        let dead: Vec<i32> = self
-            .managed
-            .keys()
-            .copied()
-            .filter(|t| crate::apply_affinity::tid_comm(*t).is_none())
-            .collect();
-        for t in dead {
-            self.bpf.applied_del(t);
-            self.managed.remove(&t);
-        }
-        self.publish_stats();
-    }
-
     /// 常驻线程入口 (纯事件驱动, 无重试/无周期)
     pub fn run(mut self, rx: mpsc::Receiver<CpuMsg>, stop: Arc<AtomicBool>) {
         let name = CString::new("CpuAffinity").unwrap();
         unsafe {
             libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
         }
-        // 周期存活清理节拍: 每 N 次超时 (300ms×10≈3s) 清一次, 但仅在 webui 可见
-        // (前端轮询中) 时执行, 避免无人查看时的 /proc 存活校验开销; tid 回收防
-        // 误抓仍由 on_uid 触发的 cleanup_dead 兜底
-        let mut timeout_tick: u32 = 0;
         while !stop.load(Ordering::Relaxed) {
             match rx.recv_timeout(Duration::from_millis(300)) {
                 Ok(CpuMsg::ApplyAll) => {
@@ -268,20 +251,18 @@ impl CpuAffinity {
                         // 标记内核主进程 tgid: 退出探针只对该主进程发布 EXIT
                         self.bpf.applied_set_main(pid);
                     }
-                    // 触发枚举时清理: 删已消失 tid 的 APPLIED 条目, 防 tid 回收后 kprobe 误抓
-                    self.cleanup_dead();
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    timeout_tick += 1;
-                    if timeout_tick >= 10 {
-                        timeout_tick = 0;
-                        // 仅 webui 可见时做周期存活清理 (web 统计实时归零);
-                        // 隐藏/无人查看时跳过
-                        if crate::web::web_active() {
-                            self.cleanup_dead();
-                        }
+                Ok(CpuMsg::EvictPid(pid)) => {
+                    // 主进程退出 (EXIT 事件): 按主进程 tid(=主 pid) 在 managed 中
+                    // 找包名, 清除该应用全部线程条目 → 立即发布统计 (web 命中归零,
+                    // 无需等 3s 存活清理)。内核侧已在 exit 探针逐 tid 摘 APPLIED。
+                    let pkg = self.managed.get(&pid).cloned();
+                    if let Some(pkg) = pkg {
+                        self.managed.retain(|_, p| p != &pkg);
                     }
+                    self.publish_stats();
                 }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }

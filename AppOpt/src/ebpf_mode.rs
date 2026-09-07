@@ -25,7 +25,6 @@ use std::sync::mpsc;
 use std::thread;
 
 use crate::apply_affinity::tid_comm;
-use crate::cache::ProcCache;
 use crate::config::AppConfig;
 
 /// eBPF 进程事件, 布局需与内核态 appopt_proc_event_t 完全一致 (28B)
@@ -172,11 +171,6 @@ impl KpmHandle {
         self.cmd("input_on");
     }
 
-    pub(crate) fn applied_del(&self, tid: i32) {
-        let s = format!("applied_del {}", tid);
-        self.cmd(&s);
-    }
-
     /// 标记规则应用主进程 tgid (内核退出探针只对主进程发布 EXIT 事件;
     /// 子进程/线程退出被内核过滤)
     pub(crate) fn applied_set_main(&self, pid: i32) {
@@ -210,7 +204,6 @@ pub struct EbpfState {
     pub reader_thread: Option<thread::JoinHandle<()>>,
     /// KPM 传输句柄 (ctl0 supercall 通道); 字段名 bpf 沿用历史
     pub bpf: KpmHandle,
-    pub cache: ProcCache,
     pub wakeup_fd: c_int,
     /// 事件到达通知 fd (eventfd): reader 收到事件后写入, 唤醒主循环 epoll
     pub kpm_wake_fd: c_int,
@@ -350,7 +343,6 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
         event_rx: rx,
         reader_thread: Some(reader_thread),
         bpf: handle,
-        cache: ProcCache::new(),
         wakeup_fd,
         kpm_wake_fd,
         evt_fd,
@@ -504,10 +496,13 @@ pub fn event_dispatch(event: &EbpfProcEvent, _cfg: &AppConfig, _state: &mut Ebpf
     if event.event_type == EBPF_EVENT_INPUT {
         crate::refresh::refresh_on_event(EBPF_EVENT_INPUT, 0);
     } else if event.event_type == EBPF_EVENT_EXIT && event.tid == event.pid {
-        // 规则应用主进程退出 (内核已按 APPLIED 过滤非规则应用; tid==pid 排除
-        // 子进程/线程退出): 清除该 uid 的 pid 列表与 cpu_known 身份。
-        // 子进程 (:yuba 等) 退出不匹配主 pid, 由 cleanup_dead 兜底清理 tid。
+        // 规则应用主进程退出 (内核已按 APPLIED+主进程标记过滤非规则应用/非主进程):
+        // 清除该 uid 的 pid 列表与 cpu_known 身份, 并通知 CPU worker 清除该应用
+        // managed 条目 → web 命中应用/绑定线程立即归零 (事件驱动, 不等 3s 存活清理)。
         crate::cpu_affinity::cpu_known_evict_by_pid(event.pid);
+        if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
+            let _ = tx.send(crate::cpu_affinity::CpuMsg::EvictPid(event.pid));
+        }
     }
 }
 
