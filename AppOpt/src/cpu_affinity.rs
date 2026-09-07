@@ -86,8 +86,8 @@ impl CpuAffinity {
             return;
         }
         // launcher3/systemui 的规则: 直接用标记目录 (免 /proc 扫描)
-        if let Some(pids) = self.marked.get(pkg) {
-            self.apply_tids(pids, pkg, cfg);
+        if let Some(pids) = self.marked.get(pkg).cloned() {
+            self.apply_tids(&pids, pkg, cfg);
             return;
         }
         // 其余应用: 跳过 init_pids (含 launcher3/systemui, 避免读其目录),
