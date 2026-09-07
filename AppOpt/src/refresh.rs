@@ -38,6 +38,12 @@ pub struct RefreshStatus {
     pub idle_mode: i32,
     /// 设备可用刷新率 (Hz), 供 web 过滤选项 (如仅 [90, 60])
     pub available: Vec<i32>,
+    /// 设备全部显示模式 (格式化: "id|WxH Hz"), 供 web 展示
+    pub device_modes: Vec<String>,
+    /// 内核 input 触摸 kprobe 是否已武装
+    pub input_hooked: bool,
+    /// 距上次 input 事件秒数 (-1 = 无事件)
+    pub last_input_secs: i64,
 }
 
 enum RefreshEvent {
@@ -60,6 +66,8 @@ struct RefreshState {
     rate_args: [i32; 3],
     /// 设备可用刷新率档位 [120, 90, 60] (web 据此隐藏不可用选项)
     available_modes: [bool; 3],
+    /// 设备全部显示模式 (格式化: "id|WxH Hz")
+    device_modes: Vec<String>,
     timeout_seconds: i32,
     active_mode: i32,
     idle_mode: i32,
@@ -283,6 +291,12 @@ fn update_status(state: &RefreshState) {
             if state.available_modes[2] { v.push(60); }
             v
         },
+        device_modes: state.device_modes.clone(),
+        input_hooked: INPUT_HOOK_ON.load(Ordering::Relaxed),
+        last_input_secs: state
+            .last_input_time
+            .map(|t| t.elapsed().as_secs() as i64)
+            .unwrap_or(-1),
     };
     *REFRESH_STATUS.lock().unwrap() = Some(status);
 }
@@ -313,6 +327,8 @@ pub fn refresh_init() {
     let (tx, rx) = mpsc::channel::<RefreshEvent>();
     *REFRESH_TX.lock().unwrap() = Some(tx);
 
+    // 初始化一次性解析 dumpsys display 的显示模式, 供检测/展示共用
+    let device_modes_raw = parse_display_modes();
     let mut state = RefreshState {
         timeout_seconds: 30,
         active_mode: MODE_120,
@@ -322,8 +338,9 @@ pub fn refresh_init() {
         current_idle: MODE_60,
         current_timeout: 30,
         current_applied_mode: -1,
-        rate_args: detect_rate_args(),
-        available_modes: detect_available_modes(),
+        rate_args: detect_rate_args(&device_modes_raw),
+        available_modes: detect_available_modes(&device_modes_raw),
+        device_modes: fmt_device_modes(&device_modes_raw),
         is_paused: false,
         timer_enabled: true,
         last_reset_time: None,
@@ -644,8 +661,7 @@ fn parse_display_modes() -> Vec<(u32, u32, u32, f32)> {
 ///   - 低档 (原 60):  最低可用刷新率的 mode id
 /// 同档多个分辨率取最小 id (首分辨率档)。解析失败返回 [-1,-1,-1] (未知),
 /// 调用方不切换刷新率; 不做硬编码回退。
-fn detect_rate_args() -> [i32; 3] {
-    let modes = parse_display_modes();
+fn detect_rate_args(modes: &[(u32, u32, u32, f32)]) -> [i32; 3] {
     if modes.is_empty() {
         return [-1, -1, -1];
     }
@@ -680,11 +696,18 @@ fn detect_rate_args() -> [i32; 3] {
 
 /// 检测设备可用刷新率档位 [120, 90, 60] (web 隐藏不可用选项)。
 /// 解析失败默认全可用 (不隐藏选项; 缺档由 rate_args=-1 在发送时直接不切换)。
-fn detect_available_modes() -> [bool; 3] {
-    let modes = parse_display_modes();
+fn detect_available_modes(modes: &[(u32, u32, u32, f32)]) -> [bool; 3] {
     if modes.is_empty() {
         return [true, true, true];
     }
     let has = |t: f32| modes.iter().any(|m| (m.3 - t).abs() < 0.5);
     [has(120.0), has(90.0), has(60.0)]
+}
+
+/// 格式化设备全部显示模式 (web "设备刷新率" 展示): "id|WxH Hz" (display_modes.sh 同款)
+fn fmt_device_modes(modes: &[(u32, u32, u32, f32)]) -> Vec<String> {
+    modes
+        .iter()
+        .map(|(id, w, h, fps)| format!("{}|{}x{} {}Hz", id, w, h, fps.trunc() as u32))
+        .collect()
 }

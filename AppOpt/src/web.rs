@@ -682,6 +682,8 @@ fn refresh_status_json() -> String {
             "idle_str": match s.idle_mode {
                 0 => "120Hz", 1 => "60Hz", 2 => "90Hz", _ => "60Hz"
             },
+            "input_hooked": s.input_hooked,
+            "last_input_secs": s.last_input_secs,
         }).to_string(),
         None => json!({"error": "refresh module not initialized"}).to_string(),
     }
@@ -690,14 +692,16 @@ fn refresh_status_json() -> String {
 fn refresh_config_json() -> String {
     let (timeout, active, idle) = crate::refresh::refresh_get_config();
     // 设备可用刷新率 (Hz), 前端据此过滤 120/90/60 选项
-    let available = crate::refresh::refresh_get_status()
-        .map(|s| s.available)
-        .unwrap_or_else(|| vec![120, 90, 60]);
+    let (available, device_modes) = match crate::refresh::refresh_get_status() {
+        Some(s) => (s.available, s.device_modes),
+        None => (vec![120, 90, 60], Vec::new()),
+    };
     json!({
         "timeout": timeout,
         "active": active,
         "idle": idle,
         "available": available,
+        "device_modes": device_modes,
     }).to_string()
 }
 
