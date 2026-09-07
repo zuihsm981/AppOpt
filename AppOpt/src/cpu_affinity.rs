@@ -155,7 +155,13 @@ impl CpuAffinity {
                     continue;
                 };
                 self.bpf.applied_set(tid, rule.cpus.bits[0]);
-                let _ = crate::apply_affinity::affinity_set(tid, &rule.cpus, &rule.cpuset_dir, &cfg.topo);
+                let _ = crate::apply_affinity::affinity_set(
+                    tid,
+                    &rule.cpus,
+                    &rule.cpuset_dir,
+                    &cfg.topo,
+                    rule.move_cpuset,
+                );
                 self.managed.insert(tid, pkg.to_string());
             }
         }

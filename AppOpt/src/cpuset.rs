@@ -256,6 +256,18 @@ pub fn ensure_cpuset_dir(cpus: &CpuSet, topo: &CpuTopology) -> String {
     }
 }
 
+/// 将线程移入 {base_cpuset()}/{dir_name} 的 cpuset (写 cpuset.tasks); best-effort
+pub fn move_tid_to_cpuset(tid: i32, dir_name: &str) {
+    if dir_name.is_empty() || tid <= 0 {
+        return;
+    }
+    let path = format!("{}/{}/cpuset.tasks", base_cpuset(), dir_name);
+    if let Ok(mut f) = fs::OpenOptions::new().write(true).open(path) {
+        use std::io::Write;
+        let _ = writeln!(f, "{}", tid);
+    }
+}
+
 #[derive(Clone)]
 pub struct CpuTopology {
     pub present_cpus: CpuSet,

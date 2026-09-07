@@ -50,6 +50,8 @@ pub struct AppConfig {
     /// 刷新率由主线程 uid 静态表驱动, 不再依赖 PID_PKG)。
     pub target_pkgs: HashSet<String>,
     pub has_thread_rules: HashSet<String>,
+    /// 逐应用“应用亲和性时同时移入 {cpuset_name}/{核集} cpuset 目录”的包集合
+    pub move_cpuset_pkgs: HashSet<String>,
     pub topo: CpuTopology,
     /// 刷新率全局配置（统一加载，供 refresh 模块从共享 CURRENT_CONFIG 读取）
     pub refresh_timeout: i32,
@@ -333,6 +335,7 @@ pub fn load_config(
     // 由 refresh 线程从 CURRENT_CONFIG 读取。
     let (mut refresh_timeout, mut refresh_active, mut refresh_idle, mut app_refresh_configs) =
         (30, 0, 1, HashMap::new());
+    let mut move_cpuset_pkgs: HashSet<String> = HashSet::new(); // 逐应用移入 cpuset 标记
     let mut cur_pkg = String::new();
     let mut pending_pkg = String::new();
     let mut in_block = false;
@@ -352,6 +355,17 @@ pub fn load_config(
             &mut refresh_idle,
             &mut app_refresh_configs,
         ) {
+            continue;
+        }
+
+        // 逐应用“应用亲和性时同时移入 cpuset”标记行: move_cpuset,<pkg>,0|1
+        let parts: Vec<&str> = p.split(',').map(str::trim).collect();
+        if parts.len() == 3 && parts[0] == "move_cpuset" && !parts[1].is_empty() {
+            if parts[2] == "1" {
+                move_cpuset_pkgs.insert(parts[1].to_string());
+            } else {
+                move_cpuset_pkgs.remove(parts[1]);
+            }
             continue;
         }
 
@@ -464,6 +478,7 @@ pub fn load_config(
         pkgs,
         target_pkgs,
         has_thread_rules,
+        move_cpuset_pkgs,
         topo: topo.clone(),
         refresh_timeout,
         refresh_active,

@@ -236,6 +236,7 @@ fn dispatch(out: &mut TcpStream, req: &Request) {
         ("POST", "/api/rule") => rule_api(req),
         ("POST", "/api/rule/del") => rule_del_api(req),
         ("POST", "/api/rule/rename") => rule_rename_api(req),
+        ("POST", "/api/rule/movecpuset") => rule_movecpuset_api(req),
         ("POST", "/api/config") => config_set_api(req),
         ("POST", "/api/suggest") => suggest_api(req),
         ("GET", "/api/refresh/status") => (200, refresh_status_json()),
@@ -328,7 +329,11 @@ fn rules_json() -> String {
     let mut index: HashMap<&str, usize> = HashMap::new();
     for r in &cfg.rules {
         let gi = *index.entry(r.pkg.as_str()).or_insert_with(|| {
-            groups.push(json!({ "pkg": r.pkg, "items": [] }));
+            groups.push(json!({
+                "pkg": r.pkg,
+                "items": [],
+                "movecpuset": cfg.move_cpuset_pkgs.contains(&r.pkg),
+            }));
             groups.len() - 1
         });
         groups[gi]["items"]
@@ -388,6 +393,45 @@ fn rule_api(req: &Request) -> (u16, String) {
         RuleEdit::Malformed => err_json(409, "配置文件存在未闭合块，请修复后重试"),
         _ => err_json(500, "配置文件写入失败"),
     }
+}
+
+/// 逐应用“应用亲和性时同时移入 cpuset”开关: 写/删 move_cpuset,<pkg>,0|1 行
+fn rule_movecpuset_api(req: &Request) -> (u16, String) {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
+        return err_json(400, "请求体不是合法 JSON");
+    };
+    let Some(pkg) = v["pkg"].as_str().map(str::trim) else {
+        return err_json(400, "缺少 pkg 字段");
+    };
+    if pkg.is_empty() {
+        return err_json(400, "无效 pkg");
+    }
+    let on = v["on"].as_bool().unwrap_or(false);
+    let file = lock_ignore_poison(&CONFIG_FILE).clone();
+    let content = fs::read_to_string(&file).unwrap_or_default();
+    let mut lines: Vec<String> = content.lines().map(String::from).collect();
+    let mut found = false;
+    for line in lines.iter_mut() {
+        let t = line.trim();
+        let parts: Vec<&str> = t.split(',').map(str::trim).collect();
+        if parts.len() == 3 && parts[0] == "move_cpuset" && parts[1] == pkg {
+            *line = if on {
+                format!("move_cpuset,{},1", pkg)
+            } else {
+                format!("move_cpuset,{},0", pkg)
+            };
+            found = true;
+            break;
+        }
+    }
+    if !found && on {
+        lines.push(format!("move_cpuset,{},1", pkg));
+    }
+    if fs::write(&file, lines.join("\n") + "\n").is_err() {
+        return err_json(500, "配置文件写入失败");
+    }
+    config_reload_now();
+    (200, json!({ "ok": true }).to_string())
 }
 
 fn rule_del_api(req: &Request) -> (u16, String) {
