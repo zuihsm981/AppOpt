@@ -35,8 +35,9 @@ const ENUM_DELAY: Duration = Duration::from_secs(2);
 pub enum CpuMsg {
     /// 主线程判定冷启动后, 下发 (主 pid, uid, 包名) → 延迟按 uid 枚举应用
     ApplyPkg(i32, i32, String),
-    /// 规则应用主进程退出 (EXIT 事件): 清除该应用在 managed 的全部条目 → web 命中归零
-    EvictPid(i32),
+    /// 规则应用主进程退出 (EXIT 事件): 按 uid 清除该应用在 managed 的全部条目
+    /// → web 命中归零 (按 uid 整清, 不依赖主线程 tid 是否在 managed)
+    EvictUid(i32),
     /// 全量应用 (启动 / 配置变更)
     ApplyAll,
 }
@@ -68,10 +69,11 @@ pub fn cpu_known_evict(uid: i32) {
 }
 
 /// 进程退出 (EXIT 事件, 仅主线程 tid==pid 时调用): 该 pid 为主进程则清除其
-/// uid 的 pid 列表与 cpu_known 身份; 子进程/线程退出不匹配主 pid, 幂等跳过。
-pub fn cpu_known_evict_by_pid(pid: i32) {
+/// uid 的 pid 列表与 cpu_known 身份并返回该 uid; 子进程/线程退出不匹配主 pid,
+/// 幂等跳过返回 None。调用方可用返回值按 uid 通知 CPU worker 清理 managed。
+pub fn cpu_known_evict_by_pid(pid: i32) -> Option<i32> {
     if pid <= 0 {
-        return;
+        return None;
     }
     let uid = {
         let k = crate::rw_read_ignore_poison(&CPU_KNOWN);
@@ -79,6 +81,9 @@ pub fn cpu_known_evict_by_pid(pid: i32) {
     };
     if let Some(u) = uid {
         cpu_known_evict(u);
+        Some(u)
+    } else {
+        None
     }
 }
 
@@ -111,6 +116,8 @@ pub struct CpuAffinity {
     bpf: KpmHandle,
     /// 已管理线程 tid → 包名 (用于清理已退出线程)
     managed: HashMap<i32, String>,
+    /// 已应用应用的 uid → 包名 (退出时按 uid 整清 managed)
+    uid_pkg: HashMap<i32, String>,
     /// 初始化时 /proc 全部 pid 快照: 其余应用枚举时跳过 (含 launcher3/systemui)
     init_pids: HashSet<i32>,
     /// 额外标记 launcher3/systemui 的 pid 目录: 其规则直接使用, 免扫描/读 cmdline
@@ -124,6 +131,7 @@ impl CpuAffinity {
         Self {
             bpf: KpmHandle::new(),
             managed: HashMap::new(),
+            uid_pkg: HashMap::new(),
             init_pids,
             marked,
         }
@@ -252,13 +260,16 @@ impl CpuAffinity {
                         crate::rw_write_ignore_poison(&PROC_SNAPSHOT).insert(uid, pids);
                         // 标记内核主进程 tgid: 退出探针只对该主进程发布 EXIT
                         self.bpf.applied_set_main(pid);
+                        // 记录 uid→pkg: 退出时按 uid 整清 managed (线程规则应用也覆盖)
+                        self.uid_pkg.insert(uid, pkg.clone());
                     }
                 }
-                Ok(CpuMsg::EvictPid(pid)) => {
-                    // 主进程退出 (EXIT 事件): 按主进程 tid(=主 pid) 在 managed 中
-                    // 找包名, 清除该应用全部线程条目 → 立即发布统计 (web 命中归零,
-                    // 无需等 3s 存活清理)。内核侧已在 exit 探针逐 tid 摘 APPLIED。
-                    let pkg = self.managed.get(&pid).cloned();
+                Ok(CpuMsg::EvictUid(uid)) => {
+                    // 主进程退出 (EXIT 事件): 按 uid 找到该应用包名, 清除 managed 中
+                    // 全部线程条目 → 立即发布统计 (web 命中归零)。不依赖主线程 tid
+                    // 是否在 managed (线程规则类应用主线程可能未被管理)。
+                    // 内核侧已在 exit 探针逐 tid 摘 APPLIED。
+                    let pkg = self.uid_pkg.remove(&uid);
                     if let Some(pkg) = pkg {
                         self.managed.retain(|_, p| p != &pkg);
                     }
