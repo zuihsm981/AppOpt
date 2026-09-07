@@ -51,13 +51,6 @@ pub fn cpu_stats() -> (usize, usize, Vec<String>) {
     (g.0, g.1.len(), g.1.clone())
 }
 
-/// 发布当前 managed 统计 (worker 调用)
-fn publish_stats(&self) {
-    let mut pkgs: Vec<String> = self.managed.values().cloned().collect();
-    pkgs.sort_unstable();
-    pkgs.dedup();
-    *CPU_STATS.lock().unwrap() = (self.managed.len(), pkgs);
-}
 
 pub fn cpu_fg_tx() -> Option<mpsc::Sender<CpuMsg>> {
     CPU_FG_TX
@@ -94,6 +87,14 @@ impl CpuAffinity {
             init_pids,
             marked,
         }
+    }
+
+    /// 发布当前 managed 统计到 CPU_STATS (web 命中应用/绑定线程在 KPM 模式显示用)
+    fn publish_stats(&self) {
+        let mut pkgs: Vec<String> = self.managed.values().cloned().collect();
+        pkgs.sort_unstable();
+        pkgs.dedup();
+        *CPU_STATS.lock().unwrap() = (self.managed.len(), pkgs);
     }
 
     /// 按 uid 枚举该应用全部进程 (主 + pkg: 子进程同 uid) → 应用全部线程。
