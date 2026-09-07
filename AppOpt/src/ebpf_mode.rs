@@ -20,7 +20,7 @@
 
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
@@ -36,6 +36,10 @@ pub struct EbpfProcEvent {
     pub comm: [u8; 16],
     pub event_type: u32,
 }
+
+/// 用户态已收到 EXIT 事件数 (web "内核 EXIT 状态" 诊断用:
+/// 与内核 stats 的 exit= 对比可定位是探针未发还是用户态未收)
+pub static USER_EXIT_EVENTS: AtomicU64 = AtomicU64::new(0);
 
 /// 事件环当前只流动 INPUT (CPU/刷新率由 binder 三线程驱动, 无进程事件)
 pub const EBPF_EVENT_INPUT: u32 = 5;
@@ -246,6 +250,38 @@ impl Drop for EbpfState {
 }
 
 /// KPM 探测: KernelPatch 就绪 且 模块可通信 (ping)
+/// 抓取内核模块 stats 文本 (ctl0 "stats")
+pub fn kpm_stats_text() -> String {
+    let c = CString::new("stats").unwrap_or_default();
+    let mut out = [0u8; 256];
+    let n = kpm_ctl0(&KpmHandle::new().key, &c, &mut out);
+    let n = n.clamp(0, 256) as usize;
+    String::from_utf8_lossy(&out[..n]).to_string()
+}
+
+/// 内核/用户态计数: (kernel_exit, kernel_input, kernel_setaffinity, user_exit_events)
+/// 用于 web "内核 EXIT 状态" 诊断:
+///   kernel_exit 不涨  → 探针未发 (模块旧/tracepoint 未注册/main_tgid 标记缺失)
+///   kernel_exit 涨而 user_exit 不涨 → 事件环/reader 链路问题
+///   user_exit 涨而命中不归零 → EvictUid/managed 问题
+pub fn kpm_counters() -> (u64, u64, u64, u64) {
+    let user_exit = USER_EXIT_EVENTS.load(Ordering::Relaxed);
+    let text = kpm_stats_text();
+    let mut ke = 0u64;
+    let mut ki = 0u64;
+    let mut ks = 0u64;
+    for (key, slot) in [("exit=", &mut ke), ("input=", &mut ki), ("setaffinity=", &mut ks)] {
+        if let Some(idx) = text.find(key) {
+            let rest = &text[idx + key.len()..];
+            let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+            if let Ok(v) = rest[..end].parse::<u64>() {
+                *slot = v;
+            }
+        }
+    }
+    (ke, ki, ks, user_exit)
+}
+
 pub fn kpm_probe() -> bool {
     let key = kpm_key();
     if !kp_ready(&key) {
@@ -496,6 +532,7 @@ pub fn event_dispatch(event: &EbpfProcEvent, _cfg: &AppConfig, _state: &mut Ebpf
     if event.event_type == EBPF_EVENT_INPUT {
         crate::refresh::refresh_on_event(EBPF_EVENT_INPUT, 0);
     } else if event.event_type == EBPF_EVENT_EXIT && event.tid == event.pid {
+        USER_EXIT_EVENTS.fetch_add(1, Ordering::Relaxed);
         // 规则应用主进程退出 (内核已按 APPLIED+主进程标记过滤非规则应用/非主进程):
         // 清除该 uid 的 pid 列表与 cpu_known 身份, 并按 uid 通知 CPU worker 清除该
         // 应用 managed 条目 → web 命中应用/绑定线程立即归零 (事件驱动, 不等周期清理)。

@@ -664,7 +664,10 @@ pub fn settings_save() {
 
 fn refresh_status_json() -> String {
     match crate::refresh::refresh_get_status() {
-        Some(s) => json!({
+        Some(s) => {
+        let (kernel_exit, kernel_input, kernel_setaffinity, user_exit_events) =
+            crate::ebpf_mode::kpm_counters();
+        json!({
             "current_mode": s.current_mode,
             "mode_str": match s.current_mode {
                 0 => "120Hz", 1 => "60Hz", 2 => "90Hz", _ => "未知"
@@ -684,7 +687,11 @@ fn refresh_status_json() -> String {
             },
             "input_hooked": s.input_hooked,
             "last_input_secs": s.last_input_secs,
-        }).to_string(),
+            "kernel_exit": kernel_exit,
+            "kernel_input": kernel_input,
+            "kernel_setaffinity": kernel_setaffinity,
+            "user_exit_events": user_exit_events,
+        }).to_string() },
         None => json!({"error": "refresh module not initialized"}).to_string(),
     }
 }
