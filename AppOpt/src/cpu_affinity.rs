@@ -85,10 +85,10 @@ impl CpuAffinity {
         if uid <= 0 {
             return;
         }
-        eprintln!("[CPU] on_uid enter uid={} pkg={}", uid, pkg);
+        cpu_log(&format!("[CPU] on_uid enter uid={} pkg={}", uid, pkg));
         // launcher3/systemui 的规则: 直接用标记目录 (免 /proc 扫描)
         if let Some(pids) = self.marked.get(pkg).cloned() {
-            eprintln!("[CPU] on_uid marked pkg={} pids={}", pkg, pids.len());
+            cpu_log(&format!("[CPU] on_uid marked pkg={} pids={}", pkg, pids.len()));
             self.apply_tids(&pids, pkg, cfg);
             return;
         }
@@ -106,7 +106,7 @@ impl CpuAffinity {
                 }
             }
         }
-        eprintln!("[CPU] on_uid uid={} pkg={} found_pids={}", uid, pkg, pids.len());
+        cpu_log(&format!("[CPU] on_uid uid={} pkg={} found_pids={}", uid, pkg, pids.len()));
         self.apply_tids(&pids, pkg, cfg);
     }
 
@@ -139,7 +139,7 @@ impl CpuAffinity {
                 self.apply_tids(pids, pkg, cfg);
             }
         }
-        eprintln!("[CPU] apply_all done pkgs={}", by_pkg.len());
+        cpu_log(&format!("[CPU] apply_all done pkgs={}", by_pkg.len()));
         by_pkg.len()
     }
 
@@ -166,10 +166,10 @@ impl CpuAffinity {
                     &cfg.topo,
                     rule.move_cpuset,
                 );
-                eprintln!(
+                cpu_log(&format!(
                     "[CPU] apply tid={} pkg={} cpus=0x{:x} dead={}",
                     tid, pkg, rule.cpus.bits[0], dead
-                );
+                ));
                 self.managed.insert(tid, pkg.to_string());
             }
         }
@@ -198,14 +198,14 @@ impl CpuAffinity {
         while !stop.load(Ordering::Relaxed) {
             match rx.recv_timeout(Duration::from_millis(300)) {
                 Ok(CpuMsg::ApplyAll) => {
-                    eprintln!("[CPU] worker ApplyAll");
+                    cpu_log("[CPU] worker ApplyAll");
                     let cfg = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
                     if let Some(cfg) = cfg {
                         self.apply_all(&cfg);
                     }
                 }
                 Ok(CpuMsg::ApplyPkg(uid, pkg)) => {
-                    eprintln!("[CPU] worker ApplyPkg uid={} pkg={}", uid, pkg);
+                    cpu_log(&format!("[CPU] worker ApplyPkg uid={} pkg={}", uid, pkg));
                     // 冷启动: 延迟 1s 覆盖子进程窗口后按 uid 枚举 (主+子进程同 uid,
                     // 精确且避免 cmdline 归因竞态; 不误捞其他用户同包名实例)
                     thread::sleep(ENUM_DELAY);
@@ -259,6 +259,20 @@ pub(crate) fn classify_marked_pids(init_pids: &HashSet<i32>) -> HashMap<String, 
         }
     }
     m
+}
+
+/// [CPU] 调试日志: 写 /data/local/tmp/appopt_cpu.log (附加) + stderr
+/// (root daemon 的 stderr 不进 logcat, 故必须落文件)
+pub(crate) fn cpu_log(msg: &str) {
+    eprintln!("{}", msg);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/data/local/tmp/appopt_cpu.log")
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{}", msg);
+    }
 }
 
 /// 缓存初始化时 /proc 下全部 pid (AppOpt 启动快照): 由 main.rs 在初始化时调用,
