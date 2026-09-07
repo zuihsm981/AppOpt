@@ -202,11 +202,12 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="card">
 <div class="card-title">刷新率状态</div>
 <div class="row" id="rf-device-wrap" role="button" tabindex="0" style="cursor:pointer" title="点击查看完整模式">
-<span class="label">设备刷新率</span><span class="value mono" id="rf-device">-</span>
+<span class="label">设备刷新率</span><span class="badge kpm mono" id="rf-device">-</span>
 </div>
-<div class="row"><span class="label">当前刷新率</span><span class="value" id="rf-mode">-</span></div>
-<div class="row"><span class="label">空闲定时器</span><span class="value" id="rf-timer">-</span></div>
-<div class="row"><span class="label">内核 input 状态</span><span class="value mono" id="rf-input">-</span></div>
+<div class="row"><span class="label">当前刷新率</span><span class="badge kpm" id="rf-mode">-</span></div>
+<div class="row"><span class="label">空闲定时器</span><span class="badge kpm" id="rf-timer">-</span></div>
+<div class="row"><span class="label">内核 input 状态</span><span class="badge kpm mono" id="rf-input">-</span>
+<div class="row"><span class="label">内核 EXIT 状态</span><span class="badge kpm mono" id="rf-exit">-</span></div></div>
 </div>
 <div class="card">
 <div class="card-title">全局配置</div>
@@ -351,7 +352,7 @@ document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{
   if(t==='refresh')loadRefresh();
 });
 
-function startStat(){stopStat();refreshStat();statTimer=setInterval(refreshStat,3000)}
+function startStat(){stopStat();refreshStat();statTimer=setInterval(refreshStat,1000)}
 function stopStat(){if(statTimer){clearInterval(statTimer);statTimer=null}}
 // 轮询可见性管理: 仅前端打开/可见时轮询; 隐藏/失焦/关闭页面即停止
 function pausePolling(){stopStat();if(rfTimer){clearInterval(rfTimer);rfTimer=null}}
@@ -738,6 +739,7 @@ async function loadRefresh(){
     $('rf-mode').textContent=st.mode_str||'-';
     $('rf-timer').textContent=st.timer_enabled?(st.is_paused?'空闲中':(st.timer_running?'计时中':'未运行')):'未启用';
     $('rf-input').textContent=fmtInput(st);
+    $('rf-exit').textContent='exit='+(st.kernel_exit||0)+' · 收到'+(st.user_exit_events||0)+'次';
     $('rf-timeout').value=cfg.timeout;
     rfAvail=cfg.available&&cfg.available.length?cfg.available:[120,90,60];
     lastRefreshCfg=cfg;
@@ -750,8 +752,9 @@ async function loadRefresh(){
         $('rf-mode').textContent=s.mode_str||'-';
         $('rf-timer').textContent=s.timer_enabled?(s.is_paused?'空闲中':(s.timer_running?'计时中':'未运行')):'未启用';
         $('rf-input').textContent=fmtInput(s);
+        $('rf-exit').textContent='exit='+(s.kernel_exit||0)+' · 收到'+(s.user_exit_events||0)+'次';
       }catch(e){}
-    },3000);
+    },1000);
   }catch(e){toast(e.message)}
 }
 let rfAppsData=[];
