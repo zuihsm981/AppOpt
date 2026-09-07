@@ -89,6 +89,9 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 .modal input{width:100%;margin-bottom:10px}
 .modal input[readonly]{background:var(--card);color:var(--sub)}
 .field input:focus,.modal input:focus{border-color:var(--blue);background:#fff}
+#mr-movecpuset{appearance:none;-webkit-appearance:none;width:18px;height:18px;flex:none;margin:0;padding:0;border:1px solid var(--sub);border-radius:5px;background:var(--bg);cursor:pointer;position:relative;display:inline-block;vertical-align:middle}
+#mr-movecpuset:checked{background:var(--blue);border-color:var(--blue)}
+#mr-movecpuset:checked::after{content:'✓';position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#fff;font-size:13px;line-height:1}
 .modal-actions{display:flex;gap:8px;margin-top:6px}
 .modal-actions button{flex:1;padding:9px 0;border-radius:999px;font-size:14px}
 .core-chips{display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap}
@@ -281,8 +284,9 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <h3 id="mr-title">添加应用</h3>
 <div class="sg-wrap"><input id="mr-pkg" placeholder="输入应用包名"><div class="sg-box" id="sg-pkg" hidden></div></div>
 <div id="mr-rows"></div>
-<label id="mr-mc-wrap" style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:var(--fg)">
-<input type="checkbox" id="mr-movecpuset" style="width:auto;margin:0;accent-color:var(--blue)"> 应用亲和性时同时移入 cpuset 目录
+<label id="mr-mc-wrap" style="display:flex;align-items:center;gap:8px;margin:10px 0;font-size:13px;color:var(--fg);cursor:pointer;user-select:none">
+<input type="checkbox" id="mr-movecpuset">
+<span style="display:inline-block;line-height:1.4">应用亲和性时同时移入 cpuset 目录</span>
 </label>
 <button class="rule-add" id="mr-addrow" hidden>＋ 线程规则</button>
 <div class="modal-actions">
