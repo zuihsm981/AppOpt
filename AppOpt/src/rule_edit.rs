@@ -274,18 +274,7 @@ fn line_remove(lines: &mut Vec<String>, pkg: &str, loc: &ThreadLoc) {
 }
 
 fn file_write(path: &str, lines: &[String]) -> RuleEdit {
-    let mut out = lines.join("\n");
-    out.push('\n');
-    let tmp = format!("{}.tmp", path);
-    let res = fs::File::create(&tmp)
-        .and_then(|mut f| {
-            f.write_all(out.as_bytes())?;
-            f.sync_all()
-        })
-        .and_then(|_| fs::rename(&tmp, path));
-    if res.is_ok() {
-        // 保存后自动整理配置文件 (按包分组)
-        crate::config::organize_config_file(path);
+    if crate::config::save_config_lines(path, lines) {
         RuleEdit::Ok
     } else {
         RuleEdit::IoErr

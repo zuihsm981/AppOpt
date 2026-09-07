@@ -519,11 +519,9 @@ pub fn refresh_add_app(pkg: &str, timeout: i32, active: &str, idle: &str) {
     if !found {
         lines.push(new_line);
     }
-    if fs::write(&path, lines.join("\n") + "\n").is_err() {
+    if !crate::config::save_config_lines(&path, &lines) {
         return;
     }
-    // 保存后自动整理配置文件 (按包分组)
-    crate::config::organize_config_file(&path);
     // 同步共享配置（仅刷新率）+ 独立通知 refresh 线程
     crate::config::reload_refresh_only();
     REFRESH_FORCE_RELOAD.store(true, Ordering::Release);
@@ -547,11 +545,9 @@ pub fn refresh_del_app(pkg: &str) -> bool {
         })
         .map(String::from)
         .collect();
-    if fs::write(&path, lines.join("\n") + "\n").is_err() {
+    if !crate::config::save_config_lines(&path, &lines) {
         return false;
     }
-    // 保存后自动整理配置文件 (按包分组)
-    crate::config::organize_config_file(&path);
     // 同步共享配置（仅刷新率）+ 独立通知 refresh 线程
     crate::config::reload_refresh_only();
     REFRESH_FORCE_RELOAD.store(true, Ordering::Release);

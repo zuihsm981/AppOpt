@@ -61,6 +61,15 @@ pub struct AppConfig {
 
 pub static CURRENT_CONFIG: Mutex<Option<Arc<AppConfig>>> = Mutex::new(None);
 
+/// 最近一次 config_reload 是否检测到 CPU 规则变化 (供主循环 apply_config 消费;
+/// 默认 true 保证首个配置事件不会漏扫)
+static CPU_RULES_CHANGED: AtomicBool = AtomicBool::new(true);
+
+/// 取出并复位“最近一次重载是否 CPU 规则变化”
+pub fn take_cpu_rules_changed() -> bool {
+    CPU_RULES_CHANGED.swap(false, Ordering::Relaxed)
+}
+
 pub static PARSE_FAILS: AtomicUsize = AtomicUsize::new(0);
 
 /// 默认参与刷新率前台识别的系统桌面。它不需要 CPU 亲和性规则，
@@ -336,12 +345,100 @@ fn is_special_attr(line: &str) -> bool {
         || t.contains("=refresh-")
 }
 
+/// 空行/注释行 (load_config 主循环 / organize / pkg_set 共用)
+fn is_skip_line(t: &str) -> bool {
+    let t = t.trim();
+    t.is_empty() || t.starts_with('#') || t.starts_with("//")
+}
+
+/// 配置行分类 (organize_config_file / pkg_set_of_config 共用)
+enum LineKind {
+    /// 空行/注释
+    Skip,
+    /// 全局设置行 (refresh_*=), 置顶保留
+    Global,
+    /// 包属性行 (规则/刷新率行), 含包名
+    Pkg(String),
+    /// 块规则首行 (含 '{' 且非单行规则), 含包名
+    Block(String),
+    /// 无法归属的杂项行
+    Other,
+}
+
+fn classify_line(t: &str) -> LineKind {
+    let raw = strip_comment(t).trim();
+    if raw.is_empty() {
+        return LineKind::Skip;
+    }
+    if raw.contains('=') && !raw.contains(',') && !raw.contains('{') {
+        if let Some((k, _)) = raw.split_once('=') {
+            if k.trim().starts_with("refresh_") {
+                return LineKind::Global;
+            }
+        }
+    }
+    if let Some(pkg) = pkg_of_line(raw) {
+        if raw.contains('{') && !raw.contains(',') {
+            return LineKind::Block(pkg);
+        }
+        return LineKind::Pkg(pkg);
+    }
+    LineKind::Other
+}
+
+/// 当前共享配置中的“规则应用集合” (CPU 规则包 ∪ 刷新率配置包)
+fn current_config_pkg_set() -> HashSet<String> {
+    let mut s = HashSet::new();
+    if let Some(cfg) = lock_ignore_poison(&CURRENT_CONFIG).as_ref() {
+        if let Some(cfg) = cfg.as_ref() {
+            s.extend(cfg.rules.iter().map(|r| r.pkg.clone()));
+            s.extend(cfg.app_refresh_configs.keys().cloned());
+        }
+    }
+    s
+}
+
+/// 从配置文件内容解析“规则应用集合”(跳过注释/空行/全局设置行)
+fn pkg_set_of_config(content: &str) -> HashSet<String> {
+    let mut s = HashSet::new();
+    for raw in content.lines() {
+        if let LineKind::Pkg(pkg) | LineKind::Block(pkg) = classify_line(raw.trim()) {
+            s.insert(pkg);
+        }
+    }
+    s
+}
+
+/// 原子写配置文件 (tmp+rename) + 保存后自动整理; 供 rule_edit/refresh 写接口共用
+pub(crate) fn save_config_lines(path: &str, lines: &[String]) -> bool {
+    let mut out = lines.join("\n");
+    out.push('\n');
+    let tmp = format!("{}.tmp", path);
+    let ok = fs::File::create(&tmp)
+        .and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(out.as_bytes())?;
+            f.sync_all()
+        })
+        .and_then(|_| fs::rename(&tmp, path));
+    if ok.is_err() {
+        return false;
+    }
+    organize_config_file(path);
+    true
+}
+
 /// 保存配置后自动整理: 注释/空行/全局设置(refresh_*)保持原序置顶;
 /// 各包属性行(规则/刷新率/移入cpuset)按包名分组, 包内规则在前、属性在后,
 /// 块规则(含 '{')作为整体随包移动。
 pub(crate) fn organize_config_file(path: &str) {
     use std::collections::BTreeMap;
     let Ok(content) = fs::read_to_string(path) else { return };
+    // 仅“规则应用集合”相对 CURRENT_CONFIG 变化 (新增/移除应用) 时重排;
+    // 只调整数值/核集不重排
+    if pkg_set_of_config(&content) == current_config_pkg_set() {
+        return;
+    }
     let lines: Vec<String> = content.lines().map(String::from).collect();
     let mut head: Vec<String> = Vec::new();
     let mut pkgs: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -349,43 +446,29 @@ pub(crate) fn organize_config_file(path: &str) {
     while i < lines.len() {
         let raw = lines[i].clone();
         let t = raw.trim();
-        if t.is_empty() || t.starts_with('#') || t.starts_with("//") {
-            head.push(raw);
-            i += 1;
-            continue;
-        }
-        if t.contains('=') && !t.contains(',') && !t.contains('{') {
-            if let Some((k, _)) = t.split_once('=') {
-                if k.trim().starts_with("refresh_") {
-                    head.push(raw);
-                    i += 1;
-                    continue;
-                }
-            }
-        }
-        if t.contains('{') && !t.contains(',') {
-            let mut unit = vec![raw];
-            i += 1;
-            while i < lines.len() {
-                unit.push(lines[i].clone());
-                if lines[i].contains('}') {
-                    i += 1;
-                    break;
-                }
+        match classify_line(t) {
+            LineKind::Skip | LineKind::Global | LineKind::Other => {
+                head.push(raw);
                 i += 1;
             }
-            if let Some(pkg) = pkg_of_line(&unit[0]) {
+            LineKind::Block(pkg) => {
+                let mut unit = vec![raw];
+                i += 1;
+                while i < lines.len() {
+                    unit.push(lines[i].clone());
+                    if lines[i].contains('}') {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
                 pkgs.entry(pkg).or_default().push(unit.join("\n"));
-            } else {
-                head.extend(unit);
             }
-            continue;
+            LineKind::Pkg(pkg) => {
+                pkgs.entry(pkg).or_default().push(raw);
+                i += 1;
+            }
         }
-        match pkg_of_line(t) {
-            Some(pkg) => pkgs.entry(pkg).or_default().push(raw),
-            None => head.push(raw),
-        }
-        i += 1;
     }
     let mut out = head;
     for (_, mut ls) in pkgs {
@@ -451,7 +534,7 @@ pub fn load_config(
 
     for line in content.lines() {
         let p = line.trim();
-        if p.is_empty() || p.starts_with('#') || p.starts_with("//") {
+        if is_skip_line(p) {
             continue;
         }
 
@@ -737,6 +820,7 @@ fn config_reload(last_mtime: &mut i64) -> bool {
         return false;
     };
     let cpu_changed = cpu_config_changed(&old_cfg, &new_cfg);
+    CPU_RULES_CHANGED.store(cpu_changed, Ordering::Relaxed);
     let mut guard = lock_ignore_poison(&CURRENT_CONFIG);
     *guard = Some(Arc::new(new_cfg));
     cpu_changed

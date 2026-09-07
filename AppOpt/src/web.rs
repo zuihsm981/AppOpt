@@ -249,6 +249,12 @@ fn dispatch(out: &mut TcpStream, req: &Request) {
     resp_send(out, status, "application/json", body.as_bytes(), !req.keep_alive);
 }
 
+/// 解析 JSON 请求体 (各写接口共用样板); 失败返回标准错误响应
+fn parse_json(req: &Request) -> Result<serde_json::Value, (u16, String)> {
+    serde_json::from_slice::<serde_json::Value>(&req.body)
+        .map_err(|_| err_json(400, "请求体不是合法 JSON"))
+}
+
 fn err_json(code: u16, msg: &str) -> (u16, String) {
     (code, json!({ "ok": false, "err": msg }).to_string())
 }
@@ -354,9 +360,7 @@ fn pkg_shape_ok(pkg: &str) -> bool {
 }
 
 fn rule_api(req: &Request) -> (u16, String) {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
-        return err_json(400, "请求体不是合法 JSON");
-    };
+    let v = match parse_json(req) { Ok(v) => v, Err(e) => return e };
     let (Some(pkg), Some(cpus)) = (
         v["pkg"].as_str().map(str::trim),
         v["cpus"].as_str().map(str::trim),
@@ -391,9 +395,7 @@ fn rule_api(req: &Request) -> (u16, String) {
 }
 
 fn rule_del_api(req: &Request) -> (u16, String) {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
-        return err_json(400, "请求体不是合法 JSON");
-    };
+    let v = match parse_json(req) { Ok(v) => v, Err(e) => return e };
     let Some(pkg) = v["pkg"].as_str().map(str::trim) else {
         return err_json(400, "缺少 pkg 字段");
     };
@@ -418,9 +420,7 @@ fn rule_del_api(req: &Request) -> (u16, String) {
 }
 
 fn rule_rename_api(req: &Request) -> (u16, String) {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
-        return err_json(400, "请求体不是合法 JSON");
-    };
+    let v = match parse_json(req) { Ok(v) => v, Err(e) => return e };
     let (Some(old), Some(new)) =
         (v["old"].as_str().map(str::trim), v["new"].as_str().map(str::trim))
     else {
@@ -451,9 +451,7 @@ fn rule_rename_api(req: &Request) -> (u16, String) {
 
 /// 输入建议
 fn suggest_api(req: &Request) -> (u16, String) {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
-        return err_json(400, "请求体不是合法 JSON");
-    };
+    let v = match parse_json(req) { Ok(v) => v, Err(e) => return e };
     let q = v["q"].as_str().map(str::trim).unwrap_or("");
     if q.len() > 64 {
         return err_json(400, "q 过长");
@@ -554,9 +552,7 @@ fn config_json() -> String {
 }
 
 fn config_set_api(req: &Request) -> (u16, String) {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
-        return err_json(400, "请求体不是合法 JSON");
-    };
+    let v = match parse_json(req) { Ok(v) => v, Err(e) => return e };
     let mode = v["mode"].as_u64();
     let interval = v["interval"].as_u64();
     let name = v["cpuset_name"].as_str();
@@ -745,9 +741,7 @@ fn refresh_config_json() -> String {
 }
 
 fn refresh_config_set_api(req: &Request) -> (u16, String) {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
-        return err_json(400, "请求体不是合法 JSON");
-    };
+    let v = match parse_json(req) { Ok(v) => v, Err(e) => return e };
     let timeout = v["timeout"].as_u64().unwrap_or(30) as i32;
     let active = v["active"].as_str().unwrap_or("120");
     let idle = v["idle"].as_str().unwrap_or("60");
@@ -770,9 +764,7 @@ fn refresh_apps_json() -> String {
 }
 
 fn refresh_app_add_api(req: &Request) -> (u16, String) {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
-        return err_json(400, "请求体不是合法 JSON");
-    };
+    let v = match parse_json(req) { Ok(v) => v, Err(e) => return e };
     let Some(pkg) = v["pkg"].as_str().map(str::trim) else {
         return err_json(400, "缺少 pkg 字段");
     };
@@ -793,9 +785,7 @@ fn refresh_app_add_api(req: &Request) -> (u16, String) {
 }
 
 fn refresh_app_del_api(req: &Request) -> (u16, String) {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
-        return err_json(400, "请求体不是合法 JSON");
-    };
+    let v = match parse_json(req) { Ok(v) => v, Err(e) => return e };
     let Some(pkg) = v["pkg"].as_str().map(str::trim) else {
         return err_json(400, "缺少 pkg 字段");
     };

@@ -348,21 +348,53 @@ fn main() {
     }
     // 配置变更后应用到当前模式: KPM 全量扫描 + uid 表重建(规则包集合门控); /proc 标记全量重扫
     fn apply_config(
+        cpu_changed: bool,
         ebpf_state: &mut Option<EbpfState>,
         proc_state: &mut Option<ProcScanState>,
         cfg: Option<&crate::config::AppConfig>,
     ) {
         let Some(cfg) = cfg else { return };
-        if let Some(es) = ebpf_state.as_mut() {
-            full_scan(cfg, es);
-        } else {
-            let ps = proc_state.get_or_insert_with(ProcScanState::new);
-            ps.scan_all_proc = true;
-            ps.last_proc_count = 0;
-            ps.force_affinity = true;
+        // CPU 规则未变 (仅刷新率/数值调整): 无需全量扫描, 亲和性/uid 表不需重放
+        if !cpu_changed {
+            return;
         }
-        // CPU 亲和性: 配置变更后全量应用一次
+        if let Some(es) = ebpf_state.as_mut() {
+            kpm_full_apply(cfg, es);
+        } else {
+            force_proc_rescan(proc_state);
+        }
+    }
+
+    /// KPM 全量归因扫描 + 亲和性全量应用 (配置变更/模式切换共用)
+    fn kpm_full_apply(cfg: &crate::config::AppConfig, es: &mut EbpfState) {
+        full_scan(cfg, es);
         crate::cpu_affinity::apply_all_now();
+    }
+
+    /// /proc 模式强制重扫 + 亲和性全量应用 (配置变更/切 /proc 共用)
+    fn force_proc_rescan(proc_state: &mut Option<ProcScanState>) {
+        let ps = proc_state.get_or_insert_with(ProcScanState::new);
+        ps.scan_all_proc = true;
+        ps.last_proc_count = 0;
+        ps.force_affinity = true;
+        crate::cpu_affinity::apply_all_now();
+    }
+
+    /// uid 表重建: 按 cpu_changed/包集合变化决定 (reload_config 与 EV_MODE 共用)
+    fn rebuild_uid_if_needed(
+        cpu_changed: bool,
+        cfg: &crate::config::AppConfig,
+        cpu_uid: &mut HashMap<i32, String>,
+        rfr_uid: &mut HashMap<i32, String>,
+        cpu_pkgs_set: &mut HashSet<String>,
+        rfr_pkgs_set: &mut HashSet<String>,
+    ) {
+        let (nc, nr) = cfg_pkg_sets(cfg);
+        if (cpu_changed && nc != *cpu_pkgs_set) || nr != *rfr_pkgs_set {
+            (*cpu_uid, *rfr_uid) = build_uid_tables(cfg);
+            *cpu_pkgs_set = nc;
+            *rfr_pkgs_set = nr;
+        }
     }
 
     // KPM 事件唤醒 eventfd: reader 收到事件后写入, 主循环 epoll 唤醒
@@ -451,6 +483,23 @@ fn main() {
 
         let mut cfg = lock_ignore_poison(&CURRENT_CONFIG).clone();
         let mut kpm_died = false;
+
+    // 配置事件 (EV_INOTIFY / EV_CONFIG) 公共处理: 重载配置 → 应用到当前模式 →
+    // 仅“规则应用集合”变更时重建 uid 表 (调整数值不重建)
+    let reload_config = |ebpf_state: &mut Option<EbpfState>,
+                         proc_state: &mut Option<ProcScanState>,
+                         cfg: &mut Option<Arc<AppConfig>>,
+                         cpu_uid: &mut HashMap<i32, String>,
+                         rfr_uid: &mut HashMap<i32, String>,
+                         cpu_pkgs_set: &mut HashSet<String>,
+                         rfr_pkgs_set: &mut HashSet<String>| {
+        let cpu_changed = crate::config::take_cpu_rules_changed();
+        *cfg = lock_ignore_poison(&CURRENT_CONFIG).clone();
+        apply_config(cpu_changed, ebpf_state, proc_state, cfg.as_deref());
+        if let Some(cfg) = cfg.as_ref() {
+            rebuild_uid_if_needed(cpu_changed, cfg, cpu_uid, rfr_uid, cpu_pkgs_set, rfr_pkgs_set);
+        }
+    };
 
         for i in 0..n as usize {
             let ev = events[i];
@@ -564,18 +613,17 @@ fn main() {
                     }
                 }
                 EV_INOTIFY => {
+                    // 配置变更 (inotify): 与 EV_CONFIG 共用 reload_config
                     if crate::config::inotify_drain() {
-                        // 配置已重载: 应用到当前模式
-                        cfg = lock_ignore_poison(&CURRENT_CONFIG).clone();
-                        apply_config(&mut ebpf_state, &mut proc_state, cfg.as_deref());
-                        if let Some(cfg) = cfg.as_ref() {
-                            let (nc, nr) = cfg_pkg_sets(cfg);
-                            if nc != cpu_pkgs_set || nr != rfr_pkgs_set {
-                                (cpu_uid, rfr_uid) = build_uid_tables(cfg);
-                                cpu_pkgs_set = nc;
-                                rfr_pkgs_set = nr;
-                            }
-                        }
+                        reload_config(
+                            &mut ebpf_state,
+                            &mut proc_state,
+                            &mut cfg,
+                            &mut cpu_uid,
+                            &mut rfr_uid,
+                            &mut cpu_pkgs_set,
+                            &mut rfr_pkgs_set,
+                        );
                     }
                 }
                 EV_MODE => {
@@ -584,10 +632,7 @@ fn main() {
                     if mode == 2 {
                         // 强制 /proc: 卸载 eBPF
                         if ebpf_state.take().is_some() {
-                            let ps = proc_state.get_or_insert_with(ProcScanState::new);
-                            ps.scan_all_proc = true;
-                            ps.last_proc_count = 0;
-                            ps.force_affinity = true;
+                            force_proc_rescan(&mut proc_state);
                         }
                     } else if ebpf_state.is_none() {
                         // 自动/强制 KPM: 尝试初始化
@@ -602,29 +647,24 @@ fn main() {
                         }
                     } else {
                         // 已在 KPM 模式: 重新应用配置 (规则应用集合可能变化)
-                        apply_config(&mut ebpf_state, &mut proc_state, cfg.as_deref());
+                        apply_config(true, &mut ebpf_state, &mut proc_state, cfg.as_deref());
                         if let Some(cfg) = cfg.as_ref() {
-                            let (nc, nr) = cfg_pkg_sets(cfg);
-                            if nc != cpu_pkgs_set || nr != rfr_pkgs_set {
-                                (cpu_uid, rfr_uid) = build_uid_tables(cfg);
-                                cpu_pkgs_set = nc;
-                                rfr_pkgs_set = nr;
-                            }
+                            rebuild_uid_if_needed(true, cfg, &mut cpu_uid, &mut rfr_uid, &mut cpu_pkgs_set, &mut rfr_pkgs_set);
                         }
                     }
                 }
                 EV_CONFIG => {
                     read_eventfd(config_wake_fd);
-                    cfg = lock_ignore_poison(&CURRENT_CONFIG).clone();
-                    apply_config(&mut ebpf_state, &mut proc_state, cfg.as_deref());
-                        if let Some(cfg) = cfg.as_ref() {
-                            let (nc, nr) = cfg_pkg_sets(cfg);
-                            if nc != cpu_pkgs_set || nr != rfr_pkgs_set {
-                                (cpu_uid, rfr_uid) = build_uid_tables(cfg);
-                                cpu_pkgs_set = nc;
-                                rfr_pkgs_set = nr;
-                            }
-                        }
+                    // 配置变更 (eventfd 主动唤醒): 与 EV_INOTIFY 共用 reload_config
+                    reload_config(
+                        &mut ebpf_state,
+                        &mut proc_state,
+                        &mut cfg,
+                        &mut cpu_uid,
+                        &mut rfr_uid,
+                        &mut cpu_pkgs_set,
+                        &mut rfr_pkgs_set,
+                    );
                 }
                 EV_PROC => {
                     read_eventfd(proc_timer_fd);
