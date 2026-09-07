@@ -89,9 +89,6 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 .modal input{width:100%;margin-bottom:10px}
 .modal input[readonly]{background:var(--card);color:var(--sub)}
 .field input:focus,.modal input:focus{border-color:var(--blue);background:#fff}
-#mr-movecpuset{appearance:none;-webkit-appearance:none;width:18px;height:18px;flex:none;margin:0;padding:0;border:1px solid var(--sub);border-radius:5px;background:var(--bg);cursor:pointer;position:relative;display:inline-block;vertical-align:middle}
-#mr-movecpuset:checked{background:var(--blue);border-color:var(--blue)}
-#mr-movecpuset:checked::after{content:'✓';position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#fff;font-size:13px;line-height:1}
 .modal-actions{display:flex;gap:8px;margin-top:6px}
 .modal-actions button{flex:1;padding:9px 0;border-radius:999px;font-size:14px}
 .core-chips{display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap}
@@ -284,10 +281,6 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <h3 id="mr-title">添加应用</h3>
 <div class="sg-wrap"><input id="mr-pkg" placeholder="输入应用包名"><div class="sg-box" id="sg-pkg" hidden></div></div>
 <div id="mr-rows"></div>
-<label id="mr-mc-wrap" style="display:flex;align-items:center;gap:8px;margin:10px 0;font-size:13px;color:var(--fg);cursor:pointer;user-select:none">
-<input type="checkbox" id="mr-movecpuset">
-<span style="display:inline-block;line-height:1.4">应用亲和性时同时移入 cpuset 目录</span>
-</label>
 <button class="rule-add" id="mr-addrow" hidden>＋ 线程规则</button>
 <div class="modal-actions">
 <button class="btn-outline" id="mr-cancel">取消</button>
@@ -581,8 +574,6 @@ async function openRuleModal(mode,gi,ii){
   pkg.readOnly=!tree;
   pkg.value=mode==='add-pkg'?'':rulesData[gi].pkg;
   $('mr-addrow').hidden=!tree;
-  $('mr-mc-wrap').style.display=tree?'':'none'; // 移入 cpuset 仅应用级 (添加/编辑应用)
-  $('mr-movecpuset').checked=mode==='add-pkg'?false:!!rulesData[gi].movecpuset;
   if(mode==='add-pkg'){
     $('mr-title').textContent='添加应用';
     mrRows=[mkRow({pkgRow:true})];
@@ -642,9 +633,6 @@ $('mr-save').onclick=async()=>{
       try{await api('/api/rule',{pkg,thread:j.thread,cpus:j.cpus})}
       catch(e){return toast(`第${i+1}条（${j.thread||'包级'}）失败：${e.message}`)}
     }
-    // 逐应用: 应用亲和性时同时移入 cpuset 目录
-    if(mrMode==='add-pkg'||mrMode==='edit-app')
-      await api('/api/rule/movecpuset',{pkg,on:$('mr-movecpuset').checked});
     $('modal-rule').hidden=true;
     toast('已保存');
     loadRules();
