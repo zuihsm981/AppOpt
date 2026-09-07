@@ -579,7 +579,6 @@ fn main() {
                                     "fg uid={} pid={} cpu_miss",
                                     uid, pid
                                 ));
-                            } else {
                             }
                             // 刷新率: 表命中 → 发包名给刷新率线程
                             if let Some(pkg) = rfr_uid.get(&uid) {
