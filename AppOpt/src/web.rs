@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -40,6 +40,12 @@ pub fn notify_mode_switch() {
 }
 
 pub static WEB_STATS: Mutex<Option<WebStats>> = Mutex::new(None);
+
+/// KPM 模式是否活跃 (main 在 ebpf_state 置位/卸载时更新)
+pub static KPM_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// 进程启动时间 (/api/status 实时计算 uptime)
+pub static START: OnceLock<Instant> = OnceLock::new();
 
 /// 状态页可见性: 前端状态页可见时每 3s 轮询 /api/status; 离开状态页/隐藏/关闭
 /// 即停止该请求。窗口取 2 个轮询间隔, 超过即视为未查看, 跳过统计汇总。
@@ -292,28 +298,35 @@ fn spec_name(cpus: &CpuSet, topo: &CpuTopology) -> String {
 }
 
 fn status_json() -> String {
-    let stats = lock_ignore_poison(&WEB_STATS).clone();
     let cfg = current_cfg();
     let topo = cfg.as_ref().map(|c| &c.topo);
-    let s = stats.unwrap_or(WebStats {
-        rules: 0,
-        pkgs: 0,
-        hit_pkgs: 0,
-        hit_list: Vec::new(),
-        threads: 0,
-        kpm: false,
-        uptime: 0,
-    });
+    // 前端轮询即实时计算: KPM 直接读 CPU worker 发布的 CPU_STATS (应用退出后
+    // 由 worker 周期清理随之归零); /proc 模式用主循环周期快照 (EV_PROC 刷新)
+    let kpm = KPM_ACTIVE.load(Ordering::Relaxed);
+    let (threads, hit_pkgs, hit_list) = if kpm {
+        crate::cpu_affinity::cpu_stats()
+    } else {
+        let stats = lock_ignore_poison(&WEB_STATS).clone();
+        match stats.as_ref() {
+            Some(s) => (s.threads, s.hit_pkgs, s.hit_list.clone()),
+            None => (0, 0, Vec::new()),
+        }
+    };
+    let (rules, pkgs) = match cfg.as_ref() {
+        Some(c) => (c.rules.len(), c.pkgs.len()),
+        None => (0, 0),
+    };
+    let uptime = START.get().map(|t| t.elapsed().as_secs()).unwrap_or(0);
     json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "mode": if s.kpm { "kpm" } else { "proc" },
-        "uptime": s.uptime,
-        "rules": s.rules,
-        "pkgs": s.pkgs,
+        "mode": if kpm { "kpm" } else { "proc" },
+        "uptime": uptime,
+        "rules": rules,
+        "pkgs": pkgs,
         "parse_fail": PARSE_FAILS.load(Ordering::Relaxed),
-        "hit_pkgs": s.hit_pkgs,
-        "hit_list": s.hit_list,
-        "threads": s.threads,
+        "hit_pkgs": hit_pkgs,
+        "hit_list": hit_list,
+        "threads": threads,
         "total_procs": sys_procs(),
         "interval": CHECK_INTERVAL.load(Ordering::Relaxed).max(1),
         "e_core": topo.map(|t| t.e_core.to_range_string()).unwrap_or_default(),

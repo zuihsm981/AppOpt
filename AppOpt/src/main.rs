@@ -301,6 +301,7 @@ fn main() {
     }
 
     let prog_start = Instant::now();
+    let _ = crate::web::START.get_or_init(|| std::time::Instant::now());
     let mut proc_state: Option<ProcScanState> = None;
     let mut ebpf_state: Option<EbpfState> = None;
 
@@ -453,6 +454,7 @@ fn main() {
             if let Some(cfg) = cfg {
                 full_scan(&cfg, &mut es);
             }
+            crate::web::KPM_ACTIVE.store(true, Ordering::Relaxed);
             ebpf_state = Some(es);
             // CPU 亲和性: binder 前台回调驱动 (cpu_affinity.rs), 启动即全量应用一次
             if cpu_ready {
@@ -632,6 +634,7 @@ fn main() {
                     if mode == 2 {
                         // 强制 /proc: 卸载 eBPF
                         if ebpf_state.take().is_some() {
+                            crate::web::KPM_ACTIVE.store(false, Ordering::Relaxed);
                             force_proc_rescan(&mut proc_state);
                         }
                     } else if ebpf_state.is_none() {
@@ -640,6 +643,7 @@ fn main() {
                             if let Some(cfg) = cfg.as_ref() {
                                 full_scan(cfg, &mut es);
                             }
+                            crate::web::KPM_ACTIVE.store(true, Ordering::Relaxed);
                             ebpf_state = Some(es);
                             if cpu_ready {
                                 crate::cpu_affinity::apply_all_now();
@@ -700,12 +704,15 @@ fn main() {
             disarm_timerfd(proc_timer_fd);
         }
 
-        // web 状态统计: 事件驱动更新 (收到事件时刷新, 不再定时轮询)
-        if WEB_ENABLED.load(Ordering::Relaxed) && crate::web::web_active() {
-            let (threads, hit_pkgs, hit_list) = match (&ebpf_state, &proc_state) {
-                (Some(_), _) => crate::cpu_affinity::cpu_stats(),
-                (None, Some(ps)) => cache_stats(&ps.cache),
-                _ => (0, 0, Vec::new()),
+        // web 统计: KPM 由前端 /api/status 实时计算 (cpu_stats), 不做事件刷新;
+        // /proc 模式保留周期 EV_PROC 快照
+        if !crate::web::KPM_ACTIVE.load(Ordering::Relaxed)
+            && WEB_ENABLED.load(Ordering::Relaxed)
+            && crate::web::web_active()
+        {
+            let (threads, hit_pkgs, hit_list) = match proc_state.as_ref() {
+                Some(ps) => cache_stats(&ps.cache),
+                None => (0, 0, Vec::new()),
             };
             if let Some(cfg) = cfg.as_ref() {
                 *lock_ignore_poison(&WEB_STATS) = Some(WebStats {
@@ -714,7 +721,7 @@ fn main() {
                     hit_pkgs,
                     hit_list,
                     threads,
-                    kpm: ebpf_state.is_some(),
+                    kpm: false,
                     uptime: prog_start.elapsed().as_secs(),
                 });
             }

@@ -205,6 +205,10 @@ impl CpuAffinity {
         unsafe {
             libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
         }
+        // 周期存活清理节拍: 每 N 次超时 (300ms×10≈3s) 清一次, 但仅在 webui 可见
+        // (前端轮询中) 时执行, 避免无人查看时的 /proc 存活校验开销; tid 回收防
+        // 误抓仍由 on_uid 触发的 cleanup_dead 兜底
+        let mut timeout_tick: u32 = 0;
         while !stop.load(Ordering::Relaxed) {
             match rx.recv_timeout(Duration::from_millis(300)) {
                 Ok(CpuMsg::ApplyAll) => {
@@ -224,7 +228,17 @@ impl CpuAffinity {
                     // 触发枚举时清理: 删已消失 tid 的 APPLIED 条目, 防 tid 回收后 kprobe 误抓
                     self.cleanup_dead();
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    timeout_tick += 1;
+                    if timeout_tick >= 10 {
+                        timeout_tick = 0;
+                        // 仅 webui 可见时做周期存活清理 (web 统计实时归零);
+                        // 隐藏/无人查看时跳过
+                        if crate::web::web_active() {
+                            self.cleanup_dead();
+                        }
+                    }
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
