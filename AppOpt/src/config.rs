@@ -287,6 +287,35 @@ fn parse_refresh_config_line(
     true
 }
 
+/// pkg=refresh-<timeout>-<active>-<idle> 与 pkg=move_cpuset-<0|1> 前缀路由
+fn route_pkg_val_line(
+    pkg: &str,
+    val: &str,
+    apps: &mut HashMap<String, (i32, i32, i32)>,
+    mc: &mut HashSet<String>,
+) -> bool {
+    if !pkg.is_empty() && val.starts_with("refresh-") {
+        let parts: Vec<&str> = val.split('-').collect();
+        if parts.len() == 4 && !parts[1].is_empty() {  // ["refresh", t, a, i]
+            let t = parts[1].parse::<i32>().unwrap_or(30).max(1);
+            let a = parse_refresh_mode(parts[2]);
+            let i = parse_refresh_mode(parts[3]);
+            apps.insert(pkg.to_string(), (t, a, i));
+        }
+        return true;
+    }
+    if !pkg.is_empty() && val.starts_with("move_cpuset-") {
+        let v = &val["move_cpuset-".len()..];
+        if v == "1" {
+            mc.insert(pkg.to_string());
+        } else {
+            mc.remove(pkg);
+        }
+        return true;
+    }
+    false
+}
+
 /// 只读取统一主配置文件中的刷新率字段。
 /// 刷新率保存后的轻量同步使用此函数，不重新解析 CPU 规则。
 pub fn load_refresh_config(config_file: &str) -> (i32, i32, i32, HashMap<String, (i32, i32, i32)>) {
@@ -414,12 +443,15 @@ pub fn load_config(
                 if !pending_pkg.is_empty() {
                     fail_cnt += 1;
                 }
-                if !add_rule(&mut rules, topo, pkg, "", cpus) {
-                    fail_cnt += 1;
-                }
-                if open {
-                    cur_pkg = pkg.to_string();
-                    in_block = true;
+                // 前缀路由: pkg=refresh-<t>-<a>-<i> / pkg=move_cpuset-<0|1> 不是 CPU 规则
+                if !route_pkg_val_line(pkg, cpus, &mut app_refresh_configs, &mut move_cpuset_pkgs) {
+                    if !add_rule(&mut rules, topo, pkg, "", cpus) {
+                        fail_cnt += 1;
+                    }
+                    if open {
+                        cur_pkg = pkg.to_string();
+                        in_block = true;
+                    }
                 }
                 pending_pkg.clear();
             }
