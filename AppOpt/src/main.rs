@@ -663,7 +663,7 @@ fn main() {
         // web 状态统计: 事件驱动更新 (收到事件时刷新, 不再定时轮询)
         if WEB_ENABLED.load(Ordering::Relaxed) && crate::web::web_active() {
             let (threads, hit_pkgs, hit_list) = match (&ebpf_state, &proc_state) {
-                (Some(es), _) => cache_stats(&es.cache),
+                (Some(_), _) => crate::cpu_affinity::cpu_stats(),
                 (None, Some(ps)) => cache_stats(&ps.cache),
                 _ => (0, 0, Vec::new()),
             };

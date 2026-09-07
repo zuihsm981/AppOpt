@@ -487,20 +487,31 @@ pub fn refresh_get_apps() -> Vec<(String, i32, String, String)> {
         .collect()
 }
 
+/// 判断一行是否属于该包的刷新率/移入cpuset配置 (新格式 pkg=refresh-*|move_cpuset-*,
+/// 兼容旧格式 refresh_app,<pkg>,… / <pkg>,t,a,i)
+fn is_refresh_pkg_line(line: &str, pkg: &str) -> bool {
+    let t = line.trim();
+    if let Some((k, v)) = t.split_once('=') {
+        return k.trim() == pkg
+            && (v.starts_with("refresh-") || v.starts_with("move_cpuset-"));
+    }
+    let fields: Vec<&str> = t.split(',').map(str::trim).collect();
+    (fields.len() == 5 && fields[0] == "refresh_app" && fields[1] == pkg)
+        || (fields.len() == 4 && fields[0] == pkg)
+}
+
 pub fn refresh_add_app(pkg: &str, timeout: i32, active: &str, idle: &str) {
     let path = config_path();
     let content = fs::read_to_string(&path).unwrap_or_default();
     let mut lines: Vec<String> = content.lines().map(String::from).collect();
-    let new_line = format!("refresh_app,{},{},{},{}", pkg, timeout, active, idle);
+    // 新格式: pkg=refresh-<timeout>-<active>-<idle>
+    let new_line = format!("{}=refresh-{}-{}-{}", pkg, timeout, active, idle);
     let mut found = false;
     for line in lines.iter_mut() {
         if line.trim().starts_with('#') || line.trim().is_empty() {
             continue;
         }
-        let fields: Vec<&str> = line.split(',').map(str::trim).collect();
-        if (fields.len() == 5 && fields[0] == "refresh_app" && fields[1] == pkg)
-            || (fields.len() == 4 && fields[0] == pkg)
-        {
+        if is_refresh_pkg_line(line, pkg) {
             *line = new_line.clone();
             found = true;
             break;
@@ -531,9 +542,7 @@ pub fn refresh_del_app(pkg: &str) -> bool {
             if line.is_empty() || line.starts_with('#') {
                 return true;
             }
-            let fields: Vec<&str> = line.split(',').map(str::trim).collect();
-            !((fields.len() == 5 && fields[0] == "refresh_app" && fields[1] == pkg)
-                || (fields.len() == 4 && fields[0] == pkg))
+            !is_refresh_pkg_line(line, pkg)
         })
         .map(String::from)
         .collect();

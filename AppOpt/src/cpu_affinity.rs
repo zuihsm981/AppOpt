@@ -42,6 +42,23 @@ pub enum CpuMsg {
 /// 全局投递通道: 主线程 (main EV_FG) 转发前台回调 → CpuMsg 消息
 static CPU_FG_TX: OnceLock<Mutex<mpsc::Sender<CpuMsg>>> = OnceLock::new();
 
+/// KPM 模式 web 统计: (绑定线程数, 命中包名列表); 由 worker 在每次应用后发布
+static CPU_STATS: Mutex<(usize, Vec<String>)> = Mutex::new((0, Vec::new()));
+
+/// 读取 KPM 模式统计: (线程数, 命中包名数, 命中包名列表)
+pub fn cpu_stats() -> (usize, usize, Vec<String>) {
+    let g = CPU_STATS.lock().unwrap();
+    (g.0, g.1.len(), g.1.clone())
+}
+
+/// 发布当前 managed 统计 (worker 调用)
+fn publish_stats(&self) {
+    let mut pkgs: Vec<String> = self.managed.values().cloned().collect();
+    pkgs.sort_unstable();
+    pkgs.dedup();
+    *CPU_STATS.lock().unwrap() = (self.managed.len(), pkgs);
+}
+
 pub fn cpu_fg_tx() -> Option<mpsc::Sender<CpuMsg>> {
     CPU_FG_TX
         .get()
@@ -164,6 +181,7 @@ impl CpuAffinity {
                 self.managed.insert(tid, pkg.to_string());
             }
         }
+        self.publish_stats();
     }
 
     /// 删除已消失线程的 APPLIED 条目 (防 tid 回收后 kprobe 误抓)
@@ -178,6 +196,7 @@ impl CpuAffinity {
             self.bpf.applied_del(t);
             self.managed.remove(&t);
         }
+        self.publish_stats();
     }
 
     /// 常驻线程入口 (纯事件驱动, 无重试/无周期)

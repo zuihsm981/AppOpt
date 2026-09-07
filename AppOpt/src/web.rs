@@ -410,22 +410,30 @@ fn rule_movecpuset_api(req: &Request) -> (u16, String) {
     let file = lock_ignore_poison(&CONFIG_FILE).clone();
     let content = fs::read_to_string(&file).unwrap_or_default();
     let mut lines: Vec<String> = content.lines().map(String::from).collect();
+    // 新格式: pkg=move_cpuset-<0|1>; 兼容旧 move_cpuset,<pkg>,<0|1> (upsert)
+    let new_line = if on {
+        format!("{}=move_cpuset-1", pkg)
+    } else {
+        format!("{}=move_cpuset-0", pkg)
+    };
     let mut found = false;
     for line in lines.iter_mut() {
         let t = line.trim();
-        let parts: Vec<&str> = t.split(',').map(str::trim).collect();
-        if parts.len() == 3 && parts[0] == "move_cpuset" && parts[1] == pkg {
-            *line = if on {
-                format!("move_cpuset,{},1", pkg)
-            } else {
-                format!("move_cpuset,{},0", pkg)
-            };
+        let new = t.starts_with(&format!("{}=", pkg))
+            && (t.contains("=move_cpuset-") || t.contains("=refresh-"));
+        let old = t.split(',')
+            .filter(|s| !s.is_empty())
+            .nth(1)
+            .map_or(false, |p| p == pkg)
+            && t.starts_with("move_cpuset,");
+        if new || old {
+            *line = new_line.clone();
             found = true;
             break;
         }
     }
     if !found && on {
-        lines.push(format!("move_cpuset,{},1", pkg));
+        lines.push(new_line);
     }
     if fs::write(&file, lines.join("\n") + "\n").is_err() {
         return err_json(500, "配置文件写入失败");
