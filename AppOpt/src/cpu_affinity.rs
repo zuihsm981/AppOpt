@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::AppConfig;
 use crate::ebpf_mode::KpmHandle;
@@ -63,15 +63,19 @@ pub struct CpuAffinity {
     managed: HashMap<i32, String>,
     /// 初始化时 /proc 全部 pid 快照: 其余应用枚举时跳过 (含 launcher3/systemui)
     init_pids: HashSet<i32>,
+    /// 额外标记 launcher3/systemui 的 pid 目录: 其规则直接使用, 免扫描/读 cmdline
+    marked: HashMap<String, Vec<i32>>,
 }
 
 impl CpuAffinity {
-    /// init_pids: main.rs 在 AppOpt 初始化时构建的 /proc pid 快照
-    pub fn new(init_pids: HashSet<i32>) -> Self {
+    /// init_pids: main.rs 在 AppOpt 初始化时构建的 /proc pid 快照;
+    /// marked: 其中 launcher3/systemui 的 pid 标记
+    pub fn new(init_pids: HashSet<i32>, marked: HashMap<String, Vec<i32>>) -> Self {
         Self {
             bpf: KpmHandle::new(),
             managed: HashMap::new(),
             init_pids,
+            marked,
         }
     }
 
@@ -79,6 +83,12 @@ impl CpuAffinity {
     /// uid 即应用身份: 精确、无 cmdline 归因竞态、多用户下不误捞其他实例。
     fn on_uid(&mut self, uid: i32, pkg: &str, cfg: &AppConfig) {
         if uid <= 0 {
+            return;
+        }
+        cpu_log(&format!("on_uid enter uid={} pkg={}", uid, pkg));
+        // launcher3/systemui 的规则: 直接用标记目录 (免 /proc 扫描)
+        if let Some(pids) = self.marked.get(pkg).cloned() {
+            self.apply_tids(&pids, pkg, cfg);
             return;
         }
         // 跳过 init_pids (含 launcher3/systemui), 只处理初始化后新出现的 pid, 按 uid 过滤
@@ -94,6 +104,7 @@ impl CpuAffinity {
                 }
             }
         }
+        cpu_log(&format!("on_uid found pids={}", pids.len()));
         self.apply_tids(&pids, pkg, cfg);
     }
 
@@ -101,11 +112,18 @@ impl CpuAffinity {
     /// apply_tids (O(P), 避免 O(P²): 每包一次全表重扫); 不做 cleanup (触发时清理)
     pub fn apply_all(&mut self, cfg: &AppConfig) -> usize {
         let mut by_pkg: HashMap<String, Vec<i32>> = HashMap::new();
-        // 全量扫描归因 (不跳过 init_pids: 初始化必须覆盖启动前已运行的目标应用)
+        // launcher3/systemui 标记 pid 直接按标记归属 (免 cmdline 读)
+        for (pkg, pids) in &self.marked {
+            if cfg.target_pkgs.contains(pkg) {
+                by_pkg.entry(pkg.clone()).or_default().extend(pids.iter().copied());
+            }
+        }
+        let marked_pid_set: HashSet<i32> = self.marked.values().flatten().copied().collect();
+        // 其余 pid 全量扫描归因 (标记 pid 已在上面处理, 跳过免重复读 cmdline)
         if let Ok(entries) = std::fs::read_dir("/proc") {
             for e in entries.flatten() {
                 let Ok(pid) = e.file_name().to_string_lossy().parse::<i32>() else { continue };
-                if pid <= 0 {
+                if pid <= 0 || marked_pid_set.contains(&pid) {
                     continue;
                 }
                 if let Some(pkg) = resolve_pkg(pid, cfg) {
@@ -119,6 +137,7 @@ impl CpuAffinity {
                 self.apply_tids(pids, pkg, cfg);
             }
         }
+        cpu_log(&format!("apply_all done pkgs={}", by_pkg.len()));
         by_pkg.len()
     }
 
@@ -145,6 +164,10 @@ impl CpuAffinity {
                     &cfg.topo,
                     rule.move_cpuset,
                 );
+                cpu_log(&format!(
+                    "apply tid={} pkg={} cpus=0x{:x} dead={}",
+                    tid, pkg, rule.cpus.bits[0], dead
+                ));
                 self.managed.insert(tid, pkg.to_string());
             }
         }
@@ -170,18 +193,22 @@ impl CpuAffinity {
         unsafe {
             libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
         }
+        cpu_log("worker started");
         while !stop.load(Ordering::Relaxed) {
             match rx.recv_timeout(Duration::from_millis(300)) {
                 Ok(CpuMsg::ApplyAll) => {
+                    cpu_log("worker ApplyAll");
                     let cfg = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
                     if let Some(cfg) = cfg {
                         self.apply_all(&cfg);
                     }
                 }
                 Ok(CpuMsg::ApplyPkg(uid, pkg)) => {
+                    cpu_log(&format!("worker ApplyPkg uid={} pkg={}", uid, pkg));
                     // 冷启动: 延迟 2s 覆盖子进程窗口后按 uid 枚举 (主+子进程同 uid,
                     // 精确且避免 cmdline 归因竞态; 不误捞其他用户同包名实例)
                     thread::sleep(ENUM_DELAY);
+                    cpu_log(&format!("on_uid begin uid={} pkg={}", uid, pkg));
                     let cfg = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
                     if let Some(cfg) = cfg {
                         self.on_uid(uid, &pkg, &cfg);
@@ -198,7 +225,7 @@ impl CpuAffinity {
 }
 
 /// 启动 CPU worker 线程 (KPM 模式下调用一次); 返回 false 表示模块不可用
-pub fn start(init_pids: HashSet<i32>) -> bool {
+pub fn start(init_pids: HashSet<i32>, marked: HashMap<String, Vec<i32>>) -> bool {
     if CPU_FG_TX.get().is_some() {
         return true;
     }
@@ -209,10 +236,50 @@ pub fn start(init_pids: HashSet<i32>) -> bool {
     }
     let (tx, rx) = mpsc::channel::<CpuMsg>();
     let _ = CPU_FG_TX.set(Mutex::new(tx));
-    // init_pids 由 main.rs 在 AppOpt 初始化时构建传入
-    let cpu = CpuAffinity::new(init_pids);
+    // init_pids/marked 由 main.rs 在 AppOpt 初始化时构建传入
+    let cpu = CpuAffinity::new(init_pids, marked);
     thread::spawn(move || cpu.run(rx, Arc::new(AtomicBool::new(false))));
     true
+}
+
+/// 从 init_pids 快照中额外标记 launcher3/systemui 的 pid 目录:
+///   - 其余应用枚举时跳过它们 (它们在 init_pids 内), 避免读其目录;
+///   - launcher3/systemui 自身规则直接使用标记目录, 免扫描。
+pub(crate) fn classify_marked_pids(init_pids: &HashSet<i32>) -> HashMap<String, Vec<i32>> {
+    let mut m: HashMap<String, Vec<i32>> = HashMap::new();
+    for &p in init_pids {
+        if let Some(cmd) = crate::apply_affinity::read_cmdline(p) {
+            if same_pkg(&cmd, crate::config::DEFAULT_REFRESH_PACKAGE) {
+                m.entry(crate::config::DEFAULT_REFRESH_PACKAGE.to_string())
+                    .or_default()
+                    .push(p);
+            } else if same_pkg(&cmd, "com.android.systemui") {
+                m.entry("com.android.systemui".to_string()).or_default().push(p);
+            }
+        }
+    }
+    m
+}
+
+/// AppOpt 启动时刻标记 (main 最先调用), 供 cpu_log 输出相对时间
+static APP_START: OnceLock<Instant> = OnceLock::new();
+pub(crate) fn cpu_start() {
+    let _ = APP_START.set(Instant::now());
+}
+
+/// [CPU] 调试日志: 带相对时间戳写 /data/local/tmp/appopt_cpu.log (附加) + stderr
+pub(crate) fn cpu_log(msg: &str) {
+    let el = APP_START.get().map(|s| s.elapsed()).unwrap_or_default();
+    let line = format!("[t=+{:.1}s] {}", el.as_secs_f64(), msg);
+    eprintln!("{}", line);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/data/local/tmp/appopt_cpu.log")
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{}", line);
+    }
 }
 
 /// 缓存初始化时 /proc 下全部 pid (AppOpt 启动快照): 由 main.rs 在初始化时调用,
