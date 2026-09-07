@@ -18,6 +18,8 @@ fn config_path() -> String {
 pub const EVENT_INPUT: u32 = 5;
 
 static REFRESH_FORCE_RELOAD: AtomicBool = AtomicBool::new(false);
+/// input 触摸事件 kprobe 当前武装状态 (初始 true: ebpf_init activate 已 input_on)
+static INPUT_HOOK_ON: AtomicBool = AtomicBool::new(true);
 static WAKE_FD: AtomicI32 = AtomicI32::new(-1);
 static REFRESH_STATUS: Mutex<Option<RefreshStatus>> = Mutex::new(None);
 static REFRESH_TX: Mutex<Option<mpsc::Sender<RefreshEvent>>> = Mutex::new(None);
@@ -77,6 +79,7 @@ fn load_global_config(state: &mut RefreshState) {
     state.current_idle = state.idle_mode;
     state.current_timeout = state.timeout_seconds;
     state.timer_enabled = state.current_idle != state.current_active;
+    sync_input_hook(state);
 }
 
 /// 从共享 CURRENT_CONFIG 读取按应用刷新率配置（统一加载）
@@ -132,6 +135,7 @@ fn apply_app_config(state: &mut RefreshState, pkg: &str) {
         state.current_idle = state.idle_mode;
     }
     state.timer_enabled = state.current_idle != state.current_active;
+    sync_input_hook(state);
 }
 
 fn timerfd_set(fd: i32, seconds: i32) {
@@ -148,6 +152,15 @@ fn timerfd_cancel(fd: i32) {
         it_value: libc::timespec { tv_sec: 0, tv_nsec: 0 },
     };
     unsafe { libc::timerfd_settime(fd, 0, &its, std::ptr::null_mut()); }
+}
+
+/// 刷新率活跃==空闲时无 idle→active 切换, 无需触摸事件: 卸载 input kprobe 省开销;
+/// 不同时重新安装。仅状态变化时下发 ctl0 (input_on/input_off)。
+fn sync_input_hook(state: &RefreshState) {
+    let want = state.timer_enabled;
+    if INPUT_HOOK_ON.swap(want, Ordering::AcqRel) != want {
+        crate::ebpf_mode::set_input_hook(want);
+    }
 }
 
 fn reset_timer(state: &mut RefreshState, force: bool) {

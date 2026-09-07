@@ -252,7 +252,13 @@ fn main() {
 
     // CPU 亲和性投递通道必须先于刷新率 observer 建立, 否则注册瞬间(或首个)
     // 前台回调会被丢弃, 导致首次打开应用不生效。
-    let cpu_ready = crate::cpu_affinity::start();
+    // AppOpt 初始化时缓存 /proc pid 快照: CPU 枚举跳过系统进程/已运行应用,
+    // 只处理之后新出现的 pid (冷启动应用)。早于 worker 线程调度, 不漏启动瞬间进程。
+    let init_pids = crate::cpu_affinity::proc_pid_set();
+    // 快照保留全部 pid (含 launcher3/systemui): 非其规则时枚举跳过, 避免读取其目录;
+    // 额外标记 launcher3/systemui 的 pid, 其规则直接使用标记目录
+    let marked = crate::cpu_affinity::classify_marked_pids(&init_pids);
+    let cpu_ready = crate::cpu_affinity::start(init_pids, marked);
 
     // 刷新率控制模块，独立线程运行 (binder 回调经主线程 uid 表 → FgPkg 消息驱动)
     refresh::refresh_init();

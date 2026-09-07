@@ -477,6 +477,17 @@ fn kpm_shm_reader(
     unsafe { libc::munmap(base, map_len); }
 }
 
+/// 按需武装/卸载 input 触摸事件 kprobe (ctl0 input_on/input_off):
+/// 刷新率活跃==空闲时无 idle→active 切换, 卸载触摸钩子省开销; 不同时重新安装。
+pub fn set_input_hook(on: bool) {
+    let h = KpmHandle::new();
+    if on {
+        h.cmd("input_on");
+    } else {
+        h.cmd("input_off");
+    }
+}
+
 /// 事件派发 (仅 input: 刷新率活动检测; CPU/刷新率由 binder 三线程驱动)
 pub fn event_dispatch(event: &EbpfProcEvent, _cfg: &AppConfig, _state: &mut EbpfState) {
     // CPU 亲和性已由 binder 触发的 CpuAffinity 模块负责 (cpu_affinity.rs):
