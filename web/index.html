@@ -137,6 +137,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="card">
 <div class="card-title">运行状态</div>
 <div class="row"><span class="label">工作模式</span><span id="s-mode" class="badge proc">-</span></div>
+<div class="row"><span class="label">连接状态</span><span id="s-conn" class="badge proc">-</span></div>
 <div class="row"><span class="label">运行时长</span><span class="value" id="s-up">-</span></div>
 <div class="row"><span class="label">版本</span><span class="value" id="s-ver">-</span></div>
 </div>
@@ -175,16 +176,6 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 </section>
 
 <section id="tab-settings" class="panel" hidden>
-<div class="card">
-<div class="card-title">工作模式</div>
-<div class="seg" id="seg-mode">
-<button data-mode="0">自动</button>
-<button data-mode="1">KPM</button>
-<button data-mode="2">Proc</button>
-</div>
-<div class="hint" id="c-mode-active">当前生效: -</div>
-<div class="hint" id="c-kpm-hint" style="color:var(--orange)" hidden>未检测到 KPM（KernelPatch/模块未加载），强制 KPM 时将保持 Proc 轮询</div>
-</div>
 <div class="card">
 <div class="card-title">扫描参数</div>
 <div class="field"><input id="c-interval" type="number" min="1" max="3600"><button class="btn" id="c-interval-save">保存</button></div>
@@ -261,7 +252,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="card-title">使用说明</div>
 <div class="text"><ol>
 <li>规则页点击「添加」，输入应用包名，可同时配置包级默认（可选）与多条线程规则后一次保存</li>
-<li>设置页可切换 KPM / Proc 工作模式、cpuset 目录名、检查间隔与配置文件路径</li>
+<li>设置页可配置 cpuset 目录名、检查间隔与配置文件路径（仅 KPM 模式）</li>
 <li>配置文件也可直接手工编辑，保存后自动热加载</li>
 <li>更多规则编写说明参考官网文档</li>
 </ol></div>
@@ -374,6 +365,9 @@ async function refreshStat(){
     const mb=$('s-mode');
     mb.textContent=modeLabel(d.mode);
     mb.className='badge '+(d.mode==='kpm'?'kpm':'proc');
+    const cn=$('s-conn');
+    cn.textContent=d.connected?'已连接':'未连接';
+    cn.className='badge '+(d.connected?'kpm':'proc');
     $('s-up').textContent=fmtUp(d.uptime);
     $('s-ver').textContent='v'+(d.version||'?');
     $('s-rules').textContent=d.rules;
@@ -712,19 +706,12 @@ $('mc-ok').onclick=()=>{$('modal-confirm').hidden=true;confirmCb&&confirmCb()};
 async function loadCfg(){
   try{
     const d=await api('/api/config');
-    document.querySelectorAll('#seg-mode button').forEach(b=>b.classList.toggle('on',+b.dataset.mode===d.mode));
-    $('c-mode-active').textContent='当前生效: '+modeLabel(d.mode_active);
-    $('c-kpm-hint').hidden=d.kpm_available;
     $('c-interval').value=d.interval;
     $('c-cpuset').value=d.cpuset_name;
     $('c-file').value=d.config_file;
     $('c-cpuset-on').textContent=d.cpuset_enabled?'已启用':'不可用';
   }catch(e){toast(e.message)}
 }
-document.querySelectorAll('#seg-mode button').forEach(b=>b.onclick=async()=>{
-  try{await api('/api/config',{mode:+b.dataset.mode});toast('已切换');loadCfg()}
-  catch(e){toast(e.message)}
-});
 async function saveField(body){
   try{await api('/api/config',body);toast('已保存');loadCfg()}
   catch(e){toast(e.message)}
