@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -45,24 +45,26 @@ pub enum CpuMsg {
 static CPU_FG_TX: OnceLock<Mutex<mpsc::Sender<CpuMsg>>> = OnceLock::new();
 
 /// 冷热身份: uid → (前台主 pid, 该 uid 全部 pid 列表); 主线程判冷热, CPU 线程回写
-pub static CPU_KNOWN: std::sync::LazyLock<Mutex<HashMap<i32, (i32, Vec<i32>)>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+/// 冷热身份: uid -> (前台主 pid, 该 uid 全部 pid 列表); 主线程每次 binder 前台
+/// 回调都读 (高频只读) -> RwLock, 仅冷启动/EXIT 时写
+pub static CPU_KNOWN: std::sync::LazyLock<RwLock<HashMap<i32, (i32, Vec<i32>)>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// proc 快照: uid → 该 uid 全部 pid 列表; 冷启动先清除再重建
-pub static PROC_SNAPSHOT: std::sync::LazyLock<Mutex<HashMap<i32, Vec<i32>>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+pub static PROC_SNAPSHOT: std::sync::LazyLock<RwLock<HashMap<i32, Vec<i32>>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// 冷热判断: cpu_known 中该 uid 的 pid 与回调 pid 一致 → 热
 pub fn cpu_known_is_hot(uid: i32, pid: i32) -> bool {
-    crate::lock_ignore_poison(&CPU_KNOWN)
+    crate::rw_read_ignore_poison(&CPU_KNOWN)
         .get(&uid)
         .is_some_and(|(p, _)| *p == pid)
 }
 
 /// 清除某 uid 的 pid 列表与 cpu_known 身份
 pub fn cpu_known_evict(uid: i32) {
-    crate::lock_ignore_poison(&PROC_SNAPSHOT).remove(&uid);
-    crate::lock_ignore_poison(&CPU_KNOWN).remove(&uid);
+    crate::rw_write_ignore_poison(&PROC_SNAPSHOT).remove(&uid);
+    crate::rw_write_ignore_poison(&CPU_KNOWN).remove(&uid);
 }
 
 /// 进程退出 (EXIT 事件, 仅主线程 tid==pid 时调用): 该 pid 为主进程则清除其
@@ -72,7 +74,7 @@ pub fn cpu_known_evict_by_pid(pid: i32) {
         return;
     }
     let uid = {
-        let k = crate::lock_ignore_poison(&CPU_KNOWN);
+        let k = crate::rw_read_ignore_poison(&CPU_KNOWN);
         k.iter().find_map(|(u, (mp, _))| (*mp == pid).then_some(*u))
     };
     if let Some(u) = uid {
@@ -81,11 +83,11 @@ pub fn cpu_known_evict_by_pid(pid: i32) {
 }
 
 /// KPM 模式 web 统计: (绑定线程数, 命中包名列表); 由 worker 在每次应用后发布
-static CPU_STATS: Mutex<(usize, Vec<String>)> = Mutex::new((0, Vec::new()));
+static CPU_STATS: RwLock<(usize, Vec<String>)> = RwLock::new((0, Vec::new()));
 
 /// 读取 KPM 模式统计: (线程数, 命中包名数, 命中包名列表)
 pub fn cpu_stats() -> (usize, usize, Vec<String>) {
-    let g = CPU_STATS.lock().unwrap();
+    let g = crate::rw_read_ignore_poison(&CPU_STATS);
     (g.0, g.1.len(), g.1.clone())
 }
 
@@ -132,7 +134,7 @@ impl CpuAffinity {
         let mut pkgs: Vec<String> = self.managed.values().cloned().collect();
         pkgs.sort_unstable();
         pkgs.dedup();
-        *CPU_STATS.lock().unwrap() = (self.managed.len(), pkgs);
+        *crate::rw_write_ignore_poison(&CPU_STATS) = (self.managed.len(), pkgs);
     }
 
     /// 按 uid 枚举该应用全部进程 (主 + pkg: 子进程同 uid) → 应用全部线程。
@@ -230,24 +232,24 @@ impl CpuAffinity {
             libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
         }
         while !stop.load(Ordering::Relaxed) {
-            match rx.recv_timeout(Duration::from_millis(300)) {
+            match rx.recv() {
                 Ok(CpuMsg::ApplyAll) => {
-                    let cfg = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
+                    let cfg = crate::rw_read_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
                     if let Some(cfg) = cfg {
                         self.apply_all(&cfg);
                     }
                 }
                 Ok(CpuMsg::ApplyPkg(pid, uid, pkg)) => {
                     // 冷启动: 先占位 cpu_known (uid+主 pid), 延迟 2s 覆盖子进程窗口
-                    crate::lock_ignore_poison(&CPU_KNOWN).insert(uid, (pid, Vec::new()));
+                    crate::rw_write_ignore_poison(&CPU_KNOWN).insert(uid, (pid, Vec::new()));
                     thread::sleep(ENUM_DELAY);
-                    let cfg = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
+                    let cfg = crate::rw_read_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
                     if let Some(cfg) = cfg {
                         let pids = self.on_uid(uid, &pkg, &cfg);
                         // 设置亲和性后: 该 uid 主进程+全部子进程 pid 列表写入
                         // cpu_known 与 proc 快照 (供后续冷热判断/统计)
-                        crate::lock_ignore_poison(&CPU_KNOWN).insert(uid, (pid, pids.clone()));
-                        crate::lock_ignore_poison(&PROC_SNAPSHOT).insert(uid, pids);
+                        crate::rw_write_ignore_poison(&CPU_KNOWN).insert(uid, (pid, pids.clone()));
+                        crate::rw_write_ignore_poison(&PROC_SNAPSHOT).insert(uid, pids);
                         // 标记内核主进程 tgid: 退出探针只对该主进程发布 EXIT
                         self.bpf.applied_set_main(pid);
                     }
@@ -262,8 +264,7 @@ impl CpuAffinity {
                     }
                     self.publish_stats();
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvError) => break,
             }
         }
         self.bpf.applied_clear();

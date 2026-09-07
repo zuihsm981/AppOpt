@@ -3,7 +3,7 @@ use std::ffi::CString;
 use std::fs;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::UNIX_EPOCH;
 
 use crate::{lock_ignore_poison, MAX_PKG_LEN, MAX_THREAD_LEN};
@@ -59,7 +59,8 @@ pub struct AppConfig {
     pub app_refresh_configs: HashMap<String, (i32, i32, i32)>,
 }
 
-pub static CURRENT_CONFIG: Mutex<Option<Arc<AppConfig>>> = Mutex::new(None);
+/// 共享配置: 读多写少 (各线程频繁读, 仅配置重载时写) -> RwLock
+pub static CURRENT_CONFIG: RwLock<Option<Arc<AppConfig>>> = RwLock::new(None);
 
 /// 最近一次 config_reload 是否检测到 CPU 规则变化 (供主循环 apply_config 消费;
 /// 默认 true 保证首个配置事件不会漏扫)
@@ -389,7 +390,7 @@ fn classify_line(t: &str) -> LineKind {
 /// 当前共享配置中的“规则应用集合” (CPU 规则包 ∪ 刷新率配置包)
 fn current_config_pkg_set() -> HashSet<String> {
     let mut s = HashSet::new();
-    if let Some(cfg) = lock_ignore_poison(&CURRENT_CONFIG).as_ref() {
+    if let Some(cfg) = rw_read_ignore_poison(&CURRENT_CONFIG).as_ref() {
         s.extend(cfg.rules.iter().map(|r| r.pkg.clone()));
         s.extend(cfg.app_refresh_configs.keys().cloned());
     }
@@ -810,7 +811,7 @@ fn cpu_config_changed(old: &AppConfig, new: &AppConfig) -> bool {
 }
 
 fn config_reload(last_mtime: &mut i64) -> bool {
-    let Some(old_cfg) = lock_ignore_poison(&CURRENT_CONFIG).clone() else {
+    let Some(old_cfg) = rw_read_ignore_poison(&CURRENT_CONFIG).clone() else {
         return false;
     };
     let file = lock_ignore_poison(&CONFIG_FILE).clone();
@@ -819,7 +820,7 @@ fn config_reload(last_mtime: &mut i64) -> bool {
     };
     let cpu_changed = cpu_config_changed(&old_cfg, &new_cfg);
     CPU_RULES_CHANGED.store(cpu_changed, Ordering::Relaxed);
-    let mut guard = lock_ignore_poison(&CURRENT_CONFIG);
+    let mut guard = rw_write_ignore_poison(&CURRENT_CONFIG);
     *guard = Some(Arc::new(new_cfg));
     cpu_changed
 }
@@ -840,13 +841,13 @@ pub fn config_reload_now() {
 /// 刷新率保存只更新共享刷新率字段并由 refresh 线程自行唤醒。
 pub fn reload_refresh_only() {
     let file = {
-        let guard = lock_ignore_poison(&CURRENT_CONFIG);
+        let guard = rw_read_ignore_poison(&CURRENT_CONFIG);
         if guard.is_none() { return; }
         lock_ignore_poison(&CONFIG_FILE).clone()
     };
     let (refresh_timeout, refresh_active, refresh_idle, app_refresh_configs) =
         load_refresh_config(&file);
-    let mut guard = lock_ignore_poison(&CURRENT_CONFIG);
+    let mut guard = rw_write_ignore_poison(&CURRENT_CONFIG);
     if let Some(cfg) = guard.as_ref() {
         let mut new_cfg = (**cfg).clone();
         new_cfg.refresh_timeout = refresh_timeout;

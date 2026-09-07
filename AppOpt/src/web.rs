@@ -231,7 +231,7 @@ fn err_json(code: u16, msg: &str) -> (u16, String) {
 }
 
 fn current_cfg() -> Option<std::sync::Arc<crate::config::AppConfig>> {
-    lock_ignore_poison(&CURRENT_CONFIG).clone()
+    rw_read_ignore_poison(&CURRENT_CONFIG).clone()
 }
 
 fn sys_procs() -> u16 {
@@ -689,10 +689,15 @@ fn refresh_status_json() -> String {
 
 fn refresh_config_json() -> String {
     let (timeout, active, idle) = crate::refresh::refresh_get_config();
+    // 设备可用刷新率 (Hz), 前端据此过滤 120/90/60 选项
+    let available = crate::refresh::refresh_get_status()
+        .map(|s| s.available)
+        .unwrap_or_else(|| vec![120, 90, 60]);
     json!({
         "timeout": timeout,
         "active": active,
         "idle": idle,
+        "available": available,
     }).to_string()
 }
 

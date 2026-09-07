@@ -19,7 +19,7 @@ use std::ffi::CString;
 use std::fs;
 use std::process;
 use std::sync::atomic::Ordering;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 
 use crate::config::{
     init_inotify, load_config, AppConfig,
@@ -38,6 +38,16 @@ pub const MAX_THREAD_LEN: usize = 32;
 
 pub(crate) fn lock_ignore_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 高频只读数据的读锁 (RwLock): 多线程并发读不互斥, 写方独占
+pub(crate) fn rw_read_ignore_poison<T>(rw: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    rw.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 高频只读数据的写锁 (RwLock): 独占写
+pub(crate) fn rw_write_ignore_poison<T>(rw: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    rw.write().unwrap_or_else(|e| e.into_inner())
 }
 
 /// 从 packages.list 构建两张 uid→包名 静态表 (主线程持有):
@@ -232,7 +242,7 @@ fn main() {
     };
 
     {
-        let mut guard = lock_ignore_poison(&CURRENT_CONFIG);
+        let mut guard = rw_write_ignore_poison(&CURRENT_CONFIG);
         *guard = Some(Arc::new(initial_config));
     }
 
@@ -288,7 +298,7 @@ fn main() {
     // 规则应用集合 (主线程对比用): 仅集合变化才重建 uid 表 (数值调整不重建)
     let mut cpu_pkgs_set: HashSet<String> = HashSet::new();
     let mut rfr_pkgs_set: HashSet<String> = HashSet::new();
-    if let Some(cfg) = lock_ignore_poison(&CURRENT_CONFIG).clone() {
+    if let Some(cfg) = rw_read_ignore_poison(&CURRENT_CONFIG).clone() {
         (cpu_uid, rfr_uid) = build_uid_tables(&cfg);
         (cpu_pkgs_set, rfr_pkgs_set) = cfg_pkg_sets(&cfg);
     }
@@ -407,7 +417,7 @@ fn main() {
 
     // 初始 KPM 初始化 (仅 KPM 模式)
     if let Some(mut es) = ebpf_init(kpm_wake_fd) {
-        let cfg = lock_ignore_poison(&CURRENT_CONFIG).clone();
+        let cfg = rw_read_ignore_poison(&CURRENT_CONFIG).clone();
         if let Some(cfg) = cfg {
             full_scan(&cfg, &mut es);
         }
@@ -434,7 +444,7 @@ fn main() {
             continue;
         }
 
-        let mut cfg = lock_ignore_poison(&CURRENT_CONFIG).clone();
+        let mut cfg = rw_read_ignore_poison(&CURRENT_CONFIG).clone();
         let mut kpm_died = false;
 
     // 配置事件 (EV_INOTIFY / EV_CONFIG) 公共处理: 重载配置 → 应用到当前模式 →
@@ -446,7 +456,7 @@ fn main() {
                          cpu_pkgs_set: &mut HashSet<String>,
                          rfr_pkgs_set: &mut HashSet<String>| {
         let cpu_changed = crate::config::take_cpu_rules_changed();
-        *cfg = lock_ignore_poison(&CURRENT_CONFIG).clone();
+        *cfg = rw_read_ignore_poison(&CURRENT_CONFIG).clone();
         apply_config(cpu_changed, ebpf_state, cfg.as_deref());
         if let Some(cfg) = cfg.as_ref() {
             rebuild_uid_if_needed(cpu_changed, cfg, cpu_uid, rfr_uid, cpu_pkgs_set, rfr_pkgs_set);
@@ -465,7 +475,7 @@ fn main() {
                             match es.event_rx.try_recv() {
                                 Ok(event) => {
                                     let Some(cfg) =
-                                        lock_ignore_poison(&CURRENT_CONFIG).clone()
+                                        rw_read_ignore_poison(&CURRENT_CONFIG).clone()
                                     else {
                                         continue;
                                     };

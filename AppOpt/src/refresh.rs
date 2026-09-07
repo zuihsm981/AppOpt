@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::process::Command;
 use std::ffi::CString;
 use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -35,6 +36,8 @@ pub struct RefreshStatus {
     pub timeout: i32,
     pub active_mode: i32,
     pub idle_mode: i32,
+    /// 设备可用刷新率 (Hz), 供 web 过滤选项 (如仅 [90, 60])
+    pub available: Vec<i32>,
 }
 
 enum RefreshEvent {
@@ -52,6 +55,11 @@ struct AppRefreshConfig {
 }
 
 struct RefreshState {
+    /// 设备实际显示模式 id: [120Hz 模式, 90Hz 模式, 60Hz 模式]
+    /// (binder 1035 的 i32 参数 = 显示模式 id; 由初始化 dumpsys 解析自动检测)
+    rate_args: [i32; 3],
+    /// 设备可用刷新率档位 [120, 90, 60] (web 据此隐藏不可用选项)
+    available_modes: [bool; 3],
     timeout_seconds: i32,
     active_mode: i32,
     idle_mode: i32,
@@ -70,7 +78,7 @@ struct RefreshState {
 
 /// 从共享 CURRENT_CONFIG 读取刷新率全局配置（统一加载，避免线程内重复读文件）
 fn load_global_config(state: &mut RefreshState) {
-    let cfg = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
+    let cfg = crate::rw_read_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
     let Some(cfg) = cfg else { return };
     state.timeout_seconds = cfg.refresh_timeout;
     state.active_mode = cfg.refresh_active;
@@ -85,7 +93,7 @@ fn load_global_config(state: &mut RefreshState) {
 /// 从共享 CURRENT_CONFIG 读取按应用刷新率配置（统一加载）
 fn load_app_configs(state: &mut RefreshState) {
     state.app_configs.clear();
-    let cfg = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
+    let cfg = crate::rw_read_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
     let Some(cfg) = cfg else { return };
     for (pkg, (timeout, active_mode, idle_mode)) in &cfg.app_refresh_configs {
         state.app_configs.insert(
@@ -103,8 +111,20 @@ fn set_refresh_rate(state: &mut RefreshState, mode: i32) {
     if mode == state.current_applied_mode {
         return;
     }
+    // 内部 mode 码 (MODE_120/60/90) → 设备实际显示模式 id (初始化检测所得)
+    let arg = match mode {
+        MODE_120 => state.rate_args[0],
+        MODE_90 => state.rate_args[1],
+        MODE_60 => state.rate_args[2],
+        _ => mode,
+    };
+    // 解析失败/未检测到该档位 (arg<0): 不切换, 避免发送错误模式 id
+    if arg < 0 {
+        state.current_applied_mode = mode;
+        return;
+    }
     // 只走 binder 直连 SurfaceFlinger，不再回退到 service 子进程
-    crate::process_observer::set_refresh_rate_binder(mode);
+    crate::process_observer::set_refresh_rate_binder(arg);
     state.current_applied_mode = mode;
 }
 
@@ -256,6 +276,13 @@ fn update_status(state: &RefreshState) {
         timeout: state.current_timeout,
         active_mode: state.current_active,
         idle_mode: state.current_idle,
+        available: {
+            let mut v = Vec::new();
+            if state.available_modes[0] { v.push(120); }
+            if state.available_modes[1] { v.push(90); }
+            if state.available_modes[2] { v.push(60); }
+            v
+        },
     };
     *REFRESH_STATUS.lock().unwrap() = Some(status);
 }
@@ -295,6 +322,8 @@ pub fn refresh_init() {
         current_idle: MODE_60,
         current_timeout: 30,
         current_applied_mode: -1,
+        rate_args: detect_rate_args(),
+        available_modes: detect_available_modes(),
         is_paused: false,
         timer_enabled: true,
         last_reset_time: None,
@@ -411,7 +440,7 @@ pub fn refresh_on_event(event_type: u32, _pid: i32) {
 
 pub fn refresh_get_config() -> (i32, String, String) {
     // 从共享 CURRENT_CONFIG 读取（统一加载；未就绪时回退默认值）
-    if let Some(cfg) = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone() {
+    if let Some(cfg) = crate::rw_read_ignore_poison(&crate::config::CURRENT_CONFIG).clone() {
         return (
             cfg.refresh_timeout,
             crate::config::refresh_mode_str(cfg.refresh_active).to_string(),
@@ -471,7 +500,7 @@ pub fn refresh_set_config(timeout: i32, active: &str, idle: &str) {
 
 pub fn refresh_get_apps() -> Vec<(String, i32, String, String)> {
     // 刷新率应用配置只从共享 CURRENT_CONFIG 返回，不再单独读取配置文件。
-    let Some(cfg) = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone() else {
+    let Some(cfg) = crate::rw_read_ignore_poison(&crate::config::CURRENT_CONFIG).clone() else {
         return Vec::new();
     };
     cfg.app_refresh_configs
@@ -557,4 +586,105 @@ pub fn refresh_del_app(pkg: &str) -> bool {
 
 pub fn refresh_get_status() -> Option<RefreshStatus> {
     REFRESH_STATUS.lock().unwrap().clone()
+}
+
+/// 解析 `dumpsys display` 支持的显示模式 (display_modes.sh v3/v2 同款文本解析):
+/// 返回 (mode_id, width, height, fps)。失败/无输出返回空表。
+/// 解析 `dumpsys display` 的显示模式 (模仿命令行):
+///   dumpsys display | grep 'DisplayMode{id=' | awk -F'[,{}]' '{... peakRefreshRate= ...}'
+/// 即: 只处理含 `DisplayMode{id=` 的行; 以 `,` `{` `}` 为分隔符切分整行;
+/// 取 `id=`/`width=`/`height=`/`peakRefreshRate=` 字段, 刷新率截断小数取整数 Hz。
+/// 另兼容部分 ROM 用 `refreshRate=`/`vsyncRate=`/`fps=` 字段 (优先 peakRefreshRate)。
+fn parse_display_modes() -> Vec<(u32, u32, u32, f32)> {
+    let out = match Command::new("dumpsys").arg("display").output() {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut modes: Vec<(u32, u32, u32, f32)> = Vec::new();
+    for line in text.lines() {
+        // 行过滤: 仅含字面量 DisplayMode{id= (awk grep 'DisplayMode{id=')
+        if !line.contains("DisplayMode{id=") {
+            continue;
+        }
+        let (mut id, mut w, mut h): (Option<u32>, Option<u32>, Option<u32>) = (None, None, None);
+        let mut fps: Option<f32> = None;
+        // 以 , { } 为分隔符切分整行 (awk -F'[,{}]')
+        for col in line.split(|c: char| c == ',' || c == '{' || c == '}') {
+            let col = col.trim();
+            if let Some(v) = col.strip_prefix("id=") {
+                id = v.trim().parse().ok();
+            } else if let Some(v) = col.strip_prefix("width=") {
+                w = v.trim().parse().ok();
+            } else if let Some(v) = col.strip_prefix("height=") {
+                h = v.trim().parse().ok();
+            } else if let Some(v) = col.strip_prefix("peakRefreshRate=") {
+                // 截断小数 → 整数 Hz (awk sub(/\..*/,"",r))
+                fps = v.split('.').next().unwrap_or(v).trim().parse().ok();
+            } else if fps.is_none() {
+                // 兜底字段 (部分 ROM): refreshRate / vsyncRate / fps, 同样截断小数
+                let r = ["refreshRate=", "vsyncRate=", "fps="]
+                    .iter()
+                    .find_map(|p| col.strip_prefix(p));
+                if let Some(v) = r {
+                    fps = v.split('.').next().unwrap_or(v).trim().parse().ok();
+                }
+            }
+        }
+        if let (Some(id), Some(w), Some(h), Some(fps)) = (id, w, h, fps) {
+            modes.push((id, w, h, fps));
+        }
+    }
+    modes
+}
+
+/// 初始化自动检测显示模式 id (返回 [高档, 中档90, 低档]):
+///   - 高档 (原 120): 最高可用刷新率的 mode id —— 只有 90/60 的设备自动落到 90
+///   - 中档 (90):     最接近 90Hz 的 mode id
+///   - 低档 (原 60):  最低可用刷新率的 mode id
+/// 同档多个分辨率取最小 id (首分辨率档)。解析失败返回 [-1,-1,-1] (未知),
+/// 调用方不切换刷新率; 不做硬编码回退。
+fn detect_rate_args() -> [i32; 3] {
+    let modes = parse_display_modes();
+    if modes.is_empty() {
+        return [-1, -1, -1];
+    }
+    let max_fps = modes.iter().map(|m| m.3).fold(0.0f32, f32::max);
+    let min_fps = modes.iter().map(|m| m.3).fold(f32::MAX, f32::min);
+    // 高档 = 最高可用刷新率 (同档取最小 id, 即首分辨率档)
+    let high = modes
+        .iter()
+        .filter(|m| (m.3 - max_fps).abs() < 0.5)
+        .min_by_key(|m| m.0)
+        .map(|m| m.0 as i32)
+        .unwrap_or(-1);
+    // 低档 = 最低可用刷新率 (同档取最小 id)
+    let low = modes
+        .iter()
+        .filter(|m| (m.3 - min_fps).abs() < 0.5)
+        .min_by_key(|m| m.0)
+        .map(|m| m.0 as i32)
+        .unwrap_or(-1);
+    // 中档 (90) = 最接近 90Hz 的 mode id (90/60 设备 → 90)
+    let mid = modes
+        .iter()
+        .min_by(|a, b| {
+            let da = (a.3 - 90.0).abs();
+            let db = (b.3 - 90.0).abs();
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|m| m.0 as i32)
+        .unwrap_or(-1);
+    [high, mid, low]
+}
+
+/// 检测设备可用刷新率档位 [120, 90, 60] (web 隐藏不可用选项)。
+/// 解析失败默认全可用 (不隐藏选项; 缺档由 rate_args=-1 在发送时直接不切换)。
+fn detect_available_modes() -> [bool; 3] {
+    let modes = parse_display_modes();
+    if modes.is_empty() {
+        return [true, true, true];
+    }
+    let has = |t: f32| modes.iter().any(|m| (m.3 - t).abs() < 0.5);
+    [has(120.0), has(90.0), has(60.0)]
 }
