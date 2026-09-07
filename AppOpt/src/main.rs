@@ -546,27 +546,15 @@ fn main() {
                             if let Some(pkg) = cpu_uid.get(&uid) {
                                 let cold = cpu_known.get(&uid).map_or(true, |&p| p != pid);
                                 cpu_known.insert(uid, pid);
-                                crate::cpu_affinity::cpu_log(&format!(
-                                    "[CPU] fg uid={} pid={} cpu_hit pkg={} cold={}",
-                                    uid, pid, pkg, cold
-                                ));
                                 if cold {
                                     if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
                                         let _ = tx.send(crate::cpu_affinity::CpuMsg::ApplyPkg(
                                             uid,
                                             pkg.clone(),
                                         ));
-                                        crate::cpu_affinity::cpu_log(&format!(
-                                            "[CPU] ApplyPkg sent uid={} pkg={}",
-                                            uid, pkg
-                                        ));
                                     }
                                 }
                             } else {
-                                crate::cpu_affinity::cpu_log(&format!(
-                                    "[CPU] fg uid={} pid={} cpu_miss",
-                                    uid, pid
-                                ));
                             }
                             // 刷新率: 表命中 → 发包名给刷新率线程
                             if let Some(pkg) = rfr_uid.get(&uid) {
