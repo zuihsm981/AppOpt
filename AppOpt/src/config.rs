@@ -50,8 +50,6 @@ pub struct AppConfig {
     /// 刷新率由主线程 uid 静态表驱动, 不再依赖 PID_PKG)。
     pub target_pkgs: HashSet<String>,
     pub has_thread_rules: HashSet<String>,
-    /// 逐应用“应用亲和性时同时移入 cpuset 目录”的包集合
-    pub move_cpuset_pkgs: HashSet<String>,
     pub topo: CpuTopology,
     /// 刷新率全局配置（统一加载，供 refresh 模块从共享 CURRENT_CONFIG 读取）
     pub refresh_timeout: i32,
@@ -287,12 +285,11 @@ fn parse_refresh_config_line(
     true
 }
 
-/// pkg=refresh-<timeout>-<active>-<idle> 与 pkg=move_cpuset-<0|1> 前缀路由
+/// pkg=refresh-<timeout>-<active>-<idle> 前缀路由
 fn route_pkg_val_line(
     pkg: &str,
     val: &str,
     apps: &mut HashMap<String, (i32, i32, i32)>,
-    mc: &mut HashSet<String>,
 ) -> bool {
     if !pkg.is_empty() && val.starts_with("refresh-") {
         let parts: Vec<&str> = val.split('-').collect();
@@ -304,19 +301,10 @@ fn route_pkg_val_line(
         }
         return true;
     }
-    if !pkg.is_empty() && val.starts_with("move_cpuset-") {
-        let v = &val["move_cpuset-".len()..];
-        if v == "1" {
-            mc.insert(pkg.to_string());
-        } else {
-            mc.remove(pkg);
-        }
-        return true;
-    }
     false
 }
 
-/// 包属性行所属包名: pkg=… / pkg,thread,cpus / refresh_app,<pkg>,… / move_cpuset,<pkg>,… / 裸块 pkg {
+/// 包属性行所属包名: pkg=… / pkg,thread,cpus / refresh_app,<pkg>,… / 裸块 pkg {
 fn pkg_of_line(t: &str) -> Option<String> {
     let t = crate::config::strip_comment(t).trim();
     if let Some((k, _)) = t.split_once('=') {
@@ -327,9 +315,6 @@ fn pkg_of_line(t: &str) -> Option<String> {
     }
     let fields: Vec<&str> = t.split(',').map(str::trim).collect();
     if fields.len() >= 2 && fields[0] == "refresh_app" {
-        return Some(fields[1].to_string());
-    }
-    if fields.len() >= 3 && fields[0] == "move_cpuset" {
         return Some(fields[1].to_string());
     }
     if fields.len() >= 3 && !fields[0].is_empty() {
@@ -348,9 +333,7 @@ fn pkg_of_line(t: &str) -> Option<String> {
 fn is_special_attr(line: &str) -> bool {
     let t = line.trim();
     t.starts_with("refresh_app,")
-        || t.starts_with("move_cpuset,")
         || t.contains("=refresh-")
-        || t.contains("=move_cpuset-")
 }
 
 /// 保存配置后自动整理: 注释/空行/全局设置(refresh_*)保持原序置顶;
@@ -462,7 +445,6 @@ pub fn load_config(
     // 由 refresh 线程从 CURRENT_CONFIG 读取。
     let (mut refresh_timeout, mut refresh_active, mut refresh_idle, mut app_refresh_configs) =
         (30, 0, 1, HashMap::new());
-    let mut move_cpuset_pkgs: HashSet<String> = HashSet::new(); // 逐应用移入 cpuset 标记
     let mut cur_pkg = String::new();
     let mut pending_pkg = String::new();
     let mut in_block = false;
@@ -482,17 +464,6 @@ pub fn load_config(
             &mut refresh_idle,
             &mut app_refresh_configs,
         ) {
-            continue;
-        }
-
-        // 逐应用“应用亲和性时同时移入 cpuset”标记行: move_cpuset,<pkg>,0|1
-        let parts: Vec<&str> = p.split(',').map(str::trim).collect();
-        if parts.len() == 3 && parts[0] == "move_cpuset" && !parts[1].is_empty() {
-            if parts[2] == "1" {
-                move_cpuset_pkgs.insert(parts[1].to_string());
-            } else {
-                move_cpuset_pkgs.remove(parts[1]);
-            }
             continue;
         }
 
@@ -542,8 +513,8 @@ pub fn load_config(
                 if !pending_pkg.is_empty() {
                     fail_cnt += 1;
                 }
-                // 前缀路由: pkg=refresh-<t>-<a>-<i> / pkg=move_cpuset-<0|1> 不是 CPU 规则
-                if !route_pkg_val_line(pkg, cpus, &mut app_refresh_configs, &mut move_cpuset_pkgs) {
+                // 前缀路由: pkg=refresh-<t>-<a>-<i> 不是 CPU 规则
+                if !route_pkg_val_line(pkg, cpus, &mut app_refresh_configs) {
                     if !add_rule(&mut rules, topo, pkg, "", cpus) {
                         fail_cnt += 1;
                     }
@@ -609,7 +580,6 @@ pub fn load_config(
         pkgs,
         target_pkgs,
         has_thread_rules,
-        move_cpuset_pkgs,
         topo: topo.clone(),
         refresh_timeout,
         refresh_active,

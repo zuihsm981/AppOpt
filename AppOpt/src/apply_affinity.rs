@@ -57,22 +57,13 @@ pub(crate) fn task_tids(pid: i32) -> Option<Vec<i32>> {
 pub fn affinity_set(
     tid: i32,
     cpus: &CpuSet,
-    cpuset_dir: &str,
-    topo: &CpuTopology,
-    move_cpuset: bool,
+    _cpuset_dir: &str,
+    _topo: &CpuTopology,
 ) -> bool {
-    // 顺序: 先设置亲和性, 再移入 cpuset (cpuset 约束在亲和性之后叠加)
     let affinity_ok = CpuSet::get_affinity(tid).is_some_and(|curr| curr == *cpus);
     if !affinity_ok {
         if let Err(e) = cpus.set_affinity(tid) {
             return e.raw_os_error() == Some(libc::ESRCH);
-        }
-    }
-    // 开启时, 再将线程移入 {base_cpuset()}/{规则核集} cpuset 目录
-    if move_cpuset {
-        let dir = crate::cpuset::ensure_cpuset_dir(cpus, topo);
-        if !dir.is_empty() {
-            crate::cpuset::move_tid_to_cpuset(tid, &dir);
         }
     }
     false

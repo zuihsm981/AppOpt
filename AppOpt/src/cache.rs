@@ -135,7 +135,7 @@ impl ProcCache {
             .tasks
             .iter()
             .filter_map(|(tid, e)| {
-                if affinity_set(*tid, &e.cpus, &e.cpuset_dir, topo, false) {
+                if affinity_set(*tid, &e.cpus, &e.cpuset_dir, topo) {
                     Some(*tid)
                 } else {
                     None

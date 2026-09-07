@@ -10,8 +10,6 @@ pub struct AffinityResult {
     pub cpus: CpuSet,
     pub cpuset_dir: String,
     pub is_thread_rule: bool,
-    /// 该包开启“同时移入 cpuset 目录”
-    pub move_cpuset: bool,
 }
 
 /// 线程规则 CPU 累加，无线程匹配走包级 fallback，仍无则返回 None
@@ -62,7 +60,6 @@ pub fn thread_affinity(
                 cpus: cfg.topo.present_cpus,
                 cpuset_dir: String::new(),
                 is_thread_rule: false,
-                move_cpuset: cfg.move_cpuset_pkgs.contains(pkg),
             });
         }
         None
@@ -71,7 +68,6 @@ pub fn thread_affinity(
             cpus,
             cpuset_dir,
             is_thread_rule: matched,
-            move_cpuset: cfg.move_cpuset_pkgs.contains(pkg),
         })
     }
 }

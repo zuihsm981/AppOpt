@@ -487,13 +487,12 @@ pub fn refresh_get_apps() -> Vec<(String, i32, String, String)> {
         .collect()
 }
 
-/// 判断一行是否属于该包的刷新率/移入cpuset配置 (新格式 pkg=refresh-*|move_cpuset-*,
-/// 兼容旧格式 refresh_app,<pkg>,… / <pkg>,t,a,i)
+/// 判断一行是否属于该包的刷新率配置 (新格式 pkg=refresh-*, 兼容旧格式
+/// refresh_app,<pkg>,… / <pkg>,t,a,i)
 fn is_refresh_pkg_line(line: &str, pkg: &str) -> bool {
     let t = line.trim();
     if let Some((k, v)) = t.split_once('=') {
-        return k.trim() == pkg
-            && (v.starts_with("refresh-") || v.starts_with("move_cpuset-"));
+        return k.trim() == pkg && v.starts_with("refresh-");
     }
     let fields: Vec<&str> = t.split(',').map(str::trim).collect();
     (fields.len() == 5 && fields[0] == "refresh_app" && fields[1] == pkg)

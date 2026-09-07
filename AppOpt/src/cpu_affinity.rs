@@ -177,7 +177,6 @@ impl CpuAffinity {
                     &rule.cpus,
                     &rule.cpuset_dir,
                     &cfg.topo,
-                    rule.move_cpuset,
                 );
                 self.managed.insert(tid, pkg.to_string());
             }
