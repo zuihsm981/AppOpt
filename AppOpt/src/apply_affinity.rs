@@ -58,7 +58,7 @@ pub fn affinity_set(
     tid: i32,
     cpus: &CpuSet,
     cpuset_dir: &str,
-    topo: &CpuTopology,
+    _topo: &CpuTopology,
     move_cpuset: bool,
 ) -> bool {
     let affinity_ok = CpuSet::get_affinity(tid).is_some_and(|curr| curr == *cpus);
