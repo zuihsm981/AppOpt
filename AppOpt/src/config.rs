@@ -50,7 +50,7 @@ pub struct AppConfig {
     /// 刷新率由主线程 uid 静态表驱动, 不再依赖 PID_PKG)。
     pub target_pkgs: HashSet<String>,
     pub has_thread_rules: HashSet<String>,
-    /// 逐应用“应用亲和性时同时移入 {cpuset_name}/{核集} cpuset 目录”的包集合
+    /// 逐应用“应用亲和性时同时移入 cpuset 目录”的包集合
     pub move_cpuset_pkgs: HashSet<String>,
     pub topo: CpuTopology,
     /// 刷新率全局配置（统一加载，供 refresh 模块从共享 CURRENT_CONFIG 读取）
@@ -495,6 +495,7 @@ pub fn load_config(
             }
             continue;
         }
+
 
         if in_block {
             if close_like(p) {
