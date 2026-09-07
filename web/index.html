@@ -201,9 +201,12 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <section id="tab-refresh" class="panel" hidden>
 <div class="card">
 <div class="card-title">刷新率状态</div>
+<div class="row" id="rf-device-wrap" role="button" tabindex="0" style="cursor:pointer" title="点击查看完整模式">
+<span class="label">设备刷新率</span><span class="value mono" id="rf-device">-</span>
+</div>
 <div class="row"><span class="label">当前刷新率</span><span class="value" id="rf-mode">-</span></div>
 <div class="row"><span class="label">空闲定时器</span><span class="value" id="rf-timer">-</span></div>
-<div class="row"><span class="label">前台应用</span><span class="value mono" id="rf-pkg">-</span></div>
+<div class="row"><span class="label">内核 input 状态</span><span class="value mono" id="rf-input">-</span></div>
 </div>
 <div class="card">
 <div class="card-title">全局配置</div>
@@ -734,9 +737,11 @@ async function loadRefresh(){
     const[st,cfg]=await Promise.all([api('/api/refresh/status'),api('/api/refresh/config')]);
     $('rf-mode').textContent=st.mode_str||'-';
     $('rf-timer').textContent=st.timer_enabled?(st.is_paused?'空闲中':(st.timer_running?'计时中':'未运行')):'未启用';
-    $('rf-pkg').textContent=st.current_package||'-';
+    $('rf-input').textContent=fmtInput(st);
     $('rf-timeout').value=cfg.timeout;
     rfAvail=cfg.available&&cfg.available.length?cfg.available:[120,90,60];
+    lastRefreshCfg=cfg;
+    renderDeviceRates(cfg);
     applyRateOptions($('rf-active'),rfAvail,cfg.active);
     applyRateOptions($('rf-idle'),rfAvail,cfg.idle);
     loadRefreshApps();
@@ -744,13 +749,30 @@ async function loadRefresh(){
       try{const s=await api('/api/refresh/status');
         $('rf-mode').textContent=s.mode_str||'-';
         $('rf-timer').textContent=s.timer_enabled?(s.is_paused?'空闲中':(s.timer_running?'计时中':'未运行')):'未启用';
-        $('rf-pkg').textContent=s.current_package||'-';
+        $('rf-input').textContent=fmtInput(s);
       }catch(e){}
     },3000);
   }catch(e){toast(e.message)}
 }
 let rfAppsData=[];
 let rfAvail=[120,90,60]; // 设备可用刷新率 (Hz), 由 /api/refresh/config 下发
+let rfDeviceExpanded=false; // 设备刷新率展开详情
+let lastRefreshCfg=null;
+// 内核 input 状态: 已武装/未武装 + 距上次 input 事件秒数
+function fmtInput(st){
+  const hooked=st.input_hooked?'已武装':'未武装';
+  const last=(st.last_input_secs||0)>=0?(' · 上次输入 '+(st.last_input_secs||0)+'s前'):'';
+  return hooked+last;
+}
+// 设备刷新率: 默认只显示刷新率 (120Hz / 90Hz / 60Hz), 点击后展开完整模式 (id|WxH Hz)
+function renderDeviceRates(cfg){
+  const el=$('rf-device');
+  if(!el)return;
+  const rates=cfg&&cfg.available&&cfg.available.length?cfg.available:[120,90,60];
+  const details=cfg&&cfg.device_modes||[];
+  if(rfDeviceExpanded&&details.length)el.innerHTML=details.map(esc).join('<br>');
+  else el.textContent=rates.map(r=>r+'Hz').join(' / ');
+}
 // 按可用刷新率过滤 <select> 选项; keep 存在且可用则选中, 否则选第一项
 function applyRateOptions(sel,avail,keep){
   if(!Array.isArray(avail)||!avail.length)return;
@@ -767,6 +789,7 @@ async function loadRefreshApps(){
     box.innerHTML=rfAppsData.map(a=>`<div class="rule-row"><span class="rule-name">${esc(a.pkg)}</span><span class="rule-sub">${a.timeout}s ${a.active}→${a.idle}</span><button class="icon-btn" data-rfedit="${esc(a.pkg)}" title="编辑">${ICO_EDIT}</button><button class="icon-btn danger" data-rfdel="${esc(a.pkg)}" title="删除">${ICO_TRASH}</button></div>`).join('');
   }catch(e){toast(e.message)}
 }
+$('rf-device-wrap').onclick=()=>{rfDeviceExpanded=!rfDeviceExpanded;renderDeviceRates(lastRefreshCfg)};
 $('rf-save').onclick=async()=>{
   try{await api('/api/refresh/config',{timeout:Math.max(1,+$('rf-timeout').value||30),active:$('rf-active').value,idle:$('rf-idle').value});toast('已保存');loadRefresh()}
   catch(e){toast(e.message)}
