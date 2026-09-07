@@ -43,10 +43,12 @@ pub enum CpuMsg {
 static CPU_FG_TX: OnceLock<Mutex<mpsc::Sender<CpuMsg>>> = OnceLock::new();
 
 /// 冷热身份: uid → (前台主 pid, 该 uid 全部 pid 列表); 主线程判冷热, CPU 线程回写
-pub static CPU_KNOWN: Mutex<HashMap<i32, (i32, Vec<i32>)>> = Mutex::new(HashMap::new());
+pub static CPU_KNOWN: std::sync::LazyLock<Mutex<HashMap<i32, (i32, Vec<i32>)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// proc 快照: uid → 该 uid 全部 pid 列表; 冷启动先清除再重建
-pub static PROC_SNAPSHOT: Mutex<HashMap<i32, Vec<i32>>> = Mutex::new(HashMap::new());
+pub static PROC_SNAPSHOT: std::sync::LazyLock<Mutex<HashMap<i32, Vec<i32>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// 冷热判断: cpu_known 中该 uid 的 pid 与回调 pid 一致 → 热
 pub fn cpu_known_is_hot(uid: i32, pid: i32) -> bool {
