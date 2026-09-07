@@ -40,6 +40,26 @@ pub(crate) fn lock_ignore_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// 诊断日志: 追加写入 /data/local/tmp/appopt.log (冷启动/EXIT 链路排查用)
+static LOG_LOCK: Mutex<()> = Mutex::new(());
+pub(crate) fn log_line(tag: &str, msg: &str) {
+    let _g = lock_ignore_poison(&LOG_LOCK);
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/data/local/tmp/appopt.log")
+    {
+        let _ = writeln!(
+            f,
+            "[{}] {:?} {}",
+            tag,
+            std::time::SystemTime::now(),
+            msg
+        );
+    }
+}
+
 /// 高频只读数据的读锁 (RwLock): 多线程并发读不互斥, 写方独占
 pub(crate) fn rw_read_ignore_poison<T>(rw: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
     rw.read().unwrap_or_else(|e| e.into_inner())
@@ -423,6 +443,7 @@ fn main() {
         }
         crate::web::KPM_ACTIVE.store(true, Ordering::Relaxed);
         ebpf_state = Some(es);
+        crate::log_line("KPM", &format!("ebpf_init ok; cpu_ready={} counters={:?}", if cpu_ready { "true" } else { "false" }, crate::ebpf_mode::kpm_counters()));
         // CPU 亲和性: binder 前台回调驱动 (cpu_affinity.rs), 启动即全量应用一次
         if cpu_ready {
             crate::cpu_affinity::apply_all_now();
@@ -566,7 +587,12 @@ fn main() {
                                             uid,
                                             pkg.clone(),
                                         ));
+                                        crate::log_line("EV_FG", &format!("uid={} pid={} pkg={} cold -> ApplyPkg 已发送", uid, pid, pkg));
+                                    } else {
+                                        crate::log_line("EV_FG", &format!("uid={} pid={} pkg={} cold 但 cpu_fg_tx 为空!", uid, pid, pkg));
                                     }
+                                } else {
+                                    crate::log_line("EV_FG", &format!("uid={} pid={} pkg={} 热, 跳过", uid, pid, pkg));
                                 }
                             } else {
                             }

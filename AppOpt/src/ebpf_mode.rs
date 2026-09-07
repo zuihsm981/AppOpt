@@ -259,12 +259,14 @@ pub fn kpm_stats_text() -> String {
     String::from_utf8_lossy(&out[..n]).to_string()
 }
 
-/// 内核/用户态计数: (kernel_exit, kernel_input, kernel_setaffinity, user_exit_events)
-/// 用于 web "内核 EXIT 状态" 诊断:
-///   kernel_exit 不涨  → 探针未发 (模块旧/tracepoint 未注册/main_tgid 标记缺失)
+/// 内核/用户态计数:
+/// (kernel_exit, kernel_input, kernel_setaffinity, user_exit_events, exit_tp_registered)
+/// 诊断用:
+///   exit_tp_registered=false → exit tracepoint 未注册 (模块旧/start 未触发/注册失败)
+///   kernel_exit 不涨         → 探针未发 (main_tgid 标记缺失等)
 ///   kernel_exit 涨而 user_exit 不涨 → 事件环/reader 链路问题
 ///   user_exit 涨而命中不归零 → EvictUid/managed 问题
-pub fn kpm_counters() -> (u64, u64, u64, u64) {
+pub fn kpm_counters() -> (u64, u64, u64, u64, bool) {
     let user_exit = USER_EXIT_EVENTS.load(Ordering::Relaxed);
     let text = kpm_stats_text();
     let mut ke = 0u64;
@@ -279,7 +281,13 @@ pub fn kpm_counters() -> (u64, u64, u64, u64) {
             }
         }
     }
-    (ke, ki, ks, user_exit)
+    // tp=1 → exit tracepoint (probe_sched_exit) 已注册
+    let tp = text
+        .find("tp=")
+        .and_then(|idx| text[idx + 3..].split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(false, |v| v == 1);
+    (ke, ki, ks, user_exit, tp)
 }
 
 pub fn kpm_probe() -> bool {
@@ -533,13 +541,17 @@ pub fn event_dispatch(event: &EbpfProcEvent, _cfg: &AppConfig, _state: &mut Ebpf
         crate::refresh::refresh_on_event(EBPF_EVENT_INPUT, 0);
     } else if event.event_type == EBPF_EVENT_EXIT && event.tid == event.pid {
         USER_EXIT_EVENTS.fetch_add(1, Ordering::Relaxed);
+        crate::log_line("EXIT", &format!("收到 EXIT: pid={} tid={} user_exit_events={} 内核计数器={:?}", event.pid, event.tid, USER_EXIT_EVENTS.load(Ordering::Relaxed), kpm_counters()));
         // 规则应用主进程退出 (内核已按 APPLIED+主进程标记过滤非规则应用/非主进程):
         // 清除该 uid 的 pid 列表与 cpu_known 身份, 并按 uid 通知 CPU worker 清除该
         // 应用 managed 条目 → web 命中应用/绑定线程立即归零 (事件驱动, 不等周期清理)。
         if let Some(uid) = crate::cpu_affinity::cpu_known_evict_by_pid(event.pid) {
+            crate::log_line("EXIT", &format!("pid={} -> uid={}, 发送 EvictUid", event.pid, uid));
             if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
                 let _ = tx.send(crate::cpu_affinity::CpuMsg::EvictUid(uid));
             }
+        } else {
+            crate::log_line("EXIT", &format!("pid={} 未匹配 CPU_KNOWN 主进程 (无身份/非规则应用)", event.pid));
         }
     }
 }

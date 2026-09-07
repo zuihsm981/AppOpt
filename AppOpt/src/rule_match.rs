@@ -8,7 +8,6 @@ use crate::cpuset::{ensure_cpuset_dir, CpuSet};
 pub struct AffinityResult {
     pub cpus: CpuSet,
     pub cpuset_dir: String,
-    pub is_thread_rule: bool,
 }
 
 /// 线程规则 CPU 累加，无线程匹配走包级 fallback，仍无则返回 None
@@ -58,7 +57,6 @@ pub fn thread_affinity(
             return Some(AffinityResult {
                 cpus: cfg.topo.present_cpus,
                 cpuset_dir: String::new(),
-                is_thread_rule: false,
             });
         }
         None
@@ -66,7 +64,6 @@ pub fn thread_affinity(
         Some(AffinityResult {
             cpus,
             cpuset_dir,
-            is_thread_rule: matched,
         })
     }
 }

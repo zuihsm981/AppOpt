@@ -31,22 +31,6 @@ pub static KPM_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// 进程启动时间 (/api/status 实时计算 uptime)
 pub static START: OnceLock<Instant> = OnceLock::new();
 
-/// 状态页可见性: 前端状态页可见时每 3s 轮询 /api/status; 离开状态页/隐藏/关闭
-/// 即停止该请求。窗口取 2 个轮询间隔, 超过即视为未查看, 跳过统计汇总。
-const WEB_ACTIVE_WINDOW: Duration = Duration::from_secs(6);
-static LAST_WEB_REQ: Mutex<Option<Instant>> = Mutex::new(None);
-
-pub fn mark_web_active() {
-    *LAST_WEB_REQ.lock().unwrap() = Some(Instant::now());
-}
-
-pub fn web_active() -> bool {
-    LAST_WEB_REQ
-        .lock()
-        .unwrap()
-        .is_some_and(|t| t.elapsed() < WEB_ACTIVE_WINDOW)
-}
-
 /// 启动 web 前端
 pub fn web_start() {
     let listener = match TcpListener::bind(("127.0.0.1", WEB_PORT)) {
@@ -199,7 +183,6 @@ fn dispatch(out: &mut TcpStream, req: &Request) {
 
     let (status, body) = match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/api/status") => {
-                mark_web_active();   /* 状态页轮询信号: 只有状态页可见才持续请求 */
                 (200, status_json())
             },
         ("GET", "/api/rules") => (200, rules_json()),
@@ -664,10 +647,7 @@ pub fn settings_save() {
 
 fn refresh_status_json() -> String {
     match crate::refresh::refresh_get_status() {
-        Some(s) => {
-        let (kernel_exit, kernel_input, kernel_setaffinity, user_exit_events) =
-            crate::ebpf_mode::kpm_counters();
-        json!({
+        Some(s) => json!({
             "current_mode": s.current_mode,
             "mode_str": match s.current_mode {
                 0 => "120Hz", 1 => "60Hz", 2 => "90Hz", _ => "未知"
@@ -687,11 +667,7 @@ fn refresh_status_json() -> String {
             },
             "input_hooked": s.input_hooked,
             "last_input_secs": s.last_input_secs,
-            "kernel_exit": kernel_exit,
-            "kernel_input": kernel_input,
-            "kernel_setaffinity": kernel_setaffinity,
-            "user_exit_events": user_exit_events,
-        }).to_string() },
+        }).to_string(),
         None => json!({"error": "refresh module not initialized"}).to_string(),
     }
 }

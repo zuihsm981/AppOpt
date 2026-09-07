@@ -209,6 +209,8 @@ impl CpuAffinity {
     /// 对给定进程集合的全部线程套用规则并应用
     fn apply_tids(&mut self, pids: &[i32], pkg: &str, cfg: &AppConfig) {
         let has_thread_rules = cfg.has_thread_rules.contains(pkg);
+        let mut applied = 0usize;
+        let mut esrch = 0usize;
         for p in pids {
             let Some(tids) = crate::apply_affinity::task_tids(*p) else { continue };
             for tid in tids {
@@ -221,15 +223,19 @@ impl CpuAffinity {
                     continue;
                 };
                 self.bpf.applied_set(tid, rule.cpus.bits[0]);
-                let _ = crate::apply_affinity::affinity_set(
+                if crate::apply_affinity::affinity_set(
                     tid,
                     &rule.cpus,
                     &rule.cpuset_dir,
                     &cfg.topo,
-                );
+                ) {
+                    esrch += 1; // 线程已退出
+                }
                 self.managed.insert(tid, pkg.to_string());
+                applied += 1;
             }
         }
+        crate::log_line("APPLY_TIDS", &format!("pkg={} pids={} 应用线程={} esrch={}", pkg, pids.len(), applied, esrch));
         self.publish_stats();
     }
 
@@ -254,14 +260,18 @@ impl CpuAffinity {
                     let cfg = crate::rw_read_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
                     if let Some(cfg) = cfg {
                         let pids = self.on_uid(uid, &pkg, &cfg);
+                        crate::log_line("APPLY", &format!("uid={} pkg={} 主pid={} on_uid 扫到 pids={:?}", uid, pkg, pid, pids));
                         // 设置亲和性后: 该 uid 主进程+全部子进程 pid 列表写入
                         // cpu_known 与 proc 快照 (供后续冷热判断/统计)
                         crate::rw_write_ignore_poison(&CPU_KNOWN).insert(uid, (pid, pids.clone()));
                         crate::rw_write_ignore_poison(&PROC_SNAPSHOT).insert(uid, pids);
                         // 标记内核主进程 tgid: 退出探针只对该主进程发布 EXIT
                         self.bpf.applied_set_main(pid);
+                        crate::log_line("APPLY", &format!("uid={} pkg={} 已 applied_set_main({})", uid, pkg, pid));
                         // 记录 uid→pkg: 退出时按 uid 整清 managed (线程规则应用也覆盖)
                         self.uid_pkg.insert(uid, pkg.clone());
+                    } else {
+                        crate::log_line("APPLY", &format!("uid={} pkg={} 主pid={} CURRENT_CONFIG 为空, 跳过", uid, pkg, pid));
                     }
                 }
                 Ok(CpuMsg::EvictUid(uid)) => {
@@ -270,9 +280,11 @@ impl CpuAffinity {
                     // 是否在 managed (线程规则类应用主线程可能未被管理)。
                     // 内核侧已在 exit 探针逐 tid 摘 APPLIED。
                     let pkg = self.uid_pkg.remove(&uid);
+                    let before = self.managed.len();
                     if let Some(pkg) = pkg {
                         self.managed.retain(|_, p| p != &pkg);
                     }
+                    crate::log_line("EVICT", &format!("uid={} pkg={:?} managed {} -> {}", uid, pkg, before, self.managed.len()));
                     self.publish_stats();
                 }
                 Err(mpsc::RecvError) => break,
