@@ -124,8 +124,6 @@ fn print_help(prog_name: &str) {
 fn main() {
     let args: Vec<String> = env::args().collect();
     let prog_name = &args[0];
-    crate::cpu_affinity::cpu_start();
-    crate::cpu_affinity::cpu_log("main start");
 
     // 参数解析先行，-v/-h/错误用法在设置加载前退出，不产生文件副作用
     let (mut cli_cfg, mut cli_interval, mut cli_cpuset, mut cli_web) =
@@ -200,7 +198,6 @@ fn main() {
 
     // 应用设置持久化于 AppOpt.json，命令行参数优先覆盖
     let st = settings_load(SETTINGS_FILE);
-    crate::cpu_affinity::cpu_log("settings loaded");
     let config_file = match cli_cfg {
         Some(path) => path,
         None if st.config_file == "./applist.conf" => "./appopt.conf".to_string(),
@@ -257,19 +254,14 @@ fn main() {
     // 前台回调会被丢弃, 导致首次打开应用不生效。
     // AppOpt 初始化时缓存 /proc pid 快照: CPU 枚举跳过系统进程/已运行应用,
     // 只处理之后新出现的 pid (冷启动应用)。早于 worker 线程调度, 不漏启动瞬间进程。
-    crate::cpu_affinity::cpu_log("init_pids build start");
     let init_pids = crate::cpu_affinity::proc_pid_set();
-    crate::cpu_affinity::cpu_log(&format!("init_pids done n={}", init_pids.len()));
     // 快照保留全部 pid (含 launcher3/systemui): 非其规则时枚举跳过, 避免读取其目录;
     // 额外标记 launcher3/systemui 的 pid, 其规则直接使用标记目录
     let marked = crate::cpu_affinity::classify_marked_pids(&init_pids);
-    crate::cpu_affinity::cpu_log(&format!("marked done n={}", marked.len()));
     let cpu_ready = crate::cpu_affinity::start(init_pids, marked);
-    crate::cpu_affinity::cpu_log("cpu worker started");
 
     // 刷新率控制模块，独立线程运行 (binder 回调经主线程 uid 表 → FgPkg 消息驱动)
     refresh::refresh_init();
-    crate::cpu_affinity::cpu_log("refresh init done");
 
     // ===== 三线程: 主线程持有 IProcessObserver 回调 socket, 分发 cpuset/刷新率线程 =====
     let mut fg_sv: [libc::c_int; 2] = [0, 0];
@@ -293,7 +285,6 @@ fn main() {
             );
         }
         crate::process_observer::init_observer(fg_sv[1]);
-        crate::cpu_affinity::cpu_log("observer registered");
     }
     let fg_recv_fd = fg_sv[0];
     let mut fg_buf = [0u8; 8];
@@ -423,7 +414,6 @@ fn main() {
         }
     }
 
-    crate::cpu_affinity::cpu_log("epoll ready, ebpf_init start");
     // 初始 eBPF 初始化 (强制 /proc 模式不尝试)
     if MODE_FORCE.load(Ordering::Relaxed) != 2 {
         if let Some(mut es) = ebpf_init(kpm_wake_fd) {
@@ -432,11 +422,9 @@ fn main() {
                 full_scan(&cfg, &mut es);
             }
             ebpf_state = Some(es);
-            crate::cpu_affinity::cpu_log("ebpf_init done");
             // CPU 亲和性: binder 前台回调驱动 (cpu_affinity.rs), 启动即全量应用一次
             if cpu_ready {
                 crate::cpu_affinity::apply_all_now();
-                crate::cpu_affinity::cpu_log("init apply_all sent");
             }
         }
     }
@@ -558,27 +546,15 @@ fn main() {
                             if let Some(pkg) = cpu_uid.get(&uid) {
                                 let cold = cpu_known.get(&uid).map_or(true, |&p| p != pid);
                                 cpu_known.insert(uid, pid);
-                                crate::cpu_affinity::cpu_log(&format!(
-                                    "fg uid={} pid={} cpu_hit pkg={} cold={}",
-                                    uid, pid, pkg, cold
-                                ));
                                 if cold {
                                     if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
                                         let _ = tx.send(crate::cpu_affinity::CpuMsg::ApplyPkg(
                                             uid,
                                             pkg.clone(),
                                         ));
-                                        crate::cpu_affinity::cpu_log(&format!(
-                                            "ApplyPkg sent uid={} pkg={}",
-                                            uid, pkg
-                                        ));
                                     }
                                 }
                             } else {
-                                crate::cpu_affinity::cpu_log(&format!(
-                                    "fg uid={} pid={} cpu_miss",
-                                    uid, pid
-                                ));
                             }
                             // 刷新率: 表命中 → 发包名给刷新率线程
                             if let Some(pkg) = rfr_uid.get(&uid) {
