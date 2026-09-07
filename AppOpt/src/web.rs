@@ -18,7 +18,7 @@ use crate::config::{
 use crate::cpuset::{base_cpuset, create_cpuset_dir, parse_cpu_spec, CpuSet, CpuTopology, DEFAULT_CPUSET_NAME};
 use crate::ebpf_mode::kpm_probe;
 use crate::rule_edit::{rule_delete, rule_delete_pkg, rule_rename, rule_upsert, RuleEdit};
-use crate::{lock_ignore_poison, MAX_PKG_LEN, MAX_THREAD_LEN};
+use crate::{lock_ignore_poison, rw_read_ignore_poison, MAX_PKG_LEN, MAX_THREAD_LEN};
 
 pub const WEB_PORT: u16 = 8889;
 const INDEX_HTML: &str = include_str!("../web/index.html");

@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::UNIX_EPOCH;
 
-use crate::{lock_ignore_poison, MAX_PKG_LEN, MAX_THREAD_LEN};
+use crate::{lock_ignore_poison, rw_read_ignore_poison, rw_write_ignore_poison, MAX_PKG_LEN, MAX_THREAD_LEN};
 use crate::cpuset::{base_cpuset, create_cpuset_dir, parse_cpu_spec, CpuSet, CpuTopology};
 
 pub static INOTIFY_SUPPORTED: AtomicBool = AtomicBool::new(false);
