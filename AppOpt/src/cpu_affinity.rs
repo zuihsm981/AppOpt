@@ -281,8 +281,8 @@ impl CpuAffinity {
                     // 内核侧已在 exit 探针逐 tid 摘 APPLIED。
                     let pkg = self.uid_pkg.remove(&uid);
                     let before = self.managed.len();
-                    if let Some(pkg) = pkg {
-                        self.managed.retain(|_, p| p != &pkg);
+                    if let Some(ref pkg) = pkg {
+                        self.managed.retain(|_, p| p != pkg);
                     }
                     crate::log_line("EVICT", &format!("uid={} pkg={:?} managed {} -> {}", uid, pkg, before, self.managed.len()));
                     self.publish_stats();
