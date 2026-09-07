@@ -255,10 +255,7 @@ fn main() {
     // AppOpt 初始化时缓存 /proc pid 快照: CPU 枚举跳过系统进程/已运行应用,
     // 只处理之后新出现的 pid (冷启动应用)。早于 worker 线程调度, 不漏启动瞬间进程。
     let init_pids = crate::cpu_affinity::proc_pid_set();
-    // 快照保留全部 pid (含 launcher3/systemui): 非其规则时枚举跳过, 避免读取其目录;
-    // 额外标记 launcher3/systemui 的 pid, 其规则直接使用标记目录
-    let marked = crate::cpu_affinity::classify_marked_pids(&init_pids);
-    let cpu_ready = crate::cpu_affinity::start(init_pids, marked);
+    let cpu_ready = crate::cpu_affinity::start(init_pids);
 
     // 刷新率控制模块，独立线程运行 (binder 回调经主线程 uid 表 → FgPkg 消息驱动)
     refresh::refresh_init();
@@ -346,6 +343,14 @@ fn main() {
         let it = libc::itimerspec { it_interval: zero, it_value: zero };
         unsafe { libc::timerfd_settime(tfd, 0, &it, std::ptr::null_mut()) };
     }
+    fn arm_oneshot(tfd: i32, secs: i64) {
+        let ts = libc::timespec { tv_sec: secs, tv_nsec: 0 };
+        let it = libc::itimerspec {
+            it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
+            it_value: ts,
+        };
+        unsafe { libc::timerfd_settime(tfd, 0, &it, std::ptr::null_mut()) };
+    }
     // 配置变更后应用到当前模式: KPM 全量扫描 + uid 表重建(规则包集合门控); /proc 标记全量重扫
     fn apply_config(
         ebpf_state: &mut Option<EbpfState>,
@@ -422,9 +427,10 @@ fn main() {
                 full_scan(&cfg, &mut es);
             }
             ebpf_state = Some(es);
-            // CPU 亲和性: binder 前台回调驱动 (cpu_affinity.rs), 启动即全量应用一次
+            // CPU 亲和性: 启动全量延迟 30s 一次性触发 (开机 exec 风暴期间读 /proc
+            // cmdline 会阻塞 worker, 抢在用户首次打开应用前完成, 避免首次生效被拖到几分钟)
             if cpu_ready {
-                crate::cpu_affinity::apply_all_now();
+                arm_oneshot(proc_timer_fd, 30);
             }
         }
     }
@@ -637,6 +643,9 @@ fn main() {
                             ps.cache.affinity_sync(&cfg.topo);
                             ps.force_affinity = false;
                         }
+                    } else {
+                        // KPM 模式: 一次性定时触发全量应用 (开机风暴后收敛)
+                        crate::cpu_affinity::apply_all_now();
                     }
                 }
                 _ => {}
