@@ -736,8 +736,9 @@ async function loadRefresh(){
     $('rf-timer').textContent=st.timer_enabled?(st.is_paused?'空闲中':(st.timer_running?'计时中':'未运行')):'未启用';
     $('rf-pkg').textContent=st.current_package||'-';
     $('rf-timeout').value=cfg.timeout;
-    $('rf-active').value=cfg.active;
-    $('rf-idle').value=cfg.idle;
+    rfAvail=cfg.available&&cfg.available.length?cfg.available:[120,90,60];
+    applyRateOptions($('rf-active'),rfAvail,cfg.active);
+    applyRateOptions($('rf-idle'),rfAvail,cfg.idle);
     loadRefreshApps();
     rfTimer=setInterval(async()=>{
       try{const s=await api('/api/refresh/status');
@@ -749,6 +750,14 @@ async function loadRefresh(){
   }catch(e){toast(e.message)}
 }
 let rfAppsData=[];
+let rfAvail=[120,90,60]; // 设备可用刷新率 (Hz), 由 /api/refresh/config 下发
+// 按可用刷新率过滤 <select> 选项; keep 存在且可用则选中, 否则选第一项
+function applyRateOptions(sel,avail,keep){
+  if(!Array.isArray(avail)||!avail.length)return;
+  [...sel.options].forEach(o=>{if(!avail.includes(Number(o.value)))o.remove()});
+  if(keep!==undefined&&[...sel.options].some(o=>o.value===String(keep)))sel.value=String(keep);
+  else if(sel.options.length)sel.value=sel.options[0].value;
+}
 async function loadRefreshApps(){
   try{
     const d=await api('/api/refresh/apps');
@@ -769,16 +778,18 @@ function openRfAppModal(pkg){
     if(a){
       $('mrf-pkg').value=a.pkg;
       $('mrf-pkg').readOnly=true;
-      $('mrf-active').value=a.active;
-      $('mrf-idle').value=a.idle;
+      applyRateOptions($('mrf-active'),rfAvail,a.active);
+      applyRateOptions($('mrf-idle'),rfAvail,a.idle);
       $('mrf-timeout').value=a.timeout;
     }
   }else{
     $('mrf-title').textContent='添加应用刷新率';
     $('mrf-pkg').value='';
     $('mrf-pkg').readOnly=false;
-    $('mrf-active').value='120';
-    $('mrf-idle').value='60';
+    applyRateOptions($('mrf-active'),rfAvail,undefined);
+    applyRateOptions($('mrf-idle'),rfAvail,undefined);
+    $('mrf-active').value=rfAvail[0];                    // 默认最高可用 (90/60 设备 → 90)
+    $('mrf-idle').value=rfAvail[rfAvail.length-1];       // 默认最低可用 (→ 60)
     $('mrf-timeout').value='';
   }
   $('modal-rf-app').hidden=false;
