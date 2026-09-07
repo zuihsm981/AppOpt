@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::config::AppConfig;
 use crate::ebpf_mode::KpmHandle;
@@ -85,7 +85,6 @@ impl CpuAffinity {
         if uid <= 0 {
             return;
         }
-        cpu_log(&format!("on_uid enter uid={} pkg={}", uid, pkg));
         // launcher3/systemui 的规则: 直接用标记目录 (免 /proc 扫描)
         if let Some(pids) = self.marked.get(pkg).cloned() {
             self.apply_tids(&pids, pkg, cfg);
@@ -104,7 +103,6 @@ impl CpuAffinity {
                 }
             }
         }
-        cpu_log(&format!("on_uid found pids={}", pids.len()));
         self.apply_tids(&pids, pkg, cfg);
     }
 
@@ -137,7 +135,6 @@ impl CpuAffinity {
                 self.apply_tids(pids, pkg, cfg);
             }
         }
-        cpu_log(&format!("apply_all done pkgs={}", by_pkg.len()));
         by_pkg.len()
     }
 
@@ -157,17 +154,13 @@ impl CpuAffinity {
                     continue;
                 };
                 self.bpf.applied_set(tid, rule.cpus.bits[0]);
-                let dead = crate::apply_affinity::affinity_set(
+                let _ = crate::apply_affinity::affinity_set(
                     tid,
                     &rule.cpus,
                     &rule.cpuset_dir,
                     &cfg.topo,
                     rule.move_cpuset,
                 );
-                cpu_log(&format!(
-                    "apply tid={} pkg={} cpus=0x{:x} dead={}",
-                    tid, pkg, rule.cpus.bits[0], dead
-                ));
                 self.managed.insert(tid, pkg.to_string());
             }
         }
@@ -193,22 +186,18 @@ impl CpuAffinity {
         unsafe {
             libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
         }
-        cpu_log("worker started");
         while !stop.load(Ordering::Relaxed) {
             match rx.recv_timeout(Duration::from_millis(300)) {
                 Ok(CpuMsg::ApplyAll) => {
-                    cpu_log("worker ApplyAll");
                     let cfg = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
                     if let Some(cfg) = cfg {
                         self.apply_all(&cfg);
                     }
                 }
                 Ok(CpuMsg::ApplyPkg(uid, pkg)) => {
-                    cpu_log(&format!("worker ApplyPkg uid={} pkg={}", uid, pkg));
                     // 冷启动: 延迟 2s 覆盖子进程窗口后按 uid 枚举 (主+子进程同 uid,
                     // 精确且避免 cmdline 归因竞态; 不误捞其他用户同包名实例)
                     thread::sleep(ENUM_DELAY);
-                    cpu_log(&format!("on_uid begin uid={} pkg={}", uid, pkg));
                     let cfg = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
                     if let Some(cfg) = cfg {
                         self.on_uid(uid, &pkg, &cfg);
@@ -259,27 +248,6 @@ pub(crate) fn classify_marked_pids(init_pids: &HashSet<i32>) -> HashMap<String, 
         }
     }
     m
-}
-
-/// AppOpt 启动时刻标记 (main 最先调用), 供 cpu_log 输出相对时间
-static APP_START: OnceLock<Instant> = OnceLock::new();
-pub(crate) fn cpu_start() {
-    let _ = APP_START.set(Instant::now());
-}
-
-/// [CPU] 调试日志: 带相对时间戳写 /data/local/tmp/appopt_cpu.log (附加) + stderr
-pub(crate) fn cpu_log(msg: &str) {
-    let el = APP_START.get().map(|s| s.elapsed()).unwrap_or_default();
-    let line = format!("[t=+{:.1}s] {}", el.as_secs_f64(), msg);
-    eprintln!("{}", line);
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/data/local/tmp/appopt_cpu.log")
-    {
-        use std::io::Write;
-        let _ = writeln!(f, "{}", line);
-    }
 }
 
 /// 缓存初始化时 /proc 下全部 pid (AppOpt 启动快照): 由 main.rs 在初始化时调用,
