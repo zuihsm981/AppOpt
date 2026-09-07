@@ -438,6 +438,7 @@ fn rule_movecpuset_api(req: &Request) -> (u16, String) {
     if fs::write(&file, lines.join("\n") + "\n").is_err() {
         return err_json(500, "配置文件写入失败");
     }
+    crate::config::organize_config_file(&file);
     config_reload_now();
     (200, json!({ "ok": true }).to_string())
 }

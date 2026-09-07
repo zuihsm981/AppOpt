@@ -61,20 +61,19 @@ pub fn affinity_set(
     topo: &CpuTopology,
     move_cpuset: bool,
 ) -> bool {
-    let affinity_ok = CpuSet::get_affinity(tid).is_some_and(|curr| curr == *cpus);
-    if !affinity_ok {
-        if let Err(e) = cpus.set_affinity(tid) {
-            return e.raw_os_error() == Some(libc::ESRCH);
-        }
-    }
-    // 该规则开启时, 同时将线程移入 {base_cpuset()}/{规则核集} cpuset 目录。
-    // 注意: BASE_CPUSET 名可热改 (set_base_cpuset), 改后规则未重建时旧名下的子目录
-    // 不存在; 故移入前先按当前 base 名幂等 ensure 子目录 (create 处理 EEXIST),
-    // 再写 cpuset.tasks, 避免 ENOENT 静默失败。
+    // 开启"同时移入 cpuset"时, 先移入 cpuset 再设亲和性:
+    // cpuset 约束先落位 (受限核集), 随后 sched_setaffinity 设置兼容的亲和性。
+    // BASE_CPUSET 名可热改, 故先按当前 base 幂等 ensure 子目录再写 tasks。
     if move_cpuset {
         let dir = crate::cpuset::ensure_cpuset_dir(cpus, topo);
         if !dir.is_empty() {
             crate::cpuset::move_tid_to_cpuset(tid, &dir);
+        }
+    }
+    let affinity_ok = CpuSet::get_affinity(tid).is_some_and(|curr| curr == *cpus);
+    if !affinity_ok {
+        if let Err(e) = cpus.set_affinity(tid) {
+            return e.raw_os_error() == Some(libc::ESRCH);
         }
     }
     false

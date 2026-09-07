@@ -284,6 +284,8 @@ fn file_write(path: &str, lines: &[String]) -> RuleEdit {
         })
         .and_then(|_| fs::rename(&tmp, path));
     if res.is_ok() {
+        // 保存后自动整理配置文件 (按包分组)
+        crate::config::organize_config_file(path);
         RuleEdit::Ok
     } else {
         RuleEdit::IoErr

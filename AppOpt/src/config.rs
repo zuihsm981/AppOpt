@@ -316,6 +316,104 @@ fn route_pkg_val_line(
     false
 }
 
+/// 包属性行所属包名: pkg=… / pkg,thread,cpus / refresh_app,<pkg>,… / move_cpuset,<pkg>,… / 裸块 pkg {
+fn pkg_of_line(t: &str) -> Option<String> {
+    let t = crate::config::strip_comment(t).trim();
+    if let Some((k, _)) = t.split_once('=') {
+        let k = k.trim().trim_end_matches('{').trim();
+        if !k.is_empty() && !k.contains(',') {
+            return Some(k.to_string());
+        }
+    }
+    let fields: Vec<&str> = t.split(',').map(str::trim).collect();
+    if fields.len() >= 2 && fields[0] == "refresh_app" {
+        return Some(fields[1].to_string());
+    }
+    if fields.len() >= 3 && fields[0] == "move_cpuset" {
+        return Some(fields[1].to_string());
+    }
+    if fields.len() >= 3 && !fields[0].is_empty() {
+        return Some(fields[0].to_string());
+    }
+    if t.ends_with('{') {
+        let k = t.trim_end_matches('{').trim();
+        if !k.is_empty() {
+            return Some(k.to_string());
+        }
+    }
+    None
+}
+
+/// 包属性行中“配置属性”(刷新率/移入cpuset), 排在同包规则行之后
+fn is_special_attr(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with("refresh_app,")
+        || t.starts_with("move_cpuset,")
+        || t.contains("=refresh-")
+        || t.contains("=move_cpuset-")
+}
+
+/// 保存配置后自动整理: 注释/空行/全局设置(refresh_*)保持原序置顶;
+/// 各包属性行(规则/刷新率/移入cpuset)按包名分组, 包内规则在前、属性在后,
+/// 块规则(含 '{')作为整体随包移动。
+pub(crate) fn organize_config_file(path: &str) {
+    use std::collections::BTreeMap;
+    let Ok(content) = fs::read_to_string(path) else { return };
+    let lines: Vec<String> = content.lines().map(String::from).collect();
+    let mut head: Vec<String> = Vec::new();
+    let mut pkgs: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let raw = lines[i].clone();
+        let t = raw.trim();
+        if t.is_empty() || t.starts_with('#') || t.starts_with("//") {
+            head.push(raw);
+            i += 1;
+            continue;
+        }
+        if t.contains('=') && !t.contains(',') && !t.contains('{') {
+            if let Some((k, _)) = t.split_once('=') {
+                if k.trim().starts_with("refresh_") {
+                    head.push(raw);
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+        if t.contains('{') && !t.contains(',') {
+            let mut unit = vec![raw];
+            i += 1;
+            while i < lines.len() {
+                unit.push(lines[i].clone());
+                if lines[i].contains('}') {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            if let Some(pkg) = pkg_of_line(&unit[0]) {
+                pkgs.entry(pkg).or_default().push(unit.join("\n"));
+            } else {
+                head.extend(unit);
+            }
+            continue;
+        }
+        match pkg_of_line(t) {
+            Some(pkg) => pkgs.entry(pkg).or_default().push(raw),
+            None => head.push(raw),
+        }
+        i += 1;
+    }
+    let mut out = head;
+    for (_, mut ls) in pkgs {
+        let (rules, attrs): (Vec<String>, Vec<String>) =
+            ls.drain(..).partition(|l| !is_special_attr(l));
+        out.extend(rules);
+        out.extend(attrs);
+    }
+    let _ = fs::write(path, out.join("\n") + "\n");
+}
+
 /// 只读取统一主配置文件中的刷新率字段。
 /// 刷新率保存后的轻量同步使用此函数，不重新解析 CPU 规则。
 pub fn load_refresh_config(config_file: &str) -> (i32, i32, i32, HashMap<String, (i32, i32, i32)>) {
