@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
 use std::sync::Mutex;
 
 use crate::config::{close_like, comment_at, parse_outer, split_rule_line, split_single_line, strip_comment, OuterLine};

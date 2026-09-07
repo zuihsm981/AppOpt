@@ -390,10 +390,8 @@ fn classify_line(t: &str) -> LineKind {
 fn current_config_pkg_set() -> HashSet<String> {
     let mut s = HashSet::new();
     if let Some(cfg) = lock_ignore_poison(&CURRENT_CONFIG).as_ref() {
-        if let Some(cfg) = cfg.as_ref() {
-            s.extend(cfg.rules.iter().map(|r| r.pkg.clone()));
-            s.extend(cfg.app_refresh_configs.keys().cloned());
-        }
+        s.extend(cfg.rules.iter().map(|r| r.pkg.clone()));
+        s.extend(cfg.app_refresh_configs.keys().cloned());
     }
     s
 }
