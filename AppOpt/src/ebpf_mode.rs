@@ -177,6 +177,13 @@ impl KpmHandle {
         self.cmd(&s);
     }
 
+    /// 标记规则应用主进程 tgid (内核退出探针只对主进程发布 EXIT 事件;
+    /// 子进程/线程退出被内核过滤)
+    pub(crate) fn applied_set_main(&self, pid: i32) {
+        let s = format!("applied_set_main {}", pid);
+        self.cmd(&s);
+    }
+
     pub(crate) fn applied_clear(&self) {
         self.cmd("clear_applied");
     }
@@ -488,12 +495,19 @@ pub fn set_input_hook(on: bool) {
     }
 }
 
-/// 事件派发 (仅 input: 刷新率活动检测; CPU/刷新率由 binder 三线程驱动)
+/// 事件派发 (input: 刷新率活动检测; EXIT: 规则应用主进程退出 → 清身份;
+/// CPU/刷新率主体由 binder 三线程驱动)
+pub const EBPF_EVENT_EXIT: u32 = 4;
 pub fn event_dispatch(event: &EbpfProcEvent, _cfg: &AppConfig, _state: &mut EbpfState) {
     // CPU 亲和性已由 binder 触发的 CpuAffinity 模块负责 (cpu_affinity.rs):
-    // 进程事件不再驱动任何 CPU 逻辑, 仅消费 input 事件 (刷新率活动检测)。
+    // 进程事件不驱动 CPU 逻辑; input 仅用于刷新率活动检测。
     if event.event_type == EBPF_EVENT_INPUT {
         crate::refresh::refresh_on_event(EBPF_EVENT_INPUT, 0);
+    } else if event.event_type == EBPF_EVENT_EXIT && event.tid == event.pid {
+        // 规则应用主进程退出 (内核已按 APPLIED 过滤非规则应用; tid==pid 排除
+        // 子进程/线程退出): 清除该 uid 的 pid 列表与 cpu_known 身份。
+        // 子进程 (:yuba 等) 退出不匹配主 pid, 由 cleanup_dead 兜底清理 tid。
+        crate::cpu_affinity::cpu_known_evict_by_pid(event.pid);
     }
 }
 

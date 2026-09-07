@@ -291,7 +291,6 @@ fn main() {
     // uid 静态表 (主线程): CPU 表 = 有 CPU 规则应用; 刷新率表 = launcher + 规则应用
     let mut cpu_uid: HashMap<i32, String> = HashMap::new();
     let mut rfr_uid: HashMap<i32, String> = HashMap::new();
-    let mut cpu_known: HashMap<i32, i32> = HashMap::new(); // uid → pid (CPU 冷热)
     // 规则应用集合 (主线程对比用): 仅集合变化才重建 uid 表 (数值调整不重建)
     let mut cpu_pkgs_set: HashSet<String> = HashSet::new();
     let mut rfr_pkgs_set: HashSet<String> = HashSet::new();
@@ -593,13 +592,16 @@ fn main() {
                         if nrecv == 8 {
                             let pid = i32::from_ne_bytes([fg_buf[0], fg_buf[1], fg_buf[2], fg_buf[3]]);
                             let uid = i32::from_ne_bytes([fg_buf[4], fg_buf[5], fg_buf[6], fg_buf[7]]);
-                            // CPU: 表命中 且 冷(新 pid) → 发包名给 cpuset 线程; 热跳过
+                            // CPU: 表命中 → 冷热判断 (cpu_known 中 uid+pid 一致=热);
+                            // 冷 → 只发 (pid+uid+包名); 身份清除由 EXIT 事件驱动
                             if let Some(pkg) = cpu_uid.get(&uid) {
-                                let cold = cpu_known.get(&uid).map_or(true, |&p| p != pid);
-                                cpu_known.insert(uid, pid);
-                                if cold {
+                                // 冷启动不再清除 pid 列表/cpu_known —— 身份清除改由
+                                // EXIT 事件驱动 (ebpf_mode::event_dispatch); 冷时仅重发
+                                // ApplyPkg, CPU 线程枚举后覆盖写回新身份
+                                if !crate::cpu_affinity::cpu_known_is_hot(uid, pid) {
                                     if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
                                         let _ = tx.send(crate::cpu_affinity::CpuMsg::ApplyPkg(
+                                            pid,
                                             uid,
                                             pkg.clone(),
                                         ));

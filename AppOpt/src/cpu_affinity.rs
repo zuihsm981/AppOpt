@@ -2,7 +2,7 @@
 //!
 //! 设计:
 //!   - 触发: IProcessObserver binder 前台回调 (主线程 EV_FG 接收 pid+uid); 主线程查
-//!     cpu uid 表, 命中且冷启动时发 CpuMsg::ApplyPkg(uid, pkg); ApplyAll = 启动/配置全量。
+//!     cpu uid 表, 命中且冷启动时发 CpuMsg::ApplyPkg(pid, uid, pkg); ApplyAll = 启动/配置全量。
 //!   - 归因: 包名由主线程 cpu uid 表提供 (随 CpuMsg 消息携带); 枚举按 uid 过滤
 //!     /proc (Uid: 字段) → 该应用全部进程 (主进程 + pkg: 子进程共享同一 uid)。
 //!   - 应用: 该 uid 全部进程的全部线程 (/proc/<pid>/task) → thread_affinity →
@@ -33,14 +33,48 @@ const ENUM_DELAY: Duration = Duration::from_secs(2);
 
 /// CPU worker 消息
 pub enum CpuMsg {
-    /// 主线程判定命中 CPU 表且为冷启动后, 下发 (uid, 包名) → 延迟按 uid 枚举应用
-    ApplyPkg(i32, String),
+    /// 主线程判定冷启动后, 下发 (主 pid, uid, 包名) → 延迟按 uid 枚举应用
+    ApplyPkg(i32, i32, String),
     /// 全量应用 (启动 / 配置变更)
     ApplyAll,
 }
 
 /// 全局投递通道: 主线程 (main EV_FG) 转发前台回调 → CpuMsg 消息
 static CPU_FG_TX: OnceLock<Mutex<mpsc::Sender<CpuMsg>>> = OnceLock::new();
+
+/// 冷热身份: uid → (前台主 pid, 该 uid 全部 pid 列表); 主线程判冷热, CPU 线程回写
+pub static CPU_KNOWN: Mutex<HashMap<i32, (i32, Vec<i32>)>> = Mutex::new(HashMap::new());
+
+/// proc 快照: uid → 该 uid 全部 pid 列表; 冷启动先清除再重建
+pub static PROC_SNAPSHOT: Mutex<HashMap<i32, Vec<i32>>> = Mutex::new(HashMap::new());
+
+/// 冷热判断: cpu_known 中该 uid 的 pid 与回调 pid 一致 → 热
+pub fn cpu_known_is_hot(uid: i32, pid: i32) -> bool {
+    crate::lock_ignore_poison(&CPU_KNOWN)
+        .get(&uid)
+        .is_some_and(|(p, _)| *p == pid)
+}
+
+/// 清除某 uid 的 pid 列表与 cpu_known 身份
+pub fn cpu_known_evict(uid: i32) {
+    crate::lock_ignore_poison(&PROC_SNAPSHOT).remove(&uid);
+    crate::lock_ignore_poison(&CPU_KNOWN).remove(&uid);
+}
+
+/// 进程退出 (EXIT 事件, 仅主线程 tid==pid 时调用): 该 pid 为主进程则清除其
+/// uid 的 pid 列表与 cpu_known 身份; 子进程/线程退出不匹配主 pid, 幂等跳过。
+pub fn cpu_known_evict_by_pid(pid: i32) {
+    if pid <= 0 {
+        return;
+    }
+    let uid = {
+        let k = crate::lock_ignore_poison(&CPU_KNOWN);
+        k.iter().find_map(|(u, (mp, _))| (*mp == pid).then_some(*u))
+    };
+    if let Some(u) = uid {
+        cpu_known_evict(u);
+    }
+}
 
 /// KPM 模式 web 统计: (绑定线程数, 命中包名列表); 由 worker 在每次应用后发布
 static CPU_STATS: Mutex<(usize, Vec<String>)> = Mutex::new((0, Vec::new()));
@@ -99,14 +133,14 @@ impl CpuAffinity {
 
     /// 按 uid 枚举该应用全部进程 (主 + pkg: 子进程同 uid) → 应用全部线程。
     /// uid 即应用身份: 精确、无 cmdline 归因竞态、多用户下不误捞其他实例。
-    fn on_uid(&mut self, uid: i32, pkg: &str, cfg: &AppConfig) {
+    fn on_uid(&mut self, uid: i32, pkg: &str, cfg: &AppConfig) -> Vec<i32> {
         if uid <= 0 {
-            return;
+            return Vec::new();
         }
         // launcher3/systemui 的规则: 直接用标记目录 (免 /proc 扫描)
         if let Some(pids) = self.marked.get(pkg).cloned() {
             self.apply_tids(&pids, pkg, cfg);
-            return;
+            return pids;
         }
         // 跳过 init_pids (含 launcher3/systemui), 只处理初始化后新出现的 pid, 按 uid 过滤
         let mut pids: Vec<i32> = Vec::new();
@@ -122,6 +156,7 @@ impl CpuAffinity {
             }
         }
         self.apply_tids(&pids, pkg, cfg);
+        pids
     }
 
     /// 全量应用 (启动 / 配置变更), 非周期; 单遍 /proc 收集 pkg→pids 后逐包
@@ -217,13 +252,19 @@ impl CpuAffinity {
                         self.apply_all(&cfg);
                     }
                 }
-                Ok(CpuMsg::ApplyPkg(uid, pkg)) => {
-                    // 冷启动: 延迟 2s 覆盖子进程窗口后按 uid 枚举 (主+子进程同 uid,
-                    // 精确且避免 cmdline 归因竞态; 不误捞其他用户同包名实例)
+                Ok(CpuMsg::ApplyPkg(pid, uid, pkg)) => {
+                    // 冷启动: 先占位 cpu_known (uid+主 pid), 延迟 2s 覆盖子进程窗口
+                    crate::lock_ignore_poison(&CPU_KNOWN).insert(uid, (pid, Vec::new()));
                     thread::sleep(ENUM_DELAY);
                     let cfg = crate::lock_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
                     if let Some(cfg) = cfg {
-                        self.on_uid(uid, &pkg, &cfg);
+                        let pids = self.on_uid(uid, &pkg, &cfg);
+                        // 设置亲和性后: 该 uid 主进程+全部子进程 pid 列表写入
+                        // cpu_known 与 proc 快照 (供后续冷热判断/统计)
+                        crate::lock_ignore_poison(&CPU_KNOWN).insert(uid, (pid, pids.clone()));
+                        crate::lock_ignore_poison(&PROC_SNAPSHOT).insert(uid, pids);
+                        // 标记内核主进程 tgid: 退出探针只对该主进程发布 EXIT
+                        self.bpf.applied_set_main(pid);
                     }
                     // 触发枚举时清理: 删已消失 tid 的 APPLIED 条目, 防 tid 回收后 kprobe 误抓
                     self.cleanup_dead();
