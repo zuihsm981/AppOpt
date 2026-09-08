@@ -507,6 +507,7 @@ pub fn set_input_hook(on: bool) {
 pub const EBPF_EVENT_EXIT: u32 = 4;
 pub const EBPF_EVENT_FG_COLD: u32 = 6; // 内核判冷 (未应用/新 pid): 需 ApplyPkg
 pub const EBPF_EVENT_FG_HOT: u32 = 7;  // 内核判热 (已应用同主 pid): 仅刷新
+pub const EBPF_EVENT_CGDBG: u32 = 8;   // 诊断: 所有 cgroup attach (路径在 comm, 临时)
 pub fn event_dispatch(
     event: &EbpfProcEvent,
     cpu_uid: &std::collections::HashMap<i32, String>,
@@ -518,6 +519,21 @@ pub fn event_dispatch(
     // 进程事件不驱动 CPU 逻辑; input 仅用于刷新率活动检测。
     if event.event_type == EBPF_EVENT_INPUT {
         crate::refresh::refresh_on_event(EBPF_EVENT_INPUT, 0);
+    } else if event.event_type == EBPF_EVENT_CGDBG {
+        // 诊断(临时): 所有 cgroup attach, 路径在 comm; 只打日志
+        let pid = event.pid;
+        let uid = event.uid;
+        let path = String::from_utf8_lossy(
+            &event.comm[..event.comm.iter().position(|&b| b == 0).unwrap_or(16)],
+        );
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/data/local/tmp/appopt_cgroup.log")
+        {
+            let _ = writeln!(f, "[{:?}] cgdbg pid={} uid={} path={:?}", std::time::SystemTime::now(), pid, uid, path);
+        }
     } else if event.event_type == EBPF_EVENT_FG_COLD || event.event_type == EBPF_EVENT_FG_HOT {
         // cgroup 前台切换: 内核已查规则表 + 判冷热 (class 0=冷 1=热), 携带 pid+uid。
         // 直发工作线程 (不走 fg socket): 冷 → CPU ApplyPkg; 热/冷 → 刷新率发包名。
