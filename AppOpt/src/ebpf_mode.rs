@@ -27,7 +27,7 @@ use std::thread;
 use crate::apply_affinity::tid_comm;
 use crate::config::AppConfig;
 
-/// eBPF 进程事件, 布局需与内核态 appopt_proc_event_t 完全一致 (28B)
+/// eBPF 进程事件, 布局需与内核态 appopt_proc_event_t 完全一致 (32B, 含 uid)
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct EbpfProcEvent {
@@ -502,16 +502,21 @@ pub fn event_dispatch(event: &EbpfProcEvent, _cfg: &AppConfig, _state: &mut Ebpf
         // 复用 binder fg 通道 → 主线程 EV_FG 冷热/ApplyPkg/刷新率逻辑
         let pid = event.pid;
         let uid = if event.uid > 0 { event.uid } else { crate::cpu_affinity::proc_uid(pid).unwrap_or(0) };
-        // 临时验证日志
+        let path = String::from_utf8_lossy(
+            &event.comm[..event.comm.iter().position(|&b| b == 0).unwrap_or(16)],
+        );
+        // 临时验证日志 (含 dst_path; pid<0 为内核注册状态标记)
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open("/data/local/tmp/appopt_cgroup.log")
         {
-            let _ = writeln!(f, "[{:?}] cgroup_fg pid={} uid={}", std::time::SystemTime::now(), pid, uid);
+            let _ = writeln!(f, "[{:?}] cgroup pid={} uid={} path={:?}", std::time::SystemTime::now(), pid, uid, path);
         }
-        crate::process_observer::send_fg_event(pid, uid);
+        if pid > 0 {
+            crate::process_observer::send_fg_event(pid, uid);
+        }
     } else if event.event_type == EBPF_EVENT_EXIT && event.tid == event.pid {
         // 规则应用主进程退出 (内核已按 APPLIED+主进程标记过滤非规则应用/非主进程):
         // 清除该 uid 的 pid 列表与 cpu_known 身份, 并按 uid 通知 CPU worker 清除该
