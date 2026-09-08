@@ -40,6 +40,18 @@ pub(crate) fn lock_ignore_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// 通用诊断日志: 追加写入 /data/local/tmp/appopt_init.log (带时间戳)
+pub(crate) fn log_diag(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/data/local/tmp/appopt_init.log")
+    {
+        let _ = writeln!(f, "[{:?}] {}", std::time::SystemTime::now(), msg);
+    }
+}
+
 /// 初始化阶段计时日志: 追加写入 /data/local/tmp/appopt_init.log (带时间戳+相对毫秒)
 pub(crate) fn log_init(phase: &str, elapsed_ms: u128) {
     use std::io::Write;
@@ -304,6 +316,10 @@ fn main() {
 
     // ===== join 各独立线程 (事件循环/使用点前就绪) =====
     let init_pids = snapshot_thread.join().unwrap_or_default();
+    // 诊断: 输出 init_pids 快照全部 pid
+    let mut snap: Vec<i32> = init_pids.iter().copied().collect();
+    snap.sort_unstable();
+    crate::log_diag(&format!("init_pids 快照: count={} pids={:?}", snap.len(), snap));
     let marked = crate::cpu_affinity::classify_marked_pids(&init_pids);
     // ebpf_init 线程: KPM 加载+激活已并行完成, join 拿 EbpfState
     let mut ebpf_state: Option<EbpfState> = ebpf_thread.join().ok().flatten();
