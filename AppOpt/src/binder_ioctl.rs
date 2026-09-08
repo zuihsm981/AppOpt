@@ -40,9 +40,8 @@ const BR_SPAWN_LOOPER: u32 = 0x720b;
 pub(crate) const BINDER_TYPE_BINDER: u32 = 1;
 const BINDER_TYPE_HANDLE: u32 = 2;
 
-// servicemanager (context manager) 句柄 = 0; getService 事务码 'S'
+// servicemanager (context manager) 句柄 = 0
 const SVC_MGR_HANDLE: u32 = 0;
-const SVC_MGR_GET_SERVICE: u32 = 0x53;
 
 // IProcessObserver 回调事务码
 const TX_ON_FG_ACTIVITIES_CHANGED: u32 = 0x02;
@@ -291,31 +290,48 @@ impl Binder {
     }
 
     /// 向 servicemanager (handle 0) 查询服务句柄。
+    /// 向 servicemanager (handle 0) 查询服务句柄。
+    /// 现代 AIDL IServiceManager.getService: code=1, parcel=[strict][this][desc][string16(name)],
+    /// reply=[异常码 i32][flat_binder_object{HANDLE}]。
     pub fn get_service(&self, name: &str) -> Option<u32> {
-        // 旧式 servicemanager 'S' 事务: 数据直接从 string16(服务名) 开始
-        // (不写 strict/this/接口 token, 其 onTransact 直接 readString16)
+        log_diag(&format!("binder: get_service({}) sending (AIDL code=1)", name));
+        // AIDL 请求带完整接口 token
         let mut data: Vec<u8> = Vec::new();
+        push_i32(&mut data, 0); // strict_mode_policy
+        push_i32(&mut data, 0); // this binder token
+        push_utf16(&mut data, "android.os.IServiceManager");
         push_utf16(&mut data, name);
-        log_diag(&format!("binder: get_service({}) sending", name));
-        let txn = self.transact_sync(SVC_MGR_HANDLE, SVC_MGR_GET_SERVICE, &data, &[]);
+        let txn = self.transact_sync(SVC_MGR_HANDLE, 1, &data, &[]);
         let (reply, _offs) = match txn {
             Some(x) => x,
             None => { log_diag(&format!("binder: get_service({}) txn FAIL", name)); return None; }
         };
-        log_diag(&format!("binder: get_service({}) reply len={} hex={:02x?}", name, reply.len(), &reply[..reply.len().min(24)]));
-        // reply (servicemanager 非 AIDL): 直接是 flat_binder_object{type=HANDLE},
-        // 无 strict/this 头, 无异常码
+        log_diag(&format!("binder: get_service({}) reply len={} hex={:02x?}", name, reply.len(), &reply[..reply.len().min(32)]));
+        // reply: [异常码 i32][flat_binder_object{HANDLE}] (AIDL);
+        // 兼容旧式 [flat_binder_object] 直排 (首 i32 可能是 binder type)
         let mut r = ParcelReader::new(&reply);
-        let t = r.read_i32()? as u32;
-        let _flags = r.read_i32()?;
-        let binder = r.read_u64()?;
-        if t == BINDER_TYPE_HANDLE {
-            log_diag(&format!("binder: get_service({}) handle={}", name, binder as u32));
-            Some(binder as u32)
-        } else {
-            log_diag(&format!("binder: get_service({}) type={} not HANDLE", name, t));
-            None
+        let first = r.read_i32()?;
+        if first == 0 {
+            // AIDL: 异常码=0, 随后是 flat_binder_object
+            let t = r.read_i32()? as u32;
+            if t == BINDER_TYPE_HANDLE {
+                let _flags = r.read_i32()?;
+                let binder = r.read_u64()?;
+                log_diag(&format!("binder: get_service({}) handle={}", name, binder as u32));
+                return Some(binder as u32);
+            }
+            log_diag(&format!("binder: get_service({}) AIDL 异常0但 type={} 非HANDLE", name, t));
+            return None;
         }
+        if first as u32 == BINDER_TYPE_HANDLE {
+            // 旧式直排 flat_binder_object
+            let _flags = r.read_i32()?;
+            let binder = r.read_u64()?;
+            log_diag(&format!("binder: get_service({}) legacy handle={}", name, binder as u32));
+            return Some(binder as u32);
+        }
+        log_diag(&format!("binder: get_service({}) reply first={} (异常/非handle)", name, first));
+        None
     }
 
     /// 启动 IProcessObserver 回调读取线程: BR_TRANSACTION → fg 事件 → send_fd (8字节 [pid,uid])。
