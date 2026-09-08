@@ -261,6 +261,13 @@ impl CpuAffinity {
                     if let Some(cfg) = cfg {
                         let pids = self.on_uid(uid, &pkg, &cfg);
                         crate::log_line("APPLY", &format!("uid={} pkg={} 主pid={} on_uid 扫到 pids={:?}", uid, pkg, pid, pids));
+                        // 诊断: 主 pid 不在扫描结果时, 定位被哪个环节排除
+                        if !pids.contains(&pid) {
+                            let in_init = self.init_pids.contains(&pid);
+                            let exists = std::path::Path::new(&format!("/proc/{}", pid)).exists();
+                            let pu = proc_uid(pid);
+                            crate::log_line("APPLY", &format!("主pid {} 未在扫描结果! init_pids命中={} /proc存在={} proc_uid(主)={:?}", pid, in_init, exists, pu));
+                        }
                         // 设置亲和性后: 该 uid 主进程+全部子进程 pid 列表写入
                         // cpu_known 与 proc 快照 (供后续冷热判断/统计)
                         crate::rw_write_ignore_poison(&CPU_KNOWN).insert(uid, (pid, pids.clone()));

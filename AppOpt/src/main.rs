@@ -617,7 +617,7 @@ fn main() {
                 }
                 EV_DIAG => {
                     read_eventfd(diag_timer_fd);
-                    crate::log_line("KPMCNT", &format!("counters={:?}", crate::ebpf_mode::kpm_counters()));
+                    crate::log_line("KPMCNT", &crate::ebpf_mode::kpm_stats_text().trim());
                 }
                 EV_INOTIFY => {
                     // 配置变更 (inotify): 与 EV_CONFIG 共用 reload_config
