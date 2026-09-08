@@ -273,8 +273,8 @@ impl CpuAffinity {
                         crate::rw_write_ignore_poison(&CPU_KNOWN).insert(uid, (pid, pids.clone()));
                         crate::rw_write_ignore_poison(&PROC_SNAPSHOT).insert(uid, pids);
                         // 标记内核主进程 tgid: 退出探针只对该主进程发布 EXIT
-                        self.bpf.applied_set_main(pid);
-                        crate::log_line("APPLY", &format!("uid={} pkg={} 已 applied_set_main({}) counters={:?}", uid, pkg, pid, crate::ebpf_mode::kpm_counters()));
+                        let rc_main = self.bpf.applied_set_main(pid);
+                        crate::log_line("APPLY", &format!("uid={} pkg={} 已 applied_set_main({}) rc={} counters={:?}", uid, pkg, pid, rc_main, crate::ebpf_mode::kpm_counters()));
                         // 记录 uid→pkg: 退出时按 uid 整清 managed (线程规则应用也覆盖)
                         self.uid_pkg.insert(uid, pkg.clone());
                     } else {

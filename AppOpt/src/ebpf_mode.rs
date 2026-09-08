@@ -176,10 +176,10 @@ impl KpmHandle {
     }
 
     /// 标记规则应用主进程 tgid (内核退出探针只对主进程发布 EXIT 事件;
-    /// 子进程/线程退出被内核过滤)
-    pub(crate) fn applied_set_main(&self, pid: i32) {
+    /// 子进程/线程退出被内核过滤); 返回 ctl0 结果 (诊断用)
+    pub(crate) fn applied_set_main(&self, pid: i32) -> i64 {
         let s = format!("applied_set_main {}", pid);
-        self.cmd(&s);
+        self.cmd(&s)
     }
 
     pub(crate) fn applied_clear(&self) {
