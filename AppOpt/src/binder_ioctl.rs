@@ -5,6 +5,18 @@
 
 use libc::{c_int, c_void};
 
+/// 诊断日志 (临时): 追加写入 /data/local/tmp/appopt_binder.log
+pub(crate) fn log_diag(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/data/local/tmp/appopt_binder.log")
+    {
+        let _ = writeln!(f, "[{:?}] {}", std::time::SystemTime::now(), msg);
+    }
+}
+
 // ================= ioctl 码 (arm64: dir<<30 | 'b'<<22 | nr<<14 | size) =================
 const BINDER_WRITE_READ: u32 = 0xc1884030;      // _IOWR('b',1,sizeof(bwr)=48)
 const BINDER_VERSION: u32 = 0xc1882404;         // _IOWR('b',9,4)
@@ -115,14 +127,18 @@ impl Binder {
             )
         };
         if fd < 0 {
+            log_diag(&format!("binder: open /dev/binder FAIL errno={}", std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)));
             return None;
         }
+        log_diag(&format!("binder: open fd={}", fd));
         let mut ver: u32 = 0;
         let r = unsafe { libc::ioctl(fd, BINDER_VERSION as i32, &mut ver as *mut u32 as *mut c_void) };
         if r < 0 {
+            log_diag(&format!("binder: BINDER_VERSION FAIL errno={}", std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)));
             unsafe { libc::close(fd) };
             return None;
         }
+        log_diag(&format!("binder: version ioctl ok ver={}", ver));
         // mmap binder 接收区 (必需: BR_REPLY/BR_TRANSACTION 数据指针指向此区域)
         let map_size: usize = 1024 * 1024;
         let map = unsafe {
@@ -136,9 +152,11 @@ impl Binder {
             )
         };
         if map == libc::MAP_FAILED {
+            log_diag(&format!("binder: mmap FAIL errno={}", std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)));
             unsafe { libc::close(fd) };
             return None;
         }
+        log_diag(&format!("binder: mmap ok base={:p}", map));
         let max_threads: u64 = 16;
         unsafe { libc::ioctl(fd, BINDER_SET_MAX_THREADS as i32, &max_threads as *const u64 as *const c_void) };
         Some(Binder {
@@ -223,6 +241,7 @@ impl Binder {
             match cmd {
                 BR_TRANSACTION_COMPLETE | BR_SPAWN_LOOPER => {}
                 BR_DEAD_REPLY | BR_FAILED_REPLY => {
+                    log_diag(&format!("binder: transact handle={} code={} -> {:x}", handle, code, cmd));
                     for p in &free_ptrs {
                         self.free_buffer(*p);
                     }
@@ -274,7 +293,13 @@ impl Binder {
         push_i32(&mut data, 0);
         push_utf16(&mut data, "android.os.IServiceManager");
         push_utf16(&mut data, name);
-        let (reply, _offs) = self.transact_sync(SVC_MGR_HANDLE, SVC_MGR_GET_SERVICE, &data, &[])?;
+        log_diag(&format!("binder: get_service({}) sending", name));
+        let txn = self.transact_sync(SVC_MGR_HANDLE, SVC_MGR_GET_SERVICE, &data, &[]);
+        let (reply, _offs) = match txn {
+            Some(x) => x,
+            None => { log_diag(&format!("binder: get_service({}) txn FAIL", name)); return None; }
+        };
+        log_diag(&format!("binder: get_service({}) reply len={} hex={:02x?}", name, reply.len(), &reply[..reply.len().min(24)]));
         // reply (servicemanager 非 AIDL): 直接是 flat_binder_object{type=HANDLE},
         // 无 strict/this 头, 无异常码
         let mut r = ParcelReader::new(&reply);
@@ -282,8 +307,10 @@ impl Binder {
         let _flags = r.read_i32()?;
         let binder = r.read_u64()?;
         if t == BINDER_TYPE_HANDLE {
+            log_diag(&format!("binder: get_service({}) handle={}", name, binder as u32));
             Some(binder as u32)
         } else {
+            log_diag(&format!("binder: get_service({}) type={} not HANDLE", name, t));
             None
         }
     }
@@ -294,6 +321,7 @@ impl Binder {
         let fd = self.fd;
         let map_base = self.map_base as usize;
         std::thread::spawn(move || {
+            log_diag(&format!("binder: observer thread start fd={} send_fd={}", fd, send_fd));
             // 进入 binder 线程循环
             let mut wb = Vec::new();
             wb.extend_from_slice(&BC_ENTER_LOOPER.to_le_bytes());
@@ -340,12 +368,14 @@ impl Binder {
                                 let _ = raw_write_read(fd, &wbf, &mut rbf);
                             }
                             // 解析回调
+                            log_diag(&format!("binder: BR_TRANSACTION code={} datalen={}", tr.code, dsz));
                             if tr.code == TX_ON_FG_ACTIVITIES_CHANGED {
                                 let mut r = ParcelReader::new(&data);
                                 let _ = r.read_i32(); // strict
                                 let _ = r.read_i32(); // this
                                 let _ = r.read_utf16_str(); // interface token
                                 if let (Some(pid), Some(uid), Some(fg)) = (r.read_i32(), r.read_i32(), r.read_i32()) {
+                                    log_diag(&format!("binder: fg pid={} uid={} fg={}", pid, uid, fg));
                                     if fg != 0 && pid > 0 && send_fd >= 0 {
                                         let pkt = [pid, uid];
                                         unsafe {
