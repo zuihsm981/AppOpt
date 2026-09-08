@@ -1,8 +1,8 @@
 //! CPU 亲和性模块（binder 前台回调触发, 无周期扫描）
 //!
 //! 设计:
-//!   - 触发: IProcessObserver binder 前台回调 (主线程 EV_FG 接收 pid+uid); 主线程查
-//!     cpu uid 表, 命中且冷启动时发 CpuMsg::ApplyPkg(pid, uid, pkg); ApplyAll = 启动/配置全量。
+//!   - 触发: 内核 cgroup_attach_task 探针判冷热 → FG_COLD/FG_HOT 事件 → event_dispatch
+//!     直发 CpuMsg::ApplyPkg(pid, uid, pkg); ApplyAll = 启动/配置全量。
 //!   - 归因: 包名由主线程 cpu uid 表提供 (随 CpuMsg 消息携带); 枚举按 uid 过滤
 //!     /proc (Uid: 字段) → 该应用全部进程 (主进程 + pkg: 子进程共享同一 uid)。
 //!   - 应用: 该 uid 全部进程的全部线程 (/proc/<pid>/task) → thread_affinity →
@@ -42,7 +42,7 @@ pub enum CpuMsg {
     ApplyAll,
 }
 
-/// 全局投递通道: 主线程 (main EV_FG) 转发前台回调 → CpuMsg 消息
+/// 全局投递通道: event_dispatch 直发内核判冷事件 → CpuMsg 消息
 static CPU_FG_TX: OnceLock<Mutex<mpsc::Sender<CpuMsg>>> = OnceLock::new();
 
 /// 冷热身份: uid → (前台主 pid, 该 uid 全部 pid 列表); 主线程判冷热, CPU 线程回写
@@ -54,13 +54,6 @@ pub static CPU_KNOWN: std::sync::LazyLock<RwLock<HashMap<i32, (i32, Vec<i32>)>>>
 /// proc 快照: uid → 该 uid 全部 pid 列表; 冷启动先清除再重建
 pub static PROC_SNAPSHOT: std::sync::LazyLock<RwLock<HashMap<i32, Vec<i32>>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
-
-/// 冷热判断: cpu_known 中该 uid 的 pid 与回调 pid 一致 → 热
-pub fn cpu_known_is_hot(uid: i32, pid: i32) -> bool {
-    crate::rw_read_ignore_poison(&CPU_KNOWN)
-        .get(&uid)
-        .is_some_and(|(p, _)| *p == pid)
-}
 
 /// 清除某 uid 的 pid 列表与 cpu_known 身份
 pub fn cpu_known_evict(uid: i32) {
@@ -259,7 +252,7 @@ impl CpuAffinity {
                         crate::rw_write_ignore_poison(&CPU_KNOWN).insert(uid, (pid, pids.clone()));
                         crate::rw_write_ignore_poison(&PROC_SNAPSHOT).insert(uid, pids);
                         // 标记内核主进程 tgid: 退出探针只对该主进程发布 EXIT
-                        self.bpf.applied_set_main(pid);
+                        self.bpf.applied_set_main(uid, pid);
                         // 记录 uid→pkg: 退出时按 uid 整清 managed (线程规则应用也覆盖)
                         self.uid_pkg.insert(uid, pkg.clone());
                     }
