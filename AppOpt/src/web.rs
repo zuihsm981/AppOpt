@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use crate::apply_affinity::{read_cmdline, task_tids};
 use crate::config::{
     config_reload_now, spec_like,
-    CHECK_INTERVAL, CONFIG_FILE, CURRENT_CONFIG, PARSE_FAILS,
+    CONFIG_FILE, CURRENT_CONFIG, PARSE_FAILS,
 };
 use crate::cpuset::{base_cpuset, create_cpuset_dir, parse_cpu_spec, CpuSet, CpuTopology, DEFAULT_CPUSET_NAME};
 use crate::ebpf_mode::kpm_probe;
@@ -268,7 +268,6 @@ fn status_json() -> String {
         "hit_list": hit_list,
         "threads": threads,
         "total_procs": sys_procs(),
-        "interval": CHECK_INTERVAL.load(Ordering::Relaxed).max(1),
         "e_core": topo.map(|t| t.e_core.to_range_string()).unwrap_or_default(),
         "p_core": topo.map(|t| t.p_core.to_range_string()).unwrap_or_default(),
         "hp_core": topo.map(|t| t.hp_core.to_range_string()).unwrap_or_default(),
@@ -495,7 +494,6 @@ fn config_json() -> String {
         "mode": 1,
         "mode_active": "kpm",
         "kpm_available": kpm_probe(),
-        "interval": CHECK_INTERVAL.load(Ordering::Relaxed).max(1),
         "cpuset_name": base_cpuset().rsplit('/').next().unwrap_or_default(),
         "config_file": lock_ignore_poison(&CONFIG_FILE).clone(),
         "cpuset_enabled": cfg.is_some_and(|c| c.topo.cpuset_enabled),
@@ -505,13 +503,9 @@ fn config_json() -> String {
 
 fn config_set_api(req: &Request) -> (u16, String) {
     let v = match parse_json(req) { Ok(v) => v, Err(e) => return e };
-    let interval = v["interval"].as_u64();
     let name = v["cpuset_name"].as_str();
     let path = v["config_file"].as_str();
 
-    if interval.is_some_and(|n| !(1..=3600).contains(&n)) {
-        return err_json(400, "间隔需在 1-3600 秒之间");
-    }
     if name.is_some_and(|n| !valid_name(n)) {
         return err_json(400, "无效的 cpuset 目录名");
     }
@@ -519,9 +513,6 @@ fn config_set_api(req: &Request) -> (u16, String) {
         return err_json(400, "无效的配置文件路径");
     }
 
-    if let Some(n) = interval {
-        CHECK_INTERVAL.store(n, Ordering::Relaxed);
-    }
     if let Some(n) = name {
         crate::cpuset::set_base_cpuset(n);
         if let Some(cfg) = current_cfg()
@@ -549,7 +540,6 @@ static SAVE_LOCK: Mutex<()> = Mutex::new(());
 #[derive(Clone)]
 pub struct Settings {
     pub web_enable: bool,
-    pub check_interval: u64,
     pub cpuset_name: String,
     pub config_file: String,
 }
@@ -558,7 +548,6 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             web_enable: false,
-            check_interval: 2,
             cpuset_name: DEFAULT_CPUSET_NAME.to_string(),
             config_file: "./appopt.conf".to_string(),
         }
@@ -578,10 +567,6 @@ impl Settings {
         let d = Settings::default();
         Self {
             web_enable: v["web_enable"].as_bool().unwrap_or(d.web_enable),
-            check_interval: v["check_interval"]
-                .as_u64()
-                .unwrap_or(d.check_interval)
-                .clamp(1, 3600),
             cpuset_name: v["cpuset_name"]
                 .as_str()
                 .filter(|s| valid_name(s))
@@ -598,7 +583,6 @@ impl Settings {
     fn to_value(&self) -> Value {
         json!({
             "web_enable": self.web_enable,
-            "check_interval": self.check_interval,
             "cpuset_name": self.cpuset_name,
             "config_file": self.config_file,
         })
@@ -636,7 +620,6 @@ pub fn settings_load(path: &str) -> Settings {
 pub fn settings_save() {
     Settings {
         web_enable: WEB_ENABLED.load(Ordering::Relaxed),
-        check_interval: CHECK_INTERVAL.load(Ordering::Relaxed).max(1),
         cpuset_name: base_cpuset().rsplit('/').next().unwrap_or_default().to_string(),
         config_file: lock_ignore_poison(&CONFIG_FILE).clone(),
     }

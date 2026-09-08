@@ -23,7 +23,7 @@ use std::sync::{mpsc, Arc, Mutex, RwLock};
 
 use crate::config::{
     init_inotify, load_config, AppConfig,
-    CHECK_INTERVAL, CONFIG_FILE, CONFIG_WAKE_FD, CURRENT_CONFIG,
+    CONFIG_FILE, CONFIG_WAKE_FD, CURRENT_CONFIG,
 };
 use crate::cpuset::{init_cpu_topo, set_base_cpuset};
 use crate::ebpf_mode::{
@@ -91,14 +91,13 @@ fn print_help(prog_name: &str) {
     println!("Usage: {} [OPTIONS]", prog_name);
     println!("Options:");
     println!("  -c <config_file>   指定统一配置文件 (默认: ./appopt.conf)");
-    println!("  -s <interval>      设置检查间隔(秒) (必须>=1, 默认: 2)");
     println!("  -b <cpuset_name>   指定 BASE_CPUSET 目录名 (默认: AppOpt)");
     println!("  -w                 启用网页前端 (仅本机 127.0.0.1:8889)");
     println!("  -v                 显示程序版本");
     println!("  -h                 显示帮助信息");
     println!();
     println!("示例:");
-    println!("  {} -c /data/appopt.conf -s 3", prog_name);
+    println!("  {} -c /data/appopt.conf", prog_name);
     println!("  {} -b MyAppOpt", prog_name);
     println!();
     println!("应用设置保存于 ./AppOpt.json，首次运行自动创建；");
@@ -131,8 +130,7 @@ fn main() {
     let prog_name = &args[0];
 
     // 参数解析先行，-v/-h/错误用法在设置加载前退出，不产生文件副作用
-    let (mut cli_cfg, mut cli_interval, mut cli_cpuset, mut cli_web) =
-        (None, None, None, false);
+    let (mut cli_cfg, mut cli_cpuset, mut cli_web) = (None, None, false);
 
     let mut i = 1;
     while i < args.len() {
@@ -143,23 +141,6 @@ fn main() {
                     cli_cfg = Some(args[i].clone());
                 } else {
                     eprintln!("错误: -c 需要指定配置文件路径");
-                    process::exit(1);
-                }
-            }
-            "-s" => {
-                i += 1;
-                if i < args.len() {
-                    let val: u64 = match args[i].parse() {
-                        Ok(v) if v >= 1 => v,
-                        _ => {
-                            eprintln!("无效的时间间隔: {}", args[i]);
-                            eprintln!("间隔必须是 >=1 的整数");
-                            process::exit(1);
-                        }
-                    };
-                    cli_interval = Some(val);
-                } else {
-                    eprintln!("错误: -s 需要指定时间间隔");
                     process::exit(1);
                 }
             }
@@ -201,6 +182,49 @@ fn main() {
         i += 1;
     }
 
+    // ================= 初始化并发: 独立无依赖项并行 =================
+    // T1: /proc pid 快照线程 (最早抓取启动瞬间 pid; 完成后线程退出)
+    let snapshot_thread = std::thread::spawn(|| crate::cpu_affinity::proc_pid_set());
+
+    // 提前创建 fd (不依赖 settings; 供各独立线程使用)
+    let kpm_wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    let mut fg_sv: [libc::c_int; 2] = [0, 0];
+    let socket_ok = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+            fg_sv.as_mut_ptr(),
+        )
+    } == 0;
+    if socket_ok {
+        let rcvbuf: libc::c_int = 256 * 1024;
+        unsafe {
+            libc::setsockopt(
+                fg_sv[0],
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &rcvbuf as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+
+    // T2: ebpf_init (KPM 加载 + shm + reader + activate; 不依赖配置)
+    let wk = kpm_wake_fd;
+    let ebpf_thread = std::thread::spawn(move || ebpf_init(wk));
+
+    // T3: process_observer (binder 回调注册; 完成后线程退出)
+    let obs_fd = fg_sv[1];
+    let observer_thread = std::thread::spawn(move || {
+        if socket_ok {
+            crate::process_observer::init_observer(obs_fd);
+        }
+    });
+
+    // T4: packages.list inotify (返回 fd; 完成后线程退出)
+    let pkg_inotify_thread = std::thread::spawn(crate::config::init_pkg_inotify);
+
     // 应用设置持久化于 AppOpt.json，命令行参数优先覆盖
     let st = settings_load(SETTINGS_FILE);
     let config_file = match cli_cfg {
@@ -210,7 +234,6 @@ fn main() {
     };
     // 默认配置升级：applist.conf -> appopt.conf；-c 显式指定的路径不受影响。
     crate::config::migrate_legacy_main_config(&config_file);
-    let sleep_interval = cli_interval.unwrap_or(st.check_interval);
     let cpuset_name = cli_cpuset.unwrap_or(st.cpuset_name);
     let web_enable = cli_web || st.web_enable;
 
@@ -230,7 +253,6 @@ fn main() {
         let mut guard = lock_ignore_poison(&CONFIG_FILE);
         *guard = config_file.clone();
     }
-    CHECK_INTERVAL.store(sleep_interval, Ordering::Release);
 
     let mut tmp_mtime: i64 = -1;
     let initial_config = match load_config(&config_file, &topo, &mut tmp_mtime) {
@@ -254,44 +276,25 @@ fn main() {
         settings_save();
     }
 
-    // CPU 亲和性投递通道必须先于刷新率 observer 建立, 否则注册瞬间(或首个)
-    // 前台回调会被丢弃, 导致首次打开应用不生效。
-    // AppOpt 初始化时缓存 /proc pid 快照: CPU 枚举跳过系统进程/已运行应用,
-    // 只处理之后新出现的 pid (冷启动应用)。早于 worker 线程调度, 不漏启动瞬间进程。
-    let init_pids = crate::cpu_affinity::proc_pid_set();
-    // 快照保留全部 pid (含 launcher3/systemui): 非其规则时枚举跳过, 避免读取其目录;
-    // 额外标记 launcher3/systemui 的 pid, 其规则直接使用标记目录
+    // ===== join 各独立线程 (事件循环/使用点前就绪) =====
+    let init_pids = snapshot_thread.join().unwrap_or_default();
     let marked = crate::cpu_affinity::classify_marked_pids(&init_pids);
+    // ebpf_init 线程: KPM 加载+激活已并行完成, join 拿 EbpfState
+    let mut ebpf_state: Option<EbpfState> = ebpf_thread.join().ok().flatten();
+    if ebpf_state.is_some() {
+        crate::web::KPM_ACTIVE.store(true, Ordering::Relaxed);
+    }
+    // T4: packages.list inotify fd
+    let pkg_inotify_fd = pkg_inotify_thread.join().unwrap_or(-1);
+    // T3: observer 注册完成
+    let _ = observer_thread.join();
+    let fg_recv_fd = fg_sv[0];
+    let mut fg_buf = [0u8; 8];
+
     let cpu_ready = crate::cpu_affinity::start(init_pids, marked);
 
     // 刷新率控制模块，独立线程运行 (binder 回调经主线程 uid 表 → FgPkg 消息驱动)
     refresh::refresh_init();
-
-    // ===== 三线程: 主线程持有 IProcessObserver 回调 socket, 分发 cpuset/刷新率线程 =====
-    let mut fg_sv: [libc::c_int; 2] = [0, 0];
-    if unsafe {
-        libc::socketpair(
-            libc::AF_UNIX,
-            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-            0,
-            fg_sv.as_mut_ptr(),
-        )
-    } == 0
-    {
-        let rcvbuf: libc::c_int = 256 * 1024;
-        unsafe {
-            libc::setsockopt(
-                fg_sv[0],
-                libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
-                &rcvbuf as *const libc::c_int as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
-        crate::process_observer::init_observer(fg_sv[1]);
-    }
-    let fg_recv_fd = fg_sv[0];
-    let mut fg_buf = [0u8; 8];
     // uid 静态表 (主线程): CPU 表 = 有 CPU 规则应用; 刷新率表 = launcher + 规则应用
     let mut cpu_uid: HashMap<i32, String> = HashMap::new();
     let mut rfr_uid: HashMap<i32, String> = HashMap::new();
@@ -304,7 +307,6 @@ fn main() {
     }
 
     let _ = crate::web::START.get_or_init(|| std::time::Instant::now());
-    let mut ebpf_state: Option<EbpfState> = None;
 
     // ================= 纯事件驱动主循环 =================
     // 事件源: KPM 事件唤醒 eventfd / inotify / 配置重载 eventfd / binder 前台回调
@@ -376,7 +378,7 @@ fn main() {
     }
 
     // KPM 事件唤醒 eventfd: reader 收到事件后写入, 主循环 epoll 唤醒
-    let kpm_wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    // (kpm_wake_fd 已在初始化并发段创建)
     epoll_add(epfd, kpm_wake_fd, EV_KPM);
     // 配置重载 eventfd: web 端写配置/规则后由 config_reload_now 写入
     let config_wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
@@ -390,44 +392,19 @@ fn main() {
     }
 
 
-    // 监听 /data/system/packages.list: 应用安装/卸载/替换 → 重建 uid 表
-    // 用 inotify 而非 mtime (用户要求); 日志确认监听是否成功 (SELinux/权限可见)
-    let mut pkg_inotify_fd: i32 = -1;
+    // packages.list inotify: 应用安装/卸载/替换 → 重建 uid 表 (fd 由并发 T4 线程建立;
+    // pkglist_path 保留供 EV_PKG 重挂 watch 用)
     let pkglist_path = CString::new("/data/system/packages.list").unwrap_or_default();
-    unsafe {
-        let ifd = libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK);
-        if ifd < 0 {
-            // inotify 不可用 (如 SELinux 拦截), 放弃监听 packages.list
-        } else {
-            let wd = libc::inotify_add_watch(
-                ifd,
-                pkglist_path.as_ptr(),
-                libc::IN_CLOSE_WRITE
-                    | libc::IN_MOVED_TO
-                    | libc::IN_MOVE_SELF
-                    | libc::IN_DELETE_SELF,
-            );
-            if wd < 0 {
-                libc::close(ifd);
-            } else {
-                epoll_add(epfd, ifd, EV_PKG);
-                pkg_inotify_fd = ifd;
-            }
+    epoll_add(epfd, pkg_inotify_fd, EV_PKG);
+
+    // 初始全量应用 (KPM 已由并发 T2 线程加载并激活, ebpf_state 已 join 就绪)
+    if let Some(cfg) = rw_read_ignore_poison(&CURRENT_CONFIG).clone() {
+        if let Some(es) = ebpf_state.as_mut() {
+            full_scan(&cfg, es);
         }
     }
-
-    // 初始 KPM 初始化 (仅 KPM 模式)
-    if let Some(mut es) = ebpf_init(kpm_wake_fd) {
-        let cfg = rw_read_ignore_poison(&CURRENT_CONFIG).clone();
-        if let Some(cfg) = cfg {
-            full_scan(&cfg, &mut es);
-        }
-        crate::web::KPM_ACTIVE.store(true, Ordering::Relaxed);
-        ebpf_state = Some(es);
-        // CPU 亲和性: binder 前台回调驱动 (cpu_affinity.rs), 启动即全量应用一次
-        if cpu_ready {
-            crate::cpu_affinity::apply_all_now();
-        }
+    if cpu_ready && ebpf_state.is_some() {
+        crate::cpu_affinity::apply_all_now();
     }
 
     let mut events = [unsafe { std::mem::zeroed::<libc::epoll_event>() }; 8];

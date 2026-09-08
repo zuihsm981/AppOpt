@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::UNIX_EPOCH;
 
@@ -12,9 +12,6 @@ use crate::cpuset::{base_cpuset, create_cpuset_dir, parse_cpu_spec, CpuSet, CpuT
 pub static INOTIFY_SUPPORTED: AtomicBool = AtomicBool::new(false);
 pub static INOTIFY_FD: AtomicI32 = AtomicI32::new(-1);
 pub static INOTIFY_WD: AtomicI32 = AtomicI32::new(-1);
-
-/// 运行时可调参数，web 端热更新
-pub static CHECK_INTERVAL: AtomicU64 = AtomicU64::new(2);
 
 /// 配置重载通知 fd (eventfd): web 端修改 cpuset/路径后写入, 唤醒主循环 epoll 处理
 pub static CONFIG_WAKE_FD: AtomicI32 = AtomicI32::new(-1);
@@ -754,6 +751,31 @@ pub fn inotify_drain() -> bool {
         return config_reload(&mut mtime);
     }
     false
+}
+
+/// 监听 /data/system/packages.list (应用安装/卸载/替换 → 重建 uid 表)。
+/// 在初始化并发线程中执行; 返回 inotify fd (失败 -1), 线程完成后自行退出。
+pub(crate) fn init_pkg_inotify() -> i32 {
+    let pkglist_path = match std::ffi::CString::new("/data/system/packages.list") {
+        Ok(p) => p,
+        Err(_) => return -1,
+    };
+    unsafe {
+        let ifd = libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK);
+        if ifd < 0 {
+            return -1; // inotify 不可用 (如 SELinux 拦截)
+        }
+        let wd = libc::inotify_add_watch(
+            ifd,
+            pkglist_path.as_ptr(),
+            libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO | libc::IN_MOVE_SELF | libc::IN_DELETE_SELF,
+        );
+        if wd < 0 {
+            libc::close(ifd);
+            return -1;
+        }
+        ifd
+    }
 }
 
 pub fn init_inotify(config_file: &str) {
