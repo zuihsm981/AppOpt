@@ -3,7 +3,7 @@
 
 use std::sync::atomic::{AtomicI32, Ordering};
 
-use crate::binder_ioctl::{observer_node, push_i32, push_utf16, Binder};
+use crate::binder_ioctl::{observer_node, push_i32, push_utf16, Binder, BINDER_TYPE_BINDER};
 
 /// 硬编码事务码: android.app.IActivityManager.registerProcessObserver
 const TX_REGISTER_PROCESS_OBSERVER: u32 = 0x0d;
@@ -32,8 +32,8 @@ pub fn init_observer(send_fd: i32) -> bool {
     push_i32(&mut data, 0); // this binder token
     push_utf16(&mut data, "android.app.IActivityManager");
     let obj_off = data.len();
-    // flat_binder_object { type=BINDER_TYPE_BINDER(1), flags=0, binder=本地节点, cookie=0 }
-    push_i32(&mut data, 1);
+    // flat_binder_object { type=BINDER_TYPE_BINDER, flags=0, binder=本地节点, cookie=0 }
+    push_i32(&mut data, BINDER_TYPE_BINDER as i32);
     push_i32(&mut data, 0);
     data.extend_from_slice(&(observer_node() as u64).to_le_bytes());
     data.extend_from_slice(&0u64.to_le_bytes());

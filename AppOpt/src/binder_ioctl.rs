@@ -12,10 +12,8 @@ const BINDER_SET_MAX_THREADS: u32 = 0x58814008; // _IOW('b',5,8)
 
 // ================= binder 命令 (type 'c') =================
 const BC_TRANSACTION: u32 = 0x58c00040;
-const BC_REPLY: u32 = 0x58c04040;
 const BC_FREE_BUFFER: u32 = 0x58c0c008;
 const BC_ENTER_LOOPER: u32 = 0x18c03000;
-const BC_REGISTER_LOOPER: u32 = 0x18c03400;
 
 const BR_ERROR: u32 = 0x98c00004;
 const BR_TRANSACTION: u32 = 0x98c08040;
@@ -27,16 +25,14 @@ const BR_FAILED_REPLY: u32 = 0x18c3c000;
 const BR_SPAWN_LOOPER: u32 = 0x18c2c000;
 
 // ================= flat_binder_object 类型 =================
-const BINDER_TYPE_BINDER: u32 = 1;
+pub(crate) const BINDER_TYPE_BINDER: u32 = 1;
 const BINDER_TYPE_HANDLE: u32 = 2;
-const TF_ONE_WAY: u32 = 0x01;
 
 // servicemanager (context manager) 句柄 = 0; getService 事务码 'S'
 const SVC_MGR_HANDLE: u32 = 0;
 const SVC_MGR_GET_SERVICE: u32 = 0x53;
 
 // IProcessObserver 回调事务码
-const TX_ON_PROCESS_STARTED: u32 = 0x01;
 const TX_ON_FG_ACTIVITIES_CHANGED: u32 = 0x02;
 
 // ================= 内核 ABI 结构 (arm64, uapi binder.h) =================
@@ -77,15 +73,6 @@ struct BinderTransactionData {
     data_size: u64,
     offsets_size: u64,
     data: BinderTxnData,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct FlatBinderObject {
-    t: u32,
-    flags: u32,
-    binder: u64, // union { binder_uintptr_t binder; u32 handle; }
-    cookie: u64,
 }
 
 // binder_transaction_data 在 arm64 为 64 字节 (data 联合体 16B, 含 2×binder_uintptr_t 指针)
