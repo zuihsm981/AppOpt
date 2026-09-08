@@ -177,6 +177,7 @@ impl Binder {
         };
         let r = unsafe { libc::ioctl(self.fd, BINDER_WRITE_READ as i32, &mut bwr as *mut BinderWriteRead as *mut c_void) };
         if r < 0 {
+            log_diag(&format!("binder: BINDER_WRITE_READ ioctl FAIL errno={}", std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)));
             None
         } else {
             Some(bwr)
@@ -229,9 +230,12 @@ impl Binder {
         let bwr = self.write_read(&wb, &mut rb)?;
         let n = bwr.read_consumed as usize;
         if n == 0 {
+            log_diag(&format!("binder: transact handle={} code={} read_consumed=0 (无回复)", handle, code));
             return None;
         }
         let rb = &rb[..n];
+        log_diag(&format!("binder: transact handle={} code={} read n={} cmds={:08x?}", handle, code, n,
+            rb.chunks_exact(4).take(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect::<Vec<_>>()));
         let mut pos = 0usize;
         let mut free_ptrs: Vec<u64> = Vec::new();
         let mut result: Option<(Vec<u8>, Vec<u64>)> = None;
@@ -287,11 +291,9 @@ impl Binder {
 
     /// 向 servicemanager (handle 0) 查询服务句柄。
     pub fn get_service(&self, name: &str) -> Option<u32> {
-        // parcel: [strict][this][desc "android.os.IServiceManager"][string16(name)]
+        // 旧式 servicemanager 'S' 事务: 数据直接从 string16(服务名) 开始
+        // (不写 strict/this/接口 token, 其 onTransact 直接 readString16)
         let mut data: Vec<u8> = Vec::new();
-        push_i32(&mut data, 0);
-        push_i32(&mut data, 0);
-        push_utf16(&mut data, "android.os.IServiceManager");
         push_utf16(&mut data, name);
         log_diag(&format!("binder: get_service({}) sending", name));
         let txn = self.transact_sync(SVC_MGR_HANDLE, SVC_MGR_GET_SERVICE, &data, &[]);
