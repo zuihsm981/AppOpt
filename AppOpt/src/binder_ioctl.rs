@@ -192,16 +192,17 @@ impl Binder {
         let _ = self.write_read(&wb, &mut rb);
     }
 
-    /// 从 mmap 接收区读取数据 (BR_REPLY/BR_TRANSACTION 的 data/offsets 指针)。
+    /// 从 mmap 接收区读取数据。tr.data.ptr.buffer 已是绝对用户态 VA
+    /// (= mmap基址 + 内核数据偏移), 直接按该指针读, 不能再加 map_base。
     unsafe fn read_mapped(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
         if ptr == 0 {
             return Some(Vec::new());
         }
         let base = self.map_base as usize;
-        if len > self.map_size as u64 {
+        if ptr < base as u64 || (ptr as usize) + len as usize > base + self.map_size {
             return None;
         }
-        Some(unsafe { std::slice::from_raw_parts((base + ptr as usize) as *const u8, len as usize).to_vec() })
+        Some(unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize).to_vec() })
     }
 
     /// 向 handle 发送同步事务; 返回 reply 的 (data, offsets)。
@@ -321,7 +322,6 @@ impl Binder {
     /// 消费 self (线程持有 Binder, 保持 fd/mmap 存活)。
     pub fn run_observer(self, send_fd: i32) {
         let fd = self.fd;
-        let map_base = self.map_base as usize;
         std::thread::spawn(move || {
             log_diag(&format!("binder: observer thread start fd={} send_fd={}", fd, send_fd));
             // 进入 binder 线程循环
@@ -356,7 +356,7 @@ impl Binder {
                             // 回调数据在 mmap 区
                             let data: Vec<u8> = if bptr != 0 {
                                 unsafe {
-                                    std::slice::from_raw_parts((map_base + bptr as usize) as *const u8, dsz as usize).to_vec()
+                                    std::slice::from_raw_parts(bptr as *const u8, dsz as usize).to_vec()
                                 }
                             } else {
                                 Vec::new()
