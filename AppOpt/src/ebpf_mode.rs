@@ -5,9 +5,9 @@
 //! reader 线程 mmap 该 fd, 阻塞在 eventfd 上, 被内核 input kprobe eventfd_signal
 //! 唤醒后直接从共享环消费 (SPSC, acquire/release 同步), 零轮询。
 //!
-//! 前台事件由内核 cgroup_attach_task 探针产生: 内核查规则表+判冷热后以
-//! FG_COLD/FG_HOT 事件发出, event_dispatch 直发 CPU 线程 (ApplyPkg) 与
-//! 刷新率线程 (FgPkg); 不再有 binder 前台回调 / fg socket。
+//! CPU 亲和性/刷新率不再由进程事件驱动: binder 前台回调 (pid+uid) 由主线程
+//! 经 uid 静态表分发到 cpuset(按 uid 枚举应用) 与刷新率线程 (见 main.rs EV_FG,
+//! cpu_affinity.rs, refresh.rs)。
 //!
 //! 控制面 (APPLIED 表 / start-stop / shm_open) 走 ctl0 supercall。
 //!
@@ -15,7 +15,7 @@
 //!   - kprobe input_handle_event (1s 节流)
 //!   - kprobe sched_setaffinity (按 APPLIED bits 强制)
 //!   - APPLIED tid 表、mmap 共享 256KB 事件环
-//! 事件结构 EbpfProcEvent 与内核 appopt_proc_event_t 布局完全一致 (32B, 含 uid),
+//! 事件结构 EbpfProcEvent 与内核 appopt_proc_event_t 布局完全一致 (28B),
 //! event_dispatch/affinity 逻辑与原先保持一致。
 
 use std::ffi::CString;
@@ -27,13 +27,12 @@ use std::thread;
 use crate::apply_affinity::tid_comm;
 use crate::config::AppConfig;
 
-/// eBPF 进程事件, 布局需与内核态 appopt_proc_event_t 完全一致 (32B, 含 uid)
+/// eBPF 进程事件, 布局需与内核态 appopt_proc_event_t 完全一致 (28B)
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct EbpfProcEvent {
     pub pid: i32,
     pub tid: i32,
-    pub uid: i32,
     pub comm: [u8; 16],
     pub event_type: u32,
 }
@@ -65,7 +64,7 @@ pub const APPOPT_SHM_VERSION: u32 = 1;
 pub const APPOPT_SHM_HDR_SIZE: usize = 48; // size_of::<ShmRing>(), data[] 偏移
 pub const APPOPT_EVENT_RING_SIZE: u32 = 256 * 1024;
 pub const APPOPT_RING_MASK: u32 = APPOPT_EVENT_RING_SIZE - 1;
-pub const APPOPT_EVENT_SZ: u32 = 32; // size_of::<EbpfProcEvent>() (4+4+4+16+4)
+pub const APPOPT_EVENT_SZ: u32 = 28; // size_of::<EbpfProcEvent>()
 
 /* ================= KernelPatch SuperCall 传输 ================= */
 
@@ -172,25 +171,11 @@ impl KpmHandle {
         self.cmd("input_on");
     }
 
-    /// 标记规则应用主进程 tgid + uid→主pid (内核退出探针只对主进程发布 EXIT 事件;
-    /// 子进程/线程退出被内核过滤; uid_main 供内核冷热判定)
-    pub(crate) fn applied_set_main(&self, uid: i32, pid: i32) {
-        let s = format!("applied_set_main {} {}", uid, pid);
+    /// 标记规则应用主进程 tgid (内核退出探针只对主进程发布 EXIT 事件;
+    /// 子进程/线程退出被内核过滤)
+    pub(crate) fn applied_set_main(&self, pid: i32) {
+        let s = format!("applied_set_main {}", pid);
         self.cmd(&s);
-    }
-
-    /// 同步规则应用 uid 集合到内核 (内核冷热判定: cgroup 前台探针查 managed_uids)。
-    /// 分块发送规避 ctl 参数长度上限; 空集发 clear。
-    pub(crate) fn set_rule_uids(&self, uids: &[i32]) {
-        if uids.is_empty() {
-            self.cmd("clear_rule_uids");
-            return;
-        }
-        for chunk in uids.chunks(40) {
-            let nums: Vec<String> = chunk.iter().map(|u| u.to_string()).collect();
-            let s = format!("set_rule_uids {}", nums.join(" "));
-            self.cmd(&s);
-        }
     }
 
     pub(crate) fn applied_clear(&self) {
@@ -505,62 +490,11 @@ pub fn set_input_hook(on: bool) {
 /// 事件派发 (input: 刷新率活动检测; EXIT: 规则应用主进程退出 → 清身份;
 /// CPU/刷新率主体由 binder 三线程驱动)
 pub const EBPF_EVENT_EXIT: u32 = 4;
-pub const EBPF_EVENT_FG_COLD: u32 = 6; // 内核判冷 (未应用/新 pid): 需 ApplyPkg
-pub const EBPF_EVENT_FG_HOT: u32 = 7;  // 内核判热 (已应用同主 pid): 仅刷新
-pub const EBPF_EVENT_CGDBG: u32 = 8;   // 诊断: 所有 cgroup attach (路径在 comm, 临时)
-pub fn event_dispatch(
-    event: &EbpfProcEvent,
-    cpu_uid: &std::collections::HashMap<i32, String>,
-    rfr_uid: &std::collections::HashMap<i32, String>,
-    _cfg: &AppConfig,
-    _state: &mut EbpfState,
-) {
+pub fn event_dispatch(event: &EbpfProcEvent, _cfg: &AppConfig, _state: &mut EbpfState) {
     // CPU 亲和性已由 binder 触发的 CpuAffinity 模块负责 (cpu_affinity.rs):
     // 进程事件不驱动 CPU 逻辑; input 仅用于刷新率活动检测。
     if event.event_type == EBPF_EVENT_INPUT {
         crate::refresh::refresh_on_event(EBPF_EVENT_INPUT, 0);
-    } else if event.event_type == EBPF_EVENT_CGDBG {
-        // 诊断(临时): 所有 cgroup attach, 路径在 comm; 只打日志
-        let pid = event.pid;
-        let uid = event.uid;
-        let path = String::from_utf8_lossy(
-            &event.comm[..event.comm.iter().position(|&b| b == 0).unwrap_or(16)],
-        );
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/data/local/tmp/appopt_cgroup.log")
-        {
-            let _ = writeln!(f, "[{:?}] cgdbg pid={} uid={} path={:?}", std::time::SystemTime::now(), pid, uid, path);
-        }
-    } else if event.event_type == EBPF_EVENT_FG_COLD || event.event_type == EBPF_EVENT_FG_HOT {
-        // cgroup 前台切换: 内核已查规则表 + 判冷热 (class 0=冷 1=热), 携带 pid+uid。
-        // 直发工作线程 (不走 fg socket): 冷 → CPU ApplyPkg; 热/冷 → 刷新率发包名。
-        let pid = event.pid;
-        let uid = event.uid;
-        let is_cold = event.event_type == EBPF_EVENT_FG_COLD;
-        // 临时验证日志 (pid<0 为内核注册状态标记)
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/data/local/tmp/appopt_cgroup.log")
-        {
-            let _ = writeln!(f, "[{:?}] cgroup_fg pid={} uid={} class={}", std::time::SystemTime::now(), pid, uid, if is_cold { 0 } else { 1 });
-        }
-        if pid > 0 {
-            if is_cold {
-                if let Some(pkg) = cpu_uid.get(&uid) {
-                    if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
-                        let _ = tx.send(crate::cpu_affinity::CpuMsg::ApplyPkg(pid, uid, pkg.clone()));
-                    }
-                }
-            }
-            if let Some(pkg) = rfr_uid.get(&uid) {
-                crate::refresh::refresh_send_fg_pkg(pkg.clone());
-            }
-        }
     } else if event.event_type == EBPF_EVENT_EXIT && event.tid == event.pid {
         // 规则应用主进程退出 (内核已按 APPLIED+主进程标记过滤非规则应用/非主进程):
         // 清除该 uid 的 pid 列表与 cpu_known 身份, 并按 uid 通知 CPU worker 清除该

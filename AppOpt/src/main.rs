@@ -3,6 +3,7 @@
 compile_error!("AppOpt requires 64-bit target due to cpu_set_t binary layout assumptions");
 
 mod apply_affinity;
+mod binder_ioctl;
 mod cpu_affinity;
 mod config;
 mod cpuset;
@@ -53,23 +54,6 @@ pub(crate) fn rw_write_ignore_poison<T>(rw: &RwLock<T>) -> std::sync::RwLockWrit
 /// 从 packages.list 构建两张 uid→包名 静态表 (主线程持有):
 ///   cpu: 有 CPU 规则的应用; rfr: com.android.launcher3 + 有刷新率规则的应用。
 /// 前台回调只查这两张表, 不查 cmdline、不管 pid。
-/// 规则应用 uid 集合同步到内核 (内核冷热判定): CPU + 刷新率两张表**并集**。
-/// 内核 managed 门控会丢弃未命中事件, 刷新率专属规则应用也必须进集合,
-/// 否则其前台事件被内核丢弃 → 刷新率不生效。冷热仍只对 CPU 应用有意义
-/// (刷新率专属 uid 永不设 uid_main → 恒判冷, 用户态 cpu_uid.get 门控 ApplyPkg)。
-fn sync_rule_uids(
-    es: &mut Option<crate::ebpf_mode::EbpfState>,
-    cpu_uid: &HashMap<i32, String>,
-    rfr_uid: &HashMap<i32, String>,
-) {
-    if let Some(es) = es.as_mut() {
-        let mut uids: HashSet<i32> = cpu_uid.keys().copied().collect();
-        uids.extend(rfr_uid.keys().copied());
-        let v: Vec<i32> = uids.into_iter().collect();
-        es.bpf.set_rule_uids(&v);
-    }
-}
-
 fn build_uid_tables(cfg: &AppConfig) -> (HashMap<i32, String>, HashMap<i32, String>) {
     let mut cpu_pkgs: HashSet<&str> = HashSet::new();
     for r in &cfg.rules {
@@ -205,10 +189,39 @@ fn main() {
 
     // 提前创建 fd (不依赖 settings; 供各独立线程使用)
     let kpm_wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    let mut fg_sv: [libc::c_int; 2] = [0, 0];
+    let socket_ok = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+            fg_sv.as_mut_ptr(),
+        )
+    } == 0;
+    if socket_ok {
+        let rcvbuf: libc::c_int = 256 * 1024;
+        unsafe {
+            libc::setsockopt(
+                fg_sv[0],
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &rcvbuf as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
 
     // T2: ebpf_init (KPM 加载 + shm + reader + activate; 不依赖配置)
     let wk = kpm_wake_fd;
     let ebpf_thread = std::thread::spawn(move || ebpf_init(wk));
+
+    // T3: process_observer (binder 回调注册; 完成后线程退出)
+    let obs_fd = fg_sv[1];
+    let observer_thread = std::thread::spawn(move || {
+        if socket_ok {
+            crate::process_observer::init_observer(obs_fd);
+        }
+    });
 
     // T4: packages.list inotify (返回 fd; 完成后线程退出)
     let pkg_inotify_thread = std::thread::spawn(crate::config::init_pkg_inotify);
@@ -277,6 +290,10 @@ fn main() {
     }
     // T4: packages.list inotify fd
     let pkg_inotify_fd = pkg_inotify_thread.join().unwrap_or(-1);
+    // T3: observer 注册完成
+    let _ = observer_thread.join();
+    let fg_recv_fd = fg_sv[0];
+    let mut fg_buf = [0u8; 8];
 
     let cpu_ready = crate::cpu_affinity::start(init_pids, marked);
 
@@ -292,7 +309,6 @@ fn main() {
         (cpu_uid, rfr_uid) = build_uid_tables(&cfg);
         (cpu_pkgs_set, rfr_pkgs_set) = cfg_pkg_sets(&cfg);
     }
-    sync_rule_uids(&mut ebpf_state, &cpu_uid, &rfr_uid);
 
     let _ = crate::web::START.get_or_init(|| std::time::Instant::now());
 
@@ -302,6 +318,7 @@ fn main() {
     const EV_KPM: u64 = 1;
     const EV_INOTIFY: u64 = 2;
     const EV_CONFIG: u64 = 4;
+    const EV_FG: u64 = 6; // binder 前台回调 (pid+uid), 主线程分发
     const EV_PKG: u64 = 7; // packages.list inotify (安装/卸载/替换)
 
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
@@ -374,6 +391,9 @@ fn main() {
     // inotify fd: 配置文件修改
     let inotify_fd = crate::config::INOTIFY_FD.load(Ordering::Acquire);
     epoll_add(epfd, inotify_fd, EV_INOTIFY);
+    if fg_recv_fd > 0 {
+        epoll_add(epfd, fg_recv_fd, EV_FG);
+    }
 
 
     // packages.list inotify: 应用安装/卸载/替换 → 重建 uid 表 (fd 由并发 T4 线程建立;
@@ -422,7 +442,6 @@ fn main() {
         apply_config(cpu_changed, ebpf_state, cfg.as_deref());
         if let Some(cfg) = cfg.as_ref() {
             rebuild_uid_if_needed(cpu_changed, cfg, cpu_uid, rfr_uid, cpu_pkgs_set, rfr_pkgs_set);
-            sync_rule_uids(ebpf_state, cpu_uid, rfr_uid);
         }
     };
 
@@ -442,7 +461,7 @@ fn main() {
                                     else {
                                         continue;
                                     };
-                                    event_dispatch(&event, &cpu_uid, &rfr_uid, &cfg, es);
+                                    event_dispatch(&event, &cfg, es);
                                 }
                                 Err(mpsc::TryRecvError::Empty) => break,
                                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -499,7 +518,44 @@ fn main() {
                         }
                         if let Some(cfg) = cfg.as_ref() {
                             (cpu_uid, rfr_uid) = build_uid_tables(cfg);
-                            sync_rule_uids(&mut ebpf_state, &cpu_uid, &rfr_uid);
+                        }
+                    }
+                }
+                EV_FG => {
+                    // binder 前台回调 (pid+uid): 主线程查两张 uid 表分发
+                    if fg_recv_fd > 0 {
+                        let nrecv = unsafe {
+                            libc::recv(
+                                fg_recv_fd,
+                                fg_buf.as_mut_ptr() as *mut libc::c_void,
+                                fg_buf.len(),
+                                0,
+                            )
+                        };
+                        if nrecv == 8 {
+                            let pid = i32::from_ne_bytes([fg_buf[0], fg_buf[1], fg_buf[2], fg_buf[3]]);
+                            let uid = i32::from_ne_bytes([fg_buf[4], fg_buf[5], fg_buf[6], fg_buf[7]]);
+                            // CPU: 表命中 → 冷热判断 (cpu_known 中 uid+pid 一致=热);
+                            // 冷 → 只发 (pid+uid+包名); 身份清除由 EXIT 事件驱动
+                            if let Some(pkg) = cpu_uid.get(&uid) {
+                                // 冷启动不再清除 pid 列表/cpu_known —— 身份清除改由
+                                // EXIT 事件驱动 (ebpf_mode::event_dispatch); 冷时仅重发
+                                // ApplyPkg, CPU 线程枚举后覆盖写回新身份
+                                if !crate::cpu_affinity::cpu_known_is_hot(uid, pid) {
+                                    if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
+                                        let _ = tx.send(crate::cpu_affinity::CpuMsg::ApplyPkg(
+                                            pid,
+                                            uid,
+                                            pkg.clone(),
+                                        ));
+                                    }
+                                }
+                            } else {
+                            }
+                            // 刷新率: 表命中 → 发包名给刷新率线程
+                            if let Some(pkg) = rfr_uid.get(&uid) {
+                                crate::refresh::refresh_send_fg_pkg(pkg.clone());
+                            }
                         }
                     }
                 }
