@@ -113,22 +113,6 @@ fn get_sf_class() -> *mut c_void {
     }).0
 }
 
-    unsafe { (ndk.parcel_delete)(in_parcel) };
-    if !out_parcel.is_null() { unsafe { (ndk.parcel_delete)(out_parcel) }; }
-
-    if status == STATUS_OK {
-        let start_fn = ndk.start_thread_pool;
-        let join_fn = ndk.join_thread_pool;
-        std::thread::spawn(move || {
-            unsafe { start_fn(); }
-            unsafe { join_fn(); }
-        });
-        true
-    } else {
-        false
-    }
-}
-
 /// binder 直连 SurfaceFlinger 设置刷新率：事务码 1035，一个 int32 参数
 /// （替代 `service call SurfaceFlinger 1035 i32 <mode>` 的 fork/exec 子进程方式）
 /// 使用 ISurfaceComposer.h 确认的描述符 android.ui.ISurfaceComposer；
