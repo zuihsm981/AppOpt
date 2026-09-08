@@ -40,36 +40,6 @@ pub(crate) fn lock_ignore_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 通用诊断日志: 追加写入 /data/local/tmp/appopt_init.log (带时间戳)
-pub(crate) fn log_diag(msg: &str) {
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/data/local/tmp/appopt_init.log")
-    {
-        let _ = writeln!(f, "[{:?}] {}", std::time::SystemTime::now(), msg);
-    }
-}
-
-/// 初始化阶段计时日志: 追加写入 /data/local/tmp/appopt_init.log (带时间戳+相对毫秒)
-pub(crate) fn log_init(phase: &str, elapsed_ms: u128) {
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/data/local/tmp/appopt_init.log")
-    {
-        let _ = writeln!(
-            f,
-            "[{:?}] +{}ms {}",
-            std::time::SystemTime::now(),
-            elapsed_ms,
-            phase
-        );
-    }
-}
-
 /// 高频只读数据的读锁 (RwLock): 多线程并发读不互斥, 写方独占
 pub(crate) fn rw_read_ignore_poison<T>(rw: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
     rw.read().unwrap_or_else(|e| e.into_inner())
@@ -212,9 +182,6 @@ fn main() {
         i += 1;
     }
 
-    let init_t0 = std::time::Instant::now();
-    crate::log_init("start (参数解析完成, L1 spawn 前)", init_t0.elapsed().as_millis());
-
     // ================= 初始化并发: 独立无依赖项并行 =================
     // T1: /proc pid 快照线程 (最早抓取启动瞬间 pid; 完成后线程退出)
     let snapshot_thread = std::thread::spawn(|| crate::cpu_affinity::proc_pid_set());
@@ -257,7 +224,6 @@ fn main() {
 
     // T4: packages.list inotify (返回 fd; 完成后线程退出)
     let pkg_inotify_thread = std::thread::spawn(crate::config::init_pkg_inotify);
-    crate::log_init("L1 spawn 完成 (snapshot/ebpf/observer/pkg)", init_t0.elapsed().as_millis());
 
     // 应用设置持久化于 AppOpt.json，命令行参数优先覆盖
     let st = settings_load(SETTINGS_FILE);
@@ -270,12 +236,10 @@ fn main() {
     crate::config::migrate_legacy_main_config(&config_file);
     let cpuset_name = cli_cpuset.unwrap_or(st.cpuset_name);
     let web_enable = cli_web || st.web_enable;
-    crate::log_init("settings+config_file 完成", init_t0.elapsed().as_millis());
 
     // 先设置 cpuset 路径再初始化拓扑，init_cpu_topo 会创建 BASE_CPUSET 目录
     set_base_cpuset(&cpuset_name);
     let topo = init_cpu_topo();
-    crate::log_init("topo 完成", init_t0.elapsed().as_millis());
 
     if fs::metadata(&config_file).is_err() {
         let initial_content = "# 规则编写与使用说明请参考 http://AppOpt.suto.top\n# 刷新率字段与 CPU 规则共用此文件\nrefresh_timeout=30\nrefresh_active=120\nrefresh_idle=60\n\n";
@@ -298,7 +262,6 @@ fn main() {
             process::exit(1);
         }
     };
-    crate::log_init("load_config 完成", init_t0.elapsed().as_millis());
 
     {
         let mut guard = rw_write_ignore_poison(&CURRENT_CONFIG);
@@ -312,14 +275,9 @@ fn main() {
         // -w 或设置恢复启用后落盘，重启保持开启
         settings_save();
     }
-    crate::log_init("web_start 完成", init_t0.elapsed().as_millis());
 
     // ===== join 各独立线程 (事件循环/使用点前就绪) =====
     let init_pids = snapshot_thread.join().unwrap_or_default();
-    // 诊断: 输出 init_pids 快照全部 pid
-    let mut snap: Vec<i32> = init_pids.iter().copied().collect();
-    snap.sort_unstable();
-    crate::log_diag(&format!("init_pids 快照: count={} pids={:?}", snap.len(), snap));
     let marked = crate::cpu_affinity::classify_marked_pids(&init_pids);
     // ebpf_init 线程: KPM 加载+激活已并行完成, join 拿 EbpfState
     let mut ebpf_state: Option<EbpfState> = ebpf_thread.join().ok().flatten();
@@ -335,11 +293,8 @@ fn main() {
 
     let cpu_ready = crate::cpu_affinity::start(init_pids, marked);
 
-    crate::log_init("joins+start+observer 完成", init_t0.elapsed().as_millis());
-
     // 刷新率控制模块，独立线程运行 (binder 回调经主线程 uid 表 → FgPkg 消息驱动)
     refresh::refresh_init();
-    crate::log_init("refresh_init 完成", init_t0.elapsed().as_millis());
     // uid 静态表 (主线程): CPU 表 = 有 CPU 规则应用; 刷新率表 = launcher + 规则应用
     let mut cpu_uid: HashMap<i32, String> = HashMap::new();
     let mut rfr_uid: HashMap<i32, String> = HashMap::new();
@@ -451,8 +406,6 @@ fn main() {
     if cpu_ready && ebpf_state.is_some() {
         crate::cpu_affinity::apply_all_now();
     }
-
-    crate::log_init("full_scan+apply_all 完成, 初始化结束", init_t0.elapsed().as_millis());
 
     let mut events = [unsafe { std::mem::zeroed::<libc::epoll_event>() }; 8];
 

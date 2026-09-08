@@ -254,8 +254,6 @@ impl CpuAffinity {
                     let cfg = crate::rw_read_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
                     if let Some(cfg) = cfg {
                         let pids = self.on_uid(uid, &pkg, &cfg);
-                        // 诊断: 主 pid 是否被 init_pids 快照包含 + 扫描结果 (排查首次冷启动失效)
-                        crate::log_diag(&format!("主pid={} 在init_pids={} 扫描pids={:?}", pid, self.init_pids.contains(&pid), pids));
                         // 设置亲和性后: 该 uid 主进程+全部子进程 pid 列表写入
                         // cpu_known 与 proc 快照 (供后续冷热判断/统计)
                         crate::rw_write_ignore_poison(&CPU_KNOWN).insert(uid, (pid, pids.clone()));
