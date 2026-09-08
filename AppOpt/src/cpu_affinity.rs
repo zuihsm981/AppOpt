@@ -323,11 +323,19 @@ pub(crate) fn classify_marked_pids(init_pids: &HashSet<i32>) -> HashMap<String, 
 
 /// 缓存初始化时 /proc 下全部 pid (AppOpt 启动快照): 由 main.rs 在初始化时调用,
 /// 传给 CPU worker 用于枚举跳过 (系统进程/已运行应用), 只处理之后新出现的 pid
+/// 快照只记低位稳定 pid (≤6100): 应用高位 pid (6000+) 不写入快照,
+/// 避免应用 pid 复用撞上快照旧号被 on_uid 误跳过 (首次冷启动失效根因)。
+/// 用过滤而非 break: /proc 枚举顺序不保证升序, 过滤同样不写高位且更安全。
+const INIT_PIDS_MAX_PID: i32 = 6100;
+
 pub(crate) fn proc_pid_set() -> HashSet<i32> {
     let mut set = HashSet::new();
     if let Ok(entries) = std::fs::read_dir("/proc") {
         for e in entries.flatten() {
             if let Ok(p) = e.file_name().to_string_lossy().parse::<i32>() {
+                if p > INIT_PIDS_MAX_PID {
+                    continue; // 高位 (应用区) 不记入快照
+                }
                 if p > 0 {
                     set.insert(p);
                 }
