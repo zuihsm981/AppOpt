@@ -334,6 +334,7 @@ fn main() {
     const EV_CONFIG: u64 = 4;
     const EV_FG: u64 = 6; // binder 前台回调 (pid+uid), 主线程分发
     const EV_PKG: u64 = 7; // packages.list inotify (安装/卸载/替换)
+    const EV_DIAG: u64 = 8; // 周期诊断日志 (每 5s 输出内核/用户态计数, 排查 exit)
 
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epfd < 0 {
@@ -407,6 +408,17 @@ fn main() {
     epoll_add(epfd, inotify_fd, EV_INOTIFY);
     if fg_recv_fd > 0 {
         epoll_add(epfd, fg_recv_fd, EV_FG);
+    }
+
+    // 诊断定时器: 每 5s 把 kpm_counters (含内核 exit=) 写入 /data/local/tmp/appopt.log
+    let diag_timer_fd = unsafe {
+        libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC | libc::TFD_NONBLOCK)
+    };
+    if diag_timer_fd >= 0 {
+        let ts = libc::timespec { tv_sec: 5, tv_nsec: 0 };
+        let it = libc::itimerspec { it_interval: ts, it_value: ts };
+        unsafe { libc::timerfd_settime(diag_timer_fd, 0, &it, std::ptr::null_mut()) };
+        epoll_add(epfd, diag_timer_fd, EV_DIAG);
     }
 
     // 监听 /data/system/packages.list: 应用安装/卸载/替换 → 重建 uid 表
@@ -587,7 +599,7 @@ fn main() {
                                             uid,
                                             pkg.clone(),
                                         ));
-                                        crate::log_line("EV_FG", &format!("uid={} pid={} pkg={} cold -> ApplyPkg 已发送", uid, pid, pkg));
+                                        crate::log_line("EV_FG", &format!("uid={} pid={} pkg={} cold -> ApplyPkg 已发送 counters={:?}", uid, pid, pkg, crate::ebpf_mode::kpm_counters()));
                                     } else {
                                         crate::log_line("EV_FG", &format!("uid={} pid={} pkg={} cold 但 cpu_fg_tx 为空!", uid, pid, pkg));
                                     }
@@ -602,6 +614,10 @@ fn main() {
                             }
                         }
                     }
+                }
+                EV_DIAG => {
+                    read_eventfd(diag_timer_fd);
+                    crate::log_line("KPMCNT", &format!("counters={:?}", crate::ebpf_mode::kpm_counters()));
                 }
                 EV_INOTIFY => {
                     // 配置变更 (inotify): 与 EV_CONFIG 共用 reload_config
