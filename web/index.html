@@ -177,11 +177,6 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 
 <section id="tab-settings" class="panel" hidden>
 <div class="card">
-<div class="card-title">扫描参数</div>
-<div class="field"><input id="c-interval" type="number" min="1" max="3600"><button class="btn" id="c-interval-save">保存</button></div>
-<div class="hint">检查间隔（秒），影响 /proc 扫描与配置轮询频率</div>
-</div>
-<div class="card">
 <div class="card-title">cpuset</div>
 <div class="field"><input id="c-cpuset"><button class="btn" id="c-cpuset-save">保存</button></div>
 <div class="hint">BASE_CPUSET 目录名（当前<span id="c-cpuset-on">未知</span>），修改后规则将重建亲和性目录并重新加载</div>
@@ -205,7 +200,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <span class="label">设备刷新率</span><span class="badge kpm mono" id="rf-device">-</span>
 </div>
 <div class="row"><span class="label">当前刷新率</span><span class="badge kpm" id="rf-mode">-</span></div>
-<div class="row"><span class="label">空闲定时器</span><span class="badge kpm" id="rf-timer">-</span></div>
+<div class="row"><span class="label">定时器状态</span><span class="badge kpm" id="rf-timer">-</span></div>
 <div class="row"><span class="label">内核 input 状态</span><span class="badge kpm mono" id="rf-input">-</span></div>
 </div>
 <div class="card">
@@ -255,7 +250,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="card-title">使用说明</div>
 <div class="text"><ol>
 <li>规则页点击「添加」，输入应用包名，可同时配置包级默认（可选）与多条线程规则后一次保存</li>
-<li>设置页可配置 cpuset 目录名、检查间隔与配置文件路径（仅 KPM 模式）</li>
+<li>设置页可配置 cpuset 目录名与配置文件路径（仅 KPM 模式）</li>
 <li>配置文件也可直接手工编辑，保存后自动热加载</li>
 <li>更多规则编写说明参考官网文档</li>
 </ol></div>
@@ -709,7 +704,6 @@ $('mc-ok').onclick=()=>{$('modal-confirm').hidden=true;confirmCb&&confirmCb()};
 async function loadCfg(){
   try{
     const d=await api('/api/config');
-    $('c-interval').value=d.interval;
     $('c-cpuset').value=d.cpuset_name;
     $('c-file').value=d.config_file;
     $('c-cpuset-on').textContent=d.cpuset_enabled?'已启用':'不可用';
@@ -719,7 +713,6 @@ async function saveField(body){
   try{await api('/api/config',body);toast('已保存');loadCfg()}
   catch(e){toast(e.message)}
 }
-$('c-interval-save').onclick=()=>saveField({interval:Math.max(1,+$('c-interval').value||0)});
 $('c-cpuset-save').onclick=()=>saveField({cpuset_name:$('c-cpuset').value.trim()});
 $('c-file-save').onclick=()=>saveField({config_file:$('c-file').value.trim()});
 
