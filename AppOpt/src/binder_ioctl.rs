@@ -17,24 +17,24 @@ pub(crate) fn log_diag(msg: &str) {
     }
 }
 
-// ================= ioctl 码 (arm64: dir<<30 | 'b'<<22 | nr<<14 | size) =================
-const BINDER_WRITE_READ: u32 = 0xc1884030;      // _IOWR('b',1,sizeof(bwr)=48)
-const BINDER_VERSION: u32 = 0xc1882404;         // _IOWR('b',9,4)
-const BINDER_SET_MAX_THREADS: u32 = 0x58814008; // _IOW('b',5,8)
+// ================= ioctl 码 (arm64 asm-generic: dir<<30 | type<<8 | nr<<0 | size<<16) =================
+const BINDER_WRITE_READ: u32 = 0xc0306201;      // _IOWR('b',1,sizeof(bwr)=48)
+const BINDER_VERSION: u32 = 0xc0046209;         // _IOWR('b',9,4)
+const BINDER_SET_MAX_THREADS: u32 = 0x40086205; // _IOW('b',5,8)
 
 // ================= binder 命令 (type 'c') =================
-const BC_TRANSACTION: u32 = 0x58c00040;
-const BC_FREE_BUFFER: u32 = 0x58c0c008;
-const BC_ENTER_LOOPER: u32 = 0x18c03000;
+const BC_TRANSACTION: u32 = 0x40406300;
+const BC_FREE_BUFFER: u32 = 0x40086303;
+const BC_ENTER_LOOPER: u32 = 0x630c;
 
-const BR_ERROR: u32 = 0x98c00004;
-const BR_TRANSACTION: u32 = 0x98c08040;
-const BR_REPLY: u32 = 0x98c0c040;
-const BR_ACQUIRE_RESULT: u32 = 0x98c10004;
-const BR_DEAD_REPLY: u32 = 0x18c14000;
-const BR_TRANSACTION_COMPLETE: u32 = 0x18c18000;
-const BR_FAILED_REPLY: u32 = 0x18c3c000;
-const BR_SPAWN_LOOPER: u32 = 0x18c2c000;
+const BR_ERROR: u32 = 0x80046300;
+const BR_TRANSACTION: u32 = 0x80406302;
+const BR_REPLY: u32 = 0x80406303;
+const BR_ACQUIRE_RESULT: u32 = 0x80046304;
+const BR_DEAD_REPLY: u32 = 0x6305;
+const BR_TRANSACTION_COMPLETE: u32 = 0x6306;
+const BR_FAILED_REPLY: u32 = 0x630f;
+const BR_SPAWN_LOOPER: u32 = 0x630b;
 
 // ================= flat_binder_object 类型 =================
 pub(crate) const BINDER_TYPE_BINDER: u32 = 1;
