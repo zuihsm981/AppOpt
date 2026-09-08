@@ -309,7 +309,7 @@ fn wake() {
     }
 }
 
-pub fn refresh_init() {
+pub fn refresh_init(display_modes: std::thread::JoinHandle<Vec<(u32, u32, u32, f32)>>) {
     let wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     if wake_fd < 0 {
         return;
@@ -327,8 +327,8 @@ pub fn refresh_init() {
     let (tx, rx) = mpsc::channel::<RefreshEvent>();
     *REFRESH_TX.lock().unwrap() = Some(tx);
 
-    // 初始化一次性解析 dumpsys display 的显示模式, 供检测/展示共用
-    let device_modes_raw = parse_display_modes();
+    // 初始化一次性解析 dumpsys display 的显示模式: 已在 L1 并发线程完成, join 取结果
+    let device_modes_raw = display_modes.join().unwrap_or_default();
     let mut state = RefreshState {
         timeout_seconds: 30,
         active_mode: MODE_120,
@@ -352,13 +352,13 @@ pub fn refresh_init() {
     load_global_config(&mut state);
     load_app_configs(&mut state);
 
-    // 初始化时先应用一次全局 active 刷新率；launcher 的全局绑定由 full_scan 事件完成。
-    let active = state.current_active;
-    set_refresh_rate(&mut state, active);
-
     let name = CString::new("RefreshRate").unwrap();
     thread::spawn(move || {
         unsafe { libc::pthread_setname_np(libc::pthread_self(), name.as_ptr()); }
+
+        // 初始化先应用一次全局 active 刷新率 (异步: 在后台线程执行 SF binder,
+        // 不阻塞主初始化; launcher 的全局绑定由 full_scan 事件完成)。
+        set_refresh_rate(&mut state, state.current_active);
 
         let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         if epfd < 0 {
@@ -612,7 +612,7 @@ pub fn refresh_get_status() -> Option<RefreshStatus> {
 /// 即: 只处理含 `DisplayMode{id=` 的行; 以 `,` `{` `}` 为分隔符切分整行;
 /// 取 `id=`/`width=`/`height=`/`peakRefreshRate=` 字段, 刷新率截断小数取整数 Hz。
 /// 另兼容部分 ROM 用 `refreshRate=`/`vsyncRate=`/`fps=` 字段 (优先 peakRefreshRate)。
-fn parse_display_modes() -> Vec<(u32, u32, u32, f32)> {
+pub(crate) fn parse_display_modes() -> Vec<(u32, u32, u32, f32)> {
     let out = match Command::new("dumpsys").arg("display").output() {
         Ok(o) if o.status.success() => o,
         _ => return Vec::new(),

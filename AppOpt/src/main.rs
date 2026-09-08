@@ -225,6 +225,9 @@ fn main() {
     // T4: packages.list inotify (返回 fd; 完成后线程退出)
     let pkg_inotify_thread = std::thread::spawn(crate::config::init_pkg_inotify);
 
+    // T5: dumpsys display 显示模式解析 (供 refresh_init; 完成后线程退出)
+    let display_modes_thread = std::thread::spawn(crate::refresh::parse_display_modes);
+
     // 应用设置持久化于 AppOpt.json，命令行参数优先覆盖
     let st = settings_load(SETTINGS_FILE);
     let config_file = match cli_cfg {
@@ -294,7 +297,7 @@ fn main() {
     let cpu_ready = crate::cpu_affinity::start(init_pids, marked);
 
     // 刷新率控制模块，独立线程运行 (binder 回调经主线程 uid 表 → FgPkg 消息驱动)
-    refresh::refresh_init();
+    refresh::refresh_init(display_modes_thread);
     // uid 静态表 (主线程): CPU 表 = 有 CPU 规则应用; 刷新率表 = launcher + 规则应用
     let mut cpu_uid: HashMap<i32, String> = HashMap::new();
     let mut rfr_uid: HashMap<i32, String> = HashMap::new();
