@@ -1,7 +1,6 @@
 //! IProcessObserver binder 回调 (手写 binder ioctl, 无 libbinder_ndk dlopen)。
 //! 前台回调经 socketpair(SOCK_DGRAM) 发 [pid, uid] 8 字节给主线程 EV_FG。
 
-use libc::c_int;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::binder_ioctl::{observer_node, push_i32, push_utf16, Binder};

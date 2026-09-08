@@ -6,9 +6,9 @@
 use libc::{c_int, c_void};
 
 // ================= ioctl 码 (arm64: dir<<30 | 'b'<<22 | nr<<14 | size) =================
-const BINDER_WRITE_READ: libc::c_ulong = 0xc1884030;      // _IOWR('b',1,sizeof(bwr)=48)
-const BINDER_VERSION: libc::c_ulong = 0xc1882404;         // _IOWR('b',9,4)
-const BINDER_SET_MAX_THREADS: libc::c_ulong = 0x58814008; // _IOW('b',5,8)
+const BINDER_WRITE_READ: u32 = 0xc1884030;      // _IOWR('b',1,sizeof(bwr)=48)
+const BINDER_VERSION: u32 = 0xc1882404;         // _IOWR('b',9,4)
+const BINDER_SET_MAX_THREADS: u32 = 0x58814008; // _IOW('b',5,8)
 
 // ================= binder 命令 (type 'c') =================
 const BC_TRANSACTION: u32 = 0x58c00040;
@@ -131,7 +131,7 @@ impl Binder {
             return None;
         }
         let mut ver: u32 = 0;
-        let r = unsafe { libc::ioctl(fd, BINDER_VERSION, &mut ver as *mut u32 as *mut c_void) };
+        let r = unsafe { libc::ioctl(fd, BINDER_VERSION as i32, &mut ver as *mut u32 as *mut c_void) };
         if r < 0 {
             unsafe { libc::close(fd) };
             return None;
@@ -153,7 +153,7 @@ impl Binder {
             return None;
         }
         let max_threads: u64 = 16;
-        unsafe { libc::ioctl(fd, BINDER_SET_MAX_THREADS, &max_threads as *const u64 as *const c_void) };
+        unsafe { libc::ioctl(fd, BINDER_SET_MAX_THREADS as i32, &max_threads as *const u64 as *const c_void) };
         Some(Binder {
             fd,
             map_base: map as *mut u8,
@@ -170,7 +170,7 @@ impl Binder {
             read_consumed: 0,
             read_buffer: rb.as_mut_ptr() as u64,
         };
-        let r = unsafe { libc::ioctl(self.fd, BINDER_WRITE_READ, &mut bwr as *mut BinderWriteRead as *mut c_void) };
+        let r = unsafe { libc::ioctl(self.fd, BINDER_WRITE_READ as i32, &mut bwr as *mut BinderWriteRead as *mut c_void) };
         if r < 0 {
             None
         } else {
@@ -195,7 +195,7 @@ impl Binder {
         if len > self.map_size as u64 {
             return None;
         }
-        Some(std::slice::from_raw_parts((base + ptr as usize) as *const u8, len as usize).to_vec())
+        Some(unsafe { std::slice::from_raw_parts((base + ptr as usize) as *const u8, len as usize).to_vec() })
     }
 
     /// 向 handle 发送同步事务; 返回 reply 的 (data, offsets)。
@@ -321,7 +321,7 @@ impl Binder {
                 if n == 0 {
                     break;
                 }
-                let rb = &rb[..n];
+                let rb = &rb[..n as usize];
                 let mut pos = 0usize;
                 while pos + 4 <= rb.len() {
                     let cmd = u32::from_le_bytes([rb[pos], rb[pos + 1], rb[pos + 2], rb[pos + 3]]);
@@ -468,7 +468,7 @@ fn raw_write_read(fd: c_int, wb: &[u8], rb: &mut [u8]) -> Option<i64> {
         read_consumed: 0,
         read_buffer: rb.as_mut_ptr() as u64,
     };
-    let r = unsafe { libc::ioctl(fd, BINDER_WRITE_READ, &mut bwr as *mut BinderWriteRead as *mut c_void) };
+    let r = unsafe { libc::ioctl(fd, BINDER_WRITE_READ as i32, &mut bwr as *mut BinderWriteRead as *mut c_void) };
     if r < 0 {
         None
     } else {
@@ -485,7 +485,7 @@ fn read_only(fd: c_int, rb: &mut [u8]) -> Option<i64> {
         read_consumed: 0,
         read_buffer: rb.as_mut_ptr() as u64,
     };
-    let r = unsafe { libc::ioctl(fd, BINDER_WRITE_READ, &mut bwr as *mut BinderWriteRead as *mut c_void) };
+    let r = unsafe { libc::ioctl(fd, BINDER_WRITE_READ as i32, &mut bwr as *mut BinderWriteRead as *mut c_void) };
     if r < 0 {
         None
     } else {
