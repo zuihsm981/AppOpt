@@ -106,6 +106,19 @@ fn ndk() -> Option<&'static BinderNdk> {
 const STATUS_OK: c_int = 0;
 const STATUS_UNKNOWN_TRANSACTION: c_int = -29;
 
+/// 经 cgroup 前台事件 (内核 cgroup_attach_task 探针) 注入 fg 通道:
+/// 与 binder 回调同格式 [pid, uid] 8 字节 → 主线程 EV_FG 复用冷热/ApplyPkg/刷新率逻辑
+pub(crate) fn send_fg_event(pid: i32, uid: i32) {
+    let fd = FG_SEND_FD.load(Ordering::Acquire);
+    if fd < 0 {
+        return;
+    }
+    let pkt = [pid, uid];
+    unsafe {
+        libc::send(fd, pkt.as_ptr() as *const libc::c_void, 8, 0);
+    }
+}
+
 // fg 事件经 socketpair(SOCK_DGRAM) 传递 pid+uid (8 字节); 主线程 EV_FG 分发
 static FG_SEND_FD: AtomicI32 = AtomicI32::new(-1);
 

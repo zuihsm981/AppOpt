@@ -344,7 +344,7 @@ pub(crate) fn proc_pid_set() -> HashSet<i32> {
 }
 
 /// /proc/<pid>/status 的有效 uid (Uid: 首值); 按 uid 枚举用
-fn proc_uid(pid: i32) -> Option<i32> {
+pub(crate) fn proc_uid(pid: i32) -> Option<i32> {
     let status = std::fs::read_to_string(format!("/proc/{}/status", pid)).ok()?;
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix("Uid:") {

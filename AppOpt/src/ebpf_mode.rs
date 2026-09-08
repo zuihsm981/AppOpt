@@ -15,7 +15,7 @@
 //!   - kprobe input_handle_event (1s 节流)
 //!   - kprobe sched_setaffinity (按 APPLIED bits 强制)
 //!   - APPLIED tid 表、mmap 共享 256KB 事件环
-//! 事件结构 EbpfProcEvent 与内核 appopt_proc_event_t 布局完全一致 (28B),
+//! 事件结构 EbpfProcEvent 与内核 appopt_proc_event_t 布局完全一致 (32B, 含 uid),
 //! event_dispatch/affinity 逻辑与原先保持一致。
 
 use std::ffi::CString;
@@ -33,6 +33,7 @@ use crate::config::AppConfig;
 pub struct EbpfProcEvent {
     pub pid: i32,
     pub tid: i32,
+    pub uid: i32,
     pub comm: [u8; 16],
     pub event_type: u32,
 }
@@ -64,7 +65,7 @@ pub const APPOPT_SHM_VERSION: u32 = 1;
 pub const APPOPT_SHM_HDR_SIZE: usize = 48; // size_of::<ShmRing>(), data[] 偏移
 pub const APPOPT_EVENT_RING_SIZE: u32 = 256 * 1024;
 pub const APPOPT_RING_MASK: u32 = APPOPT_EVENT_RING_SIZE - 1;
-pub const APPOPT_EVENT_SZ: u32 = 28; // size_of::<EbpfProcEvent>()
+pub const APPOPT_EVENT_SZ: u32 = 32; // size_of::<EbpfProcEvent>() (4+4+4+16+4)
 
 /* ================= KernelPatch SuperCall 传输 ================= */
 
@@ -490,11 +491,27 @@ pub fn set_input_hook(on: bool) {
 /// 事件派发 (input: 刷新率活动检测; EXIT: 规则应用主进程退出 → 清身份;
 /// CPU/刷新率主体由 binder 三线程驱动)
 pub const EBPF_EVENT_EXIT: u32 = 4;
+pub const EBPF_EVENT_FG: u32 = 6;
 pub fn event_dispatch(event: &EbpfProcEvent, _cfg: &AppConfig, _state: &mut EbpfState) {
     // CPU 亲和性已由 binder 触发的 CpuAffinity 模块负责 (cpu_affinity.rs):
     // 进程事件不驱动 CPU 逻辑; input 仅用于刷新率活动检测。
     if event.event_type == EBPF_EVENT_INPUT {
         crate::refresh::refresh_on_event(EBPF_EVENT_INPUT, 0);
+    } else if event.event_type == EBPF_EVENT_FG {
+        // cgroup 前台切换 (内核已过滤 top-app/foreground): 获取应用 pid + uid,
+        // 复用 binder fg 通道 → 主线程 EV_FG 冷热/ApplyPkg/刷新率逻辑
+        let pid = event.pid;
+        let uid = if event.uid > 0 { event.uid } else { crate::cpu_affinity::proc_uid(pid).unwrap_or(0) };
+        // 临时验证日志
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/data/local/tmp/appopt_cgroup.log")
+        {
+            let _ = writeln!(f, "[{:?}] cgroup_fg pid={} uid={}", std::time::SystemTime::now(), pid, uid);
+        }
+        crate::process_observer::send_fg_event(pid, uid);
     } else if event.event_type == EBPF_EVENT_EXIT && event.tid == event.pid {
         // 规则应用主进程退出 (内核已按 APPLIED+主进程标记过滤非规则应用/非主进程):
         // 清除该 uid 的 pid 列表与 cpu_known 身份, 并按 uid 通知 CPU worker 清除该
