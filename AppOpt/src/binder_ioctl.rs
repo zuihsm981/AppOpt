@@ -27,14 +27,14 @@ const BC_TRANSACTION: u32 = 0x40406300;
 const BC_FREE_BUFFER: u32 = 0x40086303;
 const BC_ENTER_LOOPER: u32 = 0x630c;
 
-const BR_ERROR: u32 = 0x80046300;
-const BR_TRANSACTION: u32 = 0x80406302;
-const BR_REPLY: u32 = 0x80406303;
-const BR_ACQUIRE_RESULT: u32 = 0x80046304;
-const BR_DEAD_REPLY: u32 = 0x6305;
-const BR_TRANSACTION_COMPLETE: u32 = 0x6306;
-const BR_FAILED_REPLY: u32 = 0x630f;
-const BR_SPAWN_LOOPER: u32 = 0x630b;
+const BR_ERROR: u32 = 0x80047200;
+const BR_TRANSACTION: u32 = 0x80407202;
+const BR_REPLY: u32 = 0x80407203;
+const BR_ACQUIRE_RESULT: u32 = 0x80047204;
+const BR_DEAD_REPLY: u32 = 0x7205;
+const BR_TRANSACTION_COMPLETE: u32 = 0x7206;
+const BR_FAILED_REPLY: u32 = 0x720f;
+const BR_SPAWN_LOOPER: u32 = 0x720b;
 
 // ================= flat_binder_object 类型 =================
 pub(crate) const BINDER_TYPE_BINDER: u32 = 1;
