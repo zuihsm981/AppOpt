@@ -27,6 +27,18 @@ use std::thread;
 use crate::apply_affinity::tid_comm;
 use crate::config::AppConfig;
 
+/// 连接诊断日志 (临时): /data/local/tmp/appopt_conn.log + stderr
+fn conn_log(msg: &str) {
+    use std::io::Write;
+    eprintln!("[appopt_conn] {}", msg);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true).append(true)
+        .open("/data/local/tmp/appopt_conn.log")
+    {
+        let _ = writeln!(f, "[{:?}] {}", std::time::SystemTime::now(), msg);
+    }
+}
+
 /// eBPF 进程事件, 布局需与内核态 appopt_proc_event_t 完全一致 (28B)
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -261,13 +273,16 @@ pub fn kpm_probe() -> bool {
 pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
     let key = kpm_key();
     if !kp_ready(&key) {
+        conn_log("ebpf_init: kp_ready=false (KP/superkey 不可用)");
         return None;
     }
 
     let handle = KpmHandle { key };
     if !handle.verify_loaded() {
+        conn_log("ebpf_init: verify_loaded=false (ping 失败, 模块未加载?)");
         return None;
     }
+    conn_log("ebpf_init: ping OK");
 
     // 配置 input 节流 (与 eBPF 默认 1s 一致)
     handle.cmd("input_ms 1000");
@@ -275,10 +290,13 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
     // ---- 建立事件传输通道: mmap 共享环 + eventfd 通知 (仅此一种, 无 drain 回退) ----
     let evt_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     if evt_fd < 0 {
+        conn_log(&format!("ebpf_init: eventfd 创建失败 errno={}", std::io::Error::last_os_error()));
         return None;
     }
+    conn_log(&format!("ebpf_init: evt_fd={}", evt_fd));
     // ctl0 shm_open: 绑定 evt_fd(通知端) + 在当前进程安装可 mmap 的 anon fd
     let shm_fd = handle.shm_open(evt_fd);
+    conn_log(&format!("ebpf_init: shm_open -> {}", shm_fd));
     if shm_fd < 0 || shm_fd > i64::from(i32::MAX) {
         unsafe { libc::close(evt_fd); }
         return None;
@@ -298,10 +316,12 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
         )
     };
     if shm_base == libc::MAP_FAILED {
+        conn_log(&format!("ebpf_init: mmap 失败 errno={}", std::io::Error::last_os_error()));
         unsafe { libc::close(evt_fd); }
         unsafe { libc::close(shm_fd); }
         return None;
     }
+    conn_log("ebpf_init: mmap OK");
     {
         let hdr = shm_base as *const ShmRing;
         let ok = unsafe {
@@ -311,6 +331,13 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
                 && (*hdr).ring_size == APPOPT_EVENT_RING_SIZE
         };
         if !ok {
+            unsafe {
+                conn_log(&format!(
+                    "ebpf_init: 共享环头校验失败 magic={:08x}(需{:08x}) ver={}(需{}) esz={}(需{}) rsz={}(需{})",
+                    (*hdr).magic, APPOPT_SHM_MAGIC, (*hdr).version, APPOPT_SHM_VERSION,
+                    (*hdr).event_size, APPOPT_EVENT_SZ, (*hdr).ring_size, APPOPT_EVENT_RING_SIZE,
+                ));
+            }
             unsafe { libc::munmap(shm_base, map_len); }
             unsafe { libc::close(evt_fd); }
             unsafe { libc::close(shm_fd); }
@@ -322,6 +349,7 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
     let (tx, rx) = mpsc::channel::<EbpfProcEvent>();
     let wakeup_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     if wakeup_fd < 0 {
+        conn_log("ebpf_init: wakeup eventfd 创建失败");
         unsafe { libc::munmap(shm_base, map_len); }
         unsafe { libc::close(evt_fd); }
         unsafe { libc::close(shm_fd); }
@@ -338,6 +366,7 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
     });
 
     handle.activate();
+    conn_log("ebpf_init: OK (reader 已启动, 事件通道建立)");
 
     Some(EbpfState {
         event_rx: rx,
