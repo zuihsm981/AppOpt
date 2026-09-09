@@ -29,7 +29,7 @@ use crate::config::{
 };
 use crate::cpuset::{init_cpu_topo, set_base_cpuset};
 use crate::ebpf_mode::{
-    full_scan, event_dispatch, ebpf_init, EbpfState,
+    event_dispatch, ebpf_init, EbpfState,
 };
 use crate::web::{
     settings_load, settings_save, web_start, SETTINGS_FILE,
@@ -396,9 +396,24 @@ fn main() {
     }
 
     /// KPM 全量归因扫描 + 亲和性全量应用 (配置变更/重连共用)
-    fn kpm_full_apply(cfg: &crate::config::AppConfig, es: &mut EbpfState) {
-        full_scan(cfg, es);
-        crate::cpu_affinity::apply_all_now();
+    fn kpm_full_apply(_cfg: &crate::config::AppConfig, _es: &mut EbpfState) {
+        // 规则编辑保存路径: 只对最近变更包单包重放亲和性 (避免改一个应用 →
+        // apply_all_now 全量重放所有规则应用); 启动/整体重载等无变更包 → 全量。
+        // 按编辑粒度重放: 单线程编辑 → 只重放该线程; 整包编辑 → 只重放该包;
+        // 无记录 (启动/整体重载) → 全量
+        match crate::web::last_rule_take() {
+            Some((pkg, Some(thread))) => {
+                if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
+                    let _ = tx.send(crate::cpu_affinity::CpuMsg::ApplyThread(pkg, thread));
+                }
+            }
+            Some((pkg, None)) => {
+                if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
+                    let _ = tx.send(crate::cpu_affinity::CpuMsg::ApplyPkgByName(pkg));
+                }
+            }
+            None => crate::cpu_affinity::apply_all_now(),
+        }
     }
 
     /// uid 表重建: 按 cpu_changed/包集合变化决定 (reload_config 共用)
@@ -445,11 +460,7 @@ fn main() {
     epoll_add(epfd, pkg_inotify_fd, EV_PKG);
 
     // 初始全量应用 (KPM 已由并发 T2 线程加载并激活, ebpf_state 已 join 就绪)
-    if let Some(cfg) = rw_read_ignore_poison(&CURRENT_CONFIG).clone() {
-        if let Some(es) = ebpf_state.as_mut() {
-            full_scan(&cfg, es);
-        }
-    }
+    // 刷新率全局初始 active 已由 refresh_init 应用; launcher 前台由 FgPkg 包名驱动。
     if cpu_ready && ebpf_state.is_some() {
         crate::cpu_affinity::apply_all_now();
     }
@@ -585,10 +596,10 @@ fn main() {
                                 // EXIT 事件驱动 (ebpf_mode::event_dispatch); 冷时仅重发
                                 // ApplyPkg, CPU 线程枚举后覆盖写回新身份
                                 if !crate::cpu_affinity::cpu_known_is_hot(uid, pid) {
-                                    // 4.19 用户态模式 (无 KPM/CPU worker): 记录主 pid 身份 +
-                                    // 注册用户态退出监听 (KPM 模式由内核 EXIT 驱动, 跳过)
+                                    // 身份记录/枚举/亲和性统一经 ApplyPkg → CPU worker 回写
+                                    // CPU_KNOWN(uid,(主pid,全部pids))。用户态退出监听仅 4.19
+                                    // (KPM 模式由内核 EXIT 驱动)。
                                     if !crate::web::KPM_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
-                                        crate::cpu_affinity::cpu_known_set_main(uid, pid);
                                         crate::exit_probe::watch(pid);
                                     }
                                     if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
@@ -682,9 +693,6 @@ fn main() {
             ebpf_state = None;
             crate::web::KPM_ACTIVE.store(false, Ordering::Relaxed);
             if let Some(mut es) = ebpf_init(kpm_wake_fd, drive_mode.clone()) {
-                if let Some(cfg) = cfg.as_ref() {
-                    full_scan(cfg, &mut es);
-                }
                 crate::web::KPM_ACTIVE.store(true, Ordering::Relaxed);
                 ebpf_state = Some(es);
                 if cpu_ready {

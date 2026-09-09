@@ -3,7 +3,7 @@
 //! 进程退出即 epoll 唤醒, 防 PID 复用误判。纯用户态、事件驱动、零轮询、
 //! 零内核模块。watch() 由主线程在 EV_FG 冷启动时为规则应用主 pid 注册;
 //! 退出时经 socketpair 通知主线程清理该 uid 身份。pidfd_open 不可用时跳过
-//! (退出清理由既有周期 /proc 扫描兜底)。
+//! (仅接受退出监听退化, 不做替代机制)。
 
 use std::collections::HashMap;
 use std::ffi::CString;

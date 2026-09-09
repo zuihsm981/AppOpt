@@ -339,8 +339,12 @@ fn rule_api(req: &Request) -> (u16, String) {
     }
 
     let file = lock_ignore_poison(&CONFIG_FILE).clone();
+    // only_thread=true (前端单线程规则编辑): 只重放该线程; 否则整包重放
+    let only_thread = v["only_thread"].as_bool().unwrap_or(false);
+    let last_thread = if only_thread { thread } else { None };
     match rule_upsert(&file, pkg, thread, cpus) {
         RuleEdit::Ok => {
+            set_last_rule(pkg, last_thread);
             config_reload_now();
             (200, json!({ "ok": true }).to_string())
         }
@@ -364,6 +368,7 @@ fn rule_del_api(req: &Request) -> (u16, String) {
     };
     match result {
         RuleEdit::Ok => {
+            set_last_rule(pkg, None);
             config_reload_now();
             (200, json!({ "ok": true }).to_string())
         }
@@ -394,6 +399,27 @@ fn rule_rename_api(req: &Request) -> (u16, String) {
     let file = lock_ignore_poison(&CONFIG_FILE).clone();
     match rule_rename(&file, old, new) {
         RuleEdit::Ok => {
+            // 联动: 同一配置文件内的刷新率配置行 old=refresh-* → new=refresh-*
+            // (刷新率与规则同文件, 规则改名后刷新率行必须同步, 否则残留旧包名)
+            let content = fs::read_to_string(&file).unwrap_or_default();
+            let mut changed = false;
+            let new_lines: Vec<String> = content
+                .lines()
+                .map(|l| {
+                    let t = l.trim();
+                    if let Some((k, v)) = t.split_once('=') {
+                        if k.trim() == old && v.trim_start().starts_with("refresh-") {
+                            changed = true;
+                            return format!("{}={}", new, v.trim());
+                        }
+                    }
+                    l.to_string()
+                })
+                .collect();
+            if changed {
+                let _ = crate::config::save_config_lines(&file, &new_lines);
+            }
+            set_last_rule(new, None);
             config_reload_now();
             (200, json!({ "ok": true }).to_string())
         }
@@ -561,6 +587,19 @@ fn config_set_api(req: &Request) -> (u16, String) {
 pub const SETTINGS_FILE: &str = "./AppOpt.json";
 
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
+
+/// 最近一次规则编辑的 (包名, 线程名?): 规则保存后 reload 时主线程按粒度重放 —
+/// Some(thread) → 只重放该线程; None → 整包重放; 无记录 → 全量。
+/// 避免"改一个应用 → apply_all_now 全量重放所有规则应用"的放大。
+static LAST_RULE: Mutex<Option<(String, Option<String>)>> = Mutex::new(None);
+
+pub fn last_rule_take() -> Option<(String, Option<String>)> {
+    lock_ignore_poison(&LAST_RULE).take()
+}
+
+fn set_last_rule(pkg: &str, thread: Option<&str>) {
+    *lock_ignore_poison(&LAST_RULE) = Some((pkg.to_string(), thread.map(str::to_string)));
+}
 
 /// 驱动模式全局: "auto"(默认) / "kpm" / "userspace"
 static DRIVE_MODE: Mutex<String> = Mutex::new(String::new());

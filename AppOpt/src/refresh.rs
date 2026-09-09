@@ -48,8 +48,6 @@ pub struct RefreshStatus {
 
 enum RefreshEvent {
     Input,
-    /// full_scan 发现已存在的默认桌面后，要求刷新线程绑定全局配置。
-    BindDefaultLauncher,
     /// 主线程判定前台 uid 命中刷新率表后, 下发包名应用刷新率
     FgPkg(String),
 }
@@ -134,14 +132,6 @@ fn set_refresh_rate(state: &mut RefreshState, mode: i32) {
     // 只走 binder 直连 SurfaceFlinger，不再回退到 service 子进程
     crate::process_observer::set_refresh_rate_binder(arg);
     state.current_applied_mode = mode;
-}
-
-fn bind_default_launcher(state: &mut RefreshState) {
-    state.current_package = crate::config::DEFAULT_REFRESH_PACKAGE.to_string();
-    // 默认 launcher 永远使用全局 timeout/active/idle。
-    apply_app_config(state, crate::config::DEFAULT_REFRESH_PACKAGE);
-    set_refresh_rate(state, state.current_active);
-    reset_timer(state, true);
 }
 
 fn apply_app_config(state: &mut RefreshState, pkg: &str) {
@@ -357,7 +347,7 @@ pub fn refresh_init(display_modes: std::thread::JoinHandle<Vec<(u32, u32, u32, f
         unsafe { libc::pthread_setname_np(libc::pthread_self(), name.as_ptr()); }
 
         // 初始化先应用一次全局 active 刷新率 (异步: 在后台线程执行 SF binder,
-        // 不阻塞主初始化; launcher 的全局绑定由 full_scan 事件完成)。
+        // 不阻塞主初始化; launcher 的全局绑定由 init 时 marked 标记完成)。
         let active = state.current_active;
         set_refresh_rate(&mut state, active);
 
@@ -395,9 +385,6 @@ pub fn refresh_init(display_modes: std::thread::JoinHandle<Vec<(u32, u32, u32, f
                         while let Ok(event) = rx.try_recv() {
                             match event {
                                 RefreshEvent::Input => handle_input(&mut state),
-                                RefreshEvent::BindDefaultLauncher => {
-                                    bind_default_launcher(&mut state)
-                                }
                                 RefreshEvent::FgPkg(pkg) => {
                                     try_apply_fg_pkg(&mut state, &pkg);
                                 }
@@ -429,15 +416,6 @@ pub fn refresh_send_fg_pkg(pkg: String) {
     let guard = REFRESH_TX.lock().unwrap();
     if let Some(tx) = guard.as_ref() {
         let _ = tx.send(RefreshEvent::FgPkg(pkg));
-        wake();
-    }
-}
-
-/// full_scan 发现默认 launcher PID 后，请求刷新线程绑定全局配置。
-pub fn refresh_bind_default_launcher() {
-    let guard = REFRESH_TX.lock().unwrap();
-    if let Some(tx) = guard.as_ref() {
-        let _ = tx.send(RefreshEvent::BindDefaultLauncher);
         wake();
     }
 }

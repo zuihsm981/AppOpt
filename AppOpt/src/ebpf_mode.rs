@@ -584,19 +584,3 @@ pub fn event_dispatch(event: &EbpfProcEvent, _cfg: &AppConfig, _state: &mut Ebpf
 }
 
 /// 启动或配置更新时全量扫描 /proc
-pub fn full_scan(_cfg: &AppConfig, _state: &mut EbpfState) {
-    // CPU 亲和性已由 binder 触发的 CpuAffinity 模块负责 (cpu_affinity.rs),
-    // 此处仅保留默认桌面进程绑定 (刷新率全局配置入口)。
-    let mut launcher_found = false;
-    if let Ok(entries) = std::fs::read_dir("/proc") {
-        for entry in entries.flatten() {
-            let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else { continue };
-            if tid_comm(pid).as_deref() == Some(crate::config::DEFAULT_REFRESH_COMM) {
-                launcher_found = true;
-            }
-        }
-    }
-    if launcher_found {
-        crate::refresh::refresh_bind_default_launcher();
-    }
-}

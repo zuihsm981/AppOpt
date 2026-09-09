@@ -40,6 +40,10 @@ pub enum CpuMsg {
     EvictUid(i32),
     /// 全量应用 (启动 / 配置变更)
     ApplyAll,
+    /// 单包重放 (整包规则编辑保存): 只对该包枚举 pid + 重设亲和, 不做全量
+    ApplyPkgByName(String),
+    /// 单线程重放 (单线程规则编辑保存): 只对该包中 comm==thread 的 tid 设亲和
+    ApplyThread(String, String),
 }
 
 /// 全局投递通道: 主线程 (main EV_FG) 转发前台回调 → CpuMsg 消息
@@ -60,17 +64,6 @@ pub fn cpu_known_is_hot(uid: i32, pid: i32) -> bool {
     crate::rw_read_ignore_poison(&CPU_KNOWN)
         .get(&uid)
         .is_some_and(|(p, _)| *p == pid)
-}
-
-/// 用户态模式 (4.19, 无 KPM/CPU worker): 前台冷启动时记录 uid 主 pid 身份,
-/// 供冷热判断与退出清理 (evict_by_pid)。已有完整 pids 时以 or_insert 保留。
-pub fn cpu_known_set_main(uid: i32, pid: i32) {
-    if uid <= 0 || pid <= 0 {
-        return;
-    }
-    crate::rw_write_ignore_poison(&CPU_KNOWN)
-        .entry(uid)
-        .or_insert((pid, Vec::new()));
 }
 
 /// 清除某 uid 的 pid 列表与 cpu_known 身份
@@ -158,6 +151,31 @@ impl CpuAffinity {
 
     /// 按 uid 枚举该应用全部进程 (主 + pkg: 子进程同 uid) → 应用全部线程。
     /// uid 即应用身份: 精确、无 cmdline 归因竞态、多用户下不误捞其他实例。
+    /// 包名 → uid (单包重放用): 优先标记目录 pid, 否则遍历 /proc 匹配 cmdline
+    fn pkg_to_uid(&self, pkg: &str) -> Option<i32> {
+        if let Some(pids) = self.marked.get(pkg) {
+            if let Some(&p) = pids.first() {
+                if let Some(u) = proc_uid(p) {
+                    return Some(u);
+                }
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir("/proc") {
+            for e in entries.flatten() {
+                let Ok(p) = e.file_name().to_string_lossy().parse::<i32>() else { continue };
+                if p <= 0 || self.init_pids.contains(&p) {
+                    continue;
+                }
+                if crate::apply_affinity::read_cmdline(p).as_deref() == Some(pkg) {
+                    if let Some(u) = proc_uid(p) {
+                        return Some(u);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn on_uid(&mut self, uid: i32, pkg: &str, cfg: &AppConfig) -> Vec<i32> {
         if uid <= 0 {
             return Vec::new();
@@ -275,6 +293,52 @@ impl CpuAffinity {
                         self.uid_pkg.insert(uid, pkg.clone());
                     }
                 }
+                Ok(CpuMsg::ApplyPkgByName(pkg)) => {
+                    // 单包重放: 找该包当前 uid → 枚举该 uid 全部 pid → 重设亲和 + 回写身份
+                    let cfg = crate::rw_read_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
+                    if let Some(cfg) = cfg {
+                        if let Some(uid) = self.pkg_to_uid(&pkg) {
+                            let pids = self.on_uid(uid, &pkg, &cfg);
+                            if let Some(&main_pid) = pids.first() {
+                                crate::rw_write_ignore_poison(&CPU_KNOWN)
+                                    .insert(uid, (main_pid, pids.clone()));
+                            }
+                            crate::rw_write_ignore_poison(&PROC_SNAPSHOT).insert(uid, pids);
+                            self.uid_pkg.insert(uid, pkg.clone());
+                        }
+                    }
+                }
+                Ok(CpuMsg::ApplyThread(pkg, thread)) => {
+                    // 单线程重放: 找该包 uid → 枚举该 uid 各 pid 的 task, 收集
+                    // comm==thread 的 tid → 只对这些 tid 应用亲和 (apply_tids 按规则匹配)
+                    let cfg = crate::rw_read_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
+                    if let Some(cfg) = cfg {
+                        if let Some(uid) = self.pkg_to_uid(&pkg) {
+                            let mut tids: Vec<i32> = Vec::new();
+                            if let Ok(entries) = std::fs::read_dir("/proc") {
+                                for e in entries.flatten() {
+                                    let Ok(p) = e.file_name().to_string_lossy().parse::<i32>() else { continue };
+                                    if p <= 0 || self.init_pids.contains(&p) {
+                                        continue;
+                                    }
+                                    if proc_uid(p) != Some(uid) {
+                                        continue;
+                                    }
+                                    for t in crate::apply_affinity::task_tids(p).unwrap_or_default() {
+                                        if crate::apply_affinity::tid_comm(t).as_deref()
+                                            == Some(thread.as_str())
+                                        {
+                                            tids.push(t);
+                                        }
+                                    }
+                                }
+                            }
+                            if !tids.is_empty() {
+                                self.apply_tids(&tids, &pkg, &cfg);
+                            }
+                        }
+                    }
+                }
                 Ok(CpuMsg::EvictUid(uid)) => {
                     // 主进程退出 (EXIT 事件): 按 uid 找到该应用包名, 清除 managed 中
                     // 全部线程条目 → 立即发布统计 (web 命中归零)。不依赖主线程 tid
@@ -298,11 +362,9 @@ pub fn start(init_pids: HashSet<i32>, marked: HashMap<String, Vec<i32>>) -> bool
     if CPU_FG_TX.get().is_some() {
         return true;
     }
-    // 校验 KPM 可 ping
-    let probe = KpmHandle::new();
-    if !probe.verify_loaded() {
-        return false;
-    }
+    // 用户态与 KPM 模式统一启动 CPU worker: 身份记录/进程枚举/亲和性施加全部经
+    // ApplyPkg 消息驱动; KPM 不可用时 bpf ctl0 调用仅失败无副作用 (用户态由
+    // apply_affinity::affinity_set 真正施加 sched_setaffinity)。
     let (tx, rx) = mpsc::channel::<CpuMsg>();
     let _ = CPU_FG_TX.set(Mutex::new(tx));
     // init_pids/marked 由 main.rs 在 AppOpt 初始化时构建传入
