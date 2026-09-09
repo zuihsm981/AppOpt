@@ -183,6 +183,25 @@ impl Binder {
         }
     }
 
+    /// 带超时的 write_read: poll(fd, POLLIN, 3s) 后再 ioctl; 避免同步 read 永久阻塞。
+    fn write_read_timeout(&self, wb: &[u8], rb: &mut [u8]) -> Option<BinderWriteRead> {
+        let mut pfd = libc::pollfd {
+            fd: self.fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // 先小读一次 (write 侧命令被处理 + BR_TRANSACTION_COMPLETE 会立刻可读)
+        // 若 3s 内无任何数据才放弃
+        let pr = unsafe { libc::poll(&mut pfd, 1, 3000) };
+        if pr < 0 {
+            return None;
+        }
+        if pr == 0 {
+            return None; // 超时
+        }
+        self.write_read(wb, rb)
+    }
+
     fn free_buffer(&self, ptr: u64) {
         let mut wb = Vec::with_capacity(12);
         wb.extend_from_slice(&BC_FREE_BUFFER.to_le_bytes());
@@ -227,7 +246,14 @@ impl Binder {
         wb.extend_from_slice(&unsafe { std::mem::transmute::<BinderTransactionData, [u8; 64]>(tr) });
 
         let mut rb = vec![0u8; 16384];
-        let bwr = self.write_read(&wb, &mut rb)?;
+        // 超时保护: 同步 read 若无回复会永远阻塞 (某些事务码 servicemanager 不回复)
+        let bwr = match self.write_read_timeout(&wb, &mut rb) {
+            Some(b) => b,
+            None => {
+                log_diag(&format!("binder: transact handle={} code={} 超时/ioctl失败", handle, code));
+                return None;
+            }
+        };
         let n = bwr.read_consumed as usize;
         if n == 0 {
             log_diag(&format!("binder: transact handle={} code={} read_consumed=0 (无回复)", handle, code));
@@ -300,6 +326,21 @@ impl Binder {
         push_i32(&mut data, 0); // this binder token
         push_utf16(&mut data, "android.os.IServiceManager");
         push_utf16(&mut data, name);
+
+        // legacy 'S'(0x53) / 'C'(0x43) 带完整 token (某些版本 legacy 也过 enforceInterface)
+        for code in [0x53u32, 0x43] {
+            log_diag(&format!("binder: get_service({}) try legacy token code={:#x}", name, code));
+            match self.transact_sync(SVC_MGR_HANDLE, code, &data, &[]) {
+                Some((reply, _)) => {
+                    log_diag(&format!("binder:   code={:#x} reply len={} hex={:02x?}", code, reply.len(), &reply[..reply.len().min(32)]));
+                    if let Some(h) = Self::parse_service_handle(&reply) {
+                        log_diag(&format!("binder: get_service({}) code={:#x} handle={}", name, code, h));
+                        return Some(h);
+                    }
+                }
+                None => log_diag(&format!("binder:   code={:#x} txn FAIL/超时", code)),
+            }
+        }
 
         for code in [1u32, 2, 3, 4] {
             log_diag(&format!("binder: get_service({}) try AIDL code={}", name, code));
