@@ -296,8 +296,8 @@ impl Binder {
             let pr = unsafe { libc::poll(&mut pfd, 1, 300) };
             if pr > 0 {
                 let mut rb_buf2 = vec![0u8; 16384];
-                if let Some(bwr2) = read_only(self.fd, &mut rb_buf2) {
-                    let n2 = bwr2.read_consumed as usize;
+                if let Some(n2_i) = read_only(self.fd, &mut rb_buf2) {
+                    let n2 = n2_i as usize;
                     if n2 > 0 {
                         rb.extend_from_slice(&rb_buf2[..n2]);
                     }
