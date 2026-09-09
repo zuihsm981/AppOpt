@@ -122,7 +122,7 @@ impl Binder {
         let fd = unsafe {
             libc::open(
                 b"/dev/binder\0".as_ptr() as *const libc::c_char,
-                libc::O_RDWR | libc::O_CLOEXEC,
+                libc::O_RDWR | libc::O_CLOEXEC | libc::O_NONBLOCK,
             )
         };
         if fd < 0 {
@@ -183,25 +183,6 @@ impl Binder {
         }
     }
 
-    /// 带超时的 write_read: poll(fd, POLLIN, 3s) 后再 ioctl; 避免同步 read 永久阻塞。
-    fn write_read_timeout(&self, wb: &[u8], rb: &mut [u8]) -> Option<BinderWriteRead> {
-        let mut pfd = libc::pollfd {
-            fd: self.fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // 先小读一次 (write 侧命令被处理 + BR_TRANSACTION_COMPLETE 会立刻可读)
-        // 若 3s 内无任何数据才放弃
-        let pr = unsafe { libc::poll(&mut pfd, 1, 3000) };
-        if pr < 0 {
-            return None;
-        }
-        if pr == 0 {
-            return None; // 超时
-        }
-        self.write_read(wb, rb)
-    }
-
     fn free_buffer(&self, ptr: u64) {
         let mut wb = Vec::with_capacity(12);
         wb.extend_from_slice(&BC_FREE_BUFFER.to_le_bytes());
@@ -245,68 +226,82 @@ impl Binder {
         };
         wb.extend_from_slice(&unsafe { std::mem::transmute::<BinderTransactionData, [u8; 64]>(tr) });
 
-        let mut rb = vec![0u8; 16384];
-        // 超时保护: 同步 read 若无回复会永远阻塞 (某些事务码 servicemanager 不回复)
-        let bwr = match self.write_read_timeout(&wb, &mut rb) {
-            Some(b) => b,
-            None => {
-                log_diag(&format!("binder: transact handle={} code={} 超时/ioctl失败", handle, code));
-                return None;
-            }
-        };
-        let n = bwr.read_consumed as usize;
-        if n == 0 {
-            log_diag(&format!("binder: transact handle={} code={} read_consumed=0 (无回复)", handle, code));
-            return None;
-        }
-        let rb = &rb[..n];
-        log_diag(&format!("binder: transact handle={} code={} read n={} cmds={:08x?}", handle, code, n,
-            rb.chunks_exact(4).take(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect::<Vec<_>>()));
-        let mut pos = 0usize;
+        // 非阻塞收发: 先发 BC_TRANSACTION, 再 poll(可读)+read 累积直到 BR_REPLY 或 3s 超时
+        let mut rb: Vec<u8> = Vec::new();
         let mut free_ptrs: Vec<u64> = Vec::new();
         let mut result: Option<(Vec<u8>, Vec<u64>)> = None;
-        while pos + 4 <= rb.len() {
-            let cmd = u32::from_le_bytes([rb[pos], rb[pos + 1], rb[pos + 2], rb[pos + 3]]);
-            pos += 4;
-            match cmd {
-                BR_TRANSACTION_COMPLETE | BR_SPAWN_LOOPER => {}
-                BR_DEAD_REPLY | BR_FAILED_REPLY => {
-                    log_diag(&format!("binder: transact handle={} code={} -> {:x}", handle, code, cmd));
-                    for p in &free_ptrs {
-                        self.free_buffer(*p);
-                    }
-                    return None;
-                }
-                BR_REPLY => {
-                    if pos + 64 > rb.len() {
-                        break;
-                    }
-                    let tr: BinderTransactionData =
-                        unsafe { std::ptr::read_unaligned(rb[pos..pos + 64].as_ptr() as *const BinderTransactionData) };
-                    pos += 64;
-                    let (dsz, osz, bptr, optr) =
-                        unsafe { (tr.data_size, tr.offsets_size, tr.data.ptr.buffer, tr.data.ptr.offsets) };
-                    if bptr != 0 {
-                        free_ptrs.push(bptr);
-                    }
-                    let rdata = unsafe { self.read_mapped(bptr, dsz) };
-                    let roffs = if osz > 0 {
-                        unsafe { self.read_mapped(optr, osz) }
-                            .map(|b| b.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect())
-                    } else {
-                        Some(Vec::new())
-                    };
-                    if let (Some(d), Some(o)) = (rdata, roffs) {
-                        result = Some((d, o));
-                    }
-                }
-                BR_ERROR | BR_ACQUIRE_RESULT => {
-                    pos += 4;
-                }
-                _ => {}
+        let mut failed: bool = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+
+        let mut rb_buf = vec![0u8; 16384];
+        if let Some(bwr) = self.write_read(&wb, &mut rb_buf) {
+            let n = bwr.read_consumed as usize;
+            if n > 0 {
+                rb.extend_from_slice(&rb_buf[..n]);
             }
-            if result.is_some() {
+        }
+        loop {
+            // 解析 rb 中已累积的命令
+            let mut pos = 0usize;
+            while pos + 4 <= rb.len() {
+                let cmd = u32::from_le_bytes([rb[pos], rb[pos + 1], rb[pos + 2], rb[pos + 3]]);
+                match cmd {
+                    BR_TRANSACTION_COMPLETE | BR_SPAWN_LOOPER => { pos += 4; }
+                    BR_DEAD_REPLY | BR_FAILED_REPLY => {
+                        log_diag(&format!("binder: transact handle={} code={} -> {:x}", handle, code, cmd));
+                        failed = true;
+                        pos += 4;
+                    }
+                    BR_REPLY => {
+                        if pos + 4 + 64 > rb.len() {
+                            break; // BR_REPLY 数据未到齐, 等更多
+                        }
+                        let tr: BinderTransactionData = unsafe {
+                            std::ptr::read_unaligned(rb[pos + 4..pos + 4 + 64].as_ptr() as *const BinderTransactionData)
+                        };
+                        pos += 4 + 64;
+                        let (dsz, osz, bptr, optr) =
+                            unsafe { (tr.data_size, tr.offsets_size, tr.data.ptr.buffer, tr.data.ptr.offsets) };
+                        if bptr != 0 {
+                            free_ptrs.push(bptr);
+                        }
+                        let rdata = unsafe { self.read_mapped(bptr, dsz) };
+                        let roffs = if osz > 0 {
+                            unsafe { self.read_mapped(optr, osz) }
+                                .map(|b| b.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect())
+                        } else {
+                            Some(Vec::new())
+                        };
+                        if let (Some(d), Some(o)) = (rdata, roffs) {
+                            result = Some((d, o));
+                        }
+                    }
+                    BR_ERROR | BR_ACQUIRE_RESULT => { pos += 4; }
+                    _ => { pos += 4; }
+                }
+                if result.is_some() || failed {
+                    break;
+                }
+            }
+            rb.drain(..pos);
+            if result.is_some() || failed {
                 break;
+            }
+            if std::time::Instant::now() >= deadline {
+                log_diag(&format!("binder: transact handle={} code={} 等待回复超时", handle, code));
+                break;
+            }
+            // poll 可读后再 read (非阻塞 fd)
+            let mut pfd = libc::pollfd { fd: self.fd, events: libc::POLLIN, revents: 0 };
+            let pr = unsafe { libc::poll(&mut pfd, 1, 300) };
+            if pr > 0 {
+                let mut rb_buf2 = vec![0u8; 16384];
+                if let Some(bwr2) = read_only(self.fd, &mut rb_buf2) {
+                    let n2 = bwr2.read_consumed as usize;
+                    if n2 > 0 {
+                        rb.extend_from_slice(&rb_buf2[..n2]);
+                    }
+                }
             }
         }
         for p in &free_ptrs {
@@ -407,6 +402,15 @@ impl Binder {
             let mut rb = [0u8; 64];
             let _ = raw_write_read(fd, &wb, &mut rb);
             loop {
+                // O_NONBLOCK: 先 poll 等可读, 再 read_only (避免 EAGAIN 空转/退出)
+                let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+                let pr = unsafe { libc::poll(&mut pfd, 1, -1) };
+                if pr < 0 {
+                    break;
+                }
+                if pr == 0 {
+                    continue;
+                }
                 let mut rb = vec![0u8; 16384];
                 let n = match read_only(fd, &mut rb) {
                     Some(n) => n,
