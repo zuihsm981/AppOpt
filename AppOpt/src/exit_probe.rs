@@ -11,7 +11,8 @@ use std::os::raw::c_int;
 use std::sync::{Mutex, OnceLock};
 
 /// 已注册 pid → 监听 fd (watch/事件清理共用)
-static REG: Mutex<HashMap<i32, c_int>> = Mutex::new(HashMap::new());
+static REG: std::sync::LazyLock<Mutex<HashMap<i32, c_int>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 /// epoll fd (由 spawn_exit 创建后设置)
 static EPFD: OnceLock<Mutex<c_int>> = OnceLock::new();
 
