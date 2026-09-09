@@ -342,11 +342,12 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
         let reader_thread = thread::spawn(move || {
             kpm_drain_reader(evt_fd, tx, wakeup_fd, kpm_wake_fd);
         });
-        // 4.19 hook 模式: 先不武装任何系统级 hook (do_exit/input/setaffinity) ——
-        // KP inline chain 在本内核上疑似破坏退出路径, 导致 system_server 崩溃;
-        // 事件通道(drain)独立可用, 钩子按需经 ctl0 start/input_on 手动开。
-        // handle.activate();
-        conn_log("ebpf_init: OK (drain 事件通道建立, reader 已启动; hook 未武装)");
+        // 4.19 hook 模式【测试2】: 只武装 input 钩子 (1s 节流 → drain ≤1次/s),
+        // 不 start (不装 do_exit/setaffinity → 无线程退出风暴)。
+        // 若稳定 → 坐实 exit 事件风暴是元凶; 若仍崩 → input 钩子/drain 低频也触发。
+        handle.cmd("input_on");
+        // handle.cmd("start");   // 暂不装 exit/setaffinity
+        conn_log("ebpf_init: OK (drain 事件通道建立, reader 已启动; 仅 input 武装)");
         return Some(EbpfState {
             event_rx: rx,
             reader_thread: Some(reader_thread),
