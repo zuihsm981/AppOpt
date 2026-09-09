@@ -61,7 +61,7 @@ pub fn spawn_touch(touch_sock: c_int) {
         unsafe { libc::close(epfd); }
         return;
     }
-    let mut fds: Vec<c_int> = vec![fd];
+    let fds: Vec<c_int> = vec![fd];
     TOUCH_LISTENING.store(true, Ordering::Relaxed);
     tlog("open /dev/input/event5 (触摸屏, 已监听)");
 
