@@ -206,7 +206,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="card">
 <div class="card-title">刷新率状态</div>
 <div class="row" id="rf-device-wrap" role="button" tabindex="0" style="cursor:pointer" title="点击查看完整模式">
-<span class="label">设备刷新率</span><span class="badge kpm mono" id="rf-device">-</span>
+<span class="label">设备刷新率</span><span class="badge kpm" id="rf-device">-</span>
 </div>
 <div class="row"><span class="label">当前刷新率</span><span class="badge kpm" id="rf-mode">-</span></div>
 <div class="row"><span class="label">定时器状态</span><span class="badge kpm" id="rf-timer">-</span></div>
@@ -214,7 +214,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 </div>
 <div class="card">
 <div class="card-title">全局配置</div>
-<div class="row"><span class="label">活跃刷新率</span>
+<div class="row"><span class="label">最大刷新率</span>
 <select id="rf-active" style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:14px;font-family:inherit">
 <option value="120">120Hz</option><option value="90">90Hz</option><option value="60">60Hz</option>
 </select></div>
@@ -225,18 +225,13 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="row"><span class="label">空闲超时(秒)</span><input id="rf-timeout" type="number" min="1" max="3600" style="width:80px;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:14px;font-family:inherit"></div>
 <div style="margin-top:10px;text-align:right"><button class="btn" id="rf-save">保存全局配置</button></div>
 </div>
-<div class="card">
-<div class="card-title">按应用配置</div>
-<div id="rf-apps"></div>
-<div style="margin-top:10px"><button class="rule-add" id="rf-add" style="width:100%">＋ 添加应用刷新率规则</button></div>
-</div>
 </section>
 
 </main>
 <nav class="tabbar">
 <button class="tab active" data-tab="status"><svg viewBox="0 0 24 24"><path d="M4 16a8 8 0 0 1 16 0"/><path d="M12 16L16 12"/><circle cx="12" cy="16" r="1.2" fill="currentColor" stroke="none"/><path d="M6 20h12"/></svg>状态</button>
-<button class="tab" data-tab="rules"><svg viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13"/><circle cx="4" cy="6" r="1" fill="currentColor" stroke="none"/><circle cx="4" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="4" cy="18" r="1" fill="currentColor" stroke="none"/></svg>规则</button>
 <button class="tab" data-tab="refresh"><svg viewBox="0 0 24 24"><path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z"/></svg>刷新率</button>
+<button class="tab" data-tab="rules"><svg viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13"/><circle cx="4" cy="6" r="1" fill="currentColor" stroke="none"/><circle cx="4" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="4" cy="18" r="1" fill="currentColor" stroke="none"/></svg>规则</button>
 <button class="tab" data-tab="settings"><svg viewBox="0 0 24 24"><path d="M5 21V9M12 21V3M19 21v-8"/><circle cx="5" cy="6" r="2"/><circle cx="12" cy="9" r="2"/><circle cx="19" cy="10" r="2"/></svg>设置</button>
 </nav>
 
@@ -278,8 +273,25 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="modal">
 <h3 id="mr-title">添加应用</h3>
 <div class="sg-wrap"><input id="mr-pkg" placeholder="输入应用包名"><div class="sg-box" id="sg-pkg" hidden></div></div>
+<div class="seg" id="mr-seg" hidden>
+<button data-tab="cpu" class="on">线程配置</button>
+<button data-tab="rf">刷新率配置</button>
+</div>
 <div id="mr-rows"></div>
 <button class="rule-add" id="mr-addrow" hidden>＋ 线程规则</button>
+<div id="mr-rf-box" hidden>
+<hr style="border:none;border-top:1px solid var(--border);margin:12px 0">
+<div class="tree-row">
+<div class="tr-head"><span class="tr-tag">最大刷新率·可选</span></div>
+<div class="core-chips" id="mr-rf-active-chips"></div>
+</div>
+<div class="tree-row">
+<div class="tr-head"><span class="tr-tag">静止刷新率·可选</span></div>
+<div class="core-chips" id="mr-rf-idle-chips"></div>
+</div>
+<div class="tr-head"><span class="tr-tag">空闲超时(秒)</span></div>
+<div class="field"><input id="mr-rf-timeout" type="number" min="1" max="3600" value="10"></div>
+</div>
 <div class="modal-actions">
 <button class="btn-outline" id="mr-cancel">取消</button>
 <button class="btn" id="mr-save">保存</button>
@@ -294,24 +306,6 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="modal-actions">
 <button class="btn-outline" id="mc-cancel">取消</button>
 <button class="btn" id="mc-ok" style="background:var(--red)">删除</button>
-</div>
-</div>
-</div>
-
-<div id="modal-rf-app" class="modal-bg" hidden>
-<div class="modal">
-<h3 id="mrf-title">添加应用刷新率</h3>
-<div class="sg-wrap"><input id="mrf-pkg" placeholder="输入应用包名"><div class="sg-box" id="sg-rf-pkg" hidden></div></div>
-<select id="mrf-active" style="width:100%;margin-bottom:10px;background:var(--bg);border:1px solid transparent;border-radius:10px;padding:9px 12px;font-size:14px;font-family:inherit;color:var(--fg)">
-<option value="120">活跃: 120Hz</option><option value="90">活跃: 90Hz</option><option value="60">活跃: 60Hz</option>
-</select>
-<select id="mrf-idle" style="width:100%;margin-bottom:10px;background:var(--bg);border:1px solid transparent;border-radius:10px;padding:9px 12px;font-size:14px;font-family:inherit;color:var(--fg)">
-<option value="120">空闲: 120Hz</option><option value="90">空闲: 90Hz</option><option value="60">空闲: 60Hz</option>
-</select>
-<input id="mrf-timeout" type="number" min="1" max="3600" value="10" placeholder="空闲超时(秒)">
-<div class="modal-actions">
-<button class="btn-outline" id="mrf-cancel">取消</button>
-<button class="btn" id="mrf-save">保存</button>
 </div>
 </div>
 </div>
@@ -537,7 +531,7 @@ function renderRows(){
   box.innerHTML=mrRows.map((r,i)=>`
 <div class="tree-row${r.pkgRow?'':' branch'}" data-ri="${i}">
 ${r.pkgRow
-  ?'<div class="tr-head"><span class="tr-tag">包级默认</span><span class="tr-sub">全部线程 · 可选</span></div>'
+  ?'<div class="tr-head"><span class="tr-tag">全部线程·可选</span></div>'
   :`<div class="tr-head sg-wrap"><input class="rr-thread" placeholder="输入线程名" value="${esc(r.thread)}"><div class="sg-box" hidden></div>${tree?`<button class="icon-btn danger rr-del" title="删除该行">${ICO_TRASH}</button>`:''}</div>`}
 <div class="core-chips">${CHIP_HTML}</div>
 <input class="rr-custom" placeholder="CPU 范围，如 0-3,6" value="${esc(r.customVal||'')}" hidden>
@@ -571,6 +565,47 @@ $('mr-rows').addEventListener('input',e=>{
 });
 $('mr-addrow').onclick=()=>{mrRows.push(mkRow({}));renderRows();const m=$('mr-addrow').closest('.modal');m.scrollTop=m.scrollHeight};
 let mrMode='add-pkg',mrOldThread='',mrOldPkg='',mrOldThreads=new Set(),mrHadPkgRule=false;
+// 编辑应用时: 当前 jobs 与该包原规则是否完全一致 (一致→跳过规则重存, 避免只改
+// 刷新率时触发 CPU 全量重放; 仅 /api/rule 保存会 config reload → full_scan+apply_all_now)
+function rulesUnchanged(gi,jobs){
+  const items=rulesData[gi]?.items||[];
+  const orig=items.map(it=>[it.thread||'',it.spec||''].join('|')).sort().join('\n');
+  const cur=jobs.map(j=>[j.thread||'',j.cpus||''].join('|')).sort().join('\n');
+  return orig===cur;
+}
+// 编辑应用弹窗分区: 'cpu'(包级默认, 默认) / 'rf'(刷新率配置)
+let mrTab='cpu';
+function renderMrTab(){
+  $('mr-seg').querySelectorAll('button').forEach(b=>b.classList.toggle('on',b.dataset.tab===mrTab));
+  const isCpu=mrTab==='cpu';
+  $('mr-rows').hidden=!isCpu;
+  $('mr-addrow').hidden=!isCpu||!isTree();
+  $('mr-rf-box').hidden=isCpu;
+}
+$('mr-seg').addEventListener('click',e=>{
+  const b=e.target.closest('[data-tab]'); if(!b)return;
+  mrTab=b.dataset.tab; renderMrTab();
+});
+// 编辑应用弹窗刷新率配置: 0=未设置, 按设备可用刷新率 chips 点选
+let mrRfActive=0, mrRfIdle=0, mrRfOldRefresh=false;
+function renderRfChips(){
+  const av=rfAvail&&rfAvail.length?rfAvail:[120,90,60];
+  $('mr-rf-active-chips').innerHTML=av.map(r=>`<button data-rf="${r}" class="${mrRfActive===r?'on':''}">${r}Hz</button>`).join('');
+  $('mr-rf-idle-chips').innerHTML=av.map(r=>`<button data-rf="${r}" class="${mrRfIdle===r?'on':''}">${r}Hz</button>`).join('');
+}
+function bindRfChips(){
+  $('mr-rf-active-chips').addEventListener('click',e=>{
+    const b=e.target.closest('[data-rf]');if(!b)return;
+    const r=+b.dataset.rf;
+    mrRfActive=mrRfActive===r?0:r;renderRfChips();
+  });
+  $('mr-rf-idle-chips').addEventListener('click',e=>{
+    const b=e.target.closest('[data-rf]');if(!b)return;
+    const r=+b.dataset.rf;
+    mrRfIdle=mrRfIdle===r?0:r;renderRfChips();
+  });
+}
+bindRfChips();
 const isTree=()=>mrMode==='add-pkg'||mrMode==='edit-app';
 async function openRuleModal(mode,gi,ii){
   await fetchTopo();
@@ -579,7 +614,23 @@ async function openRuleModal(mode,gi,ii){
   const tree=isTree();
   pkg.readOnly=!tree;
   pkg.value=mode==='add-pkg'?'':rulesData[gi].pkg;
-  $('mr-addrow').hidden=!tree;
+  // 分区: 整包(树模式)可切 包级默认/刷新率配置; 单规则编辑(非树)固定包级默认
+  mrTab='cpu';
+  $('mr-seg').hidden=!tree;
+  // 刷新率配置预填 (树模式; 显示与否由 mrTab 控制)
+  if(tree){
+    try{const rc=await api('/api/refresh/config');rfAvail=rc.available&&rc.available.length?rc.available:[120,90,60];}catch(e){}
+    const rfPkg=mode==='edit-app'?rulesData[gi].pkg:'';
+    mrRfActive=0;mrRfIdle=0;mrRfOldRefresh=false;$('mr-rf-timeout').value=10;
+    if(rfPkg){
+      try{
+        const d=await api('/api/refresh/apps');
+        const a=(d.apps||[]).find(x=>x.pkg===rfPkg);
+        if(a){mrRfActive=+a.active;mrRfIdle=+a.idle;mrRfOldRefresh=true;$('mr-rf-timeout').value=a.timeout;}
+      }catch(e){}
+    }
+    renderRfChips();
+  }
   if(mode==='add-pkg'){
     $('mr-title').textContent='添加应用';
     mrRows=[mkRow({pkgRow:true})];
@@ -604,6 +655,7 @@ async function openRuleModal(mode,gi,ii){
     mrRows=[mkRow({thread:mrOldThread,...parseSpec(rulesData[gi].items[ii].spec)})];
   }
   renderRows();
+  renderMrTab();
   $('modal-rule').hidden=false;
 }
 $('r-add').onclick=()=>openRuleModal('add-pkg');
@@ -613,31 +665,55 @@ $('mr-save').onclick=async()=>{
   if(mrSaving)return;
   const pkg=$('mr-pkg').value.trim();
   if(!$('mr-pkg').readOnly&&!pkg)return toast('请输入应用包名');
-  const jobs=[];
-  for(const r of mrRows){
-    const spec=specOf(r);
-    if(r.pkgRow){if(spec)jobs.push({thread:'',cpus:spec});continue}
-    if(!r.thread&&!spec)continue;
-    if(!r.thread)return toast('请输入线程名');
-    if(!spec)return toast(r.custom?'请输入自定义 CPU 范围，如 0-3':'请选择 CPU 核心');
-    jobs.push({thread:r.thread,cpus:spec});
-  }
-  if(!jobs.length)return toast('请至少配置一条规则');
   mrSaving=true;
   try{
-    if(mrMode==='edit-app'){
-      if(pkg!==mrOldPkg)await api('/api/rule/rename',{old:mrOldPkg,new:pkg});
-      // 清理被删的线程行与被清空的包级规则（thread=='' 即包级）
-      const cur=new Set(jobs.map(j=>j.thread));
-      for(const th of mrOldThreads)if(!cur.has(th))await api('/api/rule/del',{pkg,thread:th});
-      if(mrHadPkgRule&&!cur.has(''))await api('/api/rule/del',{pkg,thread:''});
-    }
-    if(mrMode==='edit-thread'&&mrOldThread!==jobs[0].thread)
-      await api('/api/rule/del',{pkg,thread:mrOldThread});
-    for(let i=0;i<jobs.length;i++){
-      const j=jobs[i];
-      try{await api('/api/rule',{pkg,thread:j.thread,cpus:j.cpus})}
-      catch(e){return toast(`第${i+1}条（${j.thread||'包级'}）失败：${e.message}`)}
+    if(mrTab==='cpu'){
+      // ===== 包级默认: 只保存 CPU 规则 (不触刷新率) =====
+      const jobs=[];
+      for(const r of mrRows){
+        const spec=specOf(r);
+        if(r.pkgRow){if(spec)jobs.push({thread:'',cpus:spec});continue}
+        if(!r.thread&&!spec)continue;
+        if(!r.thread)return toast('请输入线程名');
+        if(!spec)return toast(r.custom?'请输入自定义 CPU 范围，如 0-3':'请选择 CPU 核心');
+        jobs.push({thread:r.thread,cpus:spec});
+      }
+      if(jobs.length){
+        // 编辑应用且包名未变且规则与原来完全一致 → 跳过规则重存 (避免无谓重放)
+        const unchanged=mrMode==='edit-app'&&pkg===mrOldPkg&&rulesUnchanged(gi,jobs);
+        if(!unchanged){
+          if(mrMode==='edit-app'){
+            if(pkg!==mrOldPkg)await api('/api/rule/rename',{old:mrOldPkg,new:pkg});
+            const cur=new Set(jobs.map(j=>j.thread));
+            for(const th of mrOldThreads)if(!cur.has(th))await api('/api/rule/del',{pkg,thread:th});
+            if(mrHadPkgRule&&!cur.has(''))await api('/api/rule/del',{pkg,thread:''});
+          }
+          if(mrMode==='edit-thread'&&mrOldThread!==jobs[0].thread)
+            await api('/api/rule/del',{pkg,thread:mrOldThread});
+          for(let i=0;i<jobs.length;i++){
+            const j=jobs[i];
+            // 单线程规则编辑 (edit-thread): 只重放该线程; 其余整包重放
+            const body=mrMode==='edit-thread'?{pkg,thread:j.thread,cpus:j.cpus,only_thread:true}:{pkg,thread:j.thread,cpus:j.cpus};
+            try{await api('/api/rule',body)}
+            catch(e){return toast(`第${i+1}条（${j.thread||'包级'}）失败：${e.message}`)}
+          }
+        }
+      }else if(mrMode==='edit-app'&&(mrOldThreads.size||mrHadPkgRule)){
+        // 清空全部 CPU 规则
+        for(const th of mrOldThreads)await api('/api/rule/del',{pkg,thread:th});
+        if(mrHadPkgRule)await api('/api/rule/del',{pkg,thread:''});
+      }else{
+        return toast('请至少配置一条规则');
+      }
+    }else{
+      // ===== 刷新率配置: 只保存刷新率 (不触 CPU) =====
+      const timeout=Math.max(1,+$('mr-rf-timeout').value||10);
+      if(mrRfActive||mrRfIdle){
+        if(pkg!==mrOldPkg&&mrRfOldRefresh)await api('/api/refresh/app/del',{pkg:mrOldPkg});
+        await api('/api/refresh/app',{pkg,active:mrRfActive||mrRfIdle,idle:mrRfIdle||mrRfActive,timeout});
+      }else if(mrRfOldRefresh){
+        await api('/api/refresh/app/del',{pkg});
+      }
     }
     $('modal-rule').hidden=true;
     toast('已保存');
@@ -710,7 +786,15 @@ function delRule(gi,ii){
 }
 function delPkg(gi){
   const g=rulesData[gi];
-  confirmDel(`删除 ${g.pkg} 的全部 ${g.items.length} 条规则`,{pkg:g.pkg,all:true});
+  $('mc-msg').textContent=`删除 ${g.pkg} 的全部 ${g.items.length} 条规则及刷新率配置`;
+  confirmCb=async()=>{
+    try{
+      await api('/api/rule/del',{pkg:g.pkg,all:true});
+      await api('/api/refresh/app/del',{pkg:g.pkg});
+      toast('已删除');loadRules();
+    }catch(e){toast(e.message)}
+  };
+  $('modal-confirm').hidden=false;
 }
 $('mc-cancel').onclick=()=>$('modal-confirm').hidden=true;
 $('mc-ok').onclick=()=>{$('modal-confirm').hidden=true;confirmCb&&confirmCb()};
@@ -747,30 +831,37 @@ let rfTimer=null;
 async function loadRefresh(){
   if(rfTimer){clearInterval(rfTimer);rfTimer=null}
   try{
-    const[st,cfg]=await Promise.all([api('/api/refresh/status'),api('/api/refresh/config')]);
+    const[st,cfg,st0]=await Promise.all([api('/api/refresh/status'),api('/api/refresh/config'),api('/api/status')]);
+    statusDrive=st0.mode; statusConn=!!st0.connected; statusTouch=!!st0.touch_listening;
+    renderRfInput(st);
     $('rf-mode').textContent=st.mode_str||'-';
     $('rf-timer').textContent=st.timer_enabled?(st.is_paused?'空闲中':(st.timer_running?'计时中':'未运行')):'未启用';
-    $('rf-input').textContent=fmtInput(st);
     $('rf-timeout').value=cfg.timeout;
     rfAvail=cfg.available&&cfg.available.length?cfg.available:[120,90,60];
     lastRefreshCfg=cfg;
     renderDeviceRates(cfg);
     applyRateOptions($('rf-active'),rfAvail,cfg.active);
     applyRateOptions($('rf-idle'),rfAvail,cfg.idle);
-    loadRefreshApps();
     rfTimer=setInterval(async()=>{
-      try{const s=await api('/api/refresh/status');
+      try{
+        const[s,st0]=await Promise.all([api('/api/refresh/status'),api('/api/status')]);
+        statusDrive=st0.mode; statusConn=!!st0.connected; statusTouch=!!st0.touch_listening;
+        renderRfInput(s);
         $('rf-mode').textContent=s.mode_str||'-';
         $('rf-timer').textContent=s.timer_enabled?(s.is_paused?'空闲中':(s.timer_running?'计时中':'未运行')):'未启用';
-        $('rf-input').textContent=fmtInput(s);
       }catch(e){}
     },1000);
   }catch(e){toast(e.message)}
 }
-let rfAppsData=[];
 let rfAvail=[120,90,60]; // 设备可用刷新率 (Hz), 由 /api/refresh/config 下发
 let rfDeviceExpanded=false; // 设备刷新率展开详情
 let lastRefreshCfg=null;
+// 刷新率卡 input 行: 标签与值随驱动模式切换 (KPM→内核 input 状态 / 用户态→event 状态)
+function renderRfInput(st){
+  const usermode=statusDrive==='userspace'||(statusDrive==='auto'&&!statusConn);
+  $('rf-input-label').textContent=usermode?'event 状态':'内核 input 状态';
+  $('rf-input').textContent=fmtInput(st);
+}
 // 触摸事件状态: 用户态驱动 → event 监听(已监听/未监听); KPM → 已武装/未武装 + 上次输入
 function fmtInput(st){
   const usermode=statusDrive==='userspace'||(statusDrive==='auto'&&!statusConn);
@@ -795,70 +886,11 @@ function applyRateOptions(sel,avail,keep){
   if(keep!==undefined&&[...sel.options].some(o=>o.value===String(keep)))sel.value=String(keep);
   else if(sel.options.length)sel.value=sel.options[0].value;
 }
-async function loadRefreshApps(){
-  try{
-    const d=await api('/api/refresh/apps');
-    rfAppsData=d.apps||[];
-    const box=$('rf-apps');
-    if(!rfAppsData.length){box.innerHTML='<div class="empty">暂无按应用配置<br>使用全局配置</div>';return}
-    box.innerHTML=rfAppsData.map(a=>`<div class="rule-row"><span class="rule-name">${esc(a.pkg)}</span><span class="rule-sub">${a.timeout}s ${a.active}→${a.idle}</span><button class="icon-btn" data-rfedit="${esc(a.pkg)}" title="编辑">${ICO_EDIT}</button><button class="icon-btn danger" data-rfdel="${esc(a.pkg)}" title="删除">${ICO_TRASH}</button></div>`).join('');
-  }catch(e){toast(e.message)}
-}
 $('rf-device-wrap').onclick=()=>{rfDeviceExpanded=!rfDeviceExpanded;renderDeviceRates(lastRefreshCfg)};
 $('rf-save').onclick=async()=>{
   try{await api('/api/refresh/config',{timeout:Math.max(1,+$('rf-timeout').value||30),active:$('rf-active').value,idle:$('rf-idle').value});toast('已保存');loadRefresh()}
   catch(e){toast(e.message)}
 };
-function openRfAppModal(pkg){
-  if(pkg){
-    $('mrf-title').textContent='编辑应用刷新率';
-    const a=rfAppsData.find(x=>x.pkg===pkg);
-    if(a){
-      $('mrf-pkg').value=a.pkg;
-      $('mrf-pkg').readOnly=true;
-      applyRateOptions($('mrf-active'),rfAvail,a.active);
-      applyRateOptions($('mrf-idle'),rfAvail,a.idle);
-      $('mrf-timeout').value=a.timeout;
-    }
-  }else{
-    $('mrf-title').textContent='添加应用刷新率';
-    $('mrf-pkg').value='';
-    $('mrf-pkg').readOnly=false;
-    applyRateOptions($('mrf-active'),rfAvail,undefined);
-    applyRateOptions($('mrf-idle'),rfAvail,undefined);
-    $('mrf-active').value=rfAvail[0];                    // 默认最高可用 (90/60 设备 → 90)
-    $('mrf-idle').value=rfAvail[rfAvail.length-1];       // 默认最低可用 (→ 60)
-    $('mrf-timeout').value='';
-  }
-  $('modal-rf-app').hidden=false;
-}
-suggest_bind($('mrf-pkg'),$('sg-rf-pkg'),{});
-$('mrf-cancel').onclick=()=>$('modal-rf-app').hidden=true;
-let mrfSaving=false;
-$('mrf-save').onclick=async()=>{
-  if(mrfSaving)return;
-  const pkg=$('mrf-pkg').value.trim();
-  if(!pkg)return toast('请输入应用包名');
-  mrfSaving=true;
-  try{
-    await api('/api/refresh/app',{pkg,timeout:Math.max(1,+$('mrf-timeout').value||10),active:$('mrf-active').value,idle:$('mrf-idle').value});
-    $('modal-rf-app').hidden=true;
-    toast('已保存');
-    loadRefreshApps();
-  }catch(e){toast(e.message)}
-  finally{mrfSaving=false}
-};
-$('rf-add').onclick=()=>openRfAppModal();
-$('rf-apps').addEventListener('click',e=>{
-  const ed=e.target.closest('[data-rfedit]');
-  if(ed){openRfAppModal(ed.dataset.rfedit);return}
-  const del=e.target.closest('[data-rfdel]');if(!del)return;
-  const pkg=del.dataset.rfdel;
-  $('mc-msg').textContent='删除 '+pkg+' 的刷新率配置';
-  confirmCb=async()=>{try{await api('/api/refresh/app/del',{pkg});toast('已删除');loadRefreshApps()}catch(e){toast(e.message)}};
-  $('modal-confirm').hidden=false;
-});
-
 startStat();
 </script>
 </body>
