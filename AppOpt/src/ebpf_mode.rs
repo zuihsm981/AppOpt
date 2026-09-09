@@ -209,13 +209,6 @@ impl KpmHandle {
         kpm_ctl0(&self.key, &c, &mut []);
     }
 
-    /// drain: 内核充当消费者, 把共享环可用事件拷到 out (hook 路径/4.19 传输)。
-    /// 返回实际拷贝字节数 (28 的倍数), 负=错误; 零=环空。
-    fn drain(&self, out: &mut [u8]) -> i64 {
-        let c = CString::new("drain").unwrap_or_default();
-        kpm_ctl0(&self.key, &c, out)
-    }
-
     /// 查询模块事件通道模式: "hook"(KP hook 路径/4.19) / "kprobe"(6.6)
     fn mode(&self) -> Option<String> {
         let mut out = [0u8; 16];
@@ -229,12 +222,6 @@ impl KpmHandle {
         if s.is_empty() { None } else { Some(s) }
     }
 
-    /// 仅绑定 evt_fd 为内核事件通知端 (hook/drain 通道, 不创建 anon fd)
-    fn shm_bind(&self, evt_fd: c_int) -> i64 {
-        let s = format!("shm_bind {}", evt_fd);
-        let c = CString::new(s).unwrap_or_default();
-        kpm_ctl0(&self.key, &c, &mut [])
-    }
 }
 
 /// 将内核 comm 截断于首个 NUL 并 trim 尾部空白
@@ -322,43 +309,15 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
     }
     conn_log(&format!("ebpf_init: evt_fd={}", evt_fd));
 
-    // ---- 按模块模式选事件通道: hook(4.19, fops 布局未知)直接 ctl0 drain,
-    //     不创建 anon fd / 不 mmap; kprobe(6.6) 走 mmap 共享环。 ----
+    // ---- 事件通道统一: 4.19 与 6.6 均实测 file_operations.mmap @ slot 11,
+    //      统一走 mmap 共享环 (零 supercall 消费)。hook 模式(4.19)不武装系统级
+    //      hook (稳定基线: 高频 ctl0/drain 在该内核上不稳定, 曾致系统崩溃)。 ----
     let is_hook = handle.mode().map(|m| m == "hook").unwrap_or(false);
     if is_hook {
-        conn_log("ebpf_init: hook 模式 -> 直接 ctl0 drain 事件通道");
-        if handle.shm_bind(evt_fd) < 0 {
-            conn_log("ebpf_init: shm_bind 失败 (绑定 evt_fd 为通知端)");
-            unsafe { libc::close(evt_fd); }
-            return None;
-        }
-        let (tx, rx) = mpsc::channel::<EbpfProcEvent>();
-        let wakeup_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-        if wakeup_fd < 0 {
-            conn_log("ebpf_init: wakeup eventfd 创建失败");
-            unsafe { libc::close(evt_fd); }
-            return None;
-        }
-        let reader_thread = thread::spawn(move || {
-            kpm_drain_reader(evt_fd, tx, wakeup_fd, kpm_wake_fd);
-        });
-        // 4.19 hook 模式【测试2】: 只武装 input 钩子 (1s 节流 → drain ≤1次/s),
-        // 不 start (不装 do_exit/setaffinity → 无线程退出风暴)。
-        // 若稳定 → 坐实 exit 事件风暴是元凶; 若仍崩 → input 钩子/drain 低频也触发。
-        handle.cmd("input_on");
-        // handle.cmd("start");   // 暂不装 exit/setaffinity
-        conn_log("ebpf_init: OK (drain 事件通道建立, reader 已启动; 仅 input 武装)");
-        return Some(EbpfState {
-            event_rx: rx,
-            reader_thread: Some(reader_thread),
-            bpf: handle,
-            wakeup_fd,
-            kpm_wake_fd,
-            evt_fd,
-            shm_fd: -1,
-        });
+        conn_log("ebpf_init: hook 模式(4.19) -> mmap 事件通道 (slot 11, CPU 实测确定)");
+    } else {
+        conn_log("ebpf_init: kprobe 模式(6.6) -> mmap 事件通道");
     }
-
     conn_log("ebpf_init: kprobe 模式 -> mmap 事件通道");
     // ctl0 shm_open: 绑定 evt_fd(通知端) + 在当前进程安装可 mmap 的 anon fd
     let shm_fd = handle.shm_open(evt_fd);
@@ -432,7 +391,13 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
         kpm_shm_reader(shm_ptr, map_len, evt_fd, tx, wakeup_fd, kpm_wake_fd);
     });
 
-    handle.activate();
+    if !is_hook {
+        // 6.6 kprobe 模式: 武装 exit/input/setaffinity (原行为)
+        handle.activate();
+    } else {
+        // 4.19 hook 模式: 保持 hook 全关 (稳定基线), 事件通道(mmap)已建立
+        conn_log("ebpf_init: 4.19 hook 模式 -> 不武装系统级 hook (稳定基线)");
+    }
     conn_log("ebpf_init: OK (reader 已启动, 事件通道建立)");
 
     Some(EbpfState {
@@ -570,103 +535,6 @@ fn kpm_shm_reader(
     }
     unsafe { libc::close(epfd); }
     unsafe { libc::munmap(base, map_len); }
-}
-
-/// drain 传输 reader (hook 路径/4.19): 阻塞在 evt_fd (内核 eventfd 通知) 上,
-/// 唤醒后调一次 ctl0 drain 取整批事件, 零轮询; wakeup_fd 用于退出。
-fn kpm_drain_reader(
-    evt_fd: c_int,
-    tx: mpsc::Sender<EbpfProcEvent>,
-    wakeup_fd: c_int,
-    kpm_wake_fd: c_int,
-) {
-    let name = CString::new("KpmDrainReader").unwrap();
-    unsafe {
-        libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
-    }
-    let handle = KpmHandle::new();
-    let ev_sz = APPOPT_EVENT_SZ as usize;
-
-    // epoll: evt_fd(内核事件通知) + wakeup_fd(退出信号)
-    let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-    if epfd < 0 {
-        return;
-    }
-    let mut ev: libc::epoll_event = unsafe { std::mem::zeroed() };
-    ev.events = libc::EPOLLIN as u32;
-    ev.u64 = 1; // evt_fd
-    if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, evt_fd, &mut ev) } < 0 {
-        unsafe { libc::close(epfd); }
-        return;
-    }
-    ev.u64 = 2; // wakeup_fd
-    if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, wakeup_fd, &mut ev) } < 0 {
-        unsafe { libc::close(epfd); }
-        return;
-    }
-    let mut events: [libc::epoll_event; 2] = unsafe { std::mem::zeroed() };
-    let mut buf = [0u8; 4096];
-
-    loop {
-        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 2, -1) };
-        if n < 0 {
-            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            break;
-        }
-        let mut exit = false;
-        for i in 0..n as usize {
-            if events[i].u64 == 2 {
-                exit = true;
-            }
-        }
-        if exit {
-            break;
-        }
-
-        // 消费循环: 清零 eventfd 计数 → drain 取批 → 直到环空才回 epoll 阻塞。
-        // 清零后若新事件到达其 signal 使计数器非零, epoll 会再次触发, 不漏。
-        loop {
-            // 1) 清零 eventfd 计数器 (非阻塞)
-            let mut cnt: u64 = 0;
-            let _ = unsafe { libc::read(evt_fd, &mut cnt as *mut u64 as *mut _, 8) };
-            // 2) 调一次 ctl0 drain 取整批
-            let nb = handle.drain(&mut buf);
-            if nb <= 0 {
-                break; // 环空
-            }
-            let nb = nb as usize;
-            let n_ev = nb / ev_sz;
-            for e in 0..n_ev {
-                let off = e * ev_sz;
-                let mut event: EbpfProcEvent = unsafe { std::mem::zeroed() };
-                for k in 0..ev_sz {
-                    unsafe {
-                        *((&mut event as *mut EbpfProcEvent as *mut u8).add(k)) = buf[off + k];
-                    }
-                }
-                if tx.send(event).is_err() {
-                    exit = true;
-                    break;
-                }
-            }
-            if exit {
-                break;
-            }
-            // 3) 通知主循环 (每批一次; 主循环会排空 mpsc 再睡)
-            let val: u64 = 1;
-            let _ = unsafe { libc::write(kpm_wake_fd, &val as *const u64 as *const _, 8) };
-            // 4) 若本批把缓冲填满, 可能还有事件, 继续 drain
-            if nb < buf.len() {
-                break;
-            }
-        }
-        if exit {
-            break;
-        }
-    }
-    unsafe { libc::close(epfd); }
 }
 
 /// 按需武装/卸载 input 触摸事件 kprobe (ctl0 input_on/input_off):
