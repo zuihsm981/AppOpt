@@ -62,6 +62,17 @@ pub fn cpu_known_is_hot(uid: i32, pid: i32) -> bool {
         .is_some_and(|(p, _)| *p == pid)
 }
 
+/// 用户态模式 (4.19, 无 KPM/CPU worker): 前台冷启动时记录 uid 主 pid 身份,
+/// 供冷热判断与退出清理 (evict_by_pid)。已有完整 pids 时以 or_insert 保留。
+pub fn cpu_known_set_main(uid: i32, pid: i32) {
+    if uid <= 0 || pid <= 0 {
+        return;
+    }
+    crate::rw_write_ignore_poison(&CPU_KNOWN)
+        .entry(uid)
+        .or_insert((pid, Vec::new()));
+}
+
 /// 清除某 uid 的 pid 列表与 cpu_known 身份
 pub fn cpu_known_evict(uid: i32) {
     crate::rw_write_ignore_poison(&PROC_SNAPSHOT).remove(&uid);

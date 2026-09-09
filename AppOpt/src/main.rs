@@ -12,6 +12,7 @@ mod refresh;
 mod rule_edit;
 mod rule_match;
 mod touch_probe;
+mod exit_probe;
 mod web;
 
 use std::collections::{HashMap, HashSet};
@@ -209,6 +210,20 @@ fn main() {
         let tw = touch_sv[1];
         std::thread::spawn(move || crate::touch_probe::spawn_touch(tw));
     }
+    // T7: 用户态进程退出监听 (4.19 用户态模式, 替代内核 EXIT; 仅主 pid 注册)
+    let mut exit_sv: [libc::c_int; 2] = [0, 0];
+    let exit_ok = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+            exit_sv.as_mut_ptr(),
+        )
+    } == 0;
+    if exit_ok {
+        let ew = exit_sv[1];
+        std::thread::spawn(move || crate::exit_probe::spawn_exit(ew));
+    }
     let mut fg_sv: [libc::c_int; 2] = [0, 0];
     let socket_ok = unsafe {
         libc::socketpair(
@@ -341,6 +356,7 @@ fn main() {
     const EV_FG: u64 = 6; // binder 前台回调 (pid+uid), 主线程分发
     const EV_PKG: u64 = 7; // packages.list inotify (安装/卸载/替换)
     const EV_TOUCH: u64 = 8; // 用户态 /dev/input 触摸/输入活动 (替代 4.19 内核 input hook)
+    const EV_EXIT_PID: u64 = 9; // 用户态 pidfd//proc 进程退出监听 (4.19 替代内核 EXIT)
 
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epfd < 0 {
@@ -417,6 +433,9 @@ fn main() {
     }
     if touch_ok {
         epoll_add(epfd, touch_sv[0], EV_TOUCH);
+    }
+    if exit_ok {
+        epoll_add(epfd, exit_sv[0], EV_EXIT_PID);
     }
 
 
@@ -566,6 +585,12 @@ fn main() {
                                 // EXIT 事件驱动 (ebpf_mode::event_dispatch); 冷时仅重发
                                 // ApplyPkg, CPU 线程枚举后覆盖写回新身份
                                 if !crate::cpu_affinity::cpu_known_is_hot(uid, pid) {
+                                    // 4.19 用户态模式 (无 KPM/CPU worker): 记录主 pid 身份 +
+                                    // 注册用户态退出监听 (KPM 模式由内核 EXIT 驱动, 跳过)
+                                    if !crate::web::KPM_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+                                        crate::cpu_affinity::cpu_known_set_main(uid, pid);
+                                        crate::exit_probe::watch(pid);
+                                    }
                                     if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
                                         let _ = tx.send(crate::cpu_affinity::CpuMsg::ApplyPkg(
                                             pid,
@@ -609,6 +634,19 @@ fn main() {
                         }
                     }
                     crate::refresh::refresh_on_event(crate::refresh::EVENT_INPUT, 0);
+                }
+                EV_EXIT_PID => {
+                    // 用户态进程退出 (4.19): recv pid → 清理该 uid 身份
+                    if exit_ok && exit_sv[0] > 0 {
+                        let mut pb = [0u8; 4];
+                        let n = unsafe {
+                            libc::recv(exit_sv[0], pb.as_mut_ptr() as *mut libc::c_void, 4, 0)
+                        };
+                        if n == 4 {
+                            let pid = i32::from_ne_bytes([pb[0], pb[1], pb[2], pb[3]]);
+                            crate::cpu_affinity::cpu_known_evict_by_pid(pid);
+                        }
+                    }
                 }
                 EV_INOTIFY => {
                     // 配置变更 (inotify): 与 EV_CONFIG 共用 reload_config
