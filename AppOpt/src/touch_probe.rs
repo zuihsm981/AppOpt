@@ -7,6 +7,23 @@
 
 use std::os::raw::c_int;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// 用户态触摸监听状态: touch_probe 成功打开 event5 后置 true (web 状态页展示)
+pub static TOUCH_LISTENING: AtomicBool = AtomicBool::new(false);
+
+/// 触摸日志: eprintln (前台可见) + 追加 /data/local/tmp/appopt_touch.log
+fn tlog(msg: &str) {
+    use std::io::Write;
+    eprintln!("[touch_probe] {}", msg);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/data/local/tmp/appopt_touch.log")
+    {
+        let _ = writeln!(f, "[{:?}] {}", std::time::SystemTime::now(), msg);
+    }
+}
 
 /// 触摸/输入活动探测线程入口。touch_sock 为 socketpair 写端, 活动时
 /// send 触发设备索引 (i32 LE 4 字节); 主线程从读端 recv 并日志 eventN。
@@ -19,36 +36,34 @@ pub fn spawn_touch(touch_sock: c_int) {
         return;
     }
 
-    // 枚举 /dev/input/eventN
-    let mut fds: Vec<c_int> = Vec::new();
-    for i in 0..64 {
-        let p = format!("/dev/input/event{}", i);
-        if !Path::new(&p).exists() {
-            continue;
-        }
-        let c = match std::ffi::CString::new(p) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
-        if fd < 0 {
-            continue;
-        }
-        let mut ev: libc::epoll_event = unsafe { std::mem::zeroed() };
-        ev.events = libc::EPOLLIN as u32;
-        ev.u64 = fds.len() as u64 + 1;
-        if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fd, &mut ev) } == 0 {
-            fds.push(fd);
-            eprintln!("touch_probe: open /dev/input/event{}", i);
-        } else {
-            unsafe { libc::close(fd); }
-        }
-    }
-    if fds.is_empty() {
-        eprintln!("touch_probe: 无可用 /dev/input/event*");
+    // 只监听触摸屏节点 /dev/input/event5 (实测确认; 按键等其它输入不再触发活动)
+    let p = "/dev/input/event5";
+    let c = match std::ffi::CString::new(p) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    if !Path::new(p).exists() {
+        tlog("/dev/input/event5 不存在");
         unsafe { libc::close(epfd); }
         return;
     }
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+    if fd < 0 {
+        tlog("打开 /dev/input/event5 失败");
+        unsafe { libc::close(epfd); }
+        return;
+    }
+    let mut ev: libc::epoll_event = unsafe { std::mem::zeroed() };
+    ev.events = libc::EPOLLIN as u32;
+    ev.u64 = 1;
+    if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fd, &mut ev) } != 0 {
+        unsafe { libc::close(fd); }
+        unsafe { libc::close(epfd); }
+        return;
+    }
+    let mut fds: Vec<c_int> = vec![fd];
+    TOUCH_LISTENING.store(true, Ordering::Relaxed);
+    tlog("open /dev/input/event5 (触摸屏, 已监听)");
 
     let mut events: [libc::epoll_event; 16] = unsafe { std::mem::zeroed() };
     let mut buf = [0u8; 4096];
@@ -82,7 +97,7 @@ pub fn spawn_touch(touch_sock: c_int) {
         for i in 0..n as usize {
             let idx = events[i].u64 as usize;
             if idx >= 1 && idx <= fds.len() {
-                eprintln!("touch_probe: activity on /dev/input/event{}", idx - 1);
+                tlog(&format!("activity on /dev/input/event{}", idx - 1));
                 let idx32 = (idx - 1) as i32;
                 let bytes = idx32.to_ne_bytes();
                 let _ = unsafe {

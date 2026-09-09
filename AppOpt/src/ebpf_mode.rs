@@ -284,41 +284,25 @@ pub fn kpm_probe() -> bool {
 /// 初始化 KPM 事件驱动: 确保模块加载, 启动 reader 线程
 /// 失败返回 None, 由调用方回退 /proc 轮询。
 /// kpm_wake_fd 由主循环创建并注册 epoll, reader 收到事件后写入以唤醒主循环。
-pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
+/// 初始化 KPM 事件驱动。drive_mode: "userspace" 直接纯用户态(不依赖 KPM);
+/// "auto" ping 失败快速回退纯用户态; "kpm" 等待模块长时间重试。
+pub fn ebpf_init(kpm_wake_fd: c_int, drive_mode: String) -> Option<EbpfState> {
+    if drive_mode == "userspace" {
+        conn_log("ebpf_init: 纯用户态模式 (userspace), 不使用 KPM");
+        return None;
+    }
+
+    // 不重试: 连接不上 KPM 就直接回退用户态模式 (4.19 常无 KPM/或 KP hook 不可用)
     let key = kpm_key();
     if !kp_ready(&key) {
-        // KP 本身未就绪: 每 3s 重试 (最多 10 次/30s), 等待 KP 环境就绪
-        conn_log("ebpf_init: kp_ready=false, 每 3s 重试 (KP/superkey 未就绪)");
-        let mut ok = false;
-        for i in 0..10 {
-            std::thread::sleep(std::time::Duration::from_secs(3));
-            if kp_ready(&key) {
-                ok = true;
-                break;
-            }
-            conn_log(&format!("ebpf_init: kp_ready 重试 {} (3s)", i + 1));
-        }
-        if !ok {
-            return None;
-        }
+        conn_log("ebpf_init: KP 未就绪, 回退纯用户态路径");
+        return None;
     }
 
     let handle = KpmHandle { key };
     if !handle.verify_loaded() {
-        // 模块未加载 (可能由 APatch/管理器稍后加载): 每 3s 重试 (最多 20 次/60s)
-        conn_log("ebpf_init: ping 失败(模块未加载), 每 3s 重试");
-        let mut ok = false;
-        for i in 0..20 {
-            std::thread::sleep(std::time::Duration::from_secs(3));
-            if handle.verify_loaded() {
-                ok = true;
-                break;
-            }
-            conn_log(&format!("ebpf_init: ping 重试 {} (3s)", i + 1));
-        }
-        if !ok {
-            return None;
-        }
+        conn_log("ebpf_init: 模块未加载, 回退纯用户态路径");
+        return None;
     }
     conn_log("ebpf_init: ping OK");
 

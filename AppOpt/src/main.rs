@@ -183,6 +183,11 @@ fn main() {
         i += 1;
     }
 
+    // 应用设置 (AppOpt.json) 提前读取: 驱动模式需在 L1 ebpf_init spawn 前决定
+    let st = settings_load(SETTINGS_FILE);
+    let drive_mode = st.mode.clone();
+    crate::web::set_drive_mode(&drive_mode);
+
     // ================= 初始化并发: 独立无依赖项并行 =================
     // T1: /proc pid 快照线程 (最早抓取启动瞬间 pid; 完成后线程退出)
     let snapshot_thread = std::thread::spawn(|| crate::cpu_affinity::proc_pid_set());
@@ -226,9 +231,10 @@ fn main() {
         }
     }
 
-    // T2: ebpf_init (KPM 加载 + shm + reader + activate; 不依赖配置)
+    // T2: ebpf_init (按驱动模式尝试 KPM: userspace 直退 / auto 快速回退 / kpm 等待)
     let wk = kpm_wake_fd;
-    let ebpf_thread = std::thread::spawn(move || ebpf_init(wk));
+    let dm = drive_mode.clone();
+    let ebpf_thread = std::thread::spawn(move || ebpf_init(wk, dm));
 
     // T3: process_observer (binder 回调注册; 完成后线程退出)
     let obs_fd = fg_sv[1];
@@ -244,8 +250,7 @@ fn main() {
     // T5: dumpsys display 显示模式解析 (供 refresh_init; 完成后线程退出)
     let display_modes_thread = std::thread::spawn(crate::refresh::parse_display_modes);
 
-    // 应用设置持久化于 AppOpt.json，命令行参数优先覆盖
-    let st = settings_load(SETTINGS_FILE);
+    // 命令行参数优先覆盖设置 (settings_load 已在 L1 前完成)
     let config_file = match cli_cfg {
         Some(path) => path,
         None if st.config_file == "./applist.conf" => "./appopt.conf".to_string(),
@@ -592,7 +597,15 @@ fn main() {
                         };
                         if n == 4 {
                             let idx = i32::from_ne_bytes([tb[0], tb[1], tb[2], tb[3]]);
+                            use std::io::Write;
                             eprintln!("[appopt] 触摸活动 on /dev/input/event{}", idx);
+                            if let Ok(mut tf) = std::fs::OpenOptions::new()
+                                .create(true).append(true)
+                                .open("/data/local/tmp/appopt_touch.log")
+                            {
+                                let _ = writeln!(tf, "[{:?}] activity on /dev/input/event{}",
+                                                std::time::SystemTime::now(), idx);
+                            }
                         }
                     }
                     crate::refresh::refresh_on_event(crate::refresh::EVENT_INPUT, 0);

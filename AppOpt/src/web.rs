@@ -258,8 +258,11 @@ fn status_json() -> String {
     let uptime = START.get().map(|t| t.elapsed().as_secs()).unwrap_or(0);
     json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "mode": "kpm",
+        "mode": drive_mode(),
         "connected": connected,
+        "touch_listening": crate::touch_probe::TOUCH_LISTENING.load(Ordering::Relaxed),
+        "input_hooked": crate::refresh::refresh_get_status()
+            .map(|s| s.input_hooked).unwrap_or(false),
         "uptime": uptime,
         "rules": rules,
         "pkgs": pkgs,
@@ -490,9 +493,17 @@ fn suggest_threads(pkg: &str, q: &str) -> Vec<(String, usize)> {
 
 fn config_json() -> String {
     let cfg = current_cfg();
+    let dm = drive_mode();
+    let mode_num = match dm.as_str() { "kpm" => 1, "userspace" => 2, _ => 0 };
+    // 当前生效: userspace 显式或未连上 KPM → 用户态; 否则 KPM
+    let active = if dm == "userspace" || !KPM_ACTIVE.load(Ordering::Relaxed) {
+        "userspace"
+    } else {
+        "kpm"
+    };
     json!({
-        "mode": 1,
-        "mode_active": "kpm",
+        "mode": mode_num,
+        "mode_active": active,
         "kpm_available": kpm_probe(),
         "cpuset_name": base_cpuset().rsplit('/').next().unwrap_or_default(),
         "config_file": lock_ignore_poison(&CONFIG_FILE).clone(),
@@ -529,6 +540,20 @@ fn config_set_api(req: &Request) -> (u16, String) {
         crate::config::request_config_reload();
     }
 
+    // 驱动模式: 支持数字 (0=auto,1=kpm,2=userspace) 或字符串 ("auto"/"kpm"/"userspace")
+    let mode_str = v["mode"].as_str().map(|s| s.to_string()).or_else(|| {
+        v["mode"].as_i64().map(|n| match n {
+            1 => "kpm".to_string(),
+            2 => "userspace".to_string(),
+            _ => "auto".to_string(),
+        })
+    });
+    if let Some(m) = mode_str {
+        if valid_mode(&m) {
+            set_drive_mode(&m);
+        }
+    }
+
     settings_save();
     (200, json!({ "ok": true }).to_string())
 }
@@ -537,11 +562,29 @@ pub const SETTINGS_FILE: &str = "./AppOpt.json";
 
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
 
+/// 驱动模式全局: "auto"(默认) / "kpm" / "userspace"
+static DRIVE_MODE: Mutex<String> = Mutex::new(String::new());
+
+fn valid_mode(m: &str) -> bool {
+    m == "auto" || m == "kpm" || m == "userspace"
+}
+
+pub fn drive_mode() -> String {
+    let v = lock_ignore_poison(&DRIVE_MODE).clone();
+    if v.is_empty() { "auto".to_string() } else { v }
+}
+
+pub fn set_drive_mode(m: &str) {
+    let m = if valid_mode(m) { m.to_string() } else { "auto".to_string() };
+    *lock_ignore_poison(&DRIVE_MODE) = m;
+}
+
 #[derive(Clone)]
 pub struct Settings {
     pub web_enable: bool,
     pub cpuset_name: String,
     pub config_file: String,
+    pub mode: String,
 }
 
 impl Default for Settings {
@@ -550,6 +593,7 @@ impl Default for Settings {
             web_enable: false,
             cpuset_name: DEFAULT_CPUSET_NAME.to_string(),
             config_file: "./appopt.conf".to_string(),
+            mode: "auto".to_string(),
         }
     }
 }
@@ -577,6 +621,11 @@ impl Settings {
                 .filter(|s| valid_path(s))
                 .unwrap_or(&d.config_file)
                 .to_string(),
+            mode: v["mode"]
+                .as_str()
+                .filter(|s| valid_mode(s))
+                .unwrap_or("auto")
+                .to_string(),
         }
     }
 
@@ -585,6 +634,7 @@ impl Settings {
             "web_enable": self.web_enable,
             "cpuset_name": self.cpuset_name,
             "config_file": self.config_file,
+            "mode": self.mode,
         })
     }
 
@@ -622,6 +672,7 @@ pub fn settings_save() {
         web_enable: WEB_ENABLED.load(Ordering::Relaxed),
         cpuset_name: base_cpuset().rsplit('/').next().unwrap_or_default().to_string(),
         config_file: lock_ignore_poison(&CONFIG_FILE).clone(),
+        mode: drive_mode(),
     }
     .save(SETTINGS_FILE);
 }
