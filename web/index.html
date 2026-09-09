@@ -138,7 +138,6 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="card-title">运行状态</div>
 <div class="row"><span class="label">工作模式</span><span id="s-mode" class="badge proc">-</span></div>
 <div class="row"><span class="label">连接状态</span><span id="s-conn" class="badge proc">-</span></div>
-<div class="row"><span class="label">触摸事件</span><span id="s-touch" class="badge proc">-</span></div>
 <div class="row"><span class="label">运行时长</span><span class="value" id="s-up">-</span></div>
 <div class="row"><span class="label">版本</span><span class="value" id="s-ver">-</span></div>
 </div>
@@ -178,14 +177,13 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 
 <section id="tab-settings" class="panel" hidden>
 <div class="card">
-<div class="card-title">驱动模式</div>
+<div class="card-title">工作模式</div>
 <div class="seg" id="seg-mode">
 <button data-mode="0">自动</button>
 <button data-mode="1">KPM</button>
 <button data-mode="2">用户态</button>
 </div>
 <div class="hint" id="c-mode-active">当前生效: -</div>
-<div class="hint" id="c-kpm-hint" style="color:var(--orange)" hidden>未检测到 KPM（KernelPatch/模块未加载），当前回退用户态驱动</div>
 </div>
 <div class="card">
 <div class="card-title">cpuset</div>
@@ -367,6 +365,7 @@ window.addEventListener('blur',()=>pausePolling());
 window.addEventListener('focus',()=>resumePolling());
 window.addEventListener('pagehide',()=>pausePolling());
 let hitList=[];
+let statusDrive='auto',statusTouch=false,statusConn=false;
 async function refreshStat(){
   if(document.hidden)return;
   try{
@@ -375,17 +374,12 @@ async function refreshStat(){
     mb.textContent=modeLabel(d.mode);
     mb.className='badge '+(d.mode==='kpm'?'kpm':'proc');
     const cn=$('s-conn');
-    cn.textContent=d.connected?'已连接':'未连接';
-    cn.className='badge '+(d.connected?'kpm':'proc');
+    // 用户态模式: 用户态驱动生效即视为已连接; KPM 模式: 按 KPM_ACTIVE
     const usermode=d.mode==='userspace'||(d.mode==='auto'&&!d.connected);
-    const tm=$('s-touch');
-    if(usermode){
-      tm.textContent=d.touch_listening?'已监听':'未监听';
-      tm.className='badge '+(d.touch_listening?'kpm':'proc');
-    }else{
-      tm.textContent=d.input_hooked?'已武装':'未武装';
-      tm.className='badge '+(d.input_hooked?'kpm':'proc');
-    }
+    const connOk=usermode||d.connected;
+    cn.textContent=connOk?'已连接':'未连接';
+    cn.className='badge '+(connOk?'kpm':'proc');
+    statusDrive=d.mode; statusTouch=!!d.touch_listening; statusConn=!!d.connected;
     $('s-up').textContent=fmtUp(d.uptime);
     $('s-ver').textContent='v'+(d.version||'?');
     $('s-rules').textContent=d.rules;
@@ -726,7 +720,6 @@ async function loadCfg(){
     const d=await api('/api/config');
     document.querySelectorAll('#seg-mode button').forEach(b=>b.classList.toggle('on',+b.dataset.mode===d.mode));
     $('c-mode-active').textContent='当前生效: '+modeLabel(d.mode_active);
-    $('c-kpm-hint').hidden=!!d.kpm_available;
     $('c-cpuset').value=d.cpuset_name;
     $('c-file').value=d.config_file;
     $('c-cpuset-on').textContent=d.cpuset_enabled?'已启用':'不可用';
@@ -778,10 +771,12 @@ let rfAppsData=[];
 let rfAvail=[120,90,60]; // 设备可用刷新率 (Hz), 由 /api/refresh/config 下发
 let rfDeviceExpanded=false; // 设备刷新率展开详情
 let lastRefreshCfg=null;
-// 内核 input 状态: 已武装/未武装 + 距上次 input 事件秒数
+// 触摸事件状态: 用户态驱动 → event 监听(已监听/未监听); KPM → 已武装/未武装 + 上次输入
 function fmtInput(st){
-  const hooked=st.input_hooked?'已武装':'未武装';
+  const usermode=statusDrive==='userspace'||(statusDrive==='auto'&&!statusConn);
   const last=(st.last_input_secs||0)>=0?(' · 上次输入 '+(st.last_input_secs||0)+'s前'):'';
+  if(usermode) return (statusTouch?'已监听':'未监听')+last;
+  const hooked=st.input_hooked?'已武装':'未武装';
   return hooked+last;
 }
 // 设备刷新率: 默认只显示刷新率 (120Hz / 90Hz / 60Hz), 点击后展开完整模式 (id|WxH Hz)
