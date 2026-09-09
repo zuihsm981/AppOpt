@@ -287,14 +287,38 @@ pub fn kpm_probe() -> bool {
 pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
     let key = kpm_key();
     if !kp_ready(&key) {
-        conn_log("ebpf_init: kp_ready=false (KP/superkey 不可用)");
-        return None;
+        // KP 本身未就绪: 每 3s 重试 (最多 10 次/30s), 等待 KP 环境就绪
+        conn_log("ebpf_init: kp_ready=false, 每 3s 重试 (KP/superkey 未就绪)");
+        let mut ok = false;
+        for i in 0..10 {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            if kp_ready(&key) {
+                ok = true;
+                break;
+            }
+            conn_log(&format!("ebpf_init: kp_ready 重试 {} (3s)", i + 1));
+        }
+        if !ok {
+            return None;
+        }
     }
 
     let handle = KpmHandle { key };
     if !handle.verify_loaded() {
-        conn_log("ebpf_init: verify_loaded=false (ping 失败, 模块未加载?)");
-        return None;
+        // 模块未加载 (可能由 APatch/管理器稍后加载): 每 3s 重试 (最多 20 次/60s)
+        conn_log("ebpf_init: ping 失败(模块未加载), 每 3s 重试");
+        let mut ok = false;
+        for i in 0..20 {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            if handle.verify_loaded() {
+                ok = true;
+                break;
+            }
+            conn_log(&format!("ebpf_init: ping 重试 {} (3s)", i + 1));
+        }
+        if !ok {
+            return None;
+        }
     }
     conn_log("ebpf_init: ping OK");
 
@@ -318,7 +342,6 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
     } else {
         conn_log("ebpf_init: kprobe 模式(6.6) -> mmap 事件通道");
     }
-    conn_log("ebpf_init: kprobe 模式 -> mmap 事件通道");
     // ctl0 shm_open: 绑定 evt_fd(通知端) + 在当前进程安装可 mmap 的 anon fd
     let shm_fd = handle.shm_open(evt_fd);
     conn_log(&format!("ebpf_init: shm_open -> {}", shm_fd));
@@ -395,8 +418,11 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
         // 6.6 kprobe 模式: 武装 exit/input/setaffinity (原行为)
         handle.activate();
     } else {
-        // 4.19 hook 模式: 保持 hook 全关 (稳定基线), 事件通道(mmap)已建立
-        conn_log("ebpf_init: 4.19 hook 模式 -> 不武装系统级 hook (稳定基线)");
+        // 4.19 hook 模式: 仅武装 input (不 start → 不装 do_exit/setaffinity,
+        // 避免高频退出事件与解钩风险); input 事件走 mmap 共享环零 supercall 消费,
+        // input_off 已跳过(解钩在高频输入下卡死)。
+        handle.cmd("input_on");
+        conn_log("ebpf_init: 4.19 -> 仅武装 input (exit/setaffinity 保持关闭)");
     }
     conn_log("ebpf_init: OK (reader 已启动, 事件通道建立)");
 
@@ -543,6 +569,11 @@ pub fn set_input_hook(on: bool) {
     let h = KpmHandle::new();
     if on {
         h.cmd("input_on");
+    } else if h.mode().map(|m| m == "hook").unwrap_or(false) {
+        // 4.19 hook 模式: 不卸载 input hook —— KP hook_unwrap_remove 在高频
+        // 输入下解钩(恢复入口+释放 trampoline)与正在执行的代码竞争会卡死
+        // (活跃==空闲时卸载必现)。input 事件走 mmap 共享环零 supercall 消费,
+        // 保持常驻安全, 仅多一点点触摸开销。
     } else {
         h.cmd("input_off");
     }
