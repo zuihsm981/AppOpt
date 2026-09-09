@@ -358,7 +358,8 @@ pub fn refresh_init(display_modes: std::thread::JoinHandle<Vec<(u32, u32, u32, f
 
         // 初始化先应用一次全局 active 刷新率 (异步: 在后台线程执行 SF binder,
         // 不阻塞主初始化; launcher 的全局绑定由 full_scan 事件完成)。
-        set_refresh_rate(&mut state, state.current_active);
+        let active = state.current_active;
+        set_refresh_rate(&mut state, active);
 
         let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         if epfd < 0 {
