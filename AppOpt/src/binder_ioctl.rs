@@ -306,7 +306,7 @@ impl Binder {
             match self.transact_sync(SVC_MGR_HANDLE, code, &data, &[]) {
                 Some((reply, _)) => {
                     log_diag(&format!("binder:   code={} reply len={} hex={:02x?}", code, reply.len(), &reply[..reply.len().min(32)]));
-                    if let Some(h) = parse_service_handle(&reply) {
+                    if let Some(h) = Self::parse_service_handle(&reply) {
                         log_diag(&format!("binder: get_service({}) code={} handle={}", name, code, h));
                         return Some(h);
                     }
@@ -322,7 +322,7 @@ impl Binder {
         match self.transact_sync(SVC_MGR_HANDLE, 0x53, &sdata, &[]) {
             Some((reply, _)) => {
                 log_diag(&format!("binder:   legacy reply len={} hex={:02x?}", reply.len(), &reply[..reply.len().min(32)]));
-                if let Some(h) = parse_service_handle(&reply) {
+                if let Some(h) = Self::parse_service_handle(&reply) {
                     log_diag(&format!("binder: get_service({}) legacy handle={}", name, h));
                     return Some(h);
                 }
