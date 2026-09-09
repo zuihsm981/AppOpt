@@ -305,7 +305,7 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
 
     // 立即 mmap 并校验共享环头; 校验失败视为模块/客户端不匹配
     let map_len = APPOPT_SHM_HDR_SIZE + APPOPT_EVENT_RING_SIZE as usize;
-    let shm_base = unsafe {
+    let mut shm_base = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
             map_len,
@@ -316,12 +316,39 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
         )
     };
     if shm_base == libc::MAP_FAILED {
+        // 4.19 hook 模式: 厂商内核 struct file_operations 布局未知 (实测 slot
+        // 10/11 都不是 mmap), 经 ctl0 fops_slot <N> 让模块把 mmap 回调逐槽挪位
+        // 后在同一 fd 上重试 (同一 fd 的 f_op 指向模块静态数组, 改槽即生效)。
+        // 6.6 (kprobe 模式) 首次 mmap 即成功, 绝不进入此循环; 该命令在 kprobe
+        // 模式被模块拒绝, 双保险。
+        conn_log("ebpf_init: mmap 失败, 开始逐槽校准 fops_slot 0..=32");
+        for slot in 0i32..=32 {
+            handle.cmd(&format!("fops_slot {}", slot));
+            shm_base = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    map_len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    shm_fd,
+                    0,
+                )
+            };
+            if shm_base != libc::MAP_FAILED {
+                conn_log(&format!("ebpf_init: 槽位校准成功 slot={}", slot));
+                break;
+            }
+            conn_log(&format!("ebpf_init: slot={} mmap 仍失败 errno={}",
+                              slot, std::io::Error::last_os_error()));
+        }
+    }
+    if shm_base == libc::MAP_FAILED {
         conn_log(&format!("ebpf_init: mmap 失败 errno={}", std::io::Error::last_os_error()));
         unsafe { libc::close(evt_fd); }
         unsafe { libc::close(shm_fd); }
         return None;
     }
-    conn_log("ebpf_init: mmap OK");
+    conn_log("ebpf_init: mmap OK (槽位校准完成)");
     {
         let hdr = shm_base as *const ShmRing;
         let ok = unsafe {
