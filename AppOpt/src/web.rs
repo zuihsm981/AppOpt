@@ -341,7 +341,7 @@ fn rule_api(req: &Request) -> (u16, String) {
     let file = lock_ignore_poison(&CONFIG_FILE).clone();
     // only_thread=true (前端单线程规则编辑): 只重放该线程; 否则整包重放
     let only_thread = v["only_thread"].as_bool().unwrap_or(false);
-    let last_thread = if only_thread { thread } else { None };
+    let last_thread = if only_thread { Some(thread) } else { None };
     match rule_upsert(&file, pkg, thread, cpus) {
         RuleEdit::Ok => {
             set_last_rule(pkg, last_thread);

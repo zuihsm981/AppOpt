@@ -583,4 +583,3 @@ pub fn event_dispatch(event: &EbpfProcEvent, _cfg: &AppConfig, _state: &mut Ebpf
     }
 }
 
-/// 启动或配置更新时全量扫描 /proc
