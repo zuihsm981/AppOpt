@@ -418,11 +418,11 @@ pub fn ebpf_init(kpm_wake_fd: c_int) -> Option<EbpfState> {
         // 6.6 kprobe 模式: 武装 exit/input/setaffinity (原行为)
         handle.activate();
     } else {
-        // 4.19 hook 模式: 仅武装 input (不 start → 不装 do_exit/setaffinity,
-        // 避免高频退出事件与解钩风险); input 事件走 mmap 共享环零 supercall 消费,
-        // input_off 已跳过(解钩在高频输入下卡死)。
-        handle.cmd("input_on");
-        conn_log("ebpf_init: 4.19 -> 仅武装 input (exit/setaffinity 保持关闭)");
+        // 4.19 hook 模式: 全部 KP hook 不可用 (input 激活即卡死 / exit 高频崩,
+        // 解钩也卡) —— 该内核+KP1158 的 hook_wrap 触发路径不稳定, AppOpt 无法
+        // 修复。保持 hook 全关: 亲和性/刷新率由用户态与 binder 完成, exit 归零
+        // 由 /proc 扫描兜底, 触摸切换暂不可用。
+        conn_log("ebpf_init: 4.19 -> hook 全关 (KP hook 机制在此内核不可用)");
     }
     conn_log("ebpf_init: OK (reader 已启动, 事件通道建立)");
 

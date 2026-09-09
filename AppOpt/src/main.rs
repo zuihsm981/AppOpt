@@ -11,6 +11,7 @@ mod process_observer;
 mod refresh;
 mod rule_edit;
 mod rule_match;
+mod touch_probe;
 mod web;
 
 use std::collections::{HashMap, HashSet};
@@ -188,6 +189,21 @@ fn main() {
 
     // 提前创建 fd (不依赖 settings; 供各独立线程使用)
     let kpm_wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    // T6: 用户态触摸/输入活动探测线程 (root 读 /dev/input/event*, 事件驱动通知;
+    //      4.19 上替代不可用的内核 input hook; 6.6 亦可作兜底)
+    let mut touch_sv: [libc::c_int; 2] = [0, 0];
+    let touch_ok = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+            touch_sv.as_mut_ptr(),
+        )
+    } == 0;
+    if touch_ok {
+        let tw = touch_sv[1];
+        std::thread::spawn(move || crate::touch_probe::spawn_touch(tw));
+    }
     let mut fg_sv: [libc::c_int; 2] = [0, 0];
     let socket_ok = unsafe {
         libc::socketpair(
@@ -319,6 +335,7 @@ fn main() {
     const EV_CONFIG: u64 = 4;
     const EV_FG: u64 = 6; // binder 前台回调 (pid+uid), 主线程分发
     const EV_PKG: u64 = 7; // packages.list inotify (安装/卸载/替换)
+    const EV_TOUCH: u64 = 8; // 用户态 /dev/input 触摸/输入活动 (替代 4.19 内核 input hook)
 
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epfd < 0 {
@@ -392,6 +409,9 @@ fn main() {
     epoll_add(epfd, inotify_fd, EV_INOTIFY);
     if fg_recv_fd > 0 {
         epoll_add(epfd, fg_recv_fd, EV_FG);
+    }
+    if touch_ok {
+        epoll_add(epfd, touch_sv[0], EV_TOUCH);
     }
 
 
@@ -557,6 +577,25 @@ fn main() {
                             }
                         }
                     }
+                }
+                EV_TOUCH => {
+                    // 用户态触摸/输入活动: recv 触发设备索引 → 日志 → 重置刷新率空闲
+                    if touch_ok && touch_sv[0] > 0 {
+                        let mut tb = [0u8; 4];
+                        let n = unsafe {
+                            libc::recv(
+                                touch_sv[0],
+                                tb.as_mut_ptr() as *mut libc::c_void,
+                                4,
+                                0,
+                            )
+                        };
+                        if n == 4 {
+                            let idx = i32::from_ne_bytes([tb[0], tb[1], tb[2], tb[3]]);
+                            eprintln!("[appopt] 触摸活动 on /dev/input/event{}", idx);
+                        }
+                    }
+                    crate::refresh::refresh_on_event(crate::refresh::EVENT_INPUT, 0);
                 }
                 EV_INOTIFY => {
                     // 配置变更 (inotify): 与 EV_CONFIG 共用 reload_config
