@@ -201,6 +201,12 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="hint">冷启动时延迟多少毫秒再枚举该应用全部进程设亲和（默认 2000 ms）。调大覆盖更晚 spawn 的子进程，调小加快生效</div>
 </div>
 <div class="card">
+<div class="card-title">设置 cpuset</div>
+<div class="row"><span class="label">同时设置cpuset和cpus</span><label style="display:flex;align-items:center;cursor:pointer"><input type="checkbox" id="c-cpuset-use" style="width:auto;height:auto"></label></div>
+<div class="hint">开启后设置tasks 到 cpuset的同时再sched_setaffinity 收紧到目标核；关闭（默认）仅 sched_setaffinity</div>
+<div style="margin-top:10px;text-align:right"><button class="btn" id="c-cpuset-use-save">保存</button></div>
+</div>
+<div class="card">
 <div class="card-title">关于</div>
 <button class="entry" id="c-about">关于 AppOpt<svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
 </div>
@@ -813,6 +819,7 @@ async function loadCfg(){
     $('c-cpuset').value=d.cpuset_name;
     $('c-file').value=d.config_file;
     $('c-delay').value=d.affinity_delay_ms??2000;
+    $('c-cpuset-use').checked=!!d.use_cpuset;
     $('c-cpuset-on').textContent=d.cpuset_enabled?'已启用':'不可用';
   }catch(e){toast(e.message)}
 }
@@ -831,6 +838,7 @@ $('c-delay-save').onclick=()=>{
   if(isNaN(n)||n<0||n>60000){toast('请输入 0~60000 的毫秒数');return}
   saveField({affinity_delay_ms:n});
 };
+$('c-cpuset-use-save').onclick=()=>saveField({use_cpuset:$('c-cpuset-use').checked});
 
 $('c-about').onclick=async()=>{
   $('page-about').classList.add('show');
