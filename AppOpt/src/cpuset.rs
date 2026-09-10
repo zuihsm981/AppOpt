@@ -218,6 +218,41 @@ pub fn parse_cpu_spec(spec: &str, topo: &CpuTopology) -> CpuSet {
 }
 
 /// 创建 cpuset 子目录并写入 cpus 与 mems
+/// 取 /dev/cpuset/foreground 的 atime/mtime (伪装时间基准)
+fn foreground_times() -> Option<[libc::timespec; 2]> {
+    let p = CString::new("/dev/cpuset/foreground").ok()?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::stat(p.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    Some([
+        libc::timespec { tv_sec: st.st_atime, tv_nsec: st.st_atime_nsec },
+        libc::timespec { tv_sec: st.st_mtime, tv_nsec: st.st_mtime_nsec },
+    ])
+}
+
+fn set_times_like_foreground(path: &str) {
+    let Some(ts) = foreground_times() else { return };
+    let c = CString::new(path).unwrap_or_default();
+    if c.is_empty() {
+        return;
+    }
+    // 目录自身 + 目录内所有条目统一为 foreground 的时间 (伪装创建痕迹)
+    unsafe {
+        libc::utimensat(libc::AT_FDCWD, c.as_ptr(), ts.as_ptr(), 0);
+    }
+    if let Ok(rd) = fs::read_dir(path) {
+        for e in rd.flatten() {
+            let Some(name) = e.file_name().to_str().map(String::from) else { continue };
+            if let Ok(c2) = CString::new(format!("{}/{}", path, name)) {
+                unsafe {
+                    libc::utimensat(libc::AT_FDCWD, c2.as_ptr(), ts.as_ptr(), 0);
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn create_cpuset_dir(path: &str, cpus: &str, mems: &str) -> bool {
     let c_path = CString::new(path).expect("cpuset path 受控输入，无 NUL");
     let ret = unsafe { libc::mkdir(c_path.as_ptr(), 0o755) };
@@ -238,7 +273,12 @@ pub(crate) fn create_cpuset_dir(path: &str, cpus: &str, mems: &str) -> bool {
         return false;
     }
     let mems_path = format!("{}/mems", path);
-    fs::write(&mems_path, mems).is_ok()
+    if fs::write(&mems_path, mems).is_err() {
+        return false;
+    }
+    // 创建完成后统一时间戳 (目录 + 文件) 与 /dev/cpuset/foreground 一致
+    set_times_like_foreground(path);
+    true
 }
 
 /// 按合并后的 CPU 集合确保 cpuset 子目录存在，返回目录名（cpuset 未启用或创建失败返回空串）
