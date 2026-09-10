@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -27,6 +27,10 @@ pub static WEB_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// KPM 模式是否活跃 (main 在 ebpf_state 置位/卸载时更新)
 pub static KPM_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// 线程放置延迟 (ms): 冷启动 ApplyPkg 后延迟枚举 uid 全部 pid 设亲和的时间
+/// (默认 2000 = 原 ENUM_DELAY 2s), web 设置项可调, 持久化于 AppOpt.json
+pub static AFFINITY_DELAY_MS: AtomicU64 = AtomicU64::new(2000);
 
 /// 进程启动时间 (/api/status 实时计算 uptime)
 pub static START: OnceLock<Instant> = OnceLock::new();
@@ -534,6 +538,7 @@ fn config_json() -> String {
         "cpuset_name": base_cpuset().rsplit('/').next().unwrap_or_default(),
         "config_file": lock_ignore_poison(&CONFIG_FILE).clone(),
         "cpuset_enabled": cfg.is_some_and(|c| c.topo.cpuset_enabled),
+        "affinity_delay_ms": AFFINITY_DELAY_MS.load(Ordering::Relaxed),
     })
     .to_string()
 }
@@ -577,6 +582,15 @@ fn config_set_api(req: &Request) -> (u16, String) {
     if let Some(m) = mode_str {
         if valid_mode(&m) {
             set_drive_mode(&m);
+        }
+    }
+
+    // 线程放置延迟 (ms): 数字, 0~60000
+    if let Some(n) = v["affinity_delay_ms"].as_u64() {
+        if n <= 60000 {
+            AFFINITY_DELAY_MS.store(n, Ordering::Relaxed);
+        } else {
+            return err_json(400, "延迟超出范围 (0~60000ms)");
         }
     }
 
@@ -624,6 +638,7 @@ pub struct Settings {
     pub cpuset_name: String,
     pub config_file: String,
     pub mode: String,
+    pub affinity_delay_ms: u64,
 }
 
 impl Default for Settings {
@@ -633,6 +648,7 @@ impl Default for Settings {
             cpuset_name: DEFAULT_CPUSET_NAME.to_string(),
             config_file: "./appopt.conf".to_string(),
             mode: "auto".to_string(),
+            affinity_delay_ms: 2000,
         }
     }
 }
@@ -665,6 +681,10 @@ impl Settings {
                 .filter(|s| valid_mode(s))
                 .unwrap_or("auto")
                 .to_string(),
+            affinity_delay_ms: v["affinity_delay_ms"]
+                .as_u64()
+                .filter(|n| *n <= 60000)
+                .unwrap_or(2000),
         }
     }
 
@@ -674,6 +694,7 @@ impl Settings {
             "cpuset_name": self.cpuset_name,
             "config_file": self.config_file,
             "mode": self.mode,
+            "affinity_delay_ms": self.affinity_delay_ms,
         })
     }
 
@@ -692,7 +713,7 @@ impl Settings {
 }
 
 pub fn settings_load(path: &str) -> Settings {
-    match fs::read_to_string(path) {
+    let s = match fs::read_to_string(path) {
         Ok(text) => match serde_json::from_str::<Value>(&text) {
             Ok(v) => Settings::from_json(&v),
             Err(_) => Settings::default(),
@@ -703,7 +724,9 @@ pub fn settings_load(path: &str) -> Settings {
             d
         }
         Err(_) => Settings::default(),
-    }
+    };
+    AFFINITY_DELAY_MS.store(s.affinity_delay_ms, Ordering::Relaxed);
+    s
 }
 
 pub fn settings_save() {
@@ -712,6 +735,7 @@ pub fn settings_save() {
         cpuset_name: base_cpuset().rsplit('/').next().unwrap_or_default().to_string(),
         config_file: lock_ignore_poison(&CONFIG_FILE).clone(),
         mode: drive_mode(),
+        affinity_delay_ms: AFFINITY_DELAY_MS.load(Ordering::Relaxed),
     }
     .save(SETTINGS_FILE);
 }

@@ -28,8 +28,11 @@ use crate::config::AppConfig;
 use crate::ebpf_mode::KpmHandle;
 
 /// 前台回调后延迟枚举时长: 冷启动子进程 (pkg:child) 常在回调后 0.5~2s 内 spawn,
-/// 延迟 2s 后按 uid 枚举一次覆盖冷启动窗口 (主进程回调时已在, 无影响)。
-const ENUM_DELAY: Duration = Duration::from_secs(2);
+/// 延迟后按 uid 枚举一次覆盖冷启动窗口 (主进程回调时已在, 无影响)。
+/// 延迟值由 web 设置项「线程放置延迟」控制 (默认 2000ms)。
+fn enum_delay() -> Duration {
+    Duration::from_millis(crate::web::AFFINITY_DELAY_MS.load(Ordering::Relaxed))
+}
 
 /// CPU worker 消息
 pub enum CpuMsg {
@@ -279,7 +282,7 @@ impl CpuAffinity {
                 Ok(CpuMsg::ApplyPkg(pid, uid, pkg)) => {
                     // 冷启动: 先占位 cpu_known (uid+主 pid), 延迟 2s 覆盖子进程窗口
                     crate::rw_write_ignore_poison(&CPU_KNOWN).insert(uid, (pid, Vec::new()));
-                    thread::sleep(ENUM_DELAY);
+                    thread::sleep(enum_delay());
                     let cfg = crate::rw_read_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
                     if let Some(cfg) = cfg {
                         let pids = self.on_uid(uid, &pkg, &cfg);
