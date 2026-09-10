@@ -702,7 +702,7 @@ fn main() {
         if kpm_died {
             ebpf_state = None;
             crate::web::KPM_ACTIVE.store(false, Ordering::Relaxed);
-            if let Some(mut es) = ebpf_init(kpm_wake_fd, drive_mode.clone()) {
+            if let Some(es) = ebpf_init(kpm_wake_fd, drive_mode.clone()) {
                 crate::web::KPM_ACTIVE.store(true, Ordering::Relaxed);
                 ebpf_state = Some(es);
                 if cpu_ready {

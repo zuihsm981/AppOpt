@@ -24,7 +24,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
-use crate::apply_affinity::tid_comm;
 use crate::config::AppConfig;
 
 /// 安全构造 CString (输入受控/常量; 无 NUL 时保底空串, 避免 panic)
@@ -86,7 +85,7 @@ const KPM_MODULE: &[u8] = b"appopt-kpm\0";
 fn kpm_key() -> CString {
     if let Ok(k) = std::env::var("APPOPT_KPM_KEY") {
         if !k.is_empty() {
-            return cstr(k);
+            return cstr(&k);
         }
     }
     cstr("su")
@@ -192,7 +191,7 @@ impl KpmHandle {
     /// 失败返回负错误码。须在 activate()/start 之前调用, 以免漏事件。
     fn shm_open(&self, evt_fd: c_int) -> i64 {
         let s = format!("shm_open {}", evt_fd);
-        let c = cstr(s);
+        let c = cstr(&s);
         kpm_ctl0(&self.key, &c, &mut [])
     }
 
@@ -327,8 +326,6 @@ pub fn ebpf_init(kpm_wake_fd: c_int, drive_mode: String) -> Option<EbpfState> {
                 && (*hdr).ring_size == APPOPT_EVENT_RING_SIZE
         };
         if !ok {
-            unsafe {
-            }
             unsafe { libc::munmap(shm_base, map_len); }
             unsafe { libc::close(evt_fd); }
             unsafe { libc::close(shm_fd); }

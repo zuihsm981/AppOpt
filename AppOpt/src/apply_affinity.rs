@@ -1,7 +1,6 @@
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::FileExt;
-use std::sync::atomic::Ordering;
 
 use crate::{MAX_PKG_LEN, MAX_THREAD_LEN};
 use crate::cpuset::{base_cpuset, CpuSet, CpuTopology};
