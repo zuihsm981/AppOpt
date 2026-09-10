@@ -269,28 +269,17 @@ fn status_json() -> String {
         None => (0, 0),
     };
     let uptime = START.get().map(|t| t.elapsed().as_secs()).unwrap_or(0);
-    // 刷新率状态专用统计: 剔除"只有线程规则且无刷新率配置"的应用 (这类应用
-    // 不影响刷新率, 刷新率状态页不统计它们)
+    // 刷新率状态专用统计: 只统计有刷新率配置的应用 (只有线程规则且无刷新率
+    // 配置的应用不影响刷新率, 不计入)
     let (rf_rules, rf_hit_pkgs, rf_hit_list) = {
-        let mut only_thread: HashSet<&str> = HashSet::new();
-        if let Some(c) = cfg.as_ref() {
-            let rf_apps: HashSet<&str> =
-                c.app_refresh_configs.keys().map(String::as_str).collect();
-            only_thread = c.pkgs
-                .iter()
-                .filter(|p| !rf_apps.contains(p.as_str()))
-                .filter(|p| c.has_thread_rules.contains(*p))
-                .filter(|p| !c.rules.iter().any(|r| r.pkg == **p && r.thread.is_empty()))
-                .map(String::as_str)
-                .collect();
-        }
-        let rf_rules = cfg
+        let rf_apps: HashSet<&str> = cfg
             .as_ref()
-            .map(|c| c.rules.iter().filter(|r| !only_thread.contains(r.pkg.as_str())).count())
-            .unwrap_or(0);
+            .map(|c| c.app_refresh_configs.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        let rf_rules = rf_apps.len();
         let rf_hit_list: Vec<String> = hit_list
             .iter()
-            .filter(|p| !only_thread.contains(p.as_str()))
+            .filter(|p| rf_apps.contains(p.as_str()))
             .cloned()
             .collect();
         (rf_rules, rf_hit_list.len(), rf_hit_list)
