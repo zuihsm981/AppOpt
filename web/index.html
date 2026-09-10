@@ -134,8 +134,12 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <main class="main">
 
 <section id="tab-status" class="panel">
+<div class="seg" id="st-seg" style="margin-bottom:12px">
+<button data-st="thread" class="on">线程状态</button>
+<button data-st="refresh">刷新率状态</button>
+</div>
+<div id="st-thread">
 <div class="card">
-<div class="card-title">运行状态</div>
 <div class="row"><span class="label">工作模式</span><span id="s-mode" class="badge proc">-</span></div>
 <div class="row"><span class="label">连接状态</span><span id="s-conn" class="badge proc">-</span></div>
 <div class="row"><span class="label">运行时长</span><span class="value" id="s-up">-</span></div>
@@ -164,6 +168,37 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="row" id="s-row-pcore"><span class="label">p-core 中核</span><span class="chip p" id="s-pcore">-</span></div>
 <div class="row"><span class="label">hp-core 大核</span><span class="chip h" id="s-hcore">-</span></div>
 <div class="row"><span class="label">全部核心</span><span class="chip c" id="s-all">-</span></div>
+</div>
+</div>
+<div id="st-refresh" hidden>
+<div class="card">
+<div class="row" id="rf-device-wrap" role="button" tabindex="0" style="cursor:pointer" title="点击查看完整模式">
+<span class="label">设备刷新率</span><span class="badge kpm" id="rf-device">-</span>
+</div>
+<div class="row"><span class="label">当前刷新率</span><span class="badge kpm" id="rf-mode">-</span></div>
+<div class="row"><span class="label">定时器状态</span><span class="badge kpm" id="rf-timer">-</span></div>
+<div class="row"><span class="label" id="rf-input-label">内核 input 状态</span><span class="badge kpm mono" id="rf-input">-</span></div>
+</div>
+<div class="card">
+<div class="card-title">规则</div>
+<div class="grid2">
+<div class="stat"><div class="num" id="s-rf-rules">0</div><div class="lbl">规则数量</div></div>
+<div class="stat clickable" id="s-rf-hit-card" role="button" tabindex="0" title="点击查看命中的具体应用包名"><div class="num" id="s-rf-hit">0</div><div class="lbl">命中应用</div></div>
+</div>
+</div>
+<div class="card">
+<div class="card-title">全局配置</div>
+<div class="row"><span class="label">最大刷新率</span>
+<select id="rf-active" style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:14px;font-family:inherit">
+<option value="120">120Hz</option><option value="90">90Hz</option><option value="60">60Hz</option>
+</select></div>
+<div class="row"><span class="label">空闲刷新率</span>
+<select id="rf-idle" style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:14px;font-family:inherit">
+<option value="120">120Hz</option><option value="90">90Hz</option><option value="60">60Hz</option>
+</select></div>
+<div class="row"><span class="label">空闲超时(秒)</span><input id="rf-timeout" type="number" min="1" max="3600" style="width:80px;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:14px;font-family:inherit"></div>
+<div style="margin-top:10px;text-align:right"><button class="btn" id="rf-save">保存全局配置</button></div>
+</div>
 </div>
 </section>
 
@@ -213,35 +248,10 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 
 </section>
 
-<section id="tab-refresh" class="panel" hidden>
-<div class="card">
-<div class="card-title">刷新率状态</div>
-<div class="row" id="rf-device-wrap" role="button" tabindex="0" style="cursor:pointer" title="点击查看完整模式">
-<span class="label">设备刷新率</span><span class="badge kpm" id="rf-device">-</span>
-</div>
-<div class="row"><span class="label">当前刷新率</span><span class="badge kpm" id="rf-mode">-</span></div>
-<div class="row"><span class="label">定时器状态</span><span class="badge kpm" id="rf-timer">-</span></div>
-<div class="row"><span class="label" id="rf-input-label">内核 input 状态</span><span class="badge kpm mono" id="rf-input">-</span></div>
-</div>
-<div class="card">
-<div class="card-title">全局配置</div>
-<div class="row"><span class="label">最大刷新率</span>
-<select id="rf-active" style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:14px;font-family:inherit">
-<option value="120">120Hz</option><option value="90">90Hz</option><option value="60">60Hz</option>
-</select></div>
-<div class="row"><span class="label">空闲刷新率</span>
-<select id="rf-idle" style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:14px;font-family:inherit">
-<option value="120">120Hz</option><option value="90">90Hz</option><option value="60">60Hz</option>
-</select></div>
-<div class="row"><span class="label">空闲超时(秒)</span><input id="rf-timeout" type="number" min="1" max="3600" style="width:80px;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:14px;font-family:inherit"></div>
-<div style="margin-top:10px;text-align:right"><button class="btn" id="rf-save">保存全局配置</button></div>
-</div>
-</section>
 
 </main>
 <nav class="tabbar">
 <button class="tab active" data-tab="status"><svg viewBox="0 0 24 24"><path d="M4 16a8 8 0 0 1 16 0"/><path d="M12 16L16 12"/><circle cx="12" cy="16" r="1.2" fill="currentColor" stroke="none"/><path d="M6 20h12"/></svg>状态</button>
-<button class="tab" data-tab="refresh"><svg viewBox="0 0 24 24"><path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z"/></svg>刷新率</button>
 <button class="tab" data-tab="rules"><svg viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13"/><circle cx="4" cy="6" r="1" fill="currentColor" stroke="none"/><circle cx="4" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="4" cy="18" r="1" fill="currentColor" stroke="none"/></svg>规则</button>
 <button class="tab" data-tab="settings"><svg viewBox="0 0 24 24"><path d="M5 21V9M12 21V3M19 21v-8"/><circle cx="5" cy="6" r="2"/><circle cx="12" cy="9" r="2"/><circle cx="19" cy="10" r="2"/></svg>设置</button>
 </nav>
@@ -353,24 +363,72 @@ document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{
   if(t===activeTab)return;
   activeTab=t;
   document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x===b));
-  ['status','rules','settings','refresh'].forEach(n=>$('tab-'+n).hidden=n!==t);
-  if(t==='status')startStat();else stopStat();
+  ['status','rules','settings'].forEach(n=>$('tab-'+n).hidden=n!==t);
+  if(t==='status')resumeStatus();else pauseStatus();
   if(t==='rules')loadRules();
   if(t==='settings')loadCfg();
-  if(t==='refresh')loadRefresh();
 });
+
+// ===== 状态页: 线程状态 / 刷新率状态 切换 =====
+let statusSeg='thread';
+function switchStatusSeg(st){
+  statusSeg=st;
+  document.querySelectorAll('#st-seg button').forEach(x=>x.classList.toggle('on',x.dataset.st===st));
+  $('st-thread').hidden=st!=='thread';
+  $('st-refresh').hidden=st!=='refresh';
+  if(st==='thread'){stopRf();startStat();loadRefreshOnce();}
+  else{stopStat();loadRefresh();}
+}
+document.querySelectorAll('#st-seg button').forEach(b=>b.onclick=()=>switchStatusSeg(b.dataset.st));
 
 function startStat(){stopStat();refreshStat();statTimer=setInterval(refreshStat,1000)}
 function stopStat(){if(statTimer){clearInterval(statTimer);statTimer=null}}
+function stopRf(){if(rfTimer){clearInterval(rfTimer);rfTimer=null}}
+// 状态页: 按当前 seg 段轮询 (线程状态→statTimer / 刷新率状态→rfTimer)
+function pauseStatus(){stopStat();stopRf()}
+function resumeStatus(){if(statusSeg==='thread')startStat();else loadRefresh()}
+// 切到线程状态时同步拉一次刷新率数据 (供切回即时显示), 不启动 rfTimer
+async function loadRefreshOnce(){
+  try{
+    const[st,cfg,st0]=await Promise.all([api('/api/refresh/status'),api('/api/refresh/config'),api('/api/status')]);
+    renderRfInput(st);
+    fillRfRules(st0);
+    $('rf-mode').textContent=st.mode_str||'-';
+    $('rf-timer').textContent=st.timer_enabled?(st.is_paused?'空闲中':(st.timer_running?'计时中':'未运行')):'未启用';
+    $('rf-timeout').value=cfg.timeout;
+    rfAvail=cfg.available&&cfg.available.length?cfg.available:[120,90,60];
+    lastRefreshCfg=cfg;
+    renderDeviceRates(cfg);
+    applyRateOptions($('rf-active'),rfAvail,cfg.active);
+    applyRateOptions($('rf-idle'),rfAvail,cfg.idle);
+  }catch(e){}
+}
 // 轮询可见性管理: 仅前端打开/可见时轮询; 隐藏/失焦/关闭页面即停止
-function pausePolling(){stopStat();if(rfTimer){clearInterval(rfTimer);rfTimer=null}}
-function resumePolling(){if(activeTab==='status')startStat();else if(activeTab==='refresh')loadRefresh()}
+function pausePolling(){pauseStatus()}
+function resumePolling(){if(activeTab==='status')resumeStatus()}
 document.addEventListener('visibilitychange',()=>{if(document.hidden)pausePolling();else resumePolling()});
 window.addEventListener('blur',()=>pausePolling());
 window.addEventListener('focus',()=>resumePolling());
 window.addEventListener('pagehide',()=>pausePolling());
 let hitList=[];
+let rfHitList=[];
 let statusDrive='auto',statusTouch=false,statusConn=false;
+// 刷新率状态页规则卡: 规则数量/命中应用 (不含只有线程规则且无刷新率配置的应用)
+function fillRfRules(d){
+  $('s-rf-rules').textContent=d.rf_rules??0;
+  rfHitList=Array.isArray(d.rf_hit_list)?d.rf_hit_list:[];
+  $('s-rf-hit').textContent=d.rf_hit_pkgs??0;
+}
+// 刷新率状态命中应用弹窗 (复用 modal-hit)
+function showRfHitList(){
+  $('mhit-summary').textContent='共 '+rfHitList.length+' 个命中应用';
+  const box=$('mhit-list');
+  if(!rfHitList.length){box.innerHTML='<div class="empty">暂无命中应用</div>';}
+  else{box.innerHTML=rfHitList.map(p=>`<div class="rule-row"><span class="rule-name mono">${esc(p)}</span></div>`).join('');}
+  $('modal-hit').hidden=false;
+}
+$('s-rf-hit-card').onclick=showRfHitList;
+$('s-rf-hit-card').addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();showRfHitList()}});
 async function refreshStat(){
   if(document.hidden)return;
   try{
@@ -854,6 +912,7 @@ async function loadRefresh(){
     const[st,cfg,st0]=await Promise.all([api('/api/refresh/status'),api('/api/refresh/config'),api('/api/status')]);
     statusDrive=st0.mode; statusConn=!!st0.connected; statusTouch=!!st0.touch_listening;
     renderRfInput(st);
+    fillRfRules(st0);
     $('rf-mode').textContent=st.mode_str||'-';
     $('rf-timer').textContent=st.timer_enabled?(st.is_paused?'空闲中':(st.timer_running?'计时中':'未运行')):'未启用';
     $('rf-timeout').value=cfg.timeout;
@@ -867,6 +926,7 @@ async function loadRefresh(){
         const[s,st0]=await Promise.all([api('/api/refresh/status'),api('/api/status')]);
         statusDrive=st0.mode; statusConn=!!st0.connected; statusTouch=!!st0.touch_listening;
         renderRfInput(s);
+        fillRfRules(st0);
         $('rf-mode').textContent=s.mode_str||'-';
         $('rf-timer').textContent=s.timer_enabled?(s.is_paused?'空闲中':(s.timer_running?'计时中':'未运行')):'未启用';
       }catch(e){}
