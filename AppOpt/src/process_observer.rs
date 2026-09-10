@@ -131,7 +131,7 @@ extern "C" fn on_transact(
     in_parcel: *mut c_void,
     _out: *mut c_void,
 ) -> c_int {
-    let ndk = match ndk() { Some(n) => n, None => return STATUS_UNKNOWN_TRANSACTION };
+    let Some(ndk) = ndk() else { return STATUS_UNKNOWN_TRANSACTION };
 
     // NDK 的 AIBinder_onTransact 内部已通过 checkInterface() 读取了 Interface Token
     // (strict_mode i32 + UTF-16 descriptor)，且不重置 parcel 位置
@@ -179,7 +179,7 @@ extern "C" fn on_transact(
 }
 
 fn get_observer_class() -> *mut c_void {
-    let ndk = match ndk() { Some(n) => n, None => return std::ptr::null_mut() };
+    let Some(ndk) = ndk() else { return std::ptr::null_mut() };
     OBSERVER_CLASS.get_or_init(|| {
         let class = unsafe {
             (ndk.class_define)(
@@ -192,7 +192,7 @@ fn get_observer_class() -> *mut c_void {
 }
 
 fn get_am_class() -> *mut c_void {
-    let ndk = match ndk() { Some(n) => n, None => return std::ptr::null_mut() };
+    let Some(ndk) = ndk() else { return std::ptr::null_mut() };
     AM_CLASS.get_or_init(|| {
         let class = unsafe {
             (ndk.class_define)(
@@ -206,7 +206,7 @@ fn get_am_class() -> *mut c_void {
 
 /// SurfaceFlinger 的 ISurfaceComposer class（用于 binder 直连设置刷新率）
 fn get_sf_class() -> *mut c_void {
-    let ndk = match ndk() { Some(n) => n, None => return std::ptr::null_mut() };
+    let Some(ndk) = ndk() else { return std::ptr::null_mut() };
     SF_CLASS.get_or_init(|| {
         let class = unsafe {
             (ndk.class_define)(
@@ -221,7 +221,7 @@ fn get_sf_class() -> *mut c_void {
 pub fn init_observer(send_fd: i32) -> bool {
     FG_SEND_FD.store(send_fd, Ordering::Release);
 
-    let ndk = match ndk() { Some(n) => n, None => return false };
+    let Some(ndk) = ndk() else { return false };
     let class = get_observer_class();
     if class.is_null() { return false; }
 
@@ -275,7 +275,7 @@ pub fn init_observer(send_fd: i32) -> bool {
 /// 使用 ISurfaceComposer.h 确认的描述符 android.ui.ISurfaceComposer；
 /// 失败返回 false，调用方可回退到 service 命令。
 pub fn set_refresh_rate_binder(mode: i32) -> bool {
-    let ndk = match ndk() { Some(n) => n, None => return false };
+    let Some(ndk) = ndk() else { return false };
 
     let sf = unsafe { (ndk.get_service)(b"SurfaceFlinger\0".as_ptr() as *const c_char) };
     if sf.is_null() {

@@ -291,7 +291,7 @@ fn update_status(state: &RefreshState) {
             .map(|t| t.elapsed().as_secs() as i64)
             .unwrap_or(-1),
     };
-    *REFRESH_STATUS.lock().unwrap() = Some(status);
+    *crate::lock_ignore_poison(&REFRESH_STATUS) = Some(status);
 }
 
 fn wake() {
@@ -318,7 +318,7 @@ pub fn refresh_init(display_modes: std::thread::JoinHandle<Vec<(u32, u32, u32, f
     }
 
     let (tx, rx) = mpsc::channel::<RefreshEvent>();
-    *REFRESH_TX.lock().unwrap() = Some(tx);
+    *crate::lock_ignore_poison(&REFRESH_TX) = Some(tx);
 
     // 初始化一次性解析 dumpsys display 的显示模式: 已在 L1 并发线程完成, join 取结果
     let device_modes_raw = display_modes.join().unwrap_or_default();
@@ -416,7 +416,7 @@ pub fn refresh_init(display_modes: std::thread::JoinHandle<Vec<(u32, u32, u32, f
 
 /// 主线程命中刷新率 uid 表后, 下发前台包名 (三线程: 主 → 刷新率线程)。
 pub fn refresh_send_fg_pkg(pkg: String) {
-    let guard = REFRESH_TX.lock().unwrap();
+    let guard = crate::lock_ignore_poison(&REFRESH_TX);
     if let Some(tx) = guard.as_ref() {
         let _ = tx.send(RefreshEvent::FgPkg(pkg));
         wake();
@@ -424,7 +424,7 @@ pub fn refresh_send_fg_pkg(pkg: String) {
 }
 
 pub fn refresh_on_event(event_type: u32, _pid: i32) {
-    let guard = REFRESH_TX.lock().unwrap();
+    let guard = crate::lock_ignore_poison(&REFRESH_TX);
     if let Some(tx) = guard.as_ref() {
         let event = match event_type {
             EVENT_INPUT => RefreshEvent::Input,
@@ -584,7 +584,7 @@ pub fn refresh_del_app(pkg: &str) -> bool {
 }
 
 pub fn refresh_get_status() -> Option<RefreshStatus> {
-    REFRESH_STATUS.lock().unwrap().clone()
+    crate::lock_ignore_poison(&REFRESH_STATUS).clone()
 }
 
 /// 解析 `dumpsys display` 支持的显示模式 (display_modes.sh v3/v2 同款文本解析):

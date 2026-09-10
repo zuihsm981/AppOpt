@@ -27,6 +27,11 @@ use std::thread;
 use crate::apply_affinity::tid_comm;
 use crate::config::AppConfig;
 
+/// 安全构造 CString (输入受控/常量; 无 NUL 时保底空串, 避免 panic)
+fn cstr(s: &str) -> CString {
+    CString::new(s).unwrap_or_default()
+}
+
 /// eBPF 进程事件, 布局需与内核态 appopt_proc_event_t 完全一致 (28B)
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -81,10 +86,10 @@ const KPM_MODULE: &[u8] = b"appopt-kpm\0";
 fn kpm_key() -> CString {
     if let Ok(k) = std::env::var("APPOPT_KPM_KEY") {
         if !k.is_empty() {
-            return CString::new(k).unwrap_or_default();
+            return cstr(k);
         }
     }
-    CString::new("su").unwrap_or_default()
+    cstr("su")
 }
 
 /// 构造 SuperCall 命令参数: [31:16]=0x1158 magic, [15:0]=cmd, [63:32]=版本(可留 0)
@@ -144,7 +149,7 @@ impl KpmHandle {
 
     /// 确认模块已加载: ping 成功即视为已加载
     fn ping(&self) -> bool {
-        let args = CString::new("ping").unwrap_or_default();
+        let args = cstr("ping");
         let mut out = [0u8; 16];
         kpm_ctl0(&self.key, &args, &mut out) >= 0 && out[0] == b'p'
     }
@@ -156,7 +161,7 @@ impl KpmHandle {
 
     /// ctl0 命令封装
     fn cmd(&self, args: &str) -> i64 {
-        let c = CString::new(args).unwrap_or_default();
+        let c = cstr(args);
         kpm_ctl0(&self.key, &c, &mut [])
     }
 
@@ -187,13 +192,13 @@ impl KpmHandle {
     /// 失败返回负错误码。须在 activate()/start 之前调用, 以免漏事件。
     fn shm_open(&self, evt_fd: c_int) -> i64 {
         let s = format!("shm_open {}", evt_fd);
-        let c = CString::new(s).unwrap_or_default();
+        let c = cstr(s);
         kpm_ctl0(&self.key, &c, &mut [])
     }
 
     /// 解除内核侧 eventfd 通知绑定 (AppOpt 退出 / 降级 /proc 模式时调用)
     fn shm_close(&self) {
-        let c = CString::new("shm_close").unwrap_or_default();
+        let c = cstr("shm_close");
         kpm_ctl0(&self.key, &c, &mut []);
     }
 
@@ -376,7 +381,7 @@ fn kpm_shm_reader(
     wakeup_fd: c_int,
     kpm_wake_fd: c_int,
 ) {
-    let name = CString::new("KpmShmReader").unwrap();
+    let name = cstr("KpmShmReader");
     unsafe {
         libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
     }

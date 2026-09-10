@@ -19,13 +19,11 @@ pub fn set_base_cpuset(name: &str) {
     if name.is_empty() || name.contains('/') {
         return;
     }
-    *BASE_CPUSET_PATH.write().unwrap() = Some(format!("/dev/cpuset/{}", name));
+    *crate::rw_write_ignore_poison(&BASE_CPUSET_PATH) = Some(format!("/dev/cpuset/{}", name));
 }
 
 pub fn base_cpuset() -> String {
-    BASE_CPUSET_PATH
-        .read()
-        .unwrap()
+    crate::rw_read_ignore_poison(&BASE_CPUSET_PATH)
         .clone()
         .unwrap_or_else(|| "/dev/cpuset/AppOpt".to_string())
 }

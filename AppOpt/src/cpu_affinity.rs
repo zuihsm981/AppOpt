@@ -240,6 +240,8 @@ impl CpuAffinity {
     /// 应用一个包的全部进程 (主进程 + pkg: 子进程) 的全部线程
     /// 对给定进程集合的全部线程套用规则并应用
     fn apply_tids(&mut self, pids: &[i32], pkg: &str, cfg: &AppConfig) {
+        // 每个应用 (一次枚举/重放) 只查一次「设置 cpuset」开关, 本应用全部线程共用
+        let use_cpuset = crate::web::USE_CPUSET.load(Ordering::Relaxed);
         let has_thread_rules = cfg.has_thread_rules.contains(pkg);
         for p in pids {
             let Some(tids) = crate::apply_affinity::task_tids(*p) else { continue };
@@ -258,6 +260,7 @@ impl CpuAffinity {
                     &rule.cpus,
                     &rule.cpuset_dir,
                     &cfg.topo,
+                    use_cpuset,
                 );
                 self.managed.insert(tid, pkg.to_string());
             }
@@ -299,46 +302,42 @@ impl CpuAffinity {
                 Ok(CpuMsg::ApplyPkgByName(pkg)) => {
                     // 单包重放: 找该包当前 uid → 枚举该 uid 全部 pid → 重设亲和 + 回写身份
                     let cfg = crate::rw_read_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
-                    if let Some(cfg) = cfg {
-                        if let Some(uid) = self.pkg_to_uid(&pkg) {
-                            let pids = self.on_uid(uid, &pkg, &cfg);
-                            if let Some(&main_pid) = pids.first() {
-                                crate::rw_write_ignore_poison(&CPU_KNOWN)
-                                    .insert(uid, (main_pid, pids.clone()));
-                            }
-                            crate::rw_write_ignore_poison(&PROC_SNAPSHOT).insert(uid, pids);
-                            self.uid_pkg.insert(uid, pkg.clone());
+                    if let (Some(cfg), Some(uid)) = (cfg, self.pkg_to_uid(&pkg)) {
+                        let pids = self.on_uid(uid, &pkg, &cfg);
+                        if let Some(&main_pid) = pids.first() {
+                            crate::rw_write_ignore_poison(&CPU_KNOWN)
+                                .insert(uid, (main_pid, pids.clone()));
                         }
+                        crate::rw_write_ignore_poison(&PROC_SNAPSHOT).insert(uid, pids);
+                        self.uid_pkg.insert(uid, pkg.clone());
                     }
                 }
                 Ok(CpuMsg::ApplyThread(pkg, thread)) => {
                     // 单线程重放: 找该包 uid → 枚举该 uid 各 pid 的 task, 收集
                     // comm==thread 的 tid → 只对这些 tid 应用亲和 (apply_tids 按规则匹配)
                     let cfg = crate::rw_read_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
-                    if let Some(cfg) = cfg {
-                        if let Some(uid) = self.pkg_to_uid(&pkg) {
-                            let mut tids: Vec<i32> = Vec::new();
-                            if let Ok(entries) = std::fs::read_dir("/proc") {
-                                for e in entries.flatten() {
-                                    let Ok(p) = e.file_name().to_string_lossy().parse::<i32>() else { continue };
-                                    if p <= 0 || self.init_pids.contains(&p) {
-                                        continue;
-                                    }
-                                    if proc_uid(p) != Some(uid) {
-                                        continue;
-                                    }
-                                    for t in crate::apply_affinity::task_tids(p).unwrap_or_default() {
-                                        if crate::apply_affinity::tid_comm(t).as_deref()
-                                            == Some(thread.as_str())
-                                        {
-                                            tids.push(t);
-                                        }
+                    if let (Some(cfg), Some(uid)) = (cfg, self.pkg_to_uid(&pkg)) {
+                        let mut tids: Vec<i32> = Vec::new();
+                        if let Ok(entries) = std::fs::read_dir("/proc") {
+                            for e in entries.flatten() {
+                                let Ok(p) = e.file_name().to_string_lossy().parse::<i32>() else { continue };
+                                if p <= 0 || self.init_pids.contains(&p) {
+                                    continue;
+                                }
+                                if proc_uid(p) != Some(uid) {
+                                    continue;
+                                }
+                                for t in crate::apply_affinity::task_tids(p).unwrap_or_default() {
+                                    if crate::apply_affinity::tid_comm(t).as_deref()
+                                        == Some(thread.as_str())
+                                    {
+                                        tids.push(t);
                                     }
                                 }
                             }
-                            if !tids.is_empty() {
-                                self.apply_tids(&tids, &pkg, &cfg);
-                            }
+                        }
+                        if !tids.is_empty() {
+                            self.apply_tids(&tids, &pkg, &cfg);
                         }
                     }
                 }

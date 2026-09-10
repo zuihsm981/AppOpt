@@ -1,8 +1,10 @@
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::FileExt;
+use std::sync::atomic::Ordering;
 
 use crate::{MAX_PKG_LEN, MAX_THREAD_LEN};
-use crate::cpuset::{CpuSet, CpuTopology};
+use crate::cpuset::{base_cpuset, CpuSet, CpuTopology};
 
 /// 栈上构建 /proc/{pid}/{suffix} 路径读取文件
 fn read_proc_file<'a>(pid: i32, suffix: &str, buf: &'a mut [u8]) -> Option<&'a [u8]> {
@@ -49,20 +51,43 @@ pub(crate) fn task_tids(pid: i32) -> Option<Vec<i32>> {
     )
 }
 
-/// 对单线程设置 CPU 亲和性 (仅 sched_setaffinity; 不再写入 cpuset)。
+/// cpuset tasks 路径 (cpuset_dir 为空 → base 目录)
+fn cpuset_tasks_path(cpuset_dir: &str) -> String {
+    if cpuset_dir.is_empty() {
+        format!("{}/tasks", base_cpuset())
+    } else {
+        format!("{}/{}/tasks", base_cpuset(), cpuset_dir)
+    }
+}
+
+/// 对单线程设置 CPU 亲和性。
+/// use_cpuset 由调用方在「每个应用一次」的粒度上读取 (本应用全部线程共用),
+/// 避免逐线程查全局开关; true = 先写 tasks 迁移 cpuset 再 sched_setaffinity,
+/// false (默认) = 仅 sched_setaffinity (不写 cpuset)。
 /// 返回 true 表示 ESRCH 线程已退出。
-/// 亲和性已正确则跳过 sched_setaffinity (避免重复 syscall)。
 pub fn affinity_set(
     tid: i32,
     cpus: &CpuSet,
-    _cpuset_dir: &str,
-    _topo: &CpuTopology,
+    cpuset_dir: &str,
+    topo: &CpuTopology,
+    use_cpuset: bool,
 ) -> bool {
-    let affinity_ok = CpuSet::get_affinity(tid).is_some_and(|curr| curr == *cpus);
-    if !affinity_ok {
-        if let Err(e) = cpus.set_affinity(tid) {
-            return e.raw_os_error() == Some(libc::ESRCH);
-        }
+    // 亲和性已正确 → 直接成功返回 (避免重复 syscall)
+    if CpuSet::get_affinity(tid).is_some_and(|curr| curr == *cpus) {
+        return false;
+    }
+
+    // 设置项开启: 先迁移 cpuset (写 tasks, 由 cpuset 控制器接管调度域)
+    if use_cpuset
+        && topo.cpuset_enabled
+        && let Ok(mut f) = fs::OpenOptions::new().append(true).open(cpuset_tasks_path(cpuset_dir))
+    {
+        let _ = writeln!(f, "{}", tid);
+    }
+
+    // sched_setaffinity 收紧到目标核
+    if let Err(e) = cpus.set_affinity(tid) {
+        return e.raw_os_error() == Some(libc::ESRCH);
     }
     false
 }

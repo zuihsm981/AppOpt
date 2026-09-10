@@ -23,6 +23,11 @@ use crate::{lock_ignore_poison, rw_read_ignore_poison, MAX_PKG_LEN, MAX_THREAD_L
 pub const WEB_PORT: u16 = 8889;
 const INDEX_HTML: &str = include_str!("../web/index.html");
 
+/// BASE_CPUSET 目录名 (末段, 供设置项显示/持久化)
+fn cpuset_leaf() -> String {
+    base_cpuset().rsplit('/').next().unwrap_or_default().to_string()
+}
+
 pub static WEB_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// KPM 模式是否活跃 (main 在 ebpf_state 置位/卸载时更新)
@@ -31,6 +36,10 @@ pub static KPM_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// 线程放置延迟 (ms): 冷启动 ApplyPkg 后延迟枚举 uid 全部 pid 设亲和的时间
 /// (默认 2000 = 原 ENUM_DELAY 2s), web 设置项可调, 持久化于 AppOpt.json
 pub static AFFINITY_DELAY_MS: AtomicU64 = AtomicU64::new(2000);
+
+/// 设置 cpuset 选项: 开启时 affinity_set 先写 tasks 迁移 cpuset, 再 sched_setaffinity;
+/// 关闭 (默认) 只做 sched_setaffinity (不写 cpuset)。
+pub static USE_CPUSET: AtomicBool = AtomicBool::new(false);
 
 /// 进程启动时间 (/api/status 实时计算 uptime)
 pub static START: OnceLock<Instant> = OnceLock::new();
@@ -535,10 +544,11 @@ fn config_json() -> String {
         "mode": mode_num,
         "mode_active": active,
         "kpm_available": kpm_probe(),
-        "cpuset_name": base_cpuset().rsplit('/').next().unwrap_or_default(),
+        "cpuset_name": cpuset_leaf(),
         "config_file": lock_ignore_poison(&CONFIG_FILE).clone(),
         "cpuset_enabled": cfg.is_some_and(|c| c.topo.cpuset_enabled),
         "affinity_delay_ms": AFFINITY_DELAY_MS.load(Ordering::Relaxed),
+        "use_cpuset": USE_CPUSET.load(Ordering::Relaxed),
     })
     .to_string()
 }
@@ -594,6 +604,11 @@ fn config_set_api(req: &Request) -> (u16, String) {
         }
     }
 
+    // 设置 cpuset 选项
+    if let Some(b) = v["use_cpuset"].as_bool() {
+        USE_CPUSET.store(b, Ordering::Relaxed);
+    }
+
     settings_save();
     (200, json!({ "ok": true }).to_string())
 }
@@ -639,6 +654,7 @@ pub struct Settings {
     pub config_file: String,
     pub mode: String,
     pub affinity_delay_ms: u64,
+    pub use_cpuset: bool,
 }
 
 impl Default for Settings {
@@ -649,6 +665,7 @@ impl Default for Settings {
             config_file: "./appopt.conf".to_string(),
             mode: "auto".to_string(),
             affinity_delay_ms: 2000,
+            use_cpuset: false,
         }
     }
 }
@@ -685,6 +702,7 @@ impl Settings {
                 .as_u64()
                 .filter(|n| *n <= 60000)
                 .unwrap_or(2000),
+            use_cpuset: v["use_cpuset"].as_bool().unwrap_or(false),
         }
     }
 
@@ -695,6 +713,7 @@ impl Settings {
             "config_file": self.config_file,
             "mode": self.mode,
             "affinity_delay_ms": self.affinity_delay_ms,
+            "use_cpuset": self.use_cpuset,
         })
     }
 
@@ -726,16 +745,18 @@ pub fn settings_load(path: &str) -> Settings {
         Err(_) => Settings::default(),
     };
     AFFINITY_DELAY_MS.store(s.affinity_delay_ms, Ordering::Relaxed);
+    USE_CPUSET.store(s.use_cpuset, Ordering::Relaxed);
     s
 }
 
 pub fn settings_save() {
     Settings {
         web_enable: WEB_ENABLED.load(Ordering::Relaxed),
-        cpuset_name: base_cpuset().rsplit('/').next().unwrap_or_default().to_string(),
+        cpuset_name: cpuset_leaf(),
         config_file: lock_ignore_poison(&CONFIG_FILE).clone(),
         mode: drive_mode(),
         affinity_delay_ms: AFFINITY_DELAY_MS.load(Ordering::Relaxed),
+        use_cpuset: USE_CPUSET.load(Ordering::Relaxed),
     }
     .save(SETTINGS_FILE);
 }
