@@ -94,6 +94,9 @@ fn load_global_config(state: &mut RefreshState) {
     state.current_timeout = state.timeout_seconds;
     state.timer_enabled = state.current_idle != state.current_active;
     sync_input_hook(state);
+    // 用户态触摸监听按需启停: 活跃==空闲(无需 input 切换)暂停 event5, 切换应用
+    // 后按新规则恢复 (KPM 模式此开关同样生效, 避免双源)
+    crate::touch_probe::set_enabled(state.timer_enabled);
 }
 
 /// 从共享 CURRENT_CONFIG 读取按应用刷新率配置（统一加载）

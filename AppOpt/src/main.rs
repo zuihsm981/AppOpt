@@ -206,9 +206,22 @@ fn main() {
             touch_sv.as_mut_ptr(),
         )
     } == 0;
-    if touch_ok {
+    // 触摸监听控制 socket: refresh 线程按 timer_enabled 暂停/恢复 event5 监听
+    let mut touch_ctrl: [libc::c_int; 2] = [0, 0];
+    let touch_ctrl_ok = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+            touch_ctrl.as_mut_ptr(),
+        )
+    } == 0;
+    if touch_ok && touch_ctrl_ok {
         let tw = touch_sv[1];
-        std::thread::spawn(move || crate::touch_probe::spawn_touch(tw));
+        let cw = touch_ctrl[1];
+        crate::touch_probe::set_ctrl_fd(cw);   // 写端供 set_enabled 使用
+        let cr = touch_ctrl[0];
+        std::thread::spawn(move || crate::touch_probe::spawn_touch(tw, cr));
     }
     // T7: 用户态进程退出监听 (4.19 用户态模式, 替代内核 EXIT; 仅主 pid 注册)
     let mut exit_sv: [libc::c_int; 2] = [0, 0];
@@ -632,16 +645,7 @@ fn main() {
                             )
                         };
                         if n == 4 {
-                            let idx = i32::from_ne_bytes([tb[0], tb[1], tb[2], tb[3]]);
-                            use std::io::Write;
-                            eprintln!("[appopt] 触摸活动 on /dev/input/event{}", idx);
-                            if let Ok(mut tf) = std::fs::OpenOptions::new()
-                                .create(true).append(true)
-                                .open("/data/local/tmp/appopt_touch.log")
-                            {
-                                let _ = writeln!(tf, "[{:?}] activity on /dev/input/event{}",
-                                                std::time::SystemTime::now(), idx);
-                            }
+                            let _idx = i32::from_ne_bytes([tb[0], tb[1], tb[2], tb[3]]);
                         }
                     }
                     crate::refresh::refresh_on_event(crate::refresh::EVENT_INPUT, 0);
@@ -655,7 +659,13 @@ fn main() {
                         };
                         if n == 4 {
                             let pid = i32::from_ne_bytes([pb[0], pb[1], pb[2], pb[3]]);
-                            crate::cpu_affinity::cpu_known_evict_by_pid(pid);
+                            // 清身份 + 通知 CPU worker 清该 uid managed → 发布统计
+                            // (webui 命中应用/绑定线程归零, 与 KPM EXIT 同效果)
+                            if let Some(uid) = crate::cpu_affinity::cpu_known_evict_by_pid(pid) {
+                                if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
+                                    let _ = tx.send(crate::cpu_affinity::CpuMsg::EvictUid(uid));
+                                }
+                            }
                         }
                     }
                 }

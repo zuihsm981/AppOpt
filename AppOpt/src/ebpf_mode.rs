@@ -28,15 +28,6 @@ use crate::apply_affinity::tid_comm;
 use crate::config::AppConfig;
 
 /// 连接诊断日志 (临时): /data/local/tmp/appopt_conn.log + stderr
-fn conn_log(msg: &str) {
-    use std::io::Write;
-    eprintln!("[appopt_conn] {}", msg);
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true).append(true)
-        .open("/data/local/tmp/appopt_conn.log")
-    {
-        let _ = writeln!(f, "[{:?}] {}", std::time::SystemTime::now(), msg);
-    }
 }
 
 /// eBPF 进程事件, 布局需与内核态 appopt_proc_event_t 完全一致 (28B)
@@ -209,19 +200,6 @@ impl KpmHandle {
         kpm_ctl0(&self.key, &c, &mut []);
     }
 
-    /// 查询模块事件通道模式: "hook"(KP hook 路径/4.19) / "kprobe"(6.6)
-    fn mode(&self) -> Option<String> {
-        let mut out = [0u8; 16];
-        let c = CString::new("mode").unwrap_or_default();
-        let rc = kpm_ctl0(&self.key, &c, &mut out);
-        if rc < 0 {
-            return None;
-        }
-        let s = String::from_utf8_lossy(&out);
-        let s = s.trim_end_matches('\0').trim().to_string();
-        if s.is_empty() { None } else { Some(s) }
-    }
-
 }
 
 /// 将内核 comm 截断于首个 NUL 并 trim 尾部空白
@@ -288,23 +266,19 @@ pub fn kpm_probe() -> bool {
 /// "auto" ping 失败快速回退纯用户态; "kpm" 等待模块长时间重试。
 pub fn ebpf_init(kpm_wake_fd: c_int, drive_mode: String) -> Option<EbpfState> {
     if drive_mode == "userspace" {
-        conn_log("ebpf_init: 纯用户态模式 (userspace), 不使用 KPM");
         return None;
     }
 
     // 不重试: 连接不上 KPM 就直接回退用户态模式 (4.19 常无 KPM/或 KP hook 不可用)
     let key = kpm_key();
     if !kp_ready(&key) {
-        conn_log("ebpf_init: KP 未就绪, 回退纯用户态路径");
         return None;
     }
 
     let handle = KpmHandle { key };
     if !handle.verify_loaded() {
-        conn_log("ebpf_init: 模块未加载, 回退纯用户态路径");
         return None;
     }
-    conn_log("ebpf_init: ping OK");
 
     // 配置 input 节流 (与 eBPF 默认 1s 一致)
     handle.cmd("input_ms 1000");
@@ -312,23 +286,12 @@ pub fn ebpf_init(kpm_wake_fd: c_int, drive_mode: String) -> Option<EbpfState> {
     // ---- 建立事件传输通道: mmap 共享环 + eventfd 通知 (仅此一种, 无 drain 回退) ----
     let evt_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     if evt_fd < 0 {
-        conn_log(&format!("ebpf_init: eventfd 创建失败 errno={}", std::io::Error::last_os_error()));
         return None;
     }
-    conn_log(&format!("ebpf_init: evt_fd={}", evt_fd));
 
-    // ---- 事件通道统一: 4.19 与 6.6 均实测 file_operations.mmap @ slot 11,
-    //      统一走 mmap 共享环 (零 supercall 消费)。hook 模式(4.19)不武装系统级
-    //      hook (稳定基线: 高频 ctl0/drain 在该内核上不稳定, 曾致系统崩溃)。 ----
-    let is_hook = handle.mode().map(|m| m == "hook").unwrap_or(false);
-    if is_hook {
-        conn_log("ebpf_init: hook 模式(4.19) -> mmap 事件通道 (slot 11, CPU 实测确定)");
-    } else {
-        conn_log("ebpf_init: kprobe 模式(6.6) -> mmap 事件通道");
-    }
+    // ---- 事件通道: mmap 共享环 + eventfd 通知 (零 supercall 消费) ----
     // ctl0 shm_open: 绑定 evt_fd(通知端) + 在当前进程安装可 mmap 的 anon fd
     let shm_fd = handle.shm_open(evt_fd);
-    conn_log(&format!("ebpf_init: shm_open -> {}", shm_fd));
     if shm_fd < 0 || shm_fd > i64::from(i32::MAX) {
         unsafe { libc::close(evt_fd); }
         return None;
@@ -349,12 +312,10 @@ pub fn ebpf_init(kpm_wake_fd: c_int, drive_mode: String) -> Option<EbpfState> {
         )
     };
     if shm_base == libc::MAP_FAILED {
-        conn_log(&format!("ebpf_init: mmap 失败 errno={}", std::io::Error::last_os_error()));
         unsafe { libc::close(evt_fd); }
         unsafe { libc::close(shm_fd); }
         return None;
     }
-    conn_log("ebpf_init: mmap OK");
     {
         let hdr = shm_base as *const ShmRing;
         let ok = unsafe {
@@ -365,11 +326,6 @@ pub fn ebpf_init(kpm_wake_fd: c_int, drive_mode: String) -> Option<EbpfState> {
         };
         if !ok {
             unsafe {
-                conn_log(&format!(
-                    "ebpf_init: 共享环头校验失败 magic={:08x}(需{:08x}) ver={}(需{}) esz={}(需{}) rsz={}(需{})",
-                    (*hdr).magic, APPOPT_SHM_MAGIC, (*hdr).version, APPOPT_SHM_VERSION,
-                    (*hdr).event_size, APPOPT_EVENT_SZ, (*hdr).ring_size, APPOPT_EVENT_RING_SIZE,
-                ));
             }
             unsafe { libc::munmap(shm_base, map_len); }
             unsafe { libc::close(evt_fd); }
@@ -382,7 +338,6 @@ pub fn ebpf_init(kpm_wake_fd: c_int, drive_mode: String) -> Option<EbpfState> {
     let (tx, rx) = mpsc::channel::<EbpfProcEvent>();
     let wakeup_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     if wakeup_fd < 0 {
-        conn_log("ebpf_init: wakeup eventfd 创建失败");
         unsafe { libc::munmap(shm_base, map_len); }
         unsafe { libc::close(evt_fd); }
         unsafe { libc::close(shm_fd); }
@@ -398,17 +353,8 @@ pub fn ebpf_init(kpm_wake_fd: c_int, drive_mode: String) -> Option<EbpfState> {
         kpm_shm_reader(shm_ptr, map_len, evt_fd, tx, wakeup_fd, kpm_wake_fd);
     });
 
-    if !is_hook {
-        // 6.6 kprobe 模式: 武装 exit/input/setaffinity (原行为)
-        handle.activate();
-    } else {
-        // 4.19 hook 模式: 全部 KP hook 不可用 (input 激活即卡死 / exit 高频崩,
-        // 解钩也卡) —— 该内核+KP1158 的 hook_wrap 触发路径不稳定, AppOpt 无法
-        // 修复。保持 hook 全关: 亲和性/刷新率由用户态与 binder 完成, exit 归零
-        // 由 /proc 扫描兜底, 触摸切换暂不可用。
-        conn_log("ebpf_init: 4.19 -> hook 全关 (KP hook 机制在此内核不可用)");
-    }
-    conn_log("ebpf_init: OK (reader 已启动, 事件通道建立)");
+    // 武装 exit/input/setaffinity (kprobe 路径; 模块仅在 6.6 加载)
+    handle.activate();
 
     Some(EbpfState {
         event_rx: rx,
@@ -553,11 +499,6 @@ pub fn set_input_hook(on: bool) {
     let h = KpmHandle::new();
     if on {
         h.cmd("input_on");
-    } else if h.mode().map(|m| m == "hook").unwrap_or(false) {
-        // 4.19 hook 模式: 不卸载 input hook —— KP hook_unwrap_remove 在高频
-        // 输入下解钩(恢复入口+释放 trampoline)与正在执行的代码竞争会卡死
-        // (活跃==空闲时卸载必现)。input 事件走 mmap 共享环零 supercall 消费,
-        // 保持常驻安全, 仅多一点点触摸开销。
     } else {
         h.cmd("input_off");
     }

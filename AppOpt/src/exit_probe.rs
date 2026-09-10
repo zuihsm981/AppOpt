@@ -24,19 +24,6 @@ fn reg_lock() -> std::sync::MutexGuard<'static, HashMap<i32, c_int>> {
     REG.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 退出监听日志: eprintln + /data/local/tmp/appopt_exit.log
-fn elog(msg: &str) {
-    use std::io::Write;
-    eprintln!("[exit_probe] {}", msg);
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/data/local/tmp/appopt_exit.log")
-    {
-        let _ = writeln!(f, "[{:?}] {}", std::time::SystemTime::now(), msg);
-    }
-}
-
 /// 为规则应用主 pid 注册退出监听 (幂等)。仅用户态模式由调用方按 KPM_ACTIVE 门控。
 pub fn watch(pid: i32) {
     if pid <= 0 {
@@ -57,7 +44,6 @@ pub fn watch(pid: i32) {
     ev.u64 = pid as u64;
     if unsafe { libc::epoll_ctl(*epfd.lock().unwrap_or_else(|e| e.into_inner()), libc::EPOLL_CTL_ADD, fd, &mut ev) } == 0 {
         reg_lock().insert(pid, fd);
-        elog(&format!("watch pid={} fd={}", pid, fd));
     } else {
         unsafe { libc::close(fd); }
     }
@@ -94,7 +80,6 @@ pub fn spawn_exit(sock: c_int) {
                 unsafe { libc::close(fd); }
             }
             // 通知主线程: pid 已退出 → 清理该 uid 身份
-            elog(&format!("exited pid={}", pid));
             let bytes = pid.to_ne_bytes();
             let _ = unsafe {
                 libc::send(sock, bytes.as_ptr() as *const libc::c_void, 4, libc::MSG_DONTWAIT)
