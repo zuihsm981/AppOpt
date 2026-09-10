@@ -27,9 +27,6 @@ use std::thread;
 use crate::apply_affinity::tid_comm;
 use crate::config::AppConfig;
 
-/// 连接诊断日志 (临时): /data/local/tmp/appopt_conn.log + stderr
-}
-
 /// eBPF 进程事件, 布局需与内核态 appopt_proc_event_t 完全一致 (28B)
 #[repr(C)]
 #[derive(Clone, Copy)]
