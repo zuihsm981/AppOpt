@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -269,6 +269,32 @@ fn status_json() -> String {
         None => (0, 0),
     };
     let uptime = START.get().map(|t| t.elapsed().as_secs()).unwrap_or(0);
+    // 刷新率状态专用统计: 剔除"只有线程规则且无刷新率配置"的应用 (这类应用
+    // 不影响刷新率, 刷新率状态页不统计它们)
+    let (rf_rules, rf_hit_pkgs, rf_hit_list) = {
+        let mut only_thread: HashSet<&str> = HashSet::new();
+        if let Some(c) = cfg.as_ref() {
+            let rf_apps: HashSet<&str> =
+                c.app_refresh_configs.keys().map(String::as_str).collect();
+            only_thread = c.pkgs
+                .iter()
+                .filter(|p| !rf_apps.contains(p.as_str()))
+                .filter(|p| c.has_thread_rules.contains(*p))
+                .filter(|p| !c.rules.iter().any(|r| r.pkg == **p && r.thread.is_empty()))
+                .map(String::as_str)
+                .collect();
+        }
+        let rf_rules = cfg
+            .as_ref()
+            .map(|c| c.rules.iter().filter(|r| !only_thread.contains(r.pkg.as_str())).count())
+            .unwrap_or(0);
+        let rf_hit_list: Vec<String> = hit_list
+            .iter()
+            .filter(|p| !only_thread.contains(p.as_str()))
+            .cloned()
+            .collect();
+        (rf_rules, rf_hit_list.len(), rf_hit_list)
+    };
     json!({
         "version": env!("CARGO_PKG_VERSION"),
         "mode": drive_mode(),
@@ -284,6 +310,9 @@ fn status_json() -> String {
         "hit_list": hit_list,
         "threads": threads,
         "total_procs": sys_procs(),
+        "rf_rules": rf_rules,
+        "rf_hit_pkgs": rf_hit_pkgs,
+        "rf_hit_list": rf_hit_list,
         "e_core": topo.map(|t| t.e_core.to_range_string()).unwrap_or_default(),
         "p_core": topo.map(|t| t.p_core.to_range_string()).unwrap_or_default(),
         "hp_core": topo.map(|t| t.hp_core.to_range_string()).unwrap_or_default(),
