@@ -813,7 +813,7 @@ fn refresh_config_json() -> String {
     // 设备可用刷新率 (Hz), 前端据此过滤 120/90/60 选项
     let (available, device_modes) = match crate::refresh::refresh_get_status() {
         Some(s) => (s.available, s.device_modes),
-        None => (vec![120, 90, 60], Vec::new()),
+        None => (vec![120, 90, 60], std::sync::Arc::new(Vec::new())),
     };
     json!({
         "timeout": timeout,

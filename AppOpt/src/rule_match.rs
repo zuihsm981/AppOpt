@@ -2,7 +2,7 @@ use std::ffi::CString;
 
 use crate::MAX_THREAD_LEN;
 use crate::config::AppConfig;
-use crate::cpuset::{ensure_cpuset_dir, CpuSet};
+use crate::cpuset::CpuSet;
 
 /// 线程亲和性计算结果
 pub struct AffinityResult {
@@ -30,10 +30,7 @@ pub fn thread_affinity(
                 matched = true;
             }
         }
-        // 按合并后的 CPU 集合重算 cpuset 目录，确保与亲和性一致
-        if matched {
-            cpuset_dir = ensure_cpuset_dir(&cpus, &cfg.topo);
-        }
+        // cpuset 目录由调用方 (CpuAffinity) 按合并 CPU 集合缓存 ensure, 避免每线程重复建目录
     }
 
     if !matched {

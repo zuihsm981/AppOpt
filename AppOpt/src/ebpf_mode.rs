@@ -169,6 +169,16 @@ impl KpmHandle {
         self.cmd(&s);
     }
 
+    /// 批量写 APPLIED 表: 相同 bits 的一批 tid 一次 supercall (替代逐 tid ctl0)
+    pub(crate) fn applied_set_many(&self, bits: u64, tids: &[i32]) {
+        let mut s = format!("applied_set_many {:x}", bits);
+        for t in tids {
+            s.push(' ');
+            s.push_str(&t.to_string());
+        }
+        self.cmd(&s);
+    }
+
     /// AppOpt 初始化完成后激活 KPM: start 武装 sched_setaffinity kprobe + input_on 武装 input kprobe
     pub fn activate(&self) {
         self.cmd("start");

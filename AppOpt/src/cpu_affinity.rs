@@ -25,6 +25,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::config::AppConfig;
+use crate::cpuset::{CpuSet, CpuTopology};
 use crate::ebpf_mode::KpmHandle;
 
 /// 前台回调后延迟枚举时长: 冷启动子进程 (pkg:child) 常在回调后 0.5~2s 内 spawn,
@@ -129,6 +130,10 @@ pub struct CpuAffinity {
     init_pids: HashSet<i32>,
     /// 额外标记 launcher3/systemui 的 pid 目录: 其规则直接使用, 免扫描/读 cmdline
     marked: HashMap<String, Vec<i32>>,
+    /// 合并 CPU 集合 bits → cpuset 目录名 缓存 (相同集合只 ensure 一次, 避免每线程重复建目录)
+    cpuset_cache: HashMap<u64, String>,
+    /// 包名 → uid 反向缓存 (重放免扫 /proc; Android uid 固定, 缓存稳定)
+    pkg_uid_cache: HashMap<String, i32>,
 }
 
 impl CpuAffinity {
@@ -141,6 +146,8 @@ impl CpuAffinity {
             uid_pkg: HashMap::new(),
             init_pids,
             marked,
+            cpuset_cache: HashMap::new(),
+            pkg_uid_cache: HashMap::new(),
         }
     }
 
@@ -154,11 +161,15 @@ impl CpuAffinity {
 
     /// 按 uid 枚举该应用全部进程 (主 + pkg: 子进程同 uid) → 应用全部线程。
     /// uid 即应用身份: 精确、无 cmdline 归因竞态、多用户下不误捞其他实例。
-    /// 包名 → uid (单包重放用): 优先标记目录 pid, 否则遍历 /proc 匹配 cmdline
-    fn pkg_to_uid(&self, pkg: &str) -> Option<i32> {
+    /// 包名 → uid (单包重放用): 先查反向缓存, 未命中再走标记/扫描并回填
+    fn pkg_to_uid(&mut self, pkg: &str) -> Option<i32> {
+        if let Some(&u) = self.pkg_uid_cache.get(pkg) {
+            return Some(u);
+        }
         if let Some(pids) = self.marked.get(pkg) {
             if let Some(&p) = pids.first() {
                 if let Some(u) = proc_uid(p) {
+                    self.pkg_uid_cache.insert(pkg.to_string(), u);
                     return Some(u);
                 }
             }
@@ -171,6 +182,7 @@ impl CpuAffinity {
                 }
                 if crate::apply_affinity::read_cmdline(p).as_deref() == Some(pkg) {
                     if let Some(u) = proc_uid(p) {
+                        self.pkg_uid_cache.insert(pkg.to_string(), u);
                         return Some(u);
                     }
                 }
@@ -243,6 +255,9 @@ impl CpuAffinity {
         // 每个应用 (一次枚举/重放) 只查一次「设置 cpuset」开关, 本应用全部线程共用
         let use_cpuset = crate::web::USE_CPUSET.load(Ordering::Relaxed);
         let has_thread_rules = cfg.has_thread_rules.contains(pkg);
+        // 批量 applied_set: 相同 bits 的 tid 聚合, 每个 bits 一次 supercall
+        let mut set: HashMap<u64, Vec<i32>> = HashMap::new();
+        let mut aff: Vec<(i32, CpuSet, String)> = Vec::new();
         for p in pids {
             let Some(tids) = crate::apply_affinity::task_tids(*p) else { continue };
             for tid in tids {
@@ -254,18 +269,44 @@ impl CpuAffinity {
                 let Some(rule) = crate::rule_match::thread_affinity(pkg, &tname, cfg) else {
                     continue;
                 };
-                self.bpf.applied_set(tid, rule.cpus.bits[0]);
-                let _ = crate::apply_affinity::affinity_set(
-                    tid,
-                    &rule.cpus,
-                    &rule.cpuset_dir,
-                    &cfg.topo,
-                    use_cpuset,
-                );
+                let bits = rule.cpus.bits[0];
+                set.entry(bits).or_default().push(tid);
+                // cpuset 目录: 配置自带优先, 否则按合并 CPU 集合缓存 ensure
+                let cpuset_dir = if rule.cpuset_dir.is_empty() {
+                    self.cpuset_dir_for(&rule.cpus, &cfg.topo)
+                } else {
+                    rule.cpuset_dir.clone()
+                };
+                aff.push((tid, rule.cpus, cpuset_dir));
                 self.managed.insert(tid, pkg.to_string());
             }
         }
+        // 批量写内核 APPLIED 表 (每 bits 一次 supercall, 替代逐 tid ctl0)
+        for (bits, tids) in &set {
+            self.bpf.applied_set_many(*bits, tids);
+        }
+        // 逐个 sched_setaffinity (必要的每线程 syscall)
+        for (tid, cpus, cpuset_dir) in aff {
+            let _ = crate::apply_affinity::affinity_set(
+                tid,
+                &cpus,
+                &cpuset_dir,
+                &cfg.topo,
+                use_cpuset,
+            );
+        }
         self.publish_stats();
+    }
+
+    /// cpuset 目录缓存: 相同 CPU 集合 (bits) 只 ensure 一次, 其余线程直接复用
+    fn cpuset_dir_for(&mut self, cpus: &CpuSet, topo: &CpuTopology) -> String {
+        let bits = cpus.bits[0];
+        if let Some(d) = self.cpuset_cache.get(&bits) {
+            return d.clone();
+        }
+        let d = crate::cpuset::ensure_cpuset_dir(cpus, topo);
+        self.cpuset_cache.insert(bits, d.clone());
+        d
     }
 
     /// 常驻线程入口 (纯事件驱动, 无重试/无周期)
@@ -295,8 +336,9 @@ impl CpuAffinity {
                         crate::rw_write_ignore_poison(&PROC_SNAPSHOT).insert(uid, pids);
                         // 标记内核主进程 tgid: 退出探针只对该主进程发布 EXIT
                         self.bpf.applied_set_main(pid);
-                        // 记录 uid→pkg: 退出时按 uid 整清 managed (线程规则应用也覆盖)
+                        // 记录 uid→pkg + pkg→uid (反向缓存: 重放免扫 /proc)
                         self.uid_pkg.insert(uid, pkg.clone());
+                        self.pkg_uid_cache.insert(pkg.clone(), uid);
                     }
                 }
                 Ok(CpuMsg::ApplyPkgByName(pkg)) => {
@@ -310,6 +352,7 @@ impl CpuAffinity {
                         }
                         crate::rw_write_ignore_poison(&PROC_SNAPSHOT).insert(uid, pids);
                         self.uid_pkg.insert(uid, pkg.clone());
+                        self.pkg_uid_cache.insert(pkg.clone(), uid);
                     }
                 }
                 Ok(CpuMsg::ApplyThread(pkg, thread)) => {

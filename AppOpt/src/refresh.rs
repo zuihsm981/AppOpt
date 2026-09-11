@@ -39,7 +39,7 @@ pub struct RefreshStatus {
     /// 设备可用刷新率 (Hz), 供 web 过滤选项 (如仅 [90, 60])
     pub available: Vec<i32>,
     /// 设备全部显示模式 (格式化: "id|WxH Hz"), 供 web 展示
-    pub device_modes: Vec<String>,
+    pub device_modes: std::sync::Arc<Vec<String>>,
     /// 内核 input 触摸 kprobe 是否已武装
     pub input_hooked: bool,
     /// 距上次 input 事件秒数 (-1 = 无事件)
@@ -65,7 +65,7 @@ struct RefreshState {
     /// 设备可用刷新率档位 [120, 90, 60] (web 据此隐藏不可用选项)
     available_modes: [bool; 3],
     /// 设备全部显示模式 (格式化: "id|WxH Hz")
-    device_modes: Vec<String>,
+    device_modes: std::sync::Arc<Vec<String>>,
     timeout_seconds: i32,
     active_mode: i32,
     idle_mode: i32,
@@ -284,7 +284,7 @@ fn update_status(state: &RefreshState) {
             if state.available_modes[2] { v.push(60); }
             v
         },
-        device_modes: state.device_modes.clone(),
+        device_modes: std::sync::Arc::clone(&state.device_modes),
         input_hooked: INPUT_HOOK_ON.load(Ordering::Relaxed),
         last_input_secs: state
             .last_input_time
@@ -333,7 +333,7 @@ pub fn refresh_init(display_modes: std::thread::JoinHandle<Vec<(u32, u32, u32, f
         current_applied_mode: -1,
         rate_args: detect_rate_args(&device_modes_raw),
         available_modes: detect_available_modes(&device_modes_raw),
-        device_modes: fmt_device_modes(&device_modes_raw),
+        device_modes: std::sync::Arc::new(fmt_device_modes(&device_modes_raw)),
         is_paused: false,
         timer_enabled: true,
         last_reset_time: None,
