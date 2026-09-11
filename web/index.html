@@ -236,12 +236,6 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="hint">应用刚启动的时候出现部分线程没有正确设置cpus时调整，默认：2000  单位：ms</div>
 </div>
 <div class="card">
-<div class="card-title">强制cpuset </div>
-<div class="row"><span class="label">强制设置cpuset</span><label style="display:flex;align-items:center;cursor:pointer"><input type="checkbox" id="c-cpuset-use" style="width:auto;height:auto"></label></div>
-<div class="hint">需要线程在后台也保持cpus时开启</div>
-<div style="margin-top:10px;text-align:right"><button class="btn" id="c-cpuset-use-save">保存</button></div>
-</div>
-<div class="card">
 <div class="card-title">关于</div>
 <button class="entry" id="c-about">关于 AppOpt<svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
 </div>
@@ -877,7 +871,6 @@ async function loadCfg(){
     $('c-cpuset').value=d.cpuset_name;
     $('c-file').value=d.config_file;
     $('c-delay').value=d.affinity_delay_ms??2000;
-    $('c-cpuset-use').checked=!!d.use_cpuset;
     $('c-cpuset-on').textContent=d.cpuset_enabled?'已启用':'不可用';
   }catch(e){toast(e.message)}
 }
@@ -896,7 +889,6 @@ $('c-delay-save').onclick=()=>{
   if(isNaN(n)||n<0||n>60000){toast('请输入 0~60000 的毫秒数');return}
   saveField({affinity_delay_ms:n});
 };
-$('c-cpuset-use-save').onclick=()=>saveField({use_cpuset:$('c-cpuset-use').checked});
 
 $('c-about').onclick=async()=>{
   $('page-about').classList.add('show');
