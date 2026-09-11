@@ -229,16 +229,12 @@ fn foreground_times() -> Option<[libc::timespec; 2]> {
     ])
 }
 
+/// 把目录及目录内所有条目的 atime/mtime 统一为 /dev/cpuset/foreground 的时间。
+/// 注意顺序: 必须先设子项, **最后**设目录自身——read_dir 打开目录会刷新目录
+/// atime, 若先设目录再遍历, 目录时间会被 read_dir 覆盖为当前时间。
 fn set_times_like_foreground(path: &str) {
     let Some(ts) = foreground_times() else { return };
-    let c = CString::new(path).unwrap_or_default();
-    if c.is_empty() {
-        return;
-    }
-    // 目录自身 + 目录内所有条目统一为 foreground 的时间 (伪装创建痕迹)
-    unsafe {
-        libc::utimensat(libc::AT_FDCWD, c.as_ptr(), ts.as_ptr(), 0);
-    }
+    // 1) 目录内所有条目
     if let Ok(rd) = fs::read_dir(path) {
         for e in rd.flatten() {
             let Some(name) = e.file_name().to_str().map(String::from) else { continue };
@@ -248,6 +244,14 @@ fn set_times_like_foreground(path: &str) {
                 }
             }
         }
+    }
+    // 2) 最后设目录自身 (避免被上面的 read_dir 刷新 atime)
+    let c = CString::new(path).unwrap_or_default();
+    if c.is_empty() {
+        return;
+    }
+    unsafe {
+        libc::utimensat(libc::AT_FDCWD, c.as_ptr(), ts.as_ptr(), 0);
     }
 }
 
