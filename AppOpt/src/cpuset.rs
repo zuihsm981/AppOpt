@@ -215,18 +215,25 @@ pub fn parse_cpu_spec(spec: &str, topo: &CpuTopology) -> CpuSet {
     set
 }
 
-/// 创建 cpuset 子目录并写入 cpus 与 mems
-/// 取 /dev/cpuset/foreground 的 atime/mtime (伪装时间基准)
+/// foreground 时间基准缓存: 首次 stat 后复用, 避免每次同步重复读取
+static FG_TIMES: std::sync::OnceLock<[libc::timespec; 2]> = std::sync::OnceLock::new();
+
+/// 取 /dev/cpuset/foreground 的 atime/mtime (伪装时间基准, 已缓存)
 fn foreground_times() -> Option<[libc::timespec; 2]> {
+    if let Some(t) = FG_TIMES.get() {
+        return Some(*t);
+    }
     let p = CString::new("/dev/cpuset/foreground").ok()?;
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::stat(p.as_ptr(), &mut st) } != 0 {
         return None;
     }
-    Some([
+    let ts = [
         libc::timespec { tv_sec: st.st_atime, tv_nsec: st.st_atime_nsec },
         libc::timespec { tv_sec: st.st_mtime, tv_nsec: st.st_mtime_nsec },
-    ])
+    ];
+    let _ = FG_TIMES.set(ts);
+    Some(ts)
 }
 
 /// 把目录及目录内所有条目的 atime/mtime 统一为 /dev/cpuset/foreground 的时间。
@@ -278,9 +285,41 @@ pub(crate) fn create_cpuset_dir(path: &str, cpus: &str, mems: &str) -> bool {
     if fs::write(&mems_path, mems).is_err() {
         return false;
     }
-    // 创建完成后统一时间戳 (目录 + 文件) 与 /dev/cpuset/foreground 一致
-    set_times_like_foreground(path);
+    // 时间戳同步不在此处做 (创建后仍会被写入/系统操作刷新);
+    // 统一在初始化/全量应用完成后由 sync_cpuset_timestamps() 执行。
     true
+}
+
+/// 递归同步目录子树时间戳 (深→浅, 每层先子项后目录自身)
+fn sync_tree(path: &str) {
+    if let Ok(rd) = fs::read_dir(path) {
+        // file_type() 直接取 readdir 的 d_type, 避免对每个条目再 stat
+        for e in rd.flatten() {
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir()
+                && let Some(s) = e.path().to_str()
+            {
+                sync_tree(s);
+            }
+        }
+    }
+    set_times_like_foreground(path);
+}
+
+/// 递归同步 BASE_CPUSET 整棵目录树的时间戳为 /dev/cpuset/foreground 的时间。
+/// 在初始化 (含初始全量应用) 完成后调用一次。
+pub(crate) fn sync_cpuset_timestamps() {
+    sync_tree(&base_cpuset());
+}
+
+/// 同步单个 cpuset 子目录 (dir 为空 → base 目录)。冷启动/重放产生新组合目录后调用。
+pub(crate) fn sync_cpuset_dir(dir: &str) {
+    let path = if dir.is_empty() {
+        base_cpuset()
+    } else {
+        format!("{}/{}", base_cpuset(), dir)
+    };
+    sync_tree(&path);
 }
 
 

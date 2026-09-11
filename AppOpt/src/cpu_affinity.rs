@@ -246,6 +246,8 @@ impl CpuAffinity {
                 self.apply_tids(pids, pkg, cfg);
             }
         }
+        // 全量应用完成 (含启动初始): 统一同步 cpuset 目录树时间戳 (伪装为 foreground 时间)
+        crate::cpuset::sync_cpuset_timestamps();
         by_pkg.len()
     }
 
@@ -283,9 +285,26 @@ impl CpuAffinity {
         for (bits, tids) in &set {
             self.bpf.applied_set_many(*bits, tids);
         }
-        // 逐个设置 cpuset (cpuset_enabled) + sched_setaffinity (必要的每线程 syscall)
+        // 按 cpuset_dir 分组: 每个目录只拼一次 tasks 路径, 再逐线程设置
+        // (cpuset_enabled) + sched_setaffinity (必要的每线程 syscall)
+        let base = crate::cpuset::base_cpuset();
+        let mut by_dir: HashMap<String, Vec<(i32, CpuSet)>> = HashMap::new();
         for (tid, cpus, cpuset_dir) in aff {
-            let _ = crate::apply_affinity::affinity_set(tid, &cpus, &cpuset_dir, &cfg.topo);
+            by_dir.entry(cpuset_dir).or_default().push((tid, cpus));
+        }
+        for (dir, items) in &by_dir {
+            let tasks_path = if dir.is_empty() {
+                format!("{}/tasks", base)
+            } else {
+                format!("{}/{}/tasks", base, dir)
+            };
+            for (tid, cpus) in items {
+                let _ = crate::apply_affinity::affinity_set(*tid, cpus, &tasks_path, &cfg.topo);
+            }
+        }
+        // 本轮涉及的 cpuset 目录 (含冷启动新组合目录) 统一同步时间戳为 foreground 时间
+        for d in by_dir.keys() {
+            crate::cpuset::sync_cpuset_dir(d);
         }
         self.publish_stats();
     }
