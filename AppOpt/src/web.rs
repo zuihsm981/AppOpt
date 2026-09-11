@@ -679,7 +679,7 @@ impl Default for Settings {
         Self {
             web_enable: false,
             cpuset_name: DEFAULT_CPUSET_NAME.to_string(),
-            config_file: "./appopt.conf".to_string(),
+            config_file: "./applist.conf".to_string(),
             mode: "auto".to_string(),
             affinity_delay_ms: 2000,
         }

@@ -884,24 +884,6 @@ pub fn reload_refresh_only() {
     }
 }
 
-/// 将旧默认主配置 applist.conf 迁移为统一的 appopt.conf。
-/// 仅在目标不存在时执行，避免覆盖用户显式指定的配置文件。
-pub fn migrate_legacy_main_config(config_file: &str) {
-    let target = std::path::Path::new(config_file);
-    if target.exists() || target.file_name().and_then(|n| n.to_str()) != Some("appopt.conf") {
-        return;
-    }
-    let Some(parent) = target.parent() else { return };
-    let legacy = parent.join("applist.conf");
-    if !legacy.exists() { return; }
-    // rename 保证后续只有一个权威配置文件；失败时复制，避免启动因迁移失败而丢配置。
-    if fs::rename(&legacy, target).is_err() {
-        if let Ok(content) = fs::read(&legacy) {
-            let _ = fs::write(target, content);
-        }
-    }
-}
-
 /// 旧版本曾把刷新率写到可执行文件目录下的 refresh_config.conf。
 /// 启动时只做一次兼容迁移，之后所有读写均使用 CONFIG_FILE。
 pub fn migrate_legacy_refresh_config(config_file: &str) {

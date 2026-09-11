@@ -92,14 +92,14 @@ fn cfg_pkg_sets(cfg: &AppConfig) -> (HashSet<String>, HashSet<String>) {
 fn print_help(prog_name: &str) {
     println!("Usage: {} [OPTIONS]", prog_name);
     println!("Options:");
-    println!("  -c <config_file>   指定统一配置文件 (默认: ./appopt.conf)");
+    println!("  -c <config_file>   指定统一配置文件 (默认: ./applist.conf)");
     println!("  -b <cpuset_name>   指定 BASE_CPUSET 目录名 (默认: AppOpt)");
     println!("  -w                 启用网页前端 (仅本机 127.0.0.1:8889)");
     println!("  -v                 显示程序版本");
     println!("  -h                 显示帮助信息");
     println!();
     println!("示例:");
-    println!("  {} -c /data/appopt.conf", prog_name);
+    println!("  {} -c /data/applist.conf", prog_name);
     println!("  {} -b MyAppOpt", prog_name);
     println!();
     println!("应用设置保存于 ./AppOpt.json，首次运行自动创建；");
@@ -279,13 +279,8 @@ fn main() {
     let display_modes_thread = std::thread::spawn(crate::refresh::parse_display_modes);
 
     // 命令行参数优先覆盖设置 (settings_load 已在 L1 前完成)
-    let config_file = match cli_cfg {
-        Some(path) => path,
-        None if st.config_file == "./applist.conf" => "./appopt.conf".to_string(),
-        None => st.config_file,
-    };
-    // 默认配置升级：applist.conf -> appopt.conf；-c 显式指定的路径不受影响。
-    crate::config::migrate_legacy_main_config(&config_file);
+    // 默认配置文件名: applist.conf (settings 或 -c 显式指定优先)
+    let config_file = cli_cfg.unwrap_or(st.config_file);
     let cpuset_name = cli_cpuset.unwrap_or(st.cpuset_name);
     let web_enable = cli_web || st.web_enable;
 
@@ -294,7 +289,8 @@ fn main() {
     let topo = init_cpu_topo();
 
     if fs::metadata(&config_file).is_err() {
-        let initial_content = "# 规则编写与使用说明请参考 http://AppOpt.suto.top\n# 刷新率字段与 CPU 规则共用此文件\nrefresh_timeout=30\nrefresh_active=120\nrefresh_idle=60\n\n";
+        // 不预写 refresh_* (由设备可用刷新率解析后按实际档位写入文件开头)
+        let initial_content = "# 规则编写与使用说明请参考 http://AppOpt.suto.top\n# 刷新率字段与 CPU 规则共用此文件\n\n";
         let _ = fs::write(&config_file, initial_content);
     }
     // 兼容旧版本：将 refresh_config.conf 内容一次性并入当前主配置文件。
