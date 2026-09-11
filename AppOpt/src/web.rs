@@ -324,6 +324,12 @@ fn rules_json() -> String {
             .unwrap()
             .push(json!({ "thread": r.thread, "spec": spec_name(&r.cpus, &cfg.topo) }));
     }
+    // 仅刷新率配置 (无 CPU 规则) 的应用也必须列出, 否则 web 规则项看不到它们
+    for pkg in cfg.app_refresh_configs.keys() {
+        if !index.contains_key(pkg.as_str()) {
+            groups.push(json!({ "pkg": pkg, "items": [] }));
+        }
+    }
     json!({ "rules": groups }).to_string()
 }
 
@@ -389,7 +395,11 @@ fn rule_del_api(req: &Request) -> (u16, String) {
 
     let file = lock_ignore_poison(&CONFIG_FILE).clone();
     let result = if v["all"].as_bool().unwrap_or(false) {
-        rule_delete_pkg(&file, pkg)
+        // 删除应用全部规则: 应用可能只有刷新率配置 (无 CPU 规则) → 视为完成 (幂等)
+        match rule_delete_pkg(&file, pkg) {
+            RuleEdit::NotFound => RuleEdit::Ok,
+            r => r,
+        }
     } else {
         rule_delete(&file, pkg, thread)
     };
@@ -840,15 +850,36 @@ fn refresh_app_add_api(req: &Request) -> (u16, String) {
         return err_json(400, "无效的包名");
     }
     let timeout = v["timeout"].as_u64().unwrap_or(30) as i32;
-    let active = v["active"].as_str().unwrap_or("120");
-    let idle = v["idle"].as_str().unwrap_or("60");
+    // active/idle 兼容字符串 ("120") 与数字 (120): 前端可能传数字
+    let sv = |k: &str| -> String {
+        v[k].as_str()
+            .map(str::to_string)
+            .or_else(|| v[k].as_i64().map(|n| n.to_string()))
+            .unwrap_or_default()
+    };
+    let active = sv("active");
+    let idle = sv("idle");
     if timeout < 1 || timeout > 3600 {
         return err_json(400, "超时时间需在 1-3600 秒之间");
     }
-    if !matches!(active, "120" | "90" | "60") || !matches!(idle, "120" | "90" | "60") {
+    // 按设备可用档位校正 (防止默认/旧值 120 写入仅支持 90/60 的设备)
+    let avail = crate::refresh::refresh_get_status()
+        .map(|s| s.available)
+        .unwrap_or_default();
+    let fix = |r: String| -> String {
+        let r = if r.is_empty() { "120".to_string() } else { r };
+        if avail.is_empty() || avail.iter().any(|a| a.to_string() == r) {
+            r
+        } else {
+            avail[0].to_string()
+        }
+    };
+    let active = fix(active);
+    let idle = fix(idle);
+    if !matches!(active.as_str(), "120" | "90" | "60") || !matches!(idle.as_str(), "120" | "90" | "60") {
         return err_json(400, "刷新率仅支持 120/90/60");
     }
-    crate::refresh::refresh_add_app(pkg, timeout, active, idle);
+    crate::refresh::refresh_add_app(pkg, timeout, &active, &idle);
     (200, json!({"ok": true}).to_string())
 }
 
