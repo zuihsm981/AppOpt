@@ -16,6 +16,53 @@ fn config_path() -> String {
     crate::lock_ignore_poison(&crate::config::CONFIG_FILE).clone()
 }
 
+/// 设备可用刷新率解析完成后: 首次运行把全局默认刷新率写入配置文件开头
+/// (refresh_active=设备最高档 / refresh_idle=设备最低档 / refresh_timeout=30)。
+/// 已存在的字段不覆盖 (尊重用户配置); 不硬编码 120/60, 按设备实际支持档位取。
+fn ensure_global_refresh_defaults(state: &RefreshState) {
+    let mut avail: Vec<i32> = Vec::new();
+    if state.available_modes[0] { avail.push(120); }
+    if state.available_modes[1] { avail.push(90); }
+    if state.available_modes[2] { avail.push(60); }
+    if avail.is_empty() { avail = vec![120, 90, 60]; }
+
+    let path = config_path();
+    if path.is_empty() {
+        return;
+    }
+    let content = fs::read_to_string(&path).unwrap_or_default();
+    let has = |k: &str| {
+        content.lines().any(|l| {
+            l.trim()
+                .split_once('=')
+                .map(|(a, _)| a.trim() == k)
+                .unwrap_or(false)
+        })
+    };
+    let mut pre: Vec<String> = Vec::new();
+    if !has("refresh_active") {
+        pre.push(format!("refresh_active={}", avail.iter().max().unwrap()));
+    }
+    if !has("refresh_idle") {
+        pre.push(format!("refresh_idle={}", avail.iter().min().unwrap()));
+    }
+    if !has("refresh_timeout") {
+        pre.push("refresh_timeout=30".to_string());
+    }
+    if pre.is_empty() {
+        return;
+    }
+    // 写入文件开头 (保留原有内容)
+    let mut lines = pre;
+    lines.extend(content.lines().map(str::to_string));
+    if fs::write(&path, lines.join("\n") + "\n").is_err() {
+        return;
+    }
+    // 同步共享配置 (全局刷新率生效) + 通知 refresh 线程重新加载
+    crate::config::reload_refresh_only();
+    REFRESH_FORCE_RELOAD.store(true, Ordering::Release);
+}
+
 pub const EVENT_INPUT: u32 = 5;
 
 static REFRESH_FORCE_RELOAD: AtomicBool = AtomicBool::new(false);
@@ -342,6 +389,8 @@ pub fn refresh_init(display_modes: std::thread::JoinHandle<Vec<(u32, u32, u32, f
         timer_fd,
     };
 
+    // 设备可用刷新率已解析: 首次运行写入全局默认到配置文件开头 (已有字段不覆盖)
+    ensure_global_refresh_defaults(&state);
     load_global_config(&mut state);
     load_app_configs(&mut state);
 
