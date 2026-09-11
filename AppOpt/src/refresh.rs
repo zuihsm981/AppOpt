@@ -622,7 +622,9 @@ pub fn refresh_add_app(pkg: &str, timeout: i32, active: &str, idle: &str) {
         }
     }
     if !found {
-        lines.push(new_line);
+        // 插到该应用已有规则 (CPU/refresh) 之后, 保持同包行连续
+        let at = crate::config::last_pkg_end_index(&lines, pkg).unwrap_or(lines.len());
+        lines.insert(at, new_line);
     }
     if !crate::config::save_config_lines(&path, &lines) {
         return;

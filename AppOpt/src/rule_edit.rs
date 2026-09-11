@@ -185,6 +185,45 @@ impl Target {
     }
 }
 
+/// 删除线程规则后折叠空块: 块内已无任何线程规则 (与其它内容) 时,
+///   `pkg=cpus {`  → 还原为 Standalone `pkg=cpus`
+///   `pkg {`       → 整块移除 (仅线程容器)
+/// 避免残留 `pkg=cpus {\n}` 空块。
+fn collapse_empty_block(lines: &mut Vec<String>, pkg: &str) {
+    loop {
+        let t = target_scan(lines, pkg);
+        let (Some(open), Some(close)) = (t.block_open, t.block_close) else {
+            return;
+        };
+        if open >= close || !t.threads.is_empty() {
+            return;
+        }
+        // 块内是否还有实质内容 (非空 / 非注释)
+        let inner_has = lines[open + 1..close].iter().any(|l| {
+            let s = l.trim();
+            !s.is_empty() && !s.starts_with('#') && !s.starts_with("//")
+        });
+        if inner_has {
+            return;
+        }
+        match t.pkg_line {
+            Some(PkgLine::OpenInline(i)) => {
+                // pkg=cpus {  →  pkg=cpus (保留注释)
+                let l = lines[i].clone();
+                let raw = strip_comment(l.trim_end());
+                let body = raw.strip_suffix('{').map(str::trim_end).unwrap_or(raw);
+                lines[i] = with_comment(body, &l);
+                lines.remove(close);
+            }
+            _ => {
+                // 仅线程容器 (pkg { / pkg= { / 无包级行): 移除整块
+                lines.remove(close);
+                lines.remove(open);
+            }
+        }
+    }
+}
+
 fn normalize_singles(lines: &mut Vec<String>, pkg: &str) {
     let t = target_scan(lines, pkg);
     let mut items: Vec<(ThreadLoc, String)> = Vec::new();
@@ -310,7 +349,11 @@ pub fn rule_upsert(path: &str, pkg: &str, thread: &str, cpus: &str) -> RuleEdit 
                 lines[i] = with_comment(&format!("{}={} {{", pkg, cpus), &lines[i]);
             }
             None if t.unterminated => return RuleEdit::Malformed,
-            None => lines.push(format!("{}={}", pkg, cpus)),
+            None => {
+                // 该应用已有行 (如 refresh 行) → 插在其后, 保持同包行连续
+                let at = crate::config::last_pkg_end_index(&lines, pkg).unwrap_or(lines.len());
+                lines.insert(at, format!("{}={}", pkg, cpus));
+            }
         }
     } else if let Some(locs) = t.threads.get(thread) {
         let last = locs.last().copied().unwrap();
@@ -358,6 +401,8 @@ pub fn rule_delete(path: &str, pkg: &str, thread: &str) -> RuleEdit {
         for loc in locs.iter().rev() {
             line_remove(&mut lines, pkg, loc);
         }
+        // 若删除的是块内最后一条线程规则 → 折叠空块
+        collapse_empty_block(&mut lines, pkg);
     } else {
         return RuleEdit::NotFound;
     }

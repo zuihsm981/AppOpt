@@ -884,6 +884,51 @@ pub fn reload_refresh_only() {
     }
 }
 
+/// 计算该 pkg 在文件中"最后一段"的结束位置 (插入点): 同一应用的多条规则
+/// (CPU 行 + refresh 行, 或块) 连续排列时, 新行应插在其后, 保持整齐。
+/// 返回 Some(idx) = 应插入的下标; None = 文件中尚无该应用任何行。
+pub(crate) fn last_pkg_end_index(lines: &[String], pkg: &str) -> Option<usize> {
+    let eq = format!("{}=", pkg);
+    let sp = format!("{} ", pkg);
+    let br = format!("[{}]", pkg);
+    let mut last: Option<usize> = None;
+    let mut i = 0;
+    while i < lines.len() {
+        let t = lines[i].trim();
+        if t.is_empty() || t.starts_with('#') || t.starts_with("//") {
+            i += 1;
+            continue;
+        }
+        let is_pkg = t.starts_with(&eq) || t == pkg || t.starts_with(&sp) || t == br;
+        if !is_pkg {
+            i += 1;
+            continue;
+        }
+        if t.contains('{') {
+            if t.contains('}') {
+                last = Some(i);                        // 同行内联闭合
+                i += 1;
+            } else {
+                // 块: 找匹配的 '}' (首个含 '}' 的行)
+                let mut j = i + 1;
+                while j < lines.len() {
+                    if lines[j].trim().contains('}') {
+                        break;
+                    }
+                    j += 1;
+                }
+                let end = j.min(lines.len().saturating_sub(1));
+                last = Some(end);
+                i = j + 1;
+            }
+        } else {
+            last = Some(i);
+            i += 1;
+        }
+    }
+    last.map(|x| x + 1)
+}
+
 /// 旧版本曾把刷新率写到可执行文件目录下的 refresh_config.conf。
 /// 启动时只做一次兼容迁移，之后所有读写均使用 CONFIG_FILE。
 pub fn migrate_legacy_refresh_config(config_file: &str) {
