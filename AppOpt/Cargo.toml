@@ -1,3 +1,6 @@
+[lints.cargo]
+unused_dependencies = "allow"
+
 [package]
 name = "AppOpt"
 version = "2.2.3"
