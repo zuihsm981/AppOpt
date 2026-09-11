@@ -279,8 +279,16 @@ fn main() {
     let display_modes_thread = std::thread::spawn(crate::refresh::parse_display_modes);
 
     // 命令行参数优先覆盖设置 (settings_load 已在 L1 前完成)
-    // 默认配置文件名: applist.conf (settings 或 -c 显式指定优先)
-    let config_file = cli_cfg.unwrap_or(st.config_file);
+    // 默认配置文件名: applist.conf (settings 或 -c 显式指定优先)。
+    // 旧版本 AppOpt.json 里保存的默认名 "./appopt.conf" 迁移为新默认名。
+    let config_file = match cli_cfg {
+        Some(path) => path,
+        None => match st.config_file.as_str() {
+            "./appopt.conf" => "./applist.conf".to_string(),
+            _ => st.config_file,
+        },
+    };
+    // 不做旧文件自动迁移 (appopt.conf 保持原样; 由用户自行处理/用 -c 指定)
     let cpuset_name = cli_cpuset.unwrap_or(st.cpuset_name);
     let web_enable = cli_web || st.web_enable;
 
@@ -289,8 +297,8 @@ fn main() {
     let topo = init_cpu_topo();
 
     if fs::metadata(&config_file).is_err() {
-        // 不预写 refresh_* (由设备可用刷新率解析后按实际档位写入文件开头)
-        let initial_content = "# 规则编写与使用说明请参考 http://AppOpt.suto.top\n# 刷新率字段与 CPU 规则共用此文件\n\n";
+        // 头注释两行; refresh_* 由设备可用刷新率解析后写入这两行下面
+        let initial_content = "# 规则编写与使用说明请参考 http://AppOpt.suto.top\n# 刷新率字段与 CPU 规则共用此文件\n";
         let _ = fs::write(&config_file, initial_content);
     }
     // 兼容旧版本：将 refresh_config.conf 内容一次性并入当前主配置文件。
@@ -320,9 +328,9 @@ fn main() {
 
     if web_enable {
         web_start();
-        // -w 或设置恢复启用后落盘，重启保持开启
-        settings_save();
     }
+    // 落盘当前设置 (含旧默认配置名迁移后的 config_file)，重启后保持一致
+    settings_save();
 
     // ===== join 各独立线程 (事件循环/使用点前就绪) =====
     let init_pids = snapshot_thread.join().unwrap_or_default();

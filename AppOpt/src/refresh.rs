@@ -54,9 +54,20 @@ pub(crate) fn write_global_refresh_defaults(path: &str, active: i32, idle: i32) 
     if pre.is_empty() {
         return;
     }
-    // 写入文件开头 (保留原有内容)
-    let mut lines = pre;
-    lines.extend(content.lines().map(str::to_string));
+    // 写入位置: 跳过开头连续注释/空行, 插在文件头注释的下面 (保留原有内容)
+    let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+    let mut at = 0;
+    while at < lines.len() {
+        let t = lines[at].trim();
+        if t.starts_with('#') || t.is_empty() {
+            at += 1;
+        } else {
+            break;
+        }
+    }
+    for (i, l) in pre.into_iter().enumerate() {
+        lines.insert(at + i, l);
+    }
     if fs::write(path, lines.join("\n") + "\n").is_err() {
         return;
     }
