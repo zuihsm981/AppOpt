@@ -246,8 +246,8 @@ impl CpuAffinity {
                 self.apply_tids(pids, pkg, cfg);
             }
         }
-        // 全量应用完成 (含启动初始): 统一同步 cpuset 目录树时间戳 (伪装为 foreground 时间)
-        crate::cpuset::sync_cpuset_timestamps();
+        // 初始化 (初始全量应用) 完成后: 整树时间戳同步一次 (仅首次)
+        crate::cpuset::sync_init_once();
         by_pkg.len()
     }
 
@@ -302,10 +302,6 @@ impl CpuAffinity {
                 let _ = crate::apply_affinity::affinity_set(*tid, cpus, &tasks_path, &cfg.topo);
             }
         }
-        // 本轮涉及的 cpuset 目录 (含冷启动新组合目录) 统一同步时间戳为 foreground 时间
-        for d in by_dir.keys() {
-            crate::cpuset::sync_cpuset_dir(d);
-        }
         self.publish_stats();
     }
 
@@ -316,6 +312,8 @@ impl CpuAffinity {
             return d.clone();
         }
         let d = crate::cpuset::ensure_cpuset_dir(cpus, topo);
+        // 新建的 CPU 组合目录: 立即同步时间戳
+        crate::cpuset::sync_cpuset_dir(&d);
         self.cpuset_cache.insert(bits, d.clone());
         d
     }

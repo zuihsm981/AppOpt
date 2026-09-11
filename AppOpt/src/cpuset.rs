@@ -215,7 +215,7 @@ pub fn parse_cpu_spec(spec: &str, topo: &CpuTopology) -> CpuSet {
     set
 }
 
-/// foreground 时间基准缓存: 首次 stat 后复用, 避免每次同步重复读取
+/// foreground 时间基准缓存: 首次 stat 后复用
 static FG_TIMES: std::sync::OnceLock<[libc::timespec; 2]> = std::sync::OnceLock::new();
 
 /// 取 /dev/cpuset/foreground 的 atime/mtime (伪装时间基准, 已缓存)
@@ -237,11 +237,9 @@ fn foreground_times() -> Option<[libc::timespec; 2]> {
 }
 
 /// 把目录及目录内所有条目的 atime/mtime 统一为 /dev/cpuset/foreground 的时间。
-/// 注意顺序: 必须先设子项, **最后**设目录自身——read_dir 打开目录会刷新目录
-/// atime, 若先设目录再遍历, 目录时间会被 read_dir 覆盖为当前时间。
+/// 顺序: 先设子项, **最后**设目录自身 (read_dir 会刷新目录 atime)。
 fn set_times_like_foreground(path: &str) {
     let Some(ts) = foreground_times() else { return };
-    // 1) 目录内所有条目
     if let Ok(rd) = fs::read_dir(path) {
         for e in rd.flatten() {
             let Some(name) = e.file_name().to_str().map(String::from) else { continue };
@@ -252,7 +250,6 @@ fn set_times_like_foreground(path: &str) {
             }
         }
     }
-    // 2) 最后设目录自身 (避免被上面的 read_dir 刷新 atime)
     let c = CString::new(path).unwrap_or_default();
     if c.is_empty() {
         return;
@@ -285,15 +282,12 @@ pub(crate) fn create_cpuset_dir(path: &str, cpus: &str, mems: &str) -> bool {
     if fs::write(&mems_path, mems).is_err() {
         return false;
     }
-    // 时间戳同步不在此处做 (创建后仍会被写入/系统操作刷新);
-    // 统一在初始化/全量应用完成后由 sync_cpuset_timestamps() 执行。
     true
 }
 
 /// 递归同步目录子树时间戳 (深→浅, 每层先子项后目录自身)
 fn sync_tree(path: &str) {
     if let Ok(rd) = fs::read_dir(path) {
-        // file_type() 直接取 readdir 的 d_type, 避免对每个条目再 stat
         for e in rd.flatten() {
             let Ok(ft) = e.file_type() else { continue };
             if ft.is_dir()
@@ -306,13 +300,12 @@ fn sync_tree(path: &str) {
     set_times_like_foreground(path);
 }
 
-/// 递归同步 BASE_CPUSET 整棵目录树的时间戳为 /dev/cpuset/foreground 的时间。
-/// 在初始化 (含初始全量应用) 完成后调用一次。
+/// 同步 BASE_CPUSET 整棵目录树的时间戳为 /dev/cpuset/foreground 的时间。
 pub(crate) fn sync_cpuset_timestamps() {
     sync_tree(&base_cpuset());
 }
 
-/// 同步单个 cpuset 子目录 (dir 为空 → base 目录)。冷启动/重放产生新组合目录后调用。
+/// 同步单个 cpuset 子目录 (dir 为空 → base 目录)。创建新 CPU 组合目录后调用。
 pub(crate) fn sync_cpuset_dir(dir: &str) {
     let path = if dir.is_empty() {
         base_cpuset()
@@ -322,6 +315,13 @@ pub(crate) fn sync_cpuset_dir(dir: &str) {
     sync_tree(&path);
 }
 
+/// 初始化 (初始全量应用) 完成后调用, 仅首次生效一次。
+static INIT_SYNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) fn sync_init_once() {
+    if !INIT_SYNCED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        sync_cpuset_timestamps();
+    }
+}
 
 /// 按合并后的 CPU 集合确保 cpuset 子目录存在，返回目录名（cpuset 未启用或创建失败返回空串）
 pub fn ensure_cpuset_dir(cpus: &CpuSet, topo: &CpuTopology) -> String {

@@ -279,16 +279,7 @@ fn main() {
     let display_modes_thread = std::thread::spawn(crate::refresh::parse_display_modes);
 
     // 命令行参数优先覆盖设置 (settings_load 已在 L1 前完成)
-    // 默认配置文件名: applist.conf (settings 或 -c 显式指定优先)。
-    // 旧版本 AppOpt.json 里保存的默认名 "./appopt.conf" 迁移为新默认名。
-    let config_file = match cli_cfg {
-        Some(path) => path,
-        None => match st.config_file.as_str() {
-            "./appopt.conf" => "./applist.conf".to_string(),
-            _ => st.config_file,
-        },
-    };
-    // 不做旧文件自动迁移 (appopt.conf 保持原样; 由用户自行处理/用 -c 指定)
+    let config_file = cli_cfg.unwrap_or(st.config_file);
     let cpuset_name = cli_cpuset.unwrap_or(st.cpuset_name);
     let web_enable = cli_web || st.web_enable;
 
@@ -476,9 +467,9 @@ fn main() {
     let pkglist_path = CString::new("/data/system/packages.list").unwrap_or_default();
     epoll_add(epfd, pkg_inotify_fd, EV_PKG);
 
-    // 初始全量应用 (KPM 已由并发 T2 线程加载并激活, ebpf_state 已 join 就绪)
+    // 初始全量应用 (两种驱动模式都执行: KPM 事件驱动 / 纯用户态)
     // 刷新率全局初始 active 已由 refresh_init 应用; launcher 前台由 FgPkg 包名驱动。
-    if cpu_ready && ebpf_state.is_some() {
+    if cpu_ready {
         crate::cpu_affinity::apply_all_now();
     }
 
