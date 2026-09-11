@@ -16,21 +16,23 @@ fn config_path() -> String {
     crate::lock_ignore_poison(&crate::config::CONFIG_FILE).clone()
 }
 
-/// 设备可用刷新率解析完成后: 首次运行把全局默认刷新率写入配置文件开头
-/// (refresh_active=设备最高档 / refresh_idle=设备最低档 / refresh_timeout=30)。
-/// 已存在的字段不覆盖 (尊重用户配置); 不硬编码 120/60, 按设备实际支持档位取。
-fn ensure_global_refresh_defaults(state: &RefreshState) {
+/// 从设备可用档位取默认值: active=最高档, idle=最低档 (不硬编码 120/60)
+fn default_rates_from_modes(available_modes: &[bool; 3]) -> (i32, i32) {
     let mut avail: Vec<i32> = Vec::new();
-    if state.available_modes[0] { avail.push(120); }
-    if state.available_modes[1] { avail.push(90); }
-    if state.available_modes[2] { avail.push(60); }
+    if available_modes[0] { avail.push(120); }
+    if available_modes[1] { avail.push(90); }
+    if available_modes[2] { avail.push(60); }
     if avail.is_empty() { avail = vec![120, 90, 60]; }
+    (*avail.iter().max().unwrap(), *avail.iter().min().unwrap())
+}
 
-    let path = config_path();
+/// 把全局默认刷新率写入指定配置文件**开头** (已存在的字段不覆盖, 尊重用户配置)。
+/// 供启动初始化与 webui 新建配置文件复用。
+pub(crate) fn write_global_refresh_defaults(path: &str, active: i32, idle: i32) {
     if path.is_empty() {
         return;
     }
-    let content = fs::read_to_string(&path).unwrap_or_default();
+    let content = fs::read_to_string(path).unwrap_or_default();
     let has = |k: &str| {
         content.lines().any(|l| {
             l.trim()
@@ -41,10 +43,10 @@ fn ensure_global_refresh_defaults(state: &RefreshState) {
     };
     let mut pre: Vec<String> = Vec::new();
     if !has("refresh_active") {
-        pre.push(format!("refresh_active={}", avail.iter().max().unwrap()));
+        pre.push(format!("refresh_active={}", active));
     }
     if !has("refresh_idle") {
-        pre.push(format!("refresh_idle={}", avail.iter().min().unwrap()));
+        pre.push(format!("refresh_idle={}", idle));
     }
     if !has("refresh_timeout") {
         pre.push("refresh_timeout=30".to_string());
@@ -55,12 +57,27 @@ fn ensure_global_refresh_defaults(state: &RefreshState) {
     // 写入文件开头 (保留原有内容)
     let mut lines = pre;
     lines.extend(content.lines().map(str::to_string));
-    if fs::write(&path, lines.join("\n") + "\n").is_err() {
+    if fs::write(path, lines.join("\n") + "\n").is_err() {
         return;
     }
     // 同步共享配置 (全局刷新率生效) + 通知 refresh 线程重新加载
     crate::config::reload_refresh_only();
     REFRESH_FORCE_RELOAD.store(true, Ordering::Release);
+}
+
+/// 供 webui 新建配置文件使用: 取当前设备默认档位 (active=最高, idle=最低)
+pub(crate) fn refresh_device_default_rates() -> (i32, i32) {
+    let mut avail = refresh_get_status().map(|s| s.available).unwrap_or_default();
+    if avail.is_empty() {
+        avail = vec![120, 90, 60];
+    }
+    (*avail.iter().max().unwrap(), *avail.iter().min().unwrap())
+}
+
+/// 启动初始化: 设备可用刷新率解析完成后, 把全局默认写入当前配置文件开头
+fn ensure_global_refresh_defaults(state: &RefreshState) {
+    let (active, idle) = default_rates_from_modes(&state.available_modes);
+    write_global_refresh_defaults(&config_path(), active, idle);
 }
 
 pub const EVENT_INPUT: u32 = 5;
