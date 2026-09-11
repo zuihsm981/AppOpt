@@ -731,54 +731,62 @@ $('mr-save').onclick=async()=>{
   if(!$('mr-pkg').readOnly&&!pkg)return toast('请输入应用包名');
   mrSaving=true;
   try{
-    if(mrTab==='cpu'){
-      // ===== 包级默认: 只保存 CPU 规则 (不触刷新率) =====
-      const jobs=[];
-      for(const r of mrRows){
-        const spec=specOf(r);
-        if(r.pkgRow){if(spec)jobs.push({thread:'',cpus:spec});continue}
-        if(!r.thread&&!spec)continue;
-        if(!r.thread)return toast('请输入线程名');
-        if(!spec)return toast(r.custom?'请输入自定义 CPU 范围，如 0-3':'请选择 CPU 核心');
-        jobs.push({thread:r.thread,cpus:spec});
-      }
-      if(jobs.length){
-        // 编辑应用且包名未变且规则与原来完全一致 → 跳过规则重存 (避免无谓重放)
-        const unchanged=mrMode==='edit-app'&&pkg===mrOldPkg&&rulesUnchanged(mrGi,jobs);
-        if(!unchanged){
-          if(mrMode==='edit-app'){
-            if(pkg!==mrOldPkg)await api('/api/rule/rename',{old:mrOldPkg,new:pkg});
-            const cur=new Set(jobs.map(j=>j.thread));
-            for(const th of mrOldThreads)if(!cur.has(th))await api('/api/rule/del',{pkg,thread:th});
-            if(mrHadPkgRule&&!cur.has(''))await api('/api/rule/del',{pkg,thread:''});
-          }
-          if(mrMode==='edit-thread'&&mrOldThread!==jobs[0].thread)
-            await api('/api/rule/del',{pkg,thread:mrOldThread});
-          for(let i=0;i<jobs.length;i++){
-            const j=jobs[i];
-            // 单线程规则编辑 (edit-thread): 只重放该线程; 其余整包重放
-            const body=mrMode==='edit-thread'?{pkg,thread:j.thread,cpus:j.cpus,only_thread:true}:{pkg,thread:j.thread,cpus:j.cpus};
-            try{await api('/api/rule',body)}
-            catch(e){return toast(`第${i+1}条（${j.thread||'包级'}）失败：${e.message}`)}
-          }
-        }
-      }else if(mrMode==='edit-app'&&(mrOldThreads.size||mrHadPkgRule)){
-        // 清空全部 CPU 规则
-        for(const th of mrOldThreads)await api('/api/rule/del',{pkg,thread:th});
-        if(mrHadPkgRule)await api('/api/rule/del',{pkg,thread:''});
-      }else{
-        return toast('请至少配置一条规则');
-      }
-    }else{
-      // ===== 刷新率配置: 只保存刷新率 (不触 CPU) =====
-      const timeout=Math.max(1,+$('mr-rf-timeout').value||10);
-      if(mrRfActive||mrRfIdle){
-        if(pkg!==mrOldPkg&&mrRfOldRefresh)await api('/api/refresh/app/del',{pkg:mrOldPkg});
-        await api('/api/refresh/app',{pkg,active:mrRfActive||mrRfIdle,idle:mrRfIdle||mrRfActive,timeout});
-      }else if(mrRfOldRefresh){
-        await api('/api/refresh/app/del',{pkg});
-      }
+    // ===== 1) CPU 规则 (包级默认 + 线程): 始终保存, 与当前页签无关 =====
+    const jobs=[];
+    for(const r of mrRows){
+      const spec=specOf(r);
+      if(r.pkgRow){if(spec)jobs.push({thread:'',cpus:spec});continue}
+      if(!r.thread&&!spec)continue;
+      if(!r.thread)return toast('请输入线程名');
+      if(!spec)return toast(r.custom?'请输入自定义 CPU 范围，如 0-3':'请选择 CPU 核心');
+      jobs.push({thread:r.thread,cpus:spec});
     }
+    let cpuTouched=false;
+    if(jobs.length){
+      // 编辑应用且包名未变且规则与原来完全一致 → 跳过规则重存 (避免无谓重放)
+      const unchanged=mrMode==='edit-app'&&pkg===mrOldPkg&&rulesUnchanged(mrGi,jobs);
+      if(!unchanged){
+        if(mrMode==='edit-app'){
+          if(pkg!==mrOldPkg)await api('/api/rule/rename',{old:mrOldPkg,new:pkg});
+          const cur=new Set(jobs.map(j=>j.thread));
+          for(const th of mrOldThreads)if(!cur.has(th))await api('/api/rule/del',{pkg,thread:th});
+          if(mrHadPkgRule&&!cur.has(''))await api('/api/rule/del',{pkg,thread:''});
+        }
+        if(mrMode==='edit-thread'&&mrOldThread!==jobs[0].thread)
+          await api('/api/rule/del',{pkg,thread:mrOldThread});
+        for(let i=0;i<jobs.length;i++){
+          const j=jobs[i];
+          // 单线程规则编辑 (edit-thread): 只重放该线程; 其余整包重放
+          const body=mrMode==='edit-thread'?{pkg,thread:j.thread,cpus:j.cpus,only_thread:true}:{pkg,thread:j.thread,cpus:j.cpus};
+          try{await api('/api/rule',body)}
+          catch(e){return toast(`第${i+1}条（${j.thread||'包级'}）失败：${e.message}`)}
+        }
+      }
+      cpuTouched=true;
+    }else if(mrMode==='edit-app'&&(mrOldThreads.size||mrHadPkgRule)){
+      // 清空全部 CPU 规则
+      for(const th of mrOldThreads)await api('/api/rule/del',{pkg,thread:th});
+      if(mrHadPkgRule)await api('/api/rule/del',{pkg,thread:''});
+      cpuTouched=true;
+    }
+
+    // ===== 2) 刷新率配置: 始终保存 (不受页签影响); 按设备可用档位校正 =====
+    const timeout=Math.max(1,+$('mr-rf-timeout').value||10);
+    const rfOk=x=>{const av=rfAvail&&rfAvail.length?rfAvail:[120,90,60];return av.includes(x)?x:(av[0]||x)};
+    let rfTouched=false;
+    if(mrRfActive||mrRfIdle){
+      const act=rfOk(mrRfActive||mrRfIdle), idl=rfOk(mrRfIdle||mrRfActive);
+      if(pkg!==mrOldPkg&&mrRfOldRefresh)await api('/api/refresh/app/del',{pkg:mrOldPkg});
+      await api('/api/refresh/app',{pkg,active:String(act),idle:String(idl),timeout});
+      rfTouched=true;
+    }else if(mrRfOldRefresh){
+      await api('/api/refresh/app/del',{pkg});
+      rfTouched=true;
+    }
+
+    // 新增应用: CPU 与刷新率都为空 → 提示
+    if(!cpuTouched&&!rfTouched&&!mrRfOldRefresh)
+      return toast('请至少配置一条规则');
     $('modal-rule').hidden=true;
     toast('已保存');
     loadRules();
