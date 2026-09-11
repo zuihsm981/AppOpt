@@ -177,7 +177,10 @@ impl KpmHandle {
     /// AppOpt 初始化完成后激活 KPM: start 武装 sched_setaffinity kprobe + input_on 武装 input kprobe
     pub fn activate(&self) {
         self.cmd("start");
-        self.cmd("input_on");
+        if self.cmd("input_on") >= 0 {
+            // input kprobe 确实武装成功 → 更新状态 (sync_input_hook 据此跳过重复 input_on)
+            crate::refresh::INPUT_HOOK_ON.store(true, Ordering::Release);
+        }
     }
 
     /// 标记规则应用主进程 tgid (内核退出探针只对主进程发布 EXIT 事件;

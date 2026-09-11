@@ -19,8 +19,8 @@ fn config_path() -> String {
 pub const EVENT_INPUT: u32 = 5;
 
 static REFRESH_FORCE_RELOAD: AtomicBool = AtomicBool::new(false);
-/// input 触摸事件 kprobe 当前武装状态 (初始 true: ebpf_init activate 已 input_on)
-static INPUT_HOOK_ON: AtomicBool = AtomicBool::new(true);
+/// input 触摸事件 kprobe 当前武装状态 (初始 false: 由 activate() 的 input_on 成功后置位)
+pub(crate) static INPUT_HOOK_ON: AtomicBool = AtomicBool::new(false);
 static WAKE_FD: AtomicI32 = AtomicI32::new(-1);
 static REFRESH_STATUS: Mutex<Option<RefreshStatus>> = Mutex::new(None);
 static REFRESH_TX: Mutex<Option<mpsc::Sender<RefreshEvent>>> = Mutex::new(None);

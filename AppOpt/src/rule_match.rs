@@ -58,10 +58,7 @@ pub fn thread_affinity(
         }
         None
     } else {
-        Some(AffinityResult {
-            cpus,
-            cpuset_dir,
-        })
+        Some(AffinityResult { cpus, cpuset_dir })
     }
 }
 

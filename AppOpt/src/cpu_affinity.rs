@@ -130,10 +130,10 @@ pub struct CpuAffinity {
     init_pids: HashSet<i32>,
     /// 额外标记 launcher3/systemui 的 pid 目录: 其规则直接使用, 免扫描/读 cmdline
     marked: HashMap<String, Vec<i32>>,
-    /// 合并 CPU 集合 bits → cpuset 目录名 缓存 (相同集合只 ensure 一次, 避免每线程重复建目录)
-    cpuset_cache: HashMap<u64, String>,
     /// 包名 → uid 反向缓存 (重放免扫 /proc; Android uid 固定, 缓存稳定)
     pkg_uid_cache: HashMap<String, i32>,
+    /// 合并 CPU 集合 bits → cpuset 目录名 缓存 (相同集合只 ensure 一次, 避免每线程重复建目录)
+    cpuset_cache: HashMap<u64, String>,
 }
 
 impl CpuAffinity {
@@ -146,8 +146,8 @@ impl CpuAffinity {
             uid_pkg: HashMap::new(),
             init_pids,
             marked,
-            cpuset_cache: HashMap::new(),
             pkg_uid_cache: HashMap::new(),
+            cpuset_cache: HashMap::new(),
         }
     }
 
@@ -252,8 +252,6 @@ impl CpuAffinity {
     /// 应用一个包的全部进程 (主进程 + pkg: 子进程) 的全部线程
     /// 对给定进程集合的全部线程套用规则并应用
     fn apply_tids(&mut self, pids: &[i32], pkg: &str, cfg: &AppConfig) {
-        // 每个应用 (一次枚举/重放) 只查一次「设置 cpuset」开关, 本应用全部线程共用
-        let use_cpuset = crate::web::USE_CPUSET.load(Ordering::Relaxed);
         let has_thread_rules = cfg.has_thread_rules.contains(pkg);
         // 批量 applied_set: 相同 bits 的 tid 聚合, 每个 bits 一次 supercall
         let mut set: HashMap<u64, Vec<i32>> = HashMap::new();
@@ -285,15 +283,9 @@ impl CpuAffinity {
         for (bits, tids) in &set {
             self.bpf.applied_set_many(*bits, tids);
         }
-        // 逐个 sched_setaffinity (必要的每线程 syscall)
+        // 逐个设置 cpuset (cpuset_enabled) + sched_setaffinity (必要的每线程 syscall)
         for (tid, cpus, cpuset_dir) in aff {
-            let _ = crate::apply_affinity::affinity_set(
-                tid,
-                &cpus,
-                &cpuset_dir,
-                &cfg.topo,
-                use_cpuset,
-            );
+            let _ = crate::apply_affinity::affinity_set(tid, &cpus, &cpuset_dir, &cfg.topo);
         }
         self.publish_stats();
     }
