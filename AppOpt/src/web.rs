@@ -599,6 +599,9 @@ fn config_set_api(req: &Request) -> (u16, String) {
     if let Some(p) = path {
         if std::fs::metadata(p).is_err() {
             let _ = std::fs::write(p, "# 规则编写与使用说明请参考 http://AppOpt.suto.top\n\n");
+            // 新配置文件也写入设备档位的全局默认刷新率 (文件开头)
+            let (a, i) = crate::refresh::refresh_device_default_rates();
+            crate::refresh::write_global_refresh_defaults(p, a, i);
         }
         *lock_ignore_poison(&CONFIG_FILE) = p.to_string();
         crate::config::request_config_reload();
