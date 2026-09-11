@@ -164,11 +164,6 @@ impl KpmHandle {
         kpm_ctl0(&self.key, &c, &mut [])
     }
 
-    pub(crate) fn applied_set(&self, tid: i32, bits: u64) {
-        let s = format!("applied_set {} {:x}", tid, bits);
-        self.cmd(&s);
-    }
-
     /// 批量写 APPLIED 表: 相同 bits 的一批 tid 一次 supercall (替代逐 tid ctl0)
     pub(crate) fn applied_set_many(&self, bits: u64, tids: &[i32]) {
         let mut s = format!("applied_set_many {:x}", bits);

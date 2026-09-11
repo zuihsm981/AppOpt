@@ -60,9 +60,10 @@ fn cpuset_tasks_path(cpuset_dir: &str) -> String {
 }
 
 /// 对单线程设置 CPU 亲和性。
-/// use_cpuset 由调用方在「每个应用一次」的粒度上读取 (本应用全部线程共用),
-/// 避免逐线程查全局开关; true = 先写 tasks 迁移 cpuset 再 sched_setaffinity,
-/// false (默认) = 仅 sched_setaffinity (不写 cpuset)。
+/// use_cpuset (设置项「设置 cpuset」) 由调用方在「每个应用一次」的粒度上读取。
+/// 开启时: 无论亲和性是否正确都先写 tasks 迁移 cpuset (强制归属),
+///         仅当亲和性不正确时才 sched_setaffinity (正确则不重复设 cpus)。
+/// 关闭 (默认): 亲和性正确直接返回, 否则仅 sched_setaffinity (不写 cpuset)。
 /// 返回 true 表示 ESRCH 线程已退出。
 pub fn affinity_set(
     tid: i32,
@@ -71,17 +72,19 @@ pub fn affinity_set(
     topo: &CpuTopology,
     use_cpuset: bool,
 ) -> bool {
-    // 亲和性已正确 → 直接成功返回 (避免重复 syscall)
-    if CpuSet::get_affinity(tid).is_some_and(|curr| curr == *cpus) {
-        return false;
-    }
+    let affinity_ok = CpuSet::get_affinity(tid).is_some_and(|curr| curr == *cpus);
 
-    // 设置项开启: 先迁移 cpuset (写 tasks, 由 cpuset 控制器接管调度域)
+    // 设置项开启: 始终迁移 cpuset (即使亲和性已正确, 保证线程归属 cpuset 目录)
     if use_cpuset
         && topo.cpuset_enabled
         && let Ok(mut f) = fs::OpenOptions::new().append(true).open(cpuset_tasks_path(cpuset_dir))
     {
         let _ = writeln!(f, "{}", tid);
+    }
+
+    // 亲和性已正确 → 不重复设 cpus (仅在关闭 cpuset 或需收紧时执行)
+    if affinity_ok {
+        return false;
     }
 
     // sched_setaffinity 收紧到目标核
