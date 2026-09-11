@@ -233,12 +233,12 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="card">
 <div class="card-title">线程延迟放置</div>
 <div class="field"><input id="c-delay" type="number" min="0" max="60000" step="100" placeholder="2000"><button class="btn" id="c-delay-save">保存</button></div>
-<div class="hint">部分线程没有正确设置cpus时调整，默认：2000  单位：ms</div>
+<div class="hint">应用刚启动的时候出现部分线程没有正确设置cpus时调整，默认：2000  单位：ms</div>
 </div>
 <div class="card">
-<div class="card-title">设置 cpuset</div>
-<div class="row"><span class="label">同时设置cpuset和cpus</span><label style="display:flex;align-items:center;cursor:pointer"><input type="checkbox" id="c-cpuset-use" style="width:auto;height:auto"></label></div>
-<div class="hint">部分线程没有正确设置cpus时尝试开启</div>
+<div class="card-title">强制cpuset </div>
+<div class="row"><span class="label">强制设置cpuset</span><label style="display:flex;align-items:center;cursor:pointer"><input type="checkbox" id="c-cpuset-use" style="width:auto;height:auto"></label></div>
+<div class="hint">需要线程在后台也保持cpus时开启</div>
 <div style="margin-top:10px;text-align:right"><button class="btn" id="c-cpuset-use-save">保存</button></div>
 </div>
 <div class="card">
