@@ -267,6 +267,17 @@ pub(crate) fn create_cpuset_dir(path: &str, cpus: &str, mems: &str) -> bool {
         if err.raw_os_error() != Some(libc::EEXIST) {
             return false;
         }
+        // 目录已存在且 cpus/mems 内容一致 → 无需重复 chmod/chown/写文件
+        // (配置重载时避免对每个包级规则重复写)
+        let cpus_ok = fs::read_to_string(format!("{}/cpus", path))
+            .map(|cur| cur.trim() == cpus.trim())
+            .unwrap_or(false);
+        let mems_ok = fs::read_to_string(format!("{}/mems", path))
+            .map(|cur| cur.trim() == mems.trim())
+            .unwrap_or(false);
+        if cpus_ok && mems_ok {
+            return true;
+        }
     }
     if unsafe { libc::chmod(c_path.as_ptr(), 0o755) } != 0 {
         return false;

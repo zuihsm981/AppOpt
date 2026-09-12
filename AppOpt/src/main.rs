@@ -62,26 +62,45 @@ struct UidEntry {
 /// 从 packages.list 构建 uid→条目 静态表 (主线程持有):
 ///   cpu = 有 CPU 规则的应用; rfr = com.android.launcher3 + 有刷新率规则的应用。
 /// 一个应用可同时 CPU + 刷新率 (合表后用标志位表达)。前台回调只查本表。
-fn build_uid_tables(cfg: &AppConfig) -> HashMap<i32, UidEntry> {
+fn build_uid_tables(cfg: &AppConfig) -> (HashMap<i32, UidEntry>, HashMap<String, i32>) {
     let mut cpu_pkgs: HashSet<&str> = HashSet::new();
     for r in &cfg.rules {
         cpu_pkgs.insert(r.pkg.as_str());
     }
-    let mut map: HashMap<i32, UidEntry> = HashMap::new();
+    let mut fwd: HashMap<i32, UidEntry> = HashMap::new();
+    let mut rev: HashMap<String, i32> = HashMap::new();
     if let Ok(content) = std::fs::read_to_string("/data/system/packages.list") {
         for line in content.lines() {
             let mut it = line.split_whitespace();
             let (Some(pkg), Some(uid_s)) = (it.next(), it.next()) else { continue };
             let Ok(uid) = uid_s.parse::<i32>() else { continue };
+            // 只收当前用户 (Android 多用户 uid 偏移; 同一包多行时不污染)
+            if uid >= 100000 {
+                continue;
+            }
             let cpu = cpu_pkgs.contains(pkg);
             let rfr = pkg == crate::config::DEFAULT_REFRESH_PACKAGE
                 || cfg.app_refresh_configs.contains_key(pkg);
             if cpu || rfr {
-                map.entry(uid).or_insert_with(|| UidEntry { pkg: pkg.to_string(), cpu, rfr });
+                fwd.entry(uid).or_insert_with(|| UidEntry { pkg: pkg.to_string(), cpu, rfr });
+                rev.entry(pkg.to_string()).or_insert(uid);
             }
         }
     }
-    map
+    (fwd, rev)
+}
+
+/// 遍历 /proc 全部数字 pid (>0); 调用方按需过滤 (cpu_affinity / web 共用)
+pub(crate) fn for_each_proc_pid(mut f: impl FnMut(i32)) {
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for e in entries.flatten() {
+            if let Ok(p) = e.file_name().to_string_lossy().parse::<i32>()
+                && p > 0
+            {
+                f(p);
+            }
+        }
+    }
 }
 
 /// 按包名在 packages.list 查 uid (单个; 供增量维护在交叉提取失败时回退)
@@ -361,11 +380,13 @@ fn main() {
     refresh::refresh_init(display_modes_thread);
     // uid 静态表 (主线程, 合并表): uid → {pkg, cpu 规则, 刷新率}
     let mut uid_map: HashMap<i32, UidEntry> = HashMap::new();
+    // 反向表: 包名 → uid (规则编辑重放时主线程反查, 消息携带 uid 下发 worker)
+    let mut pkg_uid: HashMap<String, i32> = HashMap::new();
     // 规则应用集合 (主线程对比用): 仅集合变化才更新 uid 表 (数值调整不更新)
     let mut cpu_pkgs_set: HashSet<String> = HashSet::new();
     let mut rfr_pkgs_set: HashSet<String> = HashSet::new();
     if let Some(cfg) = rw_read_ignore_poison(&CURRENT_CONFIG).clone() {
-        uid_map = build_uid_tables(&cfg);
+        (uid_map, pkg_uid) = build_uid_tables(&cfg);
         (cpu_pkgs_set, rfr_pkgs_set) = cfg_pkg_sets(&cfg);
     }
 
@@ -408,6 +429,7 @@ fn main() {
         cpu_changed: bool,
         ebpf_state: &mut Option<EbpfState>,
         cfg: Option<&crate::config::AppConfig>,
+        pkg_uid: &HashMap<String, i32>,
     ) {
         let Some(cfg) = cfg else { return };
         // CPU 规则未变 (仅刷新率/数值调整): 无需全量扫描, 亲和性/uid 表不需重放
@@ -415,25 +437,35 @@ fn main() {
             return;
         }
         if let Some(es) = ebpf_state.as_mut() {
-            kpm_full_apply(cfg, es);
+            kpm_full_apply(cfg, es, pkg_uid);
         }
     }
 
     /// KPM 全量归因扫描 + 亲和性全量应用 (配置变更/重连共用)
-    fn kpm_full_apply(_cfg: &crate::config::AppConfig, _es: &mut EbpfState) {
+    fn kpm_full_apply(
+        _cfg: &crate::config::AppConfig,
+        _es: &mut EbpfState,
+        pkg_uid: &HashMap<String, i32>,
+    ) {
         // 规则编辑保存路径: 只对最近变更包单包重放亲和性 (避免改一个应用 →
         // apply_all_now 全量重放所有规则应用); 启动/整体重载等无变更包 → 全量。
-        // 按编辑粒度重放: 单线程编辑 → 只重放该线程; 整包编辑 → 只重放该包;
-        // 无记录 (启动/整体重载) → 全量
+        // 主线程反查 uid (pkg_uid) 后消息携带 uid 下发; 未安装/未运行的包不反查到 uid
+        // → 不发消息 (规则只对未来启动的应用生效)。
         match crate::web::last_rule_take() {
             Some((pkg, Some(thread))) => {
-                if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
-                    let _ = tx.send(crate::cpu_affinity::CpuMsg::ApplyThread(pkg, thread));
+                if let Some(uid) = pkg_uid.get(&pkg) {
+                    if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
+                        let _ = tx.send(crate::cpu_affinity::CpuMsg::ApplyThreadByUid(
+                            *uid, pkg, thread,
+                        ));
+                    }
                 }
             }
             Some((pkg, None)) => {
-                if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
-                    let _ = tx.send(crate::cpu_affinity::CpuMsg::ApplyPkgByName(pkg));
+                if let Some(uid) = pkg_uid.get(&pkg) {
+                    if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
+                        let _ = tx.send(crate::cpu_affinity::CpuMsg::ApplyPkgByUid(*uid, pkg));
+                    }
                 }
             }
             None => crate::cpu_affinity::apply_all_now(),
@@ -445,6 +477,7 @@ fn main() {
         cpu_changed: bool,
         cfg: &crate::config::AppConfig,
         uid_map: &mut HashMap<i32, UidEntry>,
+        pkg_uid: &mut HashMap<String, i32>,
         cpu_pkgs_set: &mut HashSet<String>,
         rfr_pkgs_set: &mut HashSet<String>,
     ) {
@@ -475,6 +508,11 @@ fn main() {
                     rfr: nr.contains(pkg),
                 });
             }
+        }
+        // 就地更新反向表 (pkg → uid): 移除已删除包, 再按最新 uid_map 刷新
+        pkg_uid.retain(|pkg, _| nc.contains(pkg) || nr.contains(pkg));
+        for (&u, e) in uid_map.iter() {
+            pkg_uid.insert(e.pkg.clone(), u);
         }
         *cpu_pkgs_set = nc;
         *rfr_pkgs_set = nr;
@@ -535,13 +573,14 @@ fn main() {
     let reload_config = |ebpf_state: &mut Option<EbpfState>,
                          cfg: &mut Option<Arc<AppConfig>>,
                          uid_map: &mut HashMap<i32, UidEntry>,
+                         pkg_uid: &mut HashMap<String, i32>,
                          cpu_pkgs_set: &mut HashSet<String>,
                          rfr_pkgs_set: &mut HashSet<String>| {
         let cpu_changed = crate::config::take_cpu_rules_changed();
         *cfg = rw_read_ignore_poison(&CURRENT_CONFIG).clone();
-        apply_config(cpu_changed, ebpf_state, cfg.as_deref());
+        apply_config(cpu_changed, ebpf_state, cfg.as_deref(), pkg_uid);
         if let Some(cfg) = cfg.as_ref() {
-            rebuild_uid_if_needed(cpu_changed, cfg, uid_map, cpu_pkgs_set, rfr_pkgs_set);
+            rebuild_uid_if_needed(cpu_changed, cfg, uid_map, pkg_uid, cpu_pkgs_set, rfr_pkgs_set);
         }
     };
 
@@ -617,7 +656,7 @@ fn main() {
                             }
                         }
                         if let Some(cfg) = cfg.as_ref() {
-                            uid_map = build_uid_tables(cfg);
+                            (uid_map, pkg_uid) = build_uid_tables(cfg);
                         }
                     }
                 }
@@ -711,6 +750,7 @@ fn main() {
                             &mut ebpf_state,
                             &mut cfg,
                             &mut uid_map,
+                            &mut pkg_uid,
                             &mut cpu_pkgs_set,
                             &mut rfr_pkgs_set,
                         );
@@ -723,6 +763,7 @@ fn main() {
                         &mut ebpf_state,
                         &mut cfg,
                         &mut uid_map,
+                        &mut pkg_uid,
                         &mut cpu_pkgs_set,
                         &mut rfr_pkgs_set,
                     );

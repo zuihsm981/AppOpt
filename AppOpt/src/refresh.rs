@@ -97,6 +97,8 @@ static REFRESH_FORCE_RELOAD: AtomicBool = AtomicBool::new(false);
 /// input 触摸事件 kprobe 当前武装状态 (初始 false: 由 activate() 的 input_on 成功后置位)
 pub(crate) static INPUT_HOOK_ON: AtomicBool = AtomicBool::new(false);
 static WAKE_FD: AtomicI32 = AtomicI32::new(-1);
+/// web 轮询请求刷新状态快照 (仅被请求时才 update_status, 避免每次事件都构建)
+static STATUS_REQ: AtomicBool = AtomicBool::new(false);
 static REFRESH_STATUS: Mutex<Option<RefreshStatus>> = Mutex::new(None);
 static REFRESH_TX: Mutex<Option<mpsc::Sender<RefreshEvent>>> = Mutex::new(None);
 
@@ -360,7 +362,12 @@ fn update_status(state: &RefreshState) {
             v
         },
         device_modes: std::sync::Arc::clone(&state.device_modes),
-        input_hooked: INPUT_HOOK_ON.load(Ordering::Relaxed),
+        input_hooked: if crate::web::KPM_ACTIVE.load(Ordering::Relaxed) {
+            // KPM 模式: 查询内核真实注册状态 (异步武装可能失败)
+            crate::ebpf_mode::kpm_input_hooked()
+        } else {
+            INPUT_HOOK_ON.load(Ordering::Relaxed)
+        },
         last_input_secs: state
             .last_input_time
             .map(|t| t.elapsed().as_secs() as i64)
@@ -422,6 +429,9 @@ pub fn refresh_init(display_modes: std::thread::JoinHandle<Vec<(u32, u32, u32, f
     load_global_config(&mut state);
     load_app_configs(&mut state);
 
+    // 初始状态快照 (web 首次轮询即可读到; 之后仅在轮询请求时更新)
+    update_status(&state);
+
     let name = CString::new("RefreshRate").unwrap();
     thread::spawn(move || {
         unsafe { libc::pthread_setname_np(libc::pthread_self(), name.as_ptr()); }
@@ -480,7 +490,10 @@ pub fn refresh_init(display_modes: std::thread::JoinHandle<Vec<(u32, u32, u32, f
                     _ => {}
                 }
             }
-            update_status(&state);
+            // 仅在 web 轮询请求时更新状态快照 (避免每个事件都构建)
+            if STATUS_REQ.swap(false, Ordering::AcqRel) {
+                update_status(&state);
+            }
         }
 
         unsafe {
@@ -663,6 +676,9 @@ pub fn refresh_del_app(pkg: &str) -> bool {
 }
 
 pub fn refresh_get_status() -> Option<RefreshStatus> {
+    // 请求刷新线程更新一次状态快照 (下一次轮询读到最新); 返回当前快照
+    STATUS_REQ.store(true, Ordering::Release);
+    wake();
     crate::lock_ignore_poison(&REFRESH_STATUS).clone()
 }
 

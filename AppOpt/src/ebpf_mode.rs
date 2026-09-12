@@ -153,6 +153,14 @@ impl KpmHandle {
         kpm_ctl0(&self.key, &args, &mut out) >= 0 && out[0] == b'p'
     }
 
+    /// 查询内核 input kprobe 真实注册状态 (ctl0 input_status: "1"/"0")。
+    /// cmd 返回 0 只表示 ctl0 接受请求, 实际注册在 workqueue 异步完成, 可能失败。
+    fn input_status(&self) -> bool {
+        let c = cstr("input_status");
+        let mut out = [0u8; 4];
+        kpm_ctl0(&self.key, &c, &mut out) >= 0 && out[0] == b'1'
+    }
+
     /// 确认模块已加载 (由 APatch 管理器加载; AppOpt 不自动部署/加载)
     pub(crate) fn verify_loaded(&self) -> bool {
         self.ping()
@@ -166,10 +174,12 @@ impl KpmHandle {
 
     /// 批量写 APPLIED 表: 相同 bits 的一批 tid 一次 supercall (替代逐 tid ctl0)
     pub(crate) fn applied_set_many(&self, bits: u64, tids: &[i32]) {
-        let mut s = format!("applied_set_many {:x}", bits);
+        use std::fmt::Write as _;
+        // 预分配容量, 避免逐个 t.to_string() 的临时分配
+        let mut s = String::with_capacity(32 + tids.len() * 8);
+        let _ = write!(s, "applied_set_many {:x}", bits);
         for t in tids {
-            s.push(' ');
-            s.push_str(&t.to_string());
+            let _ = write!(s, " {}", t);
         }
         self.cmd(&s);
     }
@@ -531,3 +541,8 @@ pub fn event_dispatch(event: &EbpfProcEvent, _cfg: &AppConfig, _state: &mut Ebpf
     }
 }
 
+
+/// 查询内核 input kprobe 真实注册状态 (KPM 模式 web 状态用; 不缓存, 状态动态)
+pub(crate) fn kpm_input_hooked() -> bool {
+    KpmHandle::new().input_status()
+}

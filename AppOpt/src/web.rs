@@ -498,16 +498,6 @@ fn installed_pkgs() -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn for_each_pid(mut f: impl FnMut(i32)) {
-    if let Ok(entries) = fs::read_dir("/proc") {
-        for entry in entries.flatten() {
-            if let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() {
-                f(pid);
-            }
-        }
-    }
-}
-
 /// 排序键
 fn rank_top(counts: BTreeMap<String, usize>, lq: &str) -> Vec<(String, usize)> {
     let mut ranked: Vec<(u8, Reverse<usize>, String)> = counts
@@ -526,7 +516,7 @@ fn rank_top(counts: BTreeMap<String, usize>, lq: &str) -> Vec<(String, usize)> {
 fn suggest_pkgs(q: &str) -> Vec<(String, usize)> {
     let mut counts: BTreeMap<String, usize> =
         installed_pkgs().into_iter().map(|p| (p, 0)).collect();
-    for_each_pid(|pid| {
+    crate::for_each_proc_pid(|pid| {
         if let Some(name) = read_cmdline(pid).filter(|n| n.contains('.')) {
             *counts.entry(name).or_insert(0) += 1;
         }
@@ -542,7 +532,7 @@ fn thread_comm(pid: i32, tid: i32) -> Option<String> {
 
 fn suggest_threads(pkg: &str, q: &str) -> Vec<(String, usize)> {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    for_each_pid(|pid| {
+    crate::for_each_proc_pid(|pid| {
         if read_cmdline(pid).as_deref() == Some(pkg) {
             for tid in task_tids(pid).unwrap_or_default() {
                 if let Some(comm) = thread_comm(pid, tid) {
