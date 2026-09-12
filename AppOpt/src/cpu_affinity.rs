@@ -253,7 +253,7 @@ impl CpuAffinity {
                 self.managed.insert(tid, pkg.to_string());
             }
         }
-        // 批量写内核 APPLIED 表 (每 bits 一次 supercall, 替代逐 tid ctl0)
+        // 批量写内核 APPLIED 表 (每 bits 一次 supercall)
         for (bits, tids) in &set {
             self.bpf.applied_set_many(*bits, tids);
         }

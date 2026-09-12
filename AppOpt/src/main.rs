@@ -231,48 +231,6 @@ fn main() {
 
     // 提前创建 fd (不依赖 settings; 供各独立线程使用)
     let kpm_wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-    // T6: 用户态触摸/输入活动探测线程 (root 读 /dev/input/event*, 事件驱动通知;
-    //      4.19 上替代不可用的内核 input hook; 6.6 亦可作兜底)
-    let mut touch_sv: [libc::c_int; 2] = [0, 0];
-    let touch_ok = unsafe {
-        libc::socketpair(
-            libc::AF_UNIX,
-            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-            0,
-            touch_sv.as_mut_ptr(),
-        )
-    } == 0;
-    // 触摸监听控制 socket: refresh 线程按 timer_enabled 暂停/恢复 event5 监听
-    let mut touch_ctrl: [libc::c_int; 2] = [0, 0];
-    let touch_ctrl_ok = unsafe {
-        libc::socketpair(
-            libc::AF_UNIX,
-            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-            0,
-            touch_ctrl.as_mut_ptr(),
-        )
-    } == 0;
-    if touch_ok && touch_ctrl_ok {
-        let tw = touch_sv[1];
-        let cw = touch_ctrl[1];
-        crate::touch_probe::set_ctrl_fd(cw);   // 写端供 set_enabled 使用
-        let cr = touch_ctrl[0];
-        std::thread::spawn(move || crate::touch_probe::spawn_touch(tw, cr));
-    }
-    // T7: 用户态进程退出监听 (4.19 用户态模式, 替代内核 EXIT; 仅主 pid 注册)
-    let mut exit_sv: [libc::c_int; 2] = [0, 0];
-    let exit_ok = unsafe {
-        libc::socketpair(
-            libc::AF_UNIX,
-            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-            0,
-            exit_sv.as_mut_ptr(),
-        )
-    } == 0;
-    if exit_ok {
-        let ew = exit_sv[1];
-        std::thread::spawn(move || crate::exit_probe::spawn_exit(ew));
-    }
     let mut fg_sv: [libc::c_int; 2] = [0, 0];
     let socket_ok = unsafe {
         libc::socketpair(
@@ -367,6 +325,63 @@ fn main() {
     if ebpf_state.is_some() {
         crate::web::KPM_ACTIVE.store(true, Ordering::Relaxed);
     }
+
+    // 创建用户态 touch/exit 监听线程 (socketpair + spawn); 返回 (touch_ok, exit_ok)
+    fn spawn_userspace_probes(
+        touch_sv: &mut [libc::c_int; 2],
+        exit_sv: &mut [libc::c_int; 2],
+    ) -> (bool, bool) {
+        // T6: 用户态触摸/输入活动探测 (root 读 /dev/input/event*, 事件驱动通知)
+        let touch_ok = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                0,
+                touch_sv.as_mut_ptr(),
+            )
+        } == 0;
+        // 触摸监听控制 socket: refresh 线程按 timer_enabled 暂停/恢复 event5 监听
+        let mut touch_ctrl: [libc::c_int; 2] = [0, 0];
+        let touch_ctrl_ok = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                0,
+                touch_ctrl.as_mut_ptr(),
+            )
+        } == 0;
+        if touch_ok && touch_ctrl_ok {
+            let tw = touch_sv[1];
+            crate::touch_probe::set_ctrl_fd(touch_ctrl[1]); // 写端供 set_enabled 使用
+            let cr = touch_ctrl[0];
+            std::thread::spawn(move || crate::touch_probe::spawn_touch(tw, cr));
+        }
+        // T7: 用户态进程退出监听 (替代内核 EXIT; 仅主 pid 注册)
+        let exit_ok = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                0,
+                exit_sv.as_mut_ptr(),
+            )
+        } == 0;
+        if exit_ok {
+            let ew = exit_sv[1];
+            std::thread::spawn(move || crate::exit_probe::spawn_exit(ew));
+        }
+        (touch_ok, exit_ok)
+    }
+
+    // 用户态模式才创建 touch/exit 监听线程:
+    //   KPM 模式由内核 input kprobe / EXIT 探针驱动; 若之后 KPM 断开回退用户态,
+    //   由主循环 KPM 重连失败分支补建 (spawn_userspace_probes)。
+    let mut touch_sv: [libc::c_int; 2] = [0, 0];
+    let mut exit_sv: [libc::c_int; 2] = [0, 0];
+    let (mut touch_ok, mut exit_ok) = if ebpf_state.is_none() {
+        spawn_userspace_probes(&mut touch_sv, &mut exit_sv)
+    } else {
+        (false, false)
+    };
     // T4: packages.list inotify fd
     let pkg_inotify_fd = pkg_inotify_thread.join().unwrap_or(-1);
     // T3: observer 注册完成
@@ -781,6 +796,18 @@ fn main() {
                 ebpf_state = Some(es);
                 if cpu_ready {
                     crate::cpu_affinity::apply_all_now();
+                }
+            } else if !touch_ok || !exit_ok {
+                // KPM 不可用 (重连失败) → 回退用户态: 补建 touch/exit 监听
+                // (启动为 KPM 模式时未创建, 此处兜底)
+                let (t, e) = spawn_userspace_probes(&mut touch_sv, &mut exit_sv);
+                if !touch_ok && t {
+                    touch_ok = true;
+                    epoll_add(epfd, touch_sv[0], EV_TOUCH);
+                }
+                if !exit_ok && e {
+                    exit_ok = true;
+                    epoll_add(epfd, exit_sv[0], EV_EXIT_PID);
                 }
             }
         }
