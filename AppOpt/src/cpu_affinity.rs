@@ -223,7 +223,7 @@ impl CpuAffinity {
         let mut by_pkg: HashMap<String, Vec<i32>> = HashMap::new();
         // launcher3/systemui 标记 pid 直接按标记归属 (免 cmdline 读)
         for (pkg, pids) in &self.marked {
-            if cfg.target_pkgs.contains(pkg) {
+            if cfg.pkgs.contains(pkg) {
                 by_pkg.entry(pkg.clone()).or_default().extend(pids.iter().copied());
             }
         }
@@ -484,7 +484,7 @@ fn proc_uid(pid: i32) -> Option<i32> {
 /// cmdline 归因: 目标包(精确) 或 目标包:子进程
 fn resolve_pkg(pid: i32, cfg: &AppConfig) -> Option<String> {
     let cmd = crate::apply_affinity::read_cmdline(pid)?;
-    cfg.target_pkgs
+    cfg.pkgs
         .iter()
         .find(|pkg| same_pkg(&cmd, pkg))
         .cloned()

@@ -52,32 +52,49 @@ pub(crate) fn rw_write_ignore_poison<T>(rw: &RwLock<T>) -> std::sync::RwLockWrit
     rw.write().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 从 packages.list 构建两张 uid→包名 静态表 (主线程持有):
-///   cpu: 有 CPU 规则的应用; rfr: com.android.launcher3 + 有刷新率规则的应用。
-/// 前台回调只查这两张表, 不查 cmdline、不管 pid。
-fn build_uid_tables(cfg: &AppConfig) -> (HashMap<i32, String>, HashMap<i32, String>) {
+/// uid 表条目: 一个 uid → 包名 + 用途标志 (CPU 规则 / 刷新率)
+struct UidEntry {
+    pkg: String,
+    cpu: bool,
+    rfr: bool,
+}
+
+/// 从 packages.list 构建 uid→条目 静态表 (主线程持有):
+///   cpu = 有 CPU 规则的应用; rfr = com.android.launcher3 + 有刷新率规则的应用。
+/// 一个应用可同时 CPU + 刷新率 (合表后用标志位表达)。前台回调只查本表。
+fn build_uid_tables(cfg: &AppConfig) -> HashMap<i32, UidEntry> {
     let mut cpu_pkgs: HashSet<&str> = HashSet::new();
     for r in &cfg.rules {
         cpu_pkgs.insert(r.pkg.as_str());
     }
-    let mut cpu: HashMap<i32, String> = HashMap::new();
-    let mut rfr: HashMap<i32, String> = HashMap::new();
+    let mut map: HashMap<i32, UidEntry> = HashMap::new();
     if let Ok(content) = std::fs::read_to_string("/data/system/packages.list") {
         for line in content.lines() {
             let mut it = line.split_whitespace();
             let (Some(pkg), Some(uid_s)) = (it.next(), it.next()) else { continue };
             let Ok(uid) = uid_s.parse::<i32>() else { continue };
-            if cpu_pkgs.contains(pkg) {
-                cpu.entry(uid).or_insert_with(|| pkg.to_string());
-            }
-            if pkg == crate::config::DEFAULT_REFRESH_PACKAGE
-                || cfg.app_refresh_configs.contains_key(pkg)
-            {
-                rfr.entry(uid).or_insert_with(|| pkg.to_string());
+            let cpu = cpu_pkgs.contains(pkg);
+            let rfr = pkg == crate::config::DEFAULT_REFRESH_PACKAGE
+                || cfg.app_refresh_configs.contains_key(pkg);
+            if cpu || rfr {
+                map.entry(uid).or_insert_with(|| UidEntry { pkg: pkg.to_string(), cpu, rfr });
             }
         }
     }
-    (cpu, rfr)
+    map
+}
+
+/// 按包名在 packages.list 查 uid (单个; 供增量维护在交叉提取失败时回退)
+fn lookup_uid_in_packages_list(pkg: &str) -> Option<i32> {
+    let content = std::fs::read_to_string("/data/system/packages.list").ok()?;
+    for line in content.lines() {
+        let mut it = line.split_whitespace();
+        let (Some(p), Some(u)) = (it.next(), it.next()) else { continue };
+        if p == pkg {
+            return u.parse::<i32>().ok();
+        }
+    }
+    None
 }
 
 /// 规则应用集合 (cpu/rfr): 主线程检测“新增/删除规则应用”, 集合未变则跳过重建
@@ -342,14 +359,13 @@ fn main() {
 
     // 刷新率控制模块，独立线程运行 (binder 回调经主线程 uid 表 → FgPkg 消息驱动)
     refresh::refresh_init(display_modes_thread);
-    // uid 静态表 (主线程): CPU 表 = 有 CPU 规则应用; 刷新率表 = launcher + 规则应用
-    let mut cpu_uid: HashMap<i32, String> = HashMap::new();
-    let mut rfr_uid: HashMap<i32, String> = HashMap::new();
-    // 规则应用集合 (主线程对比用): 仅集合变化才重建 uid 表 (数值调整不重建)
+    // uid 静态表 (主线程, 合并表): uid → {pkg, cpu 规则, 刷新率}
+    let mut uid_map: HashMap<i32, UidEntry> = HashMap::new();
+    // 规则应用集合 (主线程对比用): 仅集合变化才更新 uid 表 (数值调整不更新)
     let mut cpu_pkgs_set: HashSet<String> = HashSet::new();
     let mut rfr_pkgs_set: HashSet<String> = HashSet::new();
     if let Some(cfg) = rw_read_ignore_poison(&CURRENT_CONFIG).clone() {
-        (cpu_uid, rfr_uid) = build_uid_tables(&cfg);
+        uid_map = build_uid_tables(&cfg);
         (cpu_pkgs_set, rfr_pkgs_set) = cfg_pkg_sets(&cfg);
     }
 
@@ -428,17 +444,40 @@ fn main() {
     fn rebuild_uid_if_needed(
         cpu_changed: bool,
         cfg: &crate::config::AppConfig,
-        cpu_uid: &mut HashMap<i32, String>,
-        rfr_uid: &mut HashMap<i32, String>,
+        uid_map: &mut HashMap<i32, UidEntry>,
         cpu_pkgs_set: &mut HashSet<String>,
         rfr_pkgs_set: &mut HashSet<String>,
     ) {
         let (nc, nr) = cfg_pkg_sets(cfg);
-        if (cpu_changed && nc != *cpu_pkgs_set) || nr != *rfr_pkgs_set {
-            (*cpu_uid, *rfr_uid) = build_uid_tables(cfg);
-            *cpu_pkgs_set = nc;
-            *rfr_pkgs_set = nr;
+        let cpu_set_changed = cpu_changed && nc != *cpu_pkgs_set;
+        let rfr_set_changed = nr != *rfr_pkgs_set;
+        if !cpu_set_changed && !rfr_set_changed {
+            return;
         }
+        // 合表增量维护 (不再整表重扫 packages.list):
+        // - 已有条目: 按新集合刷新 cpu/rfr 标志, 两者皆无则移除;
+        // - 新增: 该包已存在 (如先有 CPU 规则后加刷新率) 时标志位自然覆盖,
+        //         仅"全新包名"才按包名查 packages.list 取 uid。
+        uid_map.retain(|_, e| {
+            e.cpu = nc.contains(&e.pkg);
+            e.rfr = nr.contains(&e.pkg);
+            e.cpu || e.rfr
+        });
+        let known: HashSet<String> = uid_map.values().map(|e| e.pkg.clone()).collect();
+        for pkg in nc.union(&nr) {
+            if known.contains(pkg.as_str()) {
+                continue;
+            }
+            if let Some(uid) = lookup_uid_in_packages_list(pkg) {
+                uid_map.insert(uid, UidEntry {
+                    pkg: pkg.clone(),
+                    cpu: nc.contains(pkg),
+                    rfr: nr.contains(pkg),
+                });
+            }
+        }
+        *cpu_pkgs_set = nc;
+        *rfr_pkgs_set = nr;
     }
 
     // KPM 事件唤醒 eventfd: reader 收到事件后写入, 主循环 epoll 唤醒
@@ -495,15 +534,14 @@ fn main() {
     // 仅“规则应用集合”变更时重建 uid 表 (调整数值不重建)
     let reload_config = |ebpf_state: &mut Option<EbpfState>,
                          cfg: &mut Option<Arc<AppConfig>>,
-                         cpu_uid: &mut HashMap<i32, String>,
-                         rfr_uid: &mut HashMap<i32, String>,
+                         uid_map: &mut HashMap<i32, UidEntry>,
                          cpu_pkgs_set: &mut HashSet<String>,
                          rfr_pkgs_set: &mut HashSet<String>| {
         let cpu_changed = crate::config::take_cpu_rules_changed();
         *cfg = rw_read_ignore_poison(&CURRENT_CONFIG).clone();
         apply_config(cpu_changed, ebpf_state, cfg.as_deref());
         if let Some(cfg) = cfg.as_ref() {
-            rebuild_uid_if_needed(cpu_changed, cfg, cpu_uid, rfr_uid, cpu_pkgs_set, rfr_pkgs_set);
+            rebuild_uid_if_needed(cpu_changed, cfg, uid_map, cpu_pkgs_set, rfr_pkgs_set);
         }
     };
 
@@ -579,7 +617,7 @@ fn main() {
                             }
                         }
                         if let Some(cfg) = cfg.as_ref() {
-                            (cpu_uid, rfr_uid) = build_uid_tables(cfg);
+                            uid_map = build_uid_tables(cfg);
                         }
                     }
                 }
@@ -599,30 +637,32 @@ fn main() {
                             let uid = i32::from_ne_bytes([fg_buf[4], fg_buf[5], fg_buf[6], fg_buf[7]]);
                             // CPU: 表命中 → 冷热判断 (cpu_known 中 uid+pid 一致=热);
                             // 冷 → 只发 (pid+uid+包名); 身份清除由 EXIT 事件驱动
-                            if let Some(pkg) = cpu_uid.get(&uid) {
-                                // 冷启动不再清除 pid 列表/cpu_known —— 身份清除改由
-                                // EXIT 事件驱动 (ebpf_mode::event_dispatch); 冷时仅重发
-                                // ApplyPkg, CPU 线程枚举后覆盖写回新身份
-                                if !crate::cpu_affinity::cpu_known_is_hot(uid, pid) {
-                                    // 身份记录/枚举/亲和性统一经 ApplyPkg → CPU worker 回写
-                                    // CPU_KNOWN(uid,(主pid,全部pids))。用户态退出监听仅 4.19
-                                    // (KPM 模式由内核 EXIT 驱动)。
-                                    if !crate::web::KPM_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
-                                        crate::exit_probe::watch(pid);
-                                    }
-                                    if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
-                                        let _ = tx.send(crate::cpu_affinity::CpuMsg::ApplyPkg(
-                                            pid,
-                                            uid,
-                                            pkg.clone(),
-                                        ));
+                            if let Some(e) = uid_map.get(&uid) {
+                                // CPU 规则: 冷热判断 (cpu_known 中 uid+pid 一致=热)
+                                if e.cpu {
+                                    // 冷启动不再清除 pid 列表/cpu_known —— 身份清除改由
+                                    // EXIT 事件驱动 (ebpf_mode::event_dispatch); 冷时仅重发
+                                    // ApplyPkg, CPU 线程枚举后覆盖写回新身份
+                                    if !crate::cpu_affinity::cpu_known_is_hot(uid, pid) {
+                                        // 身份记录/枚举/亲和性统一经 ApplyPkg → CPU worker 回写
+                                        // CPU_KNOWN(uid,(主pid,全部pids))。用户态退出监听仅 4.19
+                                        // (KPM 模式由内核 EXIT 驱动)。
+                                        if !crate::web::KPM_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+                                            crate::exit_probe::watch(pid);
+                                        }
+                                        if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
+                                            let _ = tx.send(crate::cpu_affinity::CpuMsg::ApplyPkg(
+                                                pid,
+                                                uid,
+                                                e.pkg.clone(),
+                                            ));
+                                        }
                                     }
                                 }
-                            } else {
-                            }
-                            // 刷新率: 表命中 → 发包名给刷新率线程
-                            if let Some(pkg) = rfr_uid.get(&uid) {
-                                crate::refresh::refresh_send_fg_pkg(pkg.clone());
+                                // 刷新率: 命中 → 发包名给刷新率线程
+                                if e.rfr {
+                                    crate::refresh::refresh_send_fg_pkg(e.pkg.clone());
+                                }
                             }
                         }
                     }
@@ -670,8 +710,7 @@ fn main() {
                         reload_config(
                             &mut ebpf_state,
                             &mut cfg,
-                            &mut cpu_uid,
-                            &mut rfr_uid,
+                            &mut uid_map,
                             &mut cpu_pkgs_set,
                             &mut rfr_pkgs_set,
                         );
@@ -683,8 +722,7 @@ fn main() {
                     reload_config(
                         &mut ebpf_state,
                         &mut cfg,
-                        &mut cpu_uid,
-                        &mut rfr_uid,
+                        &mut uid_map,
                         &mut cpu_pkgs_set,
                         &mut rfr_pkgs_set,
                     );
