@@ -94,8 +94,6 @@ fn ensure_global_refresh_defaults(state: &RefreshState) {
 pub const EVENT_INPUT: u32 = 5;
 
 static REFRESH_FORCE_RELOAD: AtomicBool = AtomicBool::new(false);
-/// input 触摸事件 kprobe 当前武装状态 (初始 false: 由 activate() 的 input_on 成功后置位)
-pub(crate) static INPUT_HOOK_ON: AtomicBool = AtomicBool::new(false);
 static WAKE_FD: AtomicI32 = AtomicI32::new(-1);
 /// web 轮询请求刷新状态快照 (仅被请求时才 update_status, 避免每次事件都构建)
 static STATUS_REQ: AtomicBool = AtomicBool::new(false);
@@ -170,8 +168,7 @@ fn load_global_config(state: &mut RefreshState) {
     state.current_idle = state.idle_mode;
     state.current_timeout = state.timeout_seconds;
     state.timer_enabled = state.current_idle != state.current_active;
-    sync_input_hook(state);
-    // 用户态触摸监听按需启停: 活跃==空闲(无需 input 切换)暂停 event5, 切换应用
+    // 用户态触摸监听按需启停: 活跃==空闲(无需 input 切换)暂停监听, 切换应用
     // 后按新规则恢复 (KPM 模式此开关同样生效, 避免双源)
     crate::touch_probe::set_enabled(state.timer_enabled);
 }
@@ -233,7 +230,6 @@ fn apply_app_config(state: &mut RefreshState, pkg: &str) {
         state.current_idle = state.idle_mode;
     }
     state.timer_enabled = state.current_idle != state.current_active;
-    sync_input_hook(state);
 }
 
 fn timerfd_set(fd: i32, seconds: i32) {
@@ -252,15 +248,7 @@ fn timerfd_cancel(fd: i32) {
     unsafe { libc::timerfd_settime(fd, 0, &its, std::ptr::null_mut()); }
 }
 
-/// 刷新率活跃==空闲时无 idle→active 切换, 无需触摸事件: 卸载 input kprobe 省开销;
-/// 不同时重新安装。仅状态变化时下发 ctl0 (input_on/input_off)。
-fn sync_input_hook(state: &RefreshState) {
-    let want = state.timer_enabled;
-    if INPUT_HOOK_ON.swap(want, Ordering::AcqRel) != want {
-        crate::ebpf_mode::set_input_hook(want);
-    }
-}
-
+/// 刷新率活跃==空闲时无 idle→active 切换, 无需触摸事件:
 fn reset_timer(state: &mut RefreshState, force: bool) {
     if !state.timer_enabled {
         timerfd_cancel(state.timer_fd);
@@ -362,12 +350,7 @@ fn update_status(state: &RefreshState) {
             v
         },
         device_modes: std::sync::Arc::clone(&state.device_modes),
-        input_hooked: if crate::web::KPM_ACTIVE.load(Ordering::Relaxed) {
-            // KPM 模式: 查询内核真实注册状态 (异步武装可能失败)
-            crate::ebpf_mode::kpm_input_hooked()
-        } else {
-            INPUT_HOOK_ON.load(Ordering::Relaxed)
-        },
+        input_hooked: crate::touch_probe::TOUCH_LISTENING.load(Ordering::Relaxed),
         last_input_secs: state
             .last_input_time
             .map(|t| t.elapsed().as_secs() as i64)

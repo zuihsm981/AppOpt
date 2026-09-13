@@ -285,6 +285,7 @@ fn status_json() -> String {
         "mode": drive_mode(),
         "connected": connected,
         "touch_listening": crate::touch_probe::TOUCH_LISTENING.load(Ordering::Relaxed),
+        "touch_event": crate::touch_probe::touch_event_name(),
         "input_hooked": crate::refresh::refresh_get_status()
             .map(|s| s.input_hooked).unwrap_or(false),
         "uptime": uptime,

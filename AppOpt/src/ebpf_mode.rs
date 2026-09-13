@@ -153,14 +153,6 @@ impl KpmHandle {
         kpm_ctl0(&self.key, &args, &mut out) >= 0 && out[0] == b'p'
     }
 
-    /// 查询内核 input kprobe 真实注册状态 (ctl0 input_status: "1"/"0")。
-    /// cmd 返回 0 只表示 ctl0 接受请求, 实际注册在 workqueue 异步完成, 可能失败。
-    fn input_status(&self) -> bool {
-        let c = cstr("input_status");
-        let mut out = [0u8; 4];
-        kpm_ctl0(&self.key, &c, &mut out) >= 0 && out[0] == b'1'
-    }
-
     /// 确认模块已加载 (由 APatch 管理器加载; AppOpt 不自动部署/加载)
     pub(crate) fn verify_loaded(&self) -> bool {
         self.ping()
@@ -184,13 +176,9 @@ impl KpmHandle {
         self.cmd(&s);
     }
 
-    /// AppOpt 初始化完成后激活 KPM: start 武装 sched_setaffinity kprobe + input_on 武装 input kprobe
+    /// AppOpt 初始化完成后激活 KPM: start 武装 exit/setaffinity (input 检测统一走用户态 eventX)
     pub fn activate(&self) {
         self.cmd("start");
-        if self.cmd("input_on") >= 0 {
-            // input kprobe 确实武装成功 → 更新状态 (sync_input_hook 据此跳过重复 input_on)
-            crate::refresh::INPUT_HOOK_ON.store(true, Ordering::Release);
-        }
     }
 
     /// 标记规则应用主进程 tgid (内核退出探针只对主进程发布 EXIT 事件;
@@ -510,17 +498,6 @@ fn kpm_shm_reader(
     unsafe { libc::munmap(base, map_len); }
 }
 
-/// 按需武装/卸载 input 触摸事件 kprobe (ctl0 input_on/input_off):
-/// 刷新率活跃==空闲时无 idle→active 切换, 卸载触摸钩子省开销; 不同时重新安装。
-pub fn set_input_hook(on: bool) {
-    let h = KpmHandle::new();
-    if on {
-        h.cmd("input_on");
-    } else {
-        h.cmd("input_off");
-    }
-}
-
 /// 事件派发 (input: 刷新率活动检测; EXIT: 规则应用主进程退出 → 清身份;
 /// CPU/刷新率主体由 binder 三线程驱动)
 pub const EBPF_EVENT_EXIT: u32 = 4;
@@ -542,7 +519,3 @@ pub fn event_dispatch(event: &EbpfProcEvent, _cfg: &AppConfig, _state: &mut Ebpf
 }
 
 
-/// 查询内核 input kprobe 真实注册状态 (KPM 模式 web 状态用; 不缓存, 状态动态)
-pub(crate) fn kpm_input_hooked() -> bool {
-    KpmHandle::new().input_status()
-}
