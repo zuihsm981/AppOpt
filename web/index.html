@@ -177,7 +177,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 </div>
 <div class="row"><span class="label">当前刷新率</span><span class="badge kpm" id="rf-mode">-</span></div>
 <div class="row"><span class="label">定时器状态</span><span class="badge kpm" id="rf-timer">-</span></div>
-<div class="row"><span class="label" id="rf-input-label">内核 input 状态</span><span class="badge kpm mono" id="rf-input">-</span></div>
+<div class="row"><span class="label" id="rf-input-label">触摸监听状态</span><span class="badge kpm mono" id="rf-input">-</span></div>
 </div>
 <div class="card">
 <div class="card-title">规则</div>
@@ -385,6 +385,7 @@ function resumeStatus(){if(statusSeg==='thread')startStat();else loadRefresh()}
 async function loadRefreshOnce(){
   try{
     const[st,cfg,st0]=await Promise.all([api('/api/refresh/status'),api('/api/refresh/config'),api('/api/status')]);
+    rfTouchEvent=st0.touch_event||'';
     renderRfInput(st);
     fillRfRules(st0);
     $('rf-mode').textContent=st.mode_str||'-';
@@ -911,6 +912,7 @@ async function loadRefresh(){
   try{
     const[st,cfg,st0]=await Promise.all([api('/api/refresh/status'),api('/api/refresh/config'),api('/api/status')]);
     statusDrive=st0.mode; statusConn=!!st0.connected; statusTouch=!!st0.touch_listening;
+    rfTouchEvent=st0.touch_event||'';
     renderRfInput(st);
     fillRfRules(st0);
     $('rf-mode').textContent=st.mode_str||'-';
@@ -925,6 +927,7 @@ async function loadRefresh(){
       try{
         const[s,st0]=await Promise.all([api('/api/refresh/status'),api('/api/status')]);
         statusDrive=st0.mode; statusConn=!!st0.connected; statusTouch=!!st0.touch_listening;
+        rfTouchEvent=st0.touch_event||'';
         renderRfInput(s);
         fillRfRules(st0);
         $('rf-mode').textContent=s.mode_str||'-';
@@ -933,22 +936,19 @@ async function loadRefresh(){
     },1000);
   }catch(e){toast(e.message)}
 }
+let rfTouchEvent=''; // 当前触摸屏 event 端口 (web 显示 event* 状态)
 let rfAvail=[120,90,60]; // 设备可用刷新率 (Hz), 由 /api/refresh/config 下发
 let rfDeviceExpanded=false; // 设备刷新率展开详情
 let lastRefreshCfg=null;
-// 刷新率卡 input 行: 标签与值随驱动模式切换 (KPM→内核 input 状态 / 用户态→event 状态)
+// 刷新率卡 input 行: input 检测统一走用户态 eventX, 标签/值都是监听状态
 function renderRfInput(st){
-  const usermode=statusDrive==='userspace'||(statusDrive==='auto'&&!statusConn);
-  $('rf-input-label').textContent=usermode?'event 状态':'内核 input 状态';
+  $('rf-input-label').textContent=rfTouchEvent?('event'+rfTouchEvent+' 状态'):'触摸监听状态';
   $('rf-input').textContent=fmtInput(st);
 }
-// 触摸事件状态: 用户态驱动 → event 监听(已监听/未监听); KPM → 已武装/未武装 + 上次输入
 function fmtInput(st){
-  const usermode=statusDrive==='userspace'||(statusDrive==='auto'&&!statusConn);
   const last=(st.last_input_secs||0)>=0?(' · 上次输入 '+(st.last_input_secs||0)+'s前'):'';
-  if(usermode) return (statusTouch?'已监听':'未监听')+last;
-  const hooked=st.input_hooked?'已武装':'未武装';
-  return hooked+last;
+  // input 检测统一走用户态 eventX (无内核 input hook): 一律显示监听状态
+  return (statusTouch?'已监听':'未监听')+last;
 }
 // 设备刷新率: 默认只显示刷新率 (120Hz / 90Hz / 60Hz), 点击后展开完整模式 (id|WxH Hz)
 function renderDeviceRates(cfg){
