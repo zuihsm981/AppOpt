@@ -92,7 +92,7 @@ pub fn spawn_touch(touch_sock: c_int, ctrl_sock: c_int) {
         unsafe { libc::close(epfd); }
         return;
     };
-    let c = match std::ffi::CString::new(p) {
+    let c = match std::ffi::CString::new(&p) {
         Ok(c) => c,
         Err(_) => {
             unsafe { libc::close(epfd); }

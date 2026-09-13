@@ -378,7 +378,7 @@ fn main() {
     // 退出监听: 仅用户态模式 (KPM 由内核 EXIT 探针驱动; 后续回退用户态时补建)。
     let mut touch_sv: [libc::c_int; 2] = [0, 0];
     let mut exit_sv: [libc::c_int; 2] = [0, 0];
-    let mut touch_ok = spawn_touch_probe(&mut touch_sv);
+    let touch_ok = spawn_touch_probe(&mut touch_sv);
     let mut exit_ok = if ebpf_state.is_none() {
         spawn_exit_probe(&mut exit_sv)
     } else {
