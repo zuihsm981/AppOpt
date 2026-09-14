@@ -942,7 +942,7 @@ let rfDeviceExpanded=false; // 设备刷新率展开详情
 let lastRefreshCfg=null;
 // 刷新率卡 input 行: input 检测统一走用户态 eventX, 标签/值都是监听状态
 function renderRfInput(st){
-  $('rf-input-label').textContent=rfTouchEvent?('event'+rfTouchEvent+' 状态'):'触摸监听状态';
+  $('rf-input-label').textContent=rfTouchEvent?(rfTouchEvent+' 状态'):'触摸监听状态';
   $('rf-input').textContent=fmtInput(st);
 }
 function fmtInput(st){
