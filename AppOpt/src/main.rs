@@ -726,18 +726,16 @@ fn main() {
                 EV_TOUCH => {
                     // 用户态触摸/输入活动: recv 触发设备索引 → 日志 → 重置刷新率空闲
                     if touch_ok && touch_sv[0] > 0 {
-                        let mut tb = [0u8; 4];
-                        let n = unsafe {
+                        // touch_probe 每次活动通知 1 字节; 读走即可 (只关心"有活动")
+                        let mut tb = [0u8; 1];
+                        let _ = unsafe {
                             libc::recv(
                                 touch_sv[0],
                                 tb.as_mut_ptr() as *mut libc::c_void,
-                                4,
+                                1,
                                 0,
                             )
                         };
-                        if n == 4 {
-                            let _idx = i32::from_ne_bytes([tb[0], tb[1], tb[2], tb[3]]);
-                        }
                     }
                     crate::refresh::refresh_on_event(crate::refresh::EVENT_INPUT, 0);
                 }

@@ -41,21 +41,17 @@ pub fn set_enabled(on: bool) {
     }
 }
 
-/// 判断 abs 能力掩码是否为触摸屏: 前 64 位覆盖 ABS_MT_POSITION_X=0x35 (多点)
-/// 与 ABS_X/ABS_Y (0x00/0x01, 单点)。32/64 位内核的 /sys word 格式均覆盖。
+/// 判断 abs 能力掩码是否为触摸屏: 只认 ABS_MT_POSITION_X (0x35, 多点触摸,
+/// 现代触摸屏都有)。不认 ABS_X/ABS_Y (0x00/0x01) —— 加速度计/传感器也声明
+/// 这两项, 避免误判。内核 %*pb 以 unsigned long 粒度打印, 64 位内核单 word
+/// 完整覆盖 ABS_CNT=64, split_whitespace().next() 即完整掩码。
 fn is_touch_abs(abs: &str) -> bool {
-    let mut words = abs.split_whitespace();
-    let w0 = words
+    let w0 = abs
+        .split_whitespace()
         .next()
         .and_then(|s| u64::from_str_radix(s, 16).ok())
         .unwrap_or(0);
-    let w1 = words
-        .next()
-        .and_then(|s| u64::from_str_radix(s, 16).ok())
-        .unwrap_or(0);
-    let mask = w0 | (w1 << 32);
-    (mask & (1u64 << 0x35)) != 0   // ABS_MT_POSITION_X
-        || (mask & 0x3) != 0       // ABS_X / ABS_Y
+    (w0 & (1u64 << 0x35)) != 0   // ABS_MT_POSITION_X
 }
 
 /// 探测应监听的触摸屏 event 设备: 遍历 /sys/class/input/eventX 的 abs 能力。

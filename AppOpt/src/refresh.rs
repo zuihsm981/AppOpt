@@ -442,7 +442,7 @@ pub fn refresh_init(display_modes: std::thread::JoinHandle<Vec<(u32, u32, u32, f
         loop {
             // 事件驱动：阻塞等待事件；无轮询、无超时兜底。
             // 前台包名由 binder 回调 pid + /proc cmdline 直接解析, 无共享缓存依赖。
-            let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 3, -1) };
+            let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 2, -1) };
             if n < 0 {
                 if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                     continue;

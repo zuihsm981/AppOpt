@@ -125,6 +125,14 @@ pub fn apply_all_now() {
     }
 }
 
+/// 延迟放置任务 (冷启动 ApplyPkg 登记, 到期应用)
+struct PendingTask {
+    due: std::time::Instant,
+    pid: i32,
+    uid: i32,
+    pkg: String,
+}
+
 /// CPU 亲和性执行器 (worker 线程独占)
 pub struct CpuAffinity {
     bpf: KpmHandle,
@@ -138,6 +146,9 @@ pub struct CpuAffinity {
     marked: HashMap<String, Vec<i32>>,
     /// 合并 CPU 集合 bits → cpuset 目录名 缓存 (相同集合只 ensure 一次, 避免每线程重复建目录)
     cpuset_cache: HashMap<u64, String>,
+    /// 延迟放置任务队列 (异步): 冷启动 ApplyPkg 登记, 到期应用;
+    /// EvictUid/ApplyAll 会清理对应任务 (防止与身份/配置不同步)。
+    pending: Vec<PendingTask>,
 }
 
 impl CpuAffinity {
@@ -151,6 +162,7 @@ impl CpuAffinity {
             init_pids,
             marked,
             cpuset_cache: HashMap::new(),
+            pending: Vec::new(),
         }
     }
 
@@ -290,85 +302,129 @@ impl CpuAffinity {
     }
 
     /// 常驻线程入口 (纯事件驱动, 无重试/无周期)
-    pub fn run(mut self, rx: mpsc::Receiver<CpuMsg>, stop: Arc<AtomicBool>) {
+    pub fn run(mut self, rx: mpsc::Receiver<CpuMsg>) {
         let name = CString::new("CpuAffinity").unwrap();
         unsafe {
             libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
         }
-        while !stop.load(Ordering::Relaxed) {
-            match rx.recv() {
-                Ok(CpuMsg::ApplyAll) => {
-                    if let Some(cfg) = current_cfg() {
-                        self.apply_all(&cfg);
-                    }
-                }
-                Ok(CpuMsg::ApplyPkg(pid, uid, pkg)) => {
-                    // 冷启动: 先占位 cpu_known (uid+主 pid), 延迟 2s 覆盖子进程窗口
-                    crate::rw_write_ignore_poison(&CPU_KNOWN).insert(uid, (pid, Vec::new()));
-                    thread::sleep(enum_delay());
-                    if let Some(cfg) = current_cfg() {
-                        let pids = self.on_uid(uid, &pkg, &cfg);
-                        // 设置亲和性后: 该 uid 主进程+全部子进程 pid 列表写入
-                        // cpu_known 与 proc 快照 (供后续冷热判断/统计)
-                        crate::rw_write_ignore_poison(&CPU_KNOWN).insert(uid, (pid, pids.clone()));
-                        crate::rw_write_ignore_poison(&PROC_SNAPSHOT).insert(uid, pids);
-                        // 标记内核主进程 tgid: 退出探针只对该主进程发布 EXIT
-                        self.bpf.applied_set_main(pid);
-                        // 记录 uid→pkg (退出时按 uid 整清 managed)
-                        self.uid_pkg.insert(uid, pkg.clone());
-                    }
-                }
-                Ok(CpuMsg::ApplyPkgByUid(uid, pkg)) => {
-                    // 整包重放: 仅对已接管 (CPU_KNOWN 有记录) 的应用重放; 未运行则跳过
-                    // (等下次冷启动 ApplyPkg 用最新规则接管)。
-                    let cached = crate::rw_read_ignore_poison(&CPU_KNOWN).get(&uid).cloned();
-                    let pids = match cached {
-                        Some((_, pids)) if !pids.is_empty() => pids,   // 复用缓存 pids
-                        Some(_) => self.scan_proc_by_uid(uid),          // 占位中: 现扫一次
-                        None => continue,                              // 未运行: 跳过本条
-                    };
-                    let Some(cfg) = current_cfg() else { continue };
-                    self.apply_tids(&pids, &pkg, &cfg);
-                    // pids 复用自 CPU_KNOWN, 不写回 (新增子进程由下次冷启动 ApplyPkg 覆盖)
-                }
-                Ok(CpuMsg::ApplyThreadByUid(uid, pkg, thread)) => {
-                    // 单线程重放: 同上存活判断; 收集该 uid 各 pid 中 comm==thread 的 tid
-                    let cached = crate::rw_read_ignore_poison(&CPU_KNOWN).get(&uid).cloned();
-                    let pids = match cached {
-                        Some((_, pids)) if !pids.is_empty() => pids,
-                        Some(_) => self.scan_proc_by_uid(uid),
-                        None => continue,
-                    };
-                    let Some(cfg) = current_cfg() else { continue };
-                    let mut tids: Vec<i32> = Vec::new();
-                    for p in pids {
-                        for t in crate::apply_affinity::task_tids(p).unwrap_or_default() {
-                            if crate::apply_affinity::tid_comm(t).as_deref() == Some(thread.as_str()) {
-                                tids.push(t);
-                            }
-                        }
-                    }
-                    if !tids.is_empty() {
-                        self.apply_tids(&tids, &pkg, &cfg);
-                    }
-                }
-                Ok(CpuMsg::EvictUid(uid)) => {
-                    // 主进程退出 (EXIT 事件): 按 uid 找到该应用包名, 清除 managed 中
-                    // 全部线程条目 (统计快照由 web 轮询触发发布 → 命中归零)。不依赖主线程
-                    // tid 是否在 managed (线程规则类应用主线程可能未被管理)。
-                    // 内核侧已在 exit 探针逐 tid 摘 APPLIED。
-                    let pkg = self.uid_pkg.remove(&uid);
-                    if let Some(pkg) = pkg {
-                        self.managed.retain(|_, p| p != &pkg);
-                    }
-                }
-                Ok(CpuMsg::PublishStats) => self.publish_stats(),
-                Err(mpsc::RecvError) => break,
+
+        loop {
+            let timeout = self
+                .pending
+                .iter()
+                .map(|t| t.due.saturating_duration_since(std::time::Instant::now()))
+                .min()
+                .unwrap_or(std::time::Duration::from_secs(3600)); // 无 pending: 长阻塞 (消息唤醒)
+            match rx.recv_timeout(timeout) {
+                Ok(msg) => self.handle_msg(msg),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(_) => break,
+            }
+
+            // 到期应用: 先取出到期任务, 再处理 (状态在 apply_pkg 前已更新)
+            let now = std::time::Instant::now();
+            let (due, rest): (Vec<_>, Vec<_>) = self.pending.drain(..).partition(|t| t.due <= now);
+            self.pending = rest;
+            for t in due {
+                self.apply_pkg(t.pid, t.uid, &t.pkg);
             }
         }
         self.bpf.applied_clear();
     }
-}
+
+    /// 应用已登记的前台应用 (到期执行): 枚举 uid 全部 pid 设亲和 + 回写身份
+    fn apply_pkg(&mut self, pid: i32, uid: i32, pkg: &str) {
+        let Some(cfg) = current_cfg() else {
+            // 配置异常缺失: 清占位身份, 等下次前台回调重新触发
+            crate::rw_write_ignore_poison(&CPU_KNOWN).remove(&uid);
+            return;
+        };
+        let pids = self.on_uid(uid, pkg, &cfg);
+        if pids.is_empty() {
+            // 应用已退出 (EvictUid 已清身份) → 不重插空身份
+            crate::rw_write_ignore_poison(&CPU_KNOWN).remove(&uid);
+            return;
+        }
+        // 设置亲和性后: 该 uid 主进程+全部子进程 pid 列表写入
+        // cpu_known 与 proc 快照 (供后续冷热判断/统计)
+        crate::rw_write_ignore_poison(&CPU_KNOWN).insert(uid, (pid, pids.clone()));
+        crate::rw_write_ignore_poison(&PROC_SNAPSHOT).insert(uid, pids);
+        // 标记内核主进程 tgid: 退出探针只对该主进程发布 EXIT
+        self.bpf.applied_set_main(pid);
+        // 记录 uid→pkg (退出时按 uid 整清 managed)
+        self.uid_pkg.insert(uid, pkg.to_string());
+    }
+
+    /// 消息处理 (即时; 顺序保真)。ApplyPkg 登记延迟任务; ApplyAll/EvictUid 清理 pending
+    fn handle_msg(&mut self, msg: CpuMsg) {
+        match msg {
+            CpuMsg::ApplyPkg(pid, uid, pkg) => {
+                // 配置未就绪 (CURRENT_CONFIG 未写入): 不占位不登记, 下次前台回调重试
+                if current_cfg().is_none() {
+                    return;
+                }
+                // 冷启动: 占位 (冷热判断) + 登记延迟应用; 同 uid 重复前台合并 (保留最新)
+                crate::rw_write_ignore_poison(&CPU_KNOWN).insert(uid, (pid, Vec::new()));
+                let due = std::time::Instant::now() + enum_delay();
+                match self.pending.iter_mut().find(|t| t.uid == uid) {
+                    Some(t) => {
+                        t.due = due;
+                        t.pid = pid;
+                        t.pkg = pkg;
+                    }
+                    None => self.pending.push(PendingTask { due, pid, uid, pkg }),
+                }
+            }
+            CpuMsg::ApplyAll => {
+                // 全量应用覆盖所有应用: 清掉未到期任务 (防旧任务用旧 pid/身份覆盖新配置)
+                self.pending.clear();
+                if let Some(cfg) = current_cfg() {
+                    self.apply_all(&cfg);
+                }
+            }
+            CpuMsg::ApplyPkgByUid(uid, pkg) => {
+                // 整包重放: 仅对已接管 (CPU_KNOWN 有记录) 的应用重放; 未运行则跳过
+                let cached = crate::rw_read_ignore_poison(&CPU_KNOWN).get(&uid).cloned();
+                let pids = match cached {
+                    Some((_, pids)) if !pids.is_empty() => pids, // 复用缓存 pids
+                    Some(_) => self.scan_proc_by_uid(uid),       // 占位中: 现扫一次
+                    None => return,                              // 未运行: 跳过本条
+                };
+                let Some(cfg) = current_cfg() else { return };
+                self.apply_tids(&pids, &pkg, &cfg);
+            }
+            CpuMsg::ApplyThreadByUid(uid, pkg, thread) => {
+                // 单线程重放: 同上存活判断; 收集 comm==thread 的 tid
+                let cached = crate::rw_read_ignore_poison(&CPU_KNOWN).get(&uid).cloned();
+                let pids = match cached {
+                    Some((_, pids)) if !pids.is_empty() => pids,
+                    Some(_) => self.scan_proc_by_uid(uid),
+                    None => return,
+                };
+                let Some(cfg) = current_cfg() else { return };
+                let mut tids: Vec<i32> = Vec::new();
+                for p in pids {
+                    for t in crate::apply_affinity::task_tids(p).unwrap_or_default() {
+                        if crate::apply_affinity::tid_comm(t).as_deref() == Some(thread.as_str()) {
+                            tids.push(t);
+                        }
+                    }
+                }
+                if !tids.is_empty() {
+                    self.apply_tids(&tids, &pkg, &cfg);
+                }
+            }
+            CpuMsg::EvictUid(uid) => {
+                // 应用退出: 清其 pending 任务 (防到期白跑/假存活) + 清身份/统计
+                self.pending.retain(|t| t.uid != uid);
+                let pkg = self.uid_pkg.remove(&uid);
+                if let Some(pkg) = pkg {
+                    self.managed.retain(|_, p| p != &pkg);
+                }
+            }
+            CpuMsg::PublishStats => self.publish_stats(),
+        }
+    }
 
 /// 启动 CPU worker 线程 (KPM 模式下调用一次); 返回 false 表示模块不可用
 pub fn start(init_pids: HashSet<i32>, marked: HashMap<String, Vec<i32>>) -> bool {
@@ -382,7 +438,7 @@ pub fn start(init_pids: HashSet<i32>, marked: HashMap<String, Vec<i32>>) -> bool
     let _ = CPU_FG_TX.set(Mutex::new(tx));
     // init_pids/marked 由 main.rs 在 AppOpt 初始化时构建传入
     let cpu = CpuAffinity::new(init_pids, marked);
-    thread::spawn(move || cpu.run(rx, Arc::new(AtomicBool::new(false))));
+    thread::spawn(move || cpu.run(rx));
     true
 }
 
