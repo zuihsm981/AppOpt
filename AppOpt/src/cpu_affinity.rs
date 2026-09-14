@@ -425,6 +425,7 @@ impl CpuAffinity {
             CpuMsg::PublishStats => self.publish_stats(),
         }
     }
+}
 
 /// 启动 CPU worker 线程 (KPM 模式下调用一次); 返回 false 表示模块不可用
 pub fn start(init_pids: HashSet<i32>, marked: HashMap<String, Vec<i32>>) -> bool {
