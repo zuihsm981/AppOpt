@@ -217,10 +217,8 @@ impl CpuAffinity {
                 by_pkg.entry(pkg).or_default().push(pid);
             }
         });
-        // 阶段 2: 有规则但过滤后无 pid 的包 (被 init_pids 覆盖的系统进程, 或
-        // 极少见的未运行应用) → 不过滤全量重扫一次, 使系统进程也生效。
-        // 规则应用通常都在运行 (配置时前台中), 未运行场景罕见, 重扫开销仅在
-        // 初始化/重载时一次。
+        // 阶段 2: 有规则但阶段 1 未归因到的包 (被 init_pids 过滤的系统进程,
+        // 或极少见的未运行应用)。只遍历 init_pids (被过滤的尽在其中), 无需全量。
         let need: Vec<String> = cfg
             .pkgs
             .iter()
@@ -228,12 +226,14 @@ impl CpuAffinity {
             .cloned()
             .collect();
         if !need.is_empty() {
-            crate::for_each_proc_pid(|pid| {
-                let Some(pkg) = resolve_pkg(pid, cfg) else { return };
+            // 阶段 2 只遍历 init_pids (被阶段 1 过滤的系统进程都在其中),
+            // 无需全量扫 /proc。
+            for &pid in self.init_pids.iter() {
+                let Some(pkg) = resolve_pkg(pid, cfg) else { continue };
                 if need.contains(&pkg) {
                     by_pkg.entry(pkg).or_default().push(pid);
                 }
-            });
+            }
         }
         let pkgs: Vec<String> = by_pkg.keys().cloned().collect();
         for pkg in &pkgs {
@@ -492,7 +492,7 @@ pub(crate) fn proc_pid_set() -> HashSet<i32> {
             set.insert(p);
             return;
         }
-        // 高位 (>7000): 系统/框架/守护类 (cmdline 含 com.android/scene-daemon/
+        // 高位 (>6500): 系统/框架/守护类 (cmdline 含 com.android/scene-daemon/
         // AppOpt/system/vendor) 或内核线程 (comm 含 kworker) 记入快照;
         // 其余应用高位 pid 不记入, 供 on_uid 按 uid 枚举新应用。
         if crate::apply_affinity::read_cmdline(p)
