@@ -177,11 +177,9 @@ impl CpuAffinity {
         if uid <= 0 {
             return Vec::new();
         }
-        // 冷启动枚举过滤: init_pids (系统/框架快照) + 其它已接管应用的 pid。
-        // 本应用自身 (uid) 的 pid 不滤 —— 它们正是要接管的 (主 pid + 子进程)。
+        // 冷启动枚举过滤: init_pids (系统/框架快照) + CPU_KNOWN 已接管 pid (统一过滤)
         let known: Vec<i32> = crate::rw_read_ignore_poison(&CPU_KNOWN)
             .iter()
-            .filter(|(u, _)| **u != uid)           // 排除本应用自身
             .flat_map(|(_, (_, pids))| pids.iter().copied())
             .collect();
         let mut pids: Vec<i32> = Vec::new();
