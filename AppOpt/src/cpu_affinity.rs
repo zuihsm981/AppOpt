@@ -474,7 +474,7 @@ fn current_cfg() -> Option<std::sync::Arc<AppConfig>> {
 
 /// 避免应用 pid 复用撞上快照旧号被 on_uid 误跳过 (首次冷启动失效根因)。
 /// 用过滤而非 break: /proc 枚举顺序不保证升序, 过滤同样不写高位且更安全。
-const INIT_PIDS_MAX_PID: i32 = 7000;
+const INIT_PIDS_MAX_PID: i32 = 6500;
 
 /// cmdline 是否属于系统/框架/守护类 (记入快照跳过)
 fn is_systemish_cmdline(cmd: &str) -> bool {
