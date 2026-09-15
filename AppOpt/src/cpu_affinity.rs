@@ -18,9 +18,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::Duration;
 
