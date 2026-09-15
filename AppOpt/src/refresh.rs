@@ -420,7 +420,7 @@ pub fn refresh_init(display_modes: std::thread::JoinHandle<Vec<(u32, u32, u32, f
         unsafe { libc::pthread_setname_np(libc::pthread_self(), name.as_ptr()); }
 
         // 初始化先应用一次全局 active 刷新率 (异步: 在后台线程执行 SF binder,
-        // 不阻塞主初始化; launcher 的全局绑定由 init 时 marked 标记完成)。
+        // 不阻塞主初始化; launcher 的全局刷新率绑定由主线程 uid 表驱动。
         let active = state.current_active;
         set_refresh_rate(&mut state, active);
 

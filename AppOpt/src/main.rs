@@ -319,7 +319,6 @@ fn main() {
 
     // ===== join 各独立线程 (事件循环/使用点前就绪) =====
     let init_pids = snapshot_thread.join().unwrap_or_default();
-    let marked = crate::cpu_affinity::classify_marked_pids(&init_pids);
     // ebpf_init 线程: KPM 加载+激活已并行完成, join 拿 EbpfState
     let mut ebpf_state: Option<EbpfState> = ebpf_thread.join().ok().flatten();
     if ebpf_state.is_some() {
@@ -391,7 +390,7 @@ fn main() {
     let fg_recv_fd = fg_sv[0];
     let mut fg_buf = [0u8; 8];
 
-    let cpu_ready = crate::cpu_affinity::start(init_pids, marked);
+    let cpu_ready = crate::cpu_affinity::start(init_pids);
 
     // 刷新率控制模块，独立线程运行 (binder 回调经主线程 uid 表 → FgPkg 消息驱动)
     refresh::refresh_init(display_modes_thread);
