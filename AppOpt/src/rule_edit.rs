@@ -287,12 +287,14 @@ fn with_comment(new_line: &str, old: &str) -> String {
 
 fn spec_swap(raw: &str, cpus: &str) -> String {
     let cut = comment_at(raw).unwrap_or(raw.len());
-    let Some(eq) = raw[..cut].rfind('=') else { return raw.into() };
+    // 第一个 '=' 分隔 pkg/cpus (cpus 可含 util token 的 '=')
+    let Some(eq) = raw[..cut].find('=') else { return raw.into() };
     let rhs = &raw[eq + 1..cut];
     let val = rhs.trim_start();
     let lead = rhs.len() - val.len();
+    // 替换到 '{'/'}' 前 (整段 cpus+util 一起替换; 不在空白处截断, 避免丢 util token)
     let v_end = val
-        .find(|c: char| c.is_whitespace() || c == '{' || c == '}')
+        .find(|c: char| c == '{' || c == '}')
         .unwrap_or(val.len());
     let tail: String = val[v_end..]
         .chars()
