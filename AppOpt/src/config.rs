@@ -48,6 +48,10 @@ pub struct AffinityRule {
     pub thread_pattern: CString,
     pub cpuset_dir: String,
     pub cpus: CpuSet,
+    /// uclamp 下限 (0..=1024, -1 = 未设)
+    pub util_min: i32,
+    /// uclamp 上限 (0..=1024, -1 = 未设)
+    pub util_max: i32,
 }
 
 #[derive(Clone)]
@@ -196,6 +200,24 @@ pub fn parse_outer(p: &str) -> OuterLine<'_> {
     }
 }
 
+/// 从规则 CPU 规格中提取 uclamp token (util_min=/util_max=), 返回 (纯 CPU 规格, min, max)
+/// 规则行格式: `0-3 util_min=256 util_max=1024` (util token 空格分隔, 可只给其一)
+fn split_uclamp(spec: &str) -> (&str, i32, i32) {
+    let mut util_min = -1;
+    let mut util_max = -1;
+    let mut cpus = spec;
+    for t in spec.split_whitespace() {
+        if let Some(v) = t.strip_prefix("util_min=") {
+            util_min = v.parse::<i32>().unwrap_or(-1);
+        } else if let Some(v) = t.strip_prefix("util_max=") {
+            util_max = v.parse::<i32>().unwrap_or(-1);
+        } else if cpus == spec {
+            cpus = t; // 第一个非 util token 为 CPU 集合规格
+        }
+    }
+    (cpus, util_min, util_max)
+}
+
 fn add_rule(
     rules: &mut Vec<AffinityRule>,
     topo: &CpuTopology,
@@ -209,6 +231,8 @@ fn add_rule(
     if pkg.bytes().chain(thread.bytes()).any(|b| b < 0x20 || b == 0x7f) {
         return false;
     }
+    // 先提 uclamp token, 剩余部分才做 CPU 集合校验
+    let (cpus_spec, util_min, util_max) = split_uclamp(cpus_spec);
     if !spec_like(cpus_spec) {
         return false;
     }
@@ -233,6 +257,8 @@ fn add_rule(
         thread_pattern: CString::new(thread).unwrap_or_default(),
         cpuset_dir,
         cpus: set,
+        util_min,
+        util_max,
     });
     true
 }

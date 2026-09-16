@@ -47,4 +47,40 @@ pub(crate) fn task_tids(pid: i32) -> Option<Vec<i32>> {
             .collect(),
     )
 }
+/// 内核 struct sched_attr (uapi/linux/sched.h, SCHED_ATTR_SIZE_VER0 = 48 字节)
+#[repr(C)]
+struct SchedAttr {
+    size: u32,
+    sched_policy: u32,
+    sched_flags: u64,
+    sched_nice: i32,
+    sched_priority: u32,
+    sched_runtime: u64,
+    sched_deadline: u64,
+    sched_period: u64,
+    sched_util_min: u32,
+    sched_util_max: u32,
+}
 
+/// 设置线程 uclamp (sched_util_min/max, 0..=1024) via sched_setattr。
+/// flags = SCHED_FLAG_UTIL_CLAMP (0x60): 只更新 uclamp, 不动调度策略/参数。
+/// 内核需 CONFIG_UCLAMP_TASK; 失败静默 (uclamp 是增强, 不影响亲和性)。
+pub fn set_uclamp(tid: i32, util_min: i32, util_max: i32) -> bool {
+    if util_min < 0 && util_max < 0 {
+        return false;
+    }
+    const SCHED_FLAG_UTIL_CLAMP: u64 = 0x60; // MIN(0x20) | MAX(0x40)
+    let attr = SchedAttr {
+        size: std::mem::size_of::<SchedAttr>() as u32,
+        sched_policy: 0,
+        sched_flags: SCHED_FLAG_UTIL_CLAMP,
+        sched_nice: 0,
+        sched_priority: 0,
+        sched_runtime: 0,
+        sched_deadline: 0,
+        sched_period: 0,
+        sched_util_min: util_min.clamp(0, 1024) as u32,
+        sched_util_max: util_max.clamp(0, 1024) as u32,
+    };
+    unsafe { libc::syscall(libc::SYS_sched_setattr, tid, &attr as *const SchedAttr, 0) == 0 }
+}

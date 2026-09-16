@@ -224,6 +224,7 @@ impl CpuAffinity {
         // 批量 applied_set: 相同 bits 的 tid 聚合, 每个 bits 一次 supercall
         let mut set: HashMap<u64, Vec<i32>> = HashMap::new();
         let mut aff: Vec<(i32, CpuSet, String)> = Vec::new();
+        let mut uclamps: Vec<(i32, i32, i32)> = Vec::new();
         for p in pids {
             let Some(tids) = crate::apply_affinity::task_tids(*p) else { continue };
             for tid in tids {
@@ -248,6 +249,9 @@ impl CpuAffinity {
                     rule.cpuset_dir.clone()
                 };
                 aff.push((tid, rule.cpus, cpuset_dir));
+                if rule.util_min >= 0 || rule.util_max >= 0 {
+                    uclamps.push((tid, rule.util_min, rule.util_max));
+                }
                 self.managed.entry(pkg.to_string()).or_default().insert(tid);
             }
         }
@@ -301,6 +305,10 @@ impl CpuAffinity {
                     }
                 }
             }
+        }
+        // uclamp (sched_setattr): 逐 tid 应用 util_min/max (仅设了 uclamp 的 tid)
+        for (tid, mn, mx) in uclamps {
+            let _ = crate::apply_affinity::set_uclamp(tid, mn, mx);
         }
     }
 
