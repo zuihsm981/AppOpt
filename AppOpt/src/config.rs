@@ -202,7 +202,7 @@ pub fn parse_outer(p: &str) -> OuterLine<'_> {
 
 /// 从规则 CPU 规格中提取 uclamp token (util_min=/util_max=), 返回 (纯 CPU 规格, min, max)
 /// 规则行格式: `0-3 util_min=256 util_max=1024` (util token 空格分隔, 可只给其一)
-fn split_uclamp(spec: &str) -> (&str, i32, i32) {
+pub(crate) fn split_uclamp(spec: &str) -> (&str, i32, i32) {
     let mut util_min = -1;
     let mut util_max = -1;
     let mut cpus = spec;
