@@ -242,13 +242,16 @@ impl CpuAffinity {
                 };
                 let bits = rule.cpus.bits[0];
                 set.entry(bits).or_default().push(tid);
-                // cpuset 目录: 配置自带优先, 否则按合并 CPU 集合缓存 ensure
-                let cpuset_dir = if rule.cpuset_dir.is_empty() {
-                    self.cpuset_dir_for(&rule.cpus, &cfg.topo)
-                } else {
-                    rule.cpuset_dir.clone()
-                };
-                aff.push((tid, rule.cpus, cpuset_dir));
+                // 只有 uclamp (cpus 空): 不设亲和, 仅收集 uclamp
+                if rule.cpus.count() > 0 {
+                    // cpuset 目录: 配置自带优先, 否则按合并 CPU 集合缓存 ensure
+                    let cpuset_dir = if rule.cpuset_dir.is_empty() {
+                        self.cpuset_dir_for(&rule.cpus, &cfg.topo)
+                    } else {
+                        rule.cpuset_dir.clone()
+                    };
+                    aff.push((tid, rule.cpus, cpuset_dir));
+                }
                 if rule.util_min >= 0 || rule.util_max >= 0 {
                     uclamps.push((tid, rule.util_min, rule.util_max));
                 }

@@ -69,6 +69,15 @@ pub fn thread_affinity(
     }
 
     if cpus.count() == 0 {
+        // 只有 uclamp (无 CPU 集合): 不设亲和, 仅返回 uclamp
+        if util_min >= 0 || util_max >= 0 {
+            return Some(AffinityResult {
+                cpus: CpuSet::new(),
+                cpuset_dir: String::new(),
+                util_min,
+                util_max,
+            });
+        }
         if cfg.has_thread_rules.contains(pkg) {
             return Some(AffinityResult {
                 cpus: cfg.topo.present_cpus,

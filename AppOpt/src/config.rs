@@ -205,13 +205,13 @@ pub fn parse_outer(p: &str) -> OuterLine<'_> {
 pub(crate) fn split_uclamp(spec: &str) -> (&str, i32, i32) {
     let mut util_min = -1;
     let mut util_max = -1;
-    let mut cpus = spec;
+    let mut cpus = ""; // 仅 uclamp 时保持空 (无 CPU 集合)
     for t in spec.split_whitespace() {
         if let Some(v) = t.strip_prefix("util_min=") {
             util_min = v.parse::<i32>().unwrap_or(-1);
         } else if let Some(v) = t.strip_prefix("util_max=") {
             util_max = v.parse::<i32>().unwrap_or(-1);
-        } else if cpus == spec {
+        } else if cpus.is_empty() {
             cpus = t; // 第一个非 util token 为 CPU 集合规格
         }
     }
@@ -231,26 +231,34 @@ fn add_rule(
     if pkg.bytes().chain(thread.bytes()).any(|b| b < 0x20 || b == 0x7f) {
         return false;
     }
-    // 先提 uclamp token, 剩余部分才做 CPU 集合校验
+    // 先提 uclamp token; CPU 集合可空 (只有 uclamp 时不设亲和)
     let (cpus_spec, util_min, util_max) = split_uclamp(cpus_spec);
-    if !spec_like(cpus_spec) {
-        return false;
+    let has_util = util_min >= 0 || util_max >= 0;
+    if cpus_spec.is_empty() && !has_util {
+        return false; // 无 CPU 也无 uclamp: 无意义
     }
-    let set = parse_cpu_spec(cpus_spec, topo);
-    if set.count() == 0 {
-        return false;
-    }
-    let cpuset_dir = if thread.is_empty() {
-        let dir_name = set.to_range_string();
-        if topo.cpuset_enabled {
-            let path = format!("{}/{}", base_cpuset(), dir_name);
-            if create_cpuset_dir(&path, &dir_name, &topo.mems_str) { dir_name } else { Default::default() }
+    let mut set = CpuSet::new();
+    let mut cpuset_dir = String::new();
+    if !cpus_spec.is_empty() {
+        if !spec_like(cpus_spec) {
+            return false;
+        }
+        set = parse_cpu_spec(cpus_spec, topo);
+        if set.count() == 0 {
+            return false;
+        }
+        cpuset_dir = if thread.is_empty() {
+            let dir_name = set.to_range_string();
+            if topo.cpuset_enabled {
+                let path = format!("{}/{}", base_cpuset(), dir_name);
+                if create_cpuset_dir(&path, &dir_name, &topo.mems_str) { dir_name } else { Default::default() }
+            } else {
+                String::new()
+            }
         } else {
             String::new()
-        }
-    } else {
-        String::new()
-    };
+        };
+    }
     rules.push(AffinityRule {
         pkg: pkg.to_string(),
         thread: thread.to_string(),

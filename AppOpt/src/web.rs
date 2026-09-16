@@ -371,10 +371,13 @@ fn rule_api(req: &Request) -> (u16, String) {
     if thread.is_empty() && !pkg_shape_ok(pkg) {
         return err_json(400, "包名含 { 且以 } 结尾时不支持包级规则，可改用线程规则");
     }
-    // 剥离 uclamp token (util_min=/util_max=) 后再校验 CPU 规格; 原始 cpus 原样写文件
-    let (cpu_spec, _, _) = crate::config::split_uclamp(cpus);
-    if cpu_spec.is_empty() || cpu_spec.len() >= 64 || !spec_like(cpu_spec)
-        || parse_cpu_spec(cpu_spec, &cfg.topo).count() == 0
+    // 剥离 uclamp token (util_min=/util_max=) 后再校验 CPU 规格; 原始 cpus 原样写文件。
+    // CPU 集合可空 (只有 uclamp): 允许; 空且无 util 才算无效。
+    let (cpu_spec, umin, umax) = crate::config::split_uclamp(cpus);
+    let has_util = umin >= 0 || umax >= 0;
+    if cpu_spec.len() >= 64 || (cpu_spec.is_empty() && !has_util)
+        || (!cpu_spec.is_empty()
+            && (!spec_like(cpu_spec) || parse_cpu_spec(cpu_spec, &cfg.topo).count() == 0))
     {
         return err_json(400, "无效的 CPU 规格");
     }
