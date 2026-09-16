@@ -83,30 +83,5 @@ pub fn set_uclamp(tid: i32, util_min: i32, util_max: i32) -> bool {
         sched_util_min: util_min.clamp(0, 1024) as u32,
         sched_util_max: util_max.clamp(0, 1024) as u32,
     };
-    let ret = unsafe { libc::syscall(libc::SYS_sched_setattr, tid, &attr as *const SchedAttr, 0) };
-    if ret != 0 {
-        let err = std::io::Error::last_os_error();
-        eprintln!("set_uclamp tid={} min={} max={} 失败: {}", tid, util_min, util_max, err);
-        // 诊断日志到 /data/local/tmp/appopt_uclamp.log (模块日志不可见时便于排查)
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/data/local/tmp/appopt_uclamp.log")
-        {
-            use std::io::Write;
-            let _ = f.write_all(
-                format!(
-                    "[{}] set_uclamp tid={} min={} max={} 失败: {}\n",
-                    ts, tid, util_min, util_max, err
-                )
-                .as_bytes(),
-            );
-        }
-        return false;
-    }
-    true
+    unsafe { libc::syscall(libc::SYS_sched_setattr, tid, &attr as *const SchedAttr, 0) == 0 }
 }
