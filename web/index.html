@@ -589,7 +589,8 @@ function specOf(r){
   // 仅数字才拼 util token (undefined/空串/null 一律不拼, 防 "util_max=undefined")
   if(typeof r.uclampMin==='number')u.push('util_min='+r.uclampMin);
   if(typeof r.uclampMax==='number')u.push('util_max='+r.uclampMax);
-  return u.length?(s+' '+u.join(' ')):s;
+  if(!u.length)return s;
+  return s? s+' '+u.join(' ') : u.join(' '); // 只有 util 时无前导空格
 }
 const CHIP_HTML=[['e-core','e-core 小核'],['p-core','p-core 中核'],['hp-core','hp-core 大核'],['all-core','all-core 全部'],['自定义','自定义']]
   .map(([c,t])=>`<button data-core="${c}" title="${t}">${c}</button>`).join('');
@@ -624,10 +625,10 @@ ${r.pkgRow
 <div class="core-chips">${CHIP_HTML}</div>
 <input class="rr-custom" placeholder="CPU 范围，如 0-3,6" value="${esc(r.customVal||'')}" hidden>
 <div class="rr-uclamp-row">
-  <span class="label">sched_util_clamp_max</span>
-  <span class="uclamp-chips" data-uk="max"></span>
   <span class="label">sched_util_clamp_min</span>
   <span class="uclamp-chips" data-uk="min"></span>
+  <span class="label">sched_util_clamp_max</span>
+  <span class="uclamp-chips" data-uk="max"></span>
 </div>
 </div>`).join('');
   mrRows.forEach((r,i)=>{
