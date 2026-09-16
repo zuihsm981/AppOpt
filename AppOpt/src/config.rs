@@ -16,12 +16,24 @@ pub static INOTIFY_WD: AtomicI32 = AtomicI32::new(-1);
 /// 配置重载通知 fd (eventfd): web 端修改 cpuset/路径后写入, 唤醒主循环 epoll 处理
 pub static CONFIG_WAKE_FD: AtomicI32 = AtomicI32::new(-1);
 
-/// 请求配置热加载 (事件驱动, 不轮询文件): 写 eventfd 通知主循环
-pub fn request_config_reload() {
+/// 当前配置快照 (Arc); 各模块共用 (cpu_affinity/web 统一走此, 消除重复实现)
+pub fn current_cfg() -> Option<std::sync::Arc<AppConfig>> {
+    rw_read_ignore_poison(&CURRENT_CONFIG).clone()
+}
+
+/// 写 eventfd 通知主循环应用配置 (fd 未初始化时跳过)
+fn config_wake() {
     let fd = CONFIG_WAKE_FD.load(Ordering::Relaxed);
     if fd >= 0 {
         let val: u64 = 1;
         unsafe { libc::write(fd, &val as *const u64 as *const _, 8); }
+    }
+}
+
+/// 请求配置热加载 (事件驱动, 不轮询文件): 写 eventfd 通知主循环
+pub fn request_config_reload() {
+    if CONFIG_WAKE_FD.load(Ordering::Relaxed) >= 0 {
+        config_wake();
     } else {
         // fd 尚未初始化 (启动早期): 直接重载
         config_reload_now();
@@ -550,7 +562,6 @@ pub fn load_config(
             continue;
         }
 
-
         if in_block {
             if close_like(p) {
                 in_block = false;
@@ -850,11 +861,7 @@ pub fn config_reload_now() {
     let mut mtime: i64 = -1;
     let _ = config_reload(&mut mtime);
     // 通知主循环应用新配置 (事件驱动; fd 未初始化时跳过, 启动早期由主循环自行加载)
-    let fd = CONFIG_WAKE_FD.load(Ordering::Relaxed);
-    if fd >= 0 {
-        let val: u64 = 1;
-        unsafe { libc::write(fd, &val as *const u64 as *const _, 8); }
-    }
+    config_wake();
 }
 
 /// 仅从统一主配置文件重载刷新率字段到共享 CURRENT_CONFIG。
@@ -922,55 +929,6 @@ pub(crate) fn last_pkg_end_index(lines: &[String], pkg: &str) -> Option<usize> {
         }
     }
     last.map(|x| x + 1)
-}
-
-/// 旧版本曾把刷新率写到可执行文件目录下的 refresh_config.conf。
-/// 启动时只做一次兼容迁移，之后所有读写均使用 CONFIG_FILE。
-pub fn migrate_legacy_refresh_config(config_file: &str) {
-    let mut legacy = std::env::current_exe()
-        .or_else(|_| std::env::current_dir())
-        .unwrap_or_else(|_| std::path::PathBuf::from("."));
-    legacy.pop();
-    legacy.push("refresh_config.conf");
-    if legacy == std::path::Path::new(config_file) || !legacy.exists() {
-        return;
-    }
-    let Ok(content) = fs::read_to_string(&legacy) else { return };
-    let mut additions = Vec::new();
-    for line in content.lines() {
-        let line = strip_comment(line).trim();
-        if line.is_empty() { continue; }
-        if let Some((key, value)) = line.split_once('=') {
-            let key = match key.trim() {
-                "timeout" | "refresh_timeout" => "refresh_timeout",
-                "active" | "refresh_active" => "refresh_active",
-                "idle" | "refresh_idle" => "refresh_idle",
-                _ => continue,
-            };
-            additions.push(format!("{}={}", key, value.trim()));
-        } else {
-            let parts: Vec<&str> = line.split(',').map(str::trim).collect();
-            if parts.len() == 5 && parts[0] == "refresh_app" {
-                additions.push(parts.join(","));
-            } else if parts.len() == 4 && !parts[0].is_empty() {
-                additions.push(format!("refresh_app,{}", parts.join(",")));
-            }
-        }
-    }
-    if additions.is_empty() { return; }
-    let mut main = fs::read_to_string(config_file).unwrap_or_default();
-    if !main.ends_with('\n') { main.push('\n'); }
-    main.push_str("\n# Migrated refresh-rate settings\n");
-    main.push_str(&additions.join("\n"));
-    main.push('\n');
-    let tmp = format!("{}.tmp", config_file);
-    if fs::File::create(&tmp)
-        .and_then(|mut f| { use std::io::Write; f.write_all(main.as_bytes())?; f.sync_all() })
-        .and_then(|_| fs::rename(&tmp, config_file))
-        .is_ok()
-    {
-        let _ = fs::remove_file(legacy);
-    }
 }
 
 fn inotify_rewatch(inotify_fd: i32) -> bool {

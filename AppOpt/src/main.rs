@@ -291,11 +291,8 @@ fn main() {
         let initial_content = "# 规则编写与使用说明请参考 http://AppOpt.suto.top\n# 刷新率字段与 CPU 规则共用此文件\n";
         let _ = fs::write(&config_file, initial_content);
     }
-    // 兼容旧版本：将 refresh_config.conf 内容一次性并入当前主配置文件。
-    // 迁移完成后刷新率模块不再依赖该独立文件。
-    crate::config::migrate_legacy_refresh_config(&config_file);
-
     {
+
         let mut guard = lock_ignore_poison(&CONFIG_FILE);
         *guard = config_file.clone();
     }
@@ -330,26 +327,25 @@ fn main() {
     }
 
     // 创建用户态触摸监听线程 (所有模式都创建: input 检测统一走用户态 eventX, 不再用内核 input hook)
+    // 创建探针通知 socketpair (touch/exit 共用)
+    fn spawn_probe_pipe(sv: &mut [libc::c_int; 2]) -> bool {
+        let ok = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                0,
+                sv.as_mut_ptr(),
+            )
+        };
+        ok == 0
+    }
+
     fn spawn_touch_probe(touch_sv: &mut [libc::c_int; 2]) -> bool {
         // T6: 触摸/输入活动探测 (root 读 /dev/input/eventX, abs 能力探测设备)
-        let touch_ok = unsafe {
-            libc::socketpair(
-                libc::AF_UNIX,
-                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-                0,
-                touch_sv.as_mut_ptr(),
-            )
-        } == 0;
+        let touch_ok = spawn_probe_pipe(touch_sv);
         // 触摸监听控制 socket: refresh 线程按 timer_enabled 暂停/恢复监听
         let mut touch_ctrl: [libc::c_int; 2] = [0, 0];
-        let touch_ctrl_ok = unsafe {
-            libc::socketpair(
-                libc::AF_UNIX,
-                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-                0,
-                touch_ctrl.as_mut_ptr(),
-            )
-        } == 0;
+        let touch_ctrl_ok = spawn_probe_pipe(&mut touch_ctrl);
         if touch_ok && touch_ctrl_ok {
             let tw = touch_sv[1];
             crate::touch_probe::set_ctrl_fd(touch_ctrl[1]); // 写端供 set_enabled 使用
@@ -413,14 +409,7 @@ fn main() {
     // 创建用户态退出监听线程 (仅用户态模式; KPM 由内核 EXIT 探针驱动)
     fn spawn_exit_probe(exit_sv: &mut [libc::c_int; 2]) -> bool {
         // T7: 进程退出监听 (替代内核 EXIT; 仅主 pid 注册)
-        let exit_ok = unsafe {
-            libc::socketpair(
-                libc::AF_UNIX,
-                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-                0,
-                exit_sv.as_mut_ptr(),
-            )
-        } == 0;
+        let exit_ok = spawn_probe_pipe(exit_sv);
         if exit_ok {
             let ew = exit_sv[1];
             std::thread::spawn(move || crate::exit_probe::spawn_exit(ew));

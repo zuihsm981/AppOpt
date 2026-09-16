@@ -199,6 +199,9 @@ impl CpuAffinity {
                 continue; // 未运行
             }
             self.apply_tids(&pids, pkg, cfg);
+            // 记录 uid→pkg 清理索引 (managed 按包名索引, 退出 evict_uid 需反查;
+            // 不写 CPU_KNOWN/applied_set_main —— 前台主 pid 身份仍只由 ApplyPkg 产生)
+            self.uid_pkg.insert(*uid, pkg.clone());
             applied += 1;
         }
         // 初始化 (初始全量应用) 完成后: 整树时间戳同步一次 (仅首次)
@@ -347,7 +350,7 @@ impl CpuAffinity {
 
     /// 应用已登记的前台应用 (到期执行): 枚举 uid 全部 pid 设亲和 + 回写身份
     fn apply_pkg(&mut self, pid: i32, uid: i32, pkg: &str) {
-        let Some(cfg) = current_cfg() else {
+        let Some(cfg) = crate::config::current_cfg() else {
             // 配置异常缺失: 清占位身份, 等下次前台回调重新触发
             crate::rw_write_ignore_poison(&CPU_KNOWN).remove(&uid);
             return;
@@ -372,7 +375,7 @@ impl CpuAffinity {
         match msg {
             CpuMsg::ApplyPkg(pid, uid, pkg) => {
                 // 配置未就绪 (CURRENT_CONFIG 未写入): 不占位不登记, 下次前台回调重试
-                if current_cfg().is_none() {
+                if crate::config::current_cfg().is_none() {
                     return;
                 }
                 // 冷启动: 占位 (冷热判断) + 登记延迟应用; 同 uid 重复前台合并 (保留最新)
@@ -390,7 +393,7 @@ impl CpuAffinity {
             CpuMsg::ApplyAll(pkg_uids) => {
                 // 全量应用覆盖所有应用: 清掉未到期任务 (防旧任务用旧 pid/身份覆盖新配置)
                 self.pending.clear();
-                if let Some(cfg) = current_cfg() {
+                if let Some(cfg) = crate::config::current_cfg() {
                     self.apply_all(&cfg, pkg_uids);
                 }
             }
@@ -402,7 +405,7 @@ impl CpuAffinity {
                     Some(_) => Self::cgroup_apps_pids(uid).unwrap_or_default(), // 占位中现扫
                     None => return,                              // 未运行: 跳过本条
                 };
-                let Some(cfg) = current_cfg() else { return };
+                let Some(cfg) = crate::config::current_cfg() else { return };
                 self.apply_tids(&pids, &pkg, &cfg);
             }
             CpuMsg::ApplyThreadByUid(uid, pkg, thread) => {
@@ -413,7 +416,7 @@ impl CpuAffinity {
                     Some(_) => Self::cgroup_apps_pids(uid).unwrap_or_default(), // 占位中现扫
                     None => return,
                 };
-                let Some(cfg) = current_cfg() else { return };
+                let Some(cfg) = crate::config::current_cfg() else { return };
                 let mut tids: Vec<i32> = Vec::new();
                 for p in pids {
                     for t in crate::apply_affinity::task_tids(p).unwrap_or_default() {
@@ -447,7 +450,3 @@ pub fn start() {
 }
 
 
-/// 当前配置快照 (Arc); 各消息处理共用
-fn current_cfg() -> Option<std::sync::Arc<AppConfig>> {
-    crate::rw_read_ignore_poison(&crate::config::CURRENT_CONFIG).clone()
-}

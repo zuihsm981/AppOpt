@@ -13,12 +13,12 @@ use serde_json::{json, Value};
 use crate::apply_affinity::{read_cmdline, task_tids};
 use crate::config::{
     config_reload_now, spec_like,
-    CONFIG_FILE, CURRENT_CONFIG, PARSE_FAILS,
+    CONFIG_FILE, PARSE_FAILS,
 };
 use crate::cpuset::{base_cpuset, create_cpuset_dir, parse_cpu_spec, CpuSet, CpuTopology, DEFAULT_CPUSET_NAME};
 use crate::ebpf_mode::kpm_probe;
 use crate::rule_edit::{rule_delete, rule_delete_pkg, rule_rename, rule_upsert, RuleEdit};
-use crate::{lock_ignore_poison, rw_read_ignore_poison, MAX_PKG_LEN, MAX_THREAD_LEN};
+use crate::{lock_ignore_poison, MAX_PKG_LEN, MAX_THREAD_LEN};
 
 pub const WEB_PORT: u16 = 8889;
 const INDEX_HTML: &str = include_str!("../web/index.html");
@@ -222,10 +222,6 @@ fn err_json(code: u16, msg: &str) -> (u16, String) {
     (code, json!({ "ok": false, "err": msg }).to_string())
 }
 
-fn current_cfg() -> Option<std::sync::Arc<crate::config::AppConfig>> {
-    rw_read_ignore_poison(&CURRENT_CONFIG).clone()
-}
-
 fn sys_procs() -> u16 {
     let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
     if unsafe { libc::sysinfo(&mut info) } == 0 {
@@ -255,7 +251,7 @@ fn spec_name(cpus: &CpuSet, topo: &CpuTopology) -> String {
 }
 
 fn status_json() -> String {
-    let cfg = current_cfg();
+    let cfg = crate::config::current_cfg();
     let topo = cfg.as_ref().map(|c| &c.topo);
     // 仅 KPM 模式: 前端轮询即实时读 CPU worker 发布的 CPU_STATS
     let connected = KPM_ACTIVE.load(Ordering::Relaxed);
@@ -294,8 +290,9 @@ fn status_json() -> String {
         "connected": connected,
         "touch_listening": crate::touch_probe::TOUCH_LISTENING.load(Ordering::Relaxed),
         "touch_event": crate::touch_probe::touch_event_name(),
-        "input_hooked": crate::refresh::refresh_get_status()
-            .map(|s| s.input_hooked).unwrap_or(false),
+        // 直接读原子量 (与 refresh::update_status 的 input_hooked 同源),
+        // 避免 /api/status 第二次触发 refresh_get_status (STATUS_REQ+wake)
+        "input_hooked": crate::touch_probe::TOUCH_LISTENING.load(Ordering::Relaxed),
         "uptime": uptime,
         "rules": rules,
         "pkgs": pkgs,
@@ -318,7 +315,7 @@ fn status_json() -> String {
 }
 
 fn rules_json() -> String {
-    let Some(cfg) = current_cfg() else {
+    let Some(cfg) = crate::config::current_cfg() else {
         return json!({ "rules": [] }).to_string();
     };
     let mut groups: Vec<serde_json::Value> = Vec::new();
@@ -365,7 +362,7 @@ fn rule_api(req: &Request) -> (u16, String) {
         return err_json(400, "缺少 pkg 或 cpus 字段");
     };
     let thread = v["thread"].as_str().map(str::trim).unwrap_or("");
-    let Some(cfg) = current_cfg() else {
+    let Some(cfg) = crate::config::current_cfg() else {
         return err_json(500, "配置未就绪");
     };
     if !token_ok(pkg, MAX_PKG_LEN) || (!thread.is_empty() && !token_ok(thread, MAX_THREAD_LEN)) {
@@ -554,7 +551,7 @@ fn suggest_threads(pkg: &str, q: &str) -> Vec<(String, usize)> {
 }
 
 fn config_json() -> String {
-    let cfg = current_cfg();
+    let cfg = crate::config::current_cfg();
     let dm = drive_mode();
     let mode_num = match dm.as_str() { "kpm" => 1, "userspace" => 2, _ => 0 };
     // 当前生效: userspace 显式或未连上 KPM → 用户态; 否则 KPM
@@ -589,7 +586,7 @@ fn config_set_api(req: &Request) -> (u16, String) {
 
     if let Some(n) = name {
         crate::cpuset::set_base_cpuset(n);
-        if let Some(cfg) = current_cfg()
+        if let Some(cfg) = crate::config::current_cfg()
             && cfg.topo.cpuset_enabled {
                 create_cpuset_dir(&base_cpuset(), &cfg.topo.present_str, &cfg.topo.mems_str);
             }
