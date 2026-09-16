@@ -267,7 +267,7 @@ pub fn kpm_probe() -> bool {
 }
 
 /// 初始化 KPM 事件驱动: 确保模块加载, 启动 reader 线程
-/// 失败返回 None, 由调用方回退 /proc 轮询。
+/// 失败返回 None, 由调用方回退纯用户态事件驱动 (binder+pidfd+触摸, 无 /proc 轮询)。
 /// kpm_wake_fd 由主循环创建并注册 epoll, reader 收到事件后写入以唤醒主循环。
 /// 初始化 KPM 事件驱动。drive_mode: "userspace" 直接纯用户态(不依赖 KPM);
 /// "auto" ping 失败快速回退纯用户态; "kpm" 等待模块长时间重试。
@@ -508,9 +508,9 @@ pub fn event_dispatch(event: &EbpfProcEvent, _cfg: &AppConfig, _state: &mut Ebpf
         crate::refresh::refresh_on_event(EBPF_EVENT_INPUT, 0);
     } else if event.event_type == EBPF_EVENT_EXIT && event.tid == event.pid {
         // 规则应用主进程退出 (内核已按 APPLIED+主进程标记过滤非规则应用/非主进程):
-        // 清除该 uid 的 pid 列表与 cpu_known 身份, 并按 uid 通知 CPU worker 清除该
-        // 应用 managed 条目 → web 命中应用/绑定线程立即归零 (事件驱动, 不等周期清理)。
-        if let Some(uid) = crate::cpu_affinity::cpu_known_evict_by_pid(event.pid) {
+        // 反查 uid → 通知 CPU worker 统一清身份 + managed → web 命中应用/绑定线程
+        // 立即归零 (事件驱动; 身份清理由 worker evict_uid 完成, 单一职责)。
+        if let Some(uid) = crate::cpu_affinity::cpu_known_pid_to_uid(event.pid) {
             if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
                 let _ = tx.send(crate::cpu_affinity::CpuMsg::EvictUid(uid));
             }

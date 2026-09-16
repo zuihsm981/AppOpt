@@ -103,6 +103,14 @@ pub(crate) fn for_each_proc_pid(mut f: impl FnMut(i32)) {
     }
 }
 
+/// CPU 规则包 → uid: 从 main 维护的反向表过滤 (不直接读 packages.list)
+fn cpu_pkg_uids(cfg: &crate::config::AppConfig, pkg_uid: &HashMap<String, i32>) -> HashMap<String, i32> {
+    cfg.pkgs
+        .iter()
+        .filter_map(|p| pkg_uid.get(p).map(|u| (p.clone(), *u)))
+        .collect()
+}
+
 /// 按包名在 packages.list 查 uid (单个; 供增量维护在交叉提取失败时回退)
 fn lookup_uid_in_packages_list(pkg: &str) -> Option<i32> {
     let content = std::fs::read_to_string("/data/system/packages.list").ok()?;
@@ -226,9 +234,6 @@ fn main() {
     crate::web::set_drive_mode(&drive_mode);
 
     // ================= 初始化并发: 独立无依赖项并行 =================
-    // T1: /proc pid 快照线程 (最早抓取启动瞬间 pid; 完成后线程退出)
-    let snapshot_thread = std::thread::spawn(|| crate::cpu_affinity::proc_pid_set());
-
     // 提前创建 fd (不依赖 settings; 供各独立线程使用)
     let kpm_wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     let mut fg_sv: [libc::c_int; 2] = [0, 0];
@@ -318,7 +323,6 @@ fn main() {
     settings_save();
 
     // ===== join 各独立线程 (事件循环/使用点前就绪) =====
-    let init_pids = snapshot_thread.join().unwrap_or_default();
     // ebpf_init 线程: KPM 加载+激活已并行完成, join 拿 EbpfState
     let mut ebpf_state: Option<EbpfState> = ebpf_thread.join().ok().flatten();
     if ebpf_state.is_some() {
@@ -355,24 +359,6 @@ fn main() {
         touch_ok
     }
 
-    // 创建用户态退出监听线程 (仅用户态模式; KPM 由内核 EXIT 探针驱动)
-    fn spawn_exit_probe(exit_sv: &mut [libc::c_int; 2]) -> bool {
-        // T7: 进程退出监听 (替代内核 EXIT; 仅主 pid 注册)
-        let exit_ok = unsafe {
-            libc::socketpair(
-                libc::AF_UNIX,
-                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-                0,
-                exit_sv.as_mut_ptr(),
-            )
-        } == 0;
-        if exit_ok {
-            let ew = exit_sv[1];
-            std::thread::spawn(move || crate::exit_probe::spawn_exit(ew));
-        }
-        exit_ok
-    }
-
     // 触摸监听: 所有模式都创建 (input 检测统一用户态 eventX, 不再用内核 input hook);
     // 退出监听: 仅用户态模式 (KPM 由内核 EXIT 探针驱动; 后续回退用户态时补建)。
     let mut touch_sv: [libc::c_int; 2] = [0, 0];
@@ -390,7 +376,7 @@ fn main() {
     let fg_recv_fd = fg_sv[0];
     let mut fg_buf = [0u8; 8];
 
-    let cpu_ready = crate::cpu_affinity::start(init_pids);
+    crate::cpu_affinity::start();
 
     // 刷新率控制模块，独立线程运行 (binder 回调经主线程 uid 表 → FgPkg 消息驱动)
     refresh::refresh_init(display_modes_thread);
@@ -417,13 +403,31 @@ fn main() {
     const EV_FG: u64 = 6; // binder 前台回调 (pid+uid), 主线程分发
     const EV_PKG: u64 = 7; // packages.list inotify (安装/卸载/替换)
     const EV_TOUCH: u64 = 8; // 用户态 /dev/input 触摸/输入活动 (替代 4.19 内核 input hook)
-    const EV_EXIT_PID: u64 = 9; // 用户态 pidfd//proc 进程退出监听 (4.19 替代内核 EXIT)
+    const EV_EXIT_PID: u64 = 9; // 用户态 pidfd 进程退出监听 (替代内核 EXIT)
 
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epfd < 0 {
         eprintln!("初始化 epoll 失败");
         process::exit(1);
     }
+    // 创建用户态退出监听线程 (仅用户态模式; KPM 由内核 EXIT 探针驱动)
+    fn spawn_exit_probe(exit_sv: &mut [libc::c_int; 2]) -> bool {
+        // T7: 进程退出监听 (替代内核 EXIT; 仅主 pid 注册)
+        let exit_ok = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                0,
+                exit_sv.as_mut_ptr(),
+            )
+        } == 0;
+        if exit_ok {
+            let ew = exit_sv[1];
+            std::thread::spawn(move || crate::exit_probe::spawn_exit(ew));
+        }
+        exit_ok
+    }
+
     fn epoll_add(epfd: i32, fd: i32, tag: u64) {
         if fd < 0 {
             return;
@@ -443,7 +447,6 @@ fn main() {
     // 配置变更后应用到当前模式 (仅 KPM): 全量扫描 + uid 表重建(规则包集合门控)
     fn apply_config(
         cpu_changed: bool,
-        ebpf_state: &mut Option<EbpfState>,
         cfg: Option<&crate::config::AppConfig>,
         pkg_uid: &HashMap<String, i32>,
     ) {
@@ -452,15 +455,14 @@ fn main() {
         if !cpu_changed {
             return;
         }
-        if let Some(es) = ebpf_state.as_mut() {
-            kpm_full_apply(cfg, es, pkg_uid);
-        }
+        // 两模式统一重放 (用户态亦生效; 不再按 KPM 存在与否门控)
+        kpm_full_apply(cfg, pkg_uid);
     }
 
-    /// KPM 全量归因扫描 + 亲和性全量应用 (配置变更/重连共用)
+    /// 亲和性重放 (配置变更共用): 按最近变更包单包 ApplyPkgByUid/ApplyThreadByUid,
+    /// 无变更包 → 全量。用户态与 KPM 模式一致生效。
     fn kpm_full_apply(
-        _cfg: &crate::config::AppConfig,
-        _es: &mut EbpfState,
+        cfg: &crate::config::AppConfig,
         pkg_uid: &HashMap<String, i32>,
     ) {
         // 规则编辑保存路径: 只对最近变更包单包重放亲和性 (避免改一个应用 →
@@ -484,7 +486,7 @@ fn main() {
                     }
                 }
             }
-            None => crate::cpu_affinity::apply_all_now(),
+            None => crate::cpu_affinity::apply_all_now(cpu_pkg_uids(cfg, pkg_uid)),
         }
     }
 
@@ -554,7 +556,6 @@ fn main() {
         epoll_add(epfd, exit_sv[0], EV_EXIT_PID);
     }
 
-
     // packages.list inotify: 应用安装/卸载/替换 → 重建 uid 表 (fd 由并发 T4 线程建立;
     // pkglist_path 保留供 EV_PKG 重挂 watch 用)
     let pkglist_path = CString::new("/data/system/packages.list").unwrap_or_default();
@@ -562,8 +563,8 @@ fn main() {
 
     // 初始全量应用 (两种驱动模式都执行: KPM 事件驱动 / 纯用户态)
     // 刷新率全局初始 active 已由 refresh_init 应用; launcher 前台由 FgPkg 包名驱动。
-    if cpu_ready {
-        crate::cpu_affinity::apply_all_now();
+    if let Some(cfg) = crate::rw_read_ignore_poison(&crate::config::CURRENT_CONFIG).clone() {
+        crate::cpu_affinity::apply_all_now(cpu_pkg_uids(&cfg, &pkg_uid));
     }
 
     let mut events = [unsafe { std::mem::zeroed::<libc::epoll_event>() }; 8];
@@ -586,18 +587,19 @@ fn main() {
 
     // 配置事件 (EV_INOTIFY / EV_CONFIG) 公共处理: 重载配置 → 应用到当前模式 →
     // 仅“规则应用集合”变更时重建 uid 表 (调整数值不重建)
-    let reload_config = |ebpf_state: &mut Option<EbpfState>,
-                         cfg: &mut Option<Arc<AppConfig>>,
+    let reload_config = |cfg: &mut Option<Arc<AppConfig>>,
                          uid_map: &mut HashMap<i32, UidEntry>,
                          pkg_uid: &mut HashMap<String, i32>,
                          cpu_pkgs_set: &mut HashSet<String>,
                          rfr_pkgs_set: &mut HashSet<String>| {
         let cpu_changed = crate::config::take_cpu_rules_changed();
         *cfg = rw_read_ignore_poison(&CURRENT_CONFIG).clone();
-        apply_config(cpu_changed, ebpf_state, cfg.as_deref(), pkg_uid);
+        // 先重建 uid 表 (新加规则包的 uid 进 pkg_uid), 再重放/全量 ——
+        // 顺序反了会把新规则包从 cpu_pkg_uids 过滤掉 (apply_config 不生效)
         if let Some(cfg) = cfg.as_ref() {
             rebuild_uid_if_needed(cpu_changed, cfg, uid_map, pkg_uid, cpu_pkgs_set, rfr_pkgs_set);
         }
+        apply_config(cpu_changed, cfg.as_deref(), pkg_uid);
     };
 
         for i in 0..n as usize {
@@ -739,7 +741,7 @@ fn main() {
                     crate::refresh::refresh_on_event(crate::refresh::EVENT_INPUT, 0);
                 }
                 EV_EXIT_PID => {
-                    // 用户态进程退出 (4.19): recv pid → 清理该 uid 身份
+                    // 用户态进程退出: recv pid → 清理该 uid 身份
                     if exit_ok && exit_sv[0] > 0 {
                         let mut pb = [0u8; 4];
                         let n = unsafe {
@@ -748,8 +750,7 @@ fn main() {
                         if n == 4 {
                             let pid = i32::from_ne_bytes([pb[0], pb[1], pb[2], pb[3]]);
                             // 清身份 + 通知 CPU worker 清该 uid managed → 发布统计
-                            // (webui 命中应用/绑定线程归零, 与 KPM EXIT 同效果)
-                            if let Some(uid) = crate::cpu_affinity::cpu_known_evict_by_pid(pid) {
+                            if let Some(uid) = crate::cpu_affinity::cpu_known_pid_to_uid(pid) {
                                 if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
                                     let _ = tx.send(crate::cpu_affinity::CpuMsg::EvictUid(uid));
                                 }
@@ -761,7 +762,6 @@ fn main() {
                     // 配置变更 (inotify): 与 EV_CONFIG 共用 reload_config
                     if crate::config::inotify_drain() {
                         reload_config(
-                            &mut ebpf_state,
                             &mut cfg,
                             &mut uid_map,
                             &mut pkg_uid,
@@ -774,7 +774,6 @@ fn main() {
                     read_eventfd(config_wake_fd);
                     // 配置变更 (eventfd 主动唤醒): 与 EV_INOTIFY 共用 reload_config
                     reload_config(
-                        &mut ebpf_state,
                         &mut cfg,
                         &mut uid_map,
                         &mut pkg_uid,
@@ -793,12 +792,11 @@ fn main() {
             if let Some(es) = ebpf_init(kpm_wake_fd, drive_mode.clone()) {
                 crate::web::KPM_ACTIVE.store(true, Ordering::Relaxed);
                 ebpf_state = Some(es);
-                if cpu_ready {
-                    crate::cpu_affinity::apply_all_now();
+                if let Some(cfg) = cfg.as_ref() {
+                    crate::cpu_affinity::apply_all_now(cpu_pkg_uids(cfg, &pkg_uid));
                 }
             } else if !exit_ok {
                 // KPM 不可用 (重连失败) → 回退用户态: 补建退出监听
-                // (触摸监听已全程无条件创建, 无需补建)
                 let e = spawn_exit_probe(&mut exit_sv);
                 if e {
                     exit_ok = true;

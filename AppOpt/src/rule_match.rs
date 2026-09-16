@@ -5,6 +5,7 @@ use crate::config::AppConfig;
 use crate::cpuset::CpuSet;
 
 /// 线程亲和性计算结果
+#[derive(Clone)]
 pub struct AffinityResult {
     pub cpus: CpuSet,
     pub cpuset_dir: String,

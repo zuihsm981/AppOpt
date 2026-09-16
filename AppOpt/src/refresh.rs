@@ -230,6 +230,8 @@ fn apply_app_config(state: &mut RefreshState, pkg: &str) {
         state.current_idle = state.idle_mode;
     }
     state.timer_enabled = state.current_idle != state.current_active;
+    // 同步触摸监听开关 (与 load_global_config 一致): 应用级配置切换后保持状态同步
+    crate::touch_probe::set_enabled(state.timer_enabled);
 }
 
 fn timerfd_set(fd: i32, seconds: i32) {
