@@ -129,9 +129,14 @@ pub fn close_like(p: &str) -> bool {
 }
 
 pub fn split_single_line(body: &str) -> Option<(&str, &str, &str)> {
+    // 单行内联规则格式: pkg { thread=cpus } —— '}' 在 cpus 尾部 (等号右侧),
+    // 从右侧剥离; 等号前 (left) 无 '}'。
     let eq = body.rfind('=')?;
-    let cpus = body[eq + 1..].trim();
-    let left = body[..eq].trim_end().strip_suffix('}')?.trim_end();
+    let mut cpus = body[eq + 1..].trim();
+    if let Some(stripped) = cpus.strip_suffix('}') {
+        cpus = stripped.trim();
+    }
+    let left = body[..eq].trim_end();
     let ob = left.find('{')?;
     let (pkg, thread) = (left[..ob].trim(), left[ob + 1..].trim());
     (!pkg.is_empty() && !thread.is_empty()).then_some((pkg, thread, cpus))
@@ -231,8 +236,12 @@ fn add_rule(
 /// 返回 true 表示该行是刷新率记录，调用方不应再把它当作 CPU 规则解析。
 pub fn is_refresh_config_line(line: &str) -> bool {
     let line = strip_comment(line).trim();
-    if let Some((key, _)) = line.split_once('=') {
+    if let Some((key, value)) = line.split_once('=') {
         if matches!(key.trim(), "refresh_timeout" | "refresh_active" | "refresh_idle") {
+            return true;
+        }
+        // 应用级刷新率行: pkg=refresh-<t>-<a>-<i> (与 route_pkg_val_line 一致)
+        if value.trim().starts_with("refresh-") {
             return true;
         }
     }
@@ -826,6 +835,8 @@ fn config_reload(last_mtime: &mut i64) -> bool {
     };
     let file = lock_ignore_poison(&CONFIG_FILE).clone();
     let Some(new_cfg) = load_config(&file, &old_cfg.topo, last_mtime) else {
+        // 解析失败: 保留旧配置, 规则未变 → 清变更标记 (防残留 true 触发误重放)
+        CPU_RULES_CHANGED.store(false, Ordering::Relaxed);
         return false;
     };
     let cpu_changed = cpu_config_changed(&old_cfg, &new_cfg);
@@ -964,9 +975,11 @@ pub fn migrate_legacy_refresh_config(config_file: &str) {
 
 fn inotify_rewatch(inotify_fd: i32) -> bool {
     let inotify_wd = INOTIFY_WD.load(Ordering::Acquire);
-    unsafe {
-        libc::inotify_rm_watch(inotify_fd, inotify_wd);
-    }
+    // Android libc 的 inotify_rm_watch 第二参为 u32; linux 为 i32 —— 按 target 适配
+    #[cfg(target_os = "android")]
+    unsafe { libc::inotify_rm_watch(inotify_fd, inotify_wd as u32); }
+    #[cfg(not(target_os = "android"))]
+    unsafe { libc::inotify_rm_watch(inotify_fd, inotify_wd); }
     let cfg_cstr = match CString::new(lock_ignore_poison(&CONFIG_FILE).clone()) {
         Ok(c) => c,
         Err(_) => {

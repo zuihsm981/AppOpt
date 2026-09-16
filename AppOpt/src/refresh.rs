@@ -201,9 +201,9 @@ fn set_refresh_rate(state: &mut RefreshState, mode: i32) {
         MODE_60 => state.rate_args[2],
         _ => mode,
     };
-    // 解析失败/未检测到该档位 (arg<0): 不切换, 避免发送错误模式 id
+    // 解析失败/未检测到该档位 (arg<0): 不切换也不改内部状态 (保持原档位,
+    // 避免"假切换"——实际没切, 内部却以为切了)
     if arg < 0 {
-        state.current_applied_mode = mode;
         return;
     }
     // 只走 binder 直连 SurfaceFlinger，不再回退到 service 子进程
@@ -563,7 +563,13 @@ pub fn refresh_set_config(timeout: i32, active: &str, idle: &str) {
         lines.push(format!("refresh_idle={}", idle));
     }
 
-    if fs::write(&path, lines.join("\n") + "\n").is_err() {
+    // 原子写: 先写临时文件再 rename, 避免中途崩溃留下半写配置
+    let tmp = format!("{}.tmp", path);
+    if fs::write(&tmp, lines.join("\n") + "\n").is_err() {
+        return;
+    }
+    if fs::rename(&tmp, &path).is_err() {
+        let _ = fs::remove_file(&tmp);
         return;
     }
     // 同步共享配置（仅刷新率，不触发 CPU 重载）+ 独立通知 refresh 线程

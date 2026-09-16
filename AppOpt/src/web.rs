@@ -273,11 +273,19 @@ fn status_json() -> String {
             .map(|c| c.app_refresh_configs.keys().map(String::as_str).collect())
             .unwrap_or_default();
         let rf_rules = rf_apps.len();
-        let rf_hit_list: Vec<String> = hit_list
-            .iter()
-            .filter(|p| rf_apps.contains(p.as_str()))
-            .cloned()
-            .collect();
+        // 刷新率命中不能从 CPU hit_list 派生 (仅刷新率应用不在 CPU 命中里, 恒空);
+        // 取 refresh 状态当前被应用级配置驱动的前台包 (launcher 用全局 → 不计)
+        let cur = crate::refresh::refresh_get_status()
+            .map(|s| s.current_package)
+            .unwrap_or_default();
+        let rf_hit_list: Vec<String> = if cur.is_empty()
+            || cur == crate::config::DEFAULT_REFRESH_PACKAGE
+            || !rf_apps.contains(cur.as_str())
+        {
+            Vec::new()
+        } else {
+            vec![cur]
+        };
         (rf_rules, rf_hit_list.len(), rf_hit_list)
     };
     json!({
