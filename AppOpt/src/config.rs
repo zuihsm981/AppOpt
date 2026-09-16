@@ -999,3 +999,4 @@ fn inotify_rewatch(inotify_fd: i32) -> bool {
     INOTIFY_WD.store(new_wd, Ordering::Release);
     true
 }
+
