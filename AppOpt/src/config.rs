@@ -141,7 +141,7 @@ pub fn strip_comment(s: &str) -> &str {
 pub fn split_rule_line(p: &str) -> Option<(&str, &str, bool)> {
     let p = strip_comment(p);
     fn kv(s: &str) -> Option<(&str, &str)> {
-        s.rfind('=')
+        s.find('=')
             .map(|eq| (s[..eq].trim(), s[eq + 1..].trim()))
             .filter(|(k, _)| !k.is_empty())
     }
@@ -159,7 +159,7 @@ pub fn close_like(p: &str) -> bool {
 pub fn split_single_line(body: &str) -> Option<(&str, &str, &str)> {
     // 单行内联规则格式: pkg { thread=cpus } —— '}' 在 cpus 尾部 (等号右侧),
     // 从右侧剥离; 等号前 (left) 无 '}'。
-    let eq = body.rfind('=')?;
+    let eq = body.find('=')?;
     let mut cpus = body[eq + 1..].trim();
     if let Some(stripped) = cpus.strip_suffix('}') {
         cpus = stripped.trim();
@@ -190,7 +190,7 @@ pub fn parse_outer(p: &str) -> OuterLine<'_> {
     if !open && close_like(body) {
         return OuterLine::Junk;
     }
-    match body.rfind('=') {
+    match body.find('=') {
         Some(eq) => {
             let (pkg, cpus) = (body[..eq].trim(), body[eq + 1..].trim());
             if cpus.is_empty() {
