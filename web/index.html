@@ -586,8 +586,9 @@ const mkRow=o=>({thread:'',sem:[],all:false,custom:false,customVal:'',uclampMin:
 function specOf(r){
   let s=r.custom?r.customVal.trim():r.all?'all-core':r.sem.join(',');
   const u=[];
-  if(r.uclampMin!==null&&r.uclampMin!=='')u.push('util_min='+r.uclampMin);
-  if(r.uclampMax!==null&&r.uclampMax!=='')u.push('util_max='+r.uclampMax);
+  // 仅数字才拼 util token (undefined/空串/null 一律不拼, 防 "util_max=undefined")
+  if(typeof r.uclampMin==='number')u.push('util_min='+r.uclampMin);
+  if(typeof r.uclampMax==='number')u.push('util_max='+r.uclampMax);
   return u.length?(s+' '+u.join(' ')):s;
 }
 const CHIP_HTML=[['e-core','e-core 小核'],['p-core','p-core 中核'],['hp-core','hp-core 大核'],['all-core','all-core 全部'],['自定义','自定义']]
