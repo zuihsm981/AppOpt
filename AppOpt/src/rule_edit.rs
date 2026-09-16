@@ -335,7 +335,8 @@ pub fn rule_upsert(path: &str, pkg: &str, thread: &str, cpus: &str) -> RuleEdit 
                 lines[i] = spec_swap(&lines[i], cpus);
             }
             Some(PkgLine::BarePending(i)) => {
-                lines[i] = with_comment(&format!("{}={} {{", pkg, cpus), &lines[i]);
+                // 包级默认规则写单行 (不写 open 块: 避免产生无配对 } 破坏后续解析)
+                lines[i] = with_comment(&format!("{}={}", pkg, cpus), &lines[i]);
                 if let Some(open) = t.block_open
                     && matches!(parse_outer(lines[open].trim()), OuterLine::BareOpen { pkg: "" })
                 {
@@ -346,6 +347,9 @@ pub fn rule_upsert(path: &str, pkg: &str, thread: &str, cpus: &str) -> RuleEdit 
                 lines[i] = spec_swap(&lines[i], cpus);
             }
             Some(PkgLine::BareOpen(i)) => {
+                if t.unterminated {
+                    return RuleEdit::Malformed; // 原块未闭合: 拒写, 避免破坏文件
+                }
                 lines[i] = with_comment(&format!("{}={} {{", pkg, cpus), &lines[i]);
             }
             None if t.unterminated => return RuleEdit::Malformed,
