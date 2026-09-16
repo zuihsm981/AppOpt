@@ -88,6 +88,18 @@ pub static PARSE_FAILS: AtomicUsize = AtomicUsize::new(0);
 pub const DEFAULT_REFRESH_PACKAGE: &str = "com.android.launcher3";
 
 /// 校验 CPU 规格形态
+/// 解析失败行诊断: 追加到 /data/local/tmp/appopt_parse_fail.log (webui 提示"格式无效"时定位)
+pub(crate) fn log_parse_fail(line: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/data/local/tmp/appopt_parse_fail.log")
+    {
+        use std::io::Write;
+        let _ = f.write_all(format!("parse_fail: {}\n", line).as_bytes());
+    }
+}
+
 pub fn spec_like(s: &str) -> bool {
     let mut any = false;
     for part in s.split(',') {
@@ -597,7 +609,7 @@ pub fn load_config(
             match split_rule_line(p) {
                 Some((thread, cpus, closed)) => {
                     if !add_rule(&mut rules, topo, &cur_pkg, thread, cpus) {
-                        fail_cnt += 1;
+                        fail_cnt += 1; log_parse_fail(p);
                     }
                     if closed {
                         in_block = false;
@@ -605,7 +617,7 @@ pub fn load_config(
                     }
                 }
                 None => {
-                    fail_cnt += 1;
+                    fail_cnt += 1; log_parse_fail(p);
                     if p.contains('}') {
                         in_block = false;
                         cur_pkg.clear();
@@ -618,11 +630,11 @@ pub fn load_config(
         match parse_outer(p) {
             OuterLine::Single { pkg, thread, cpus, open } => {
                 if !pending_pkg.is_empty() {
-                    fail_cnt += 1;
+                    fail_cnt += 1; log_parse_fail(p);
                 }
                 pending_pkg.clear();
                 if !add_rule(&mut rules, topo, pkg, thread, cpus) {
-                    fail_cnt += 1;
+                    fail_cnt += 1; log_parse_fail(p);
                 }
                 if open {
                     cur_pkg = pkg.to_string();
@@ -631,12 +643,12 @@ pub fn load_config(
             }
             OuterLine::Rule { pkg, cpus, open } => {
                 if !pending_pkg.is_empty() {
-                    fail_cnt += 1;
+                    fail_cnt += 1; log_parse_fail(p);
                 }
                 // 前缀路由: pkg=refresh-<t>-<a>-<i> 不是 CPU 规则
                 if !route_pkg_val_line(pkg, cpus, &mut app_refresh_configs) {
                     if !add_rule(&mut rules, topo, pkg, "", cpus) {
-                        fail_cnt += 1;
+                        fail_cnt += 1; log_parse_fail(p);
                     }
                     if open {
                         cur_pkg = pkg.to_string();
@@ -648,14 +660,14 @@ pub fn load_config(
             OuterLine::BareOpen { pkg } => {
                 let owner = if !pkg.is_empty() {
                     if !pending_pkg.is_empty() {
-                        fail_cnt += 1;
+                        fail_cnt += 1; log_parse_fail(p);
                     }
                     pkg.to_string()
                 } else {
                     pending_pkg.clone()
                 };
                 if owner.is_empty() {
-                    fail_cnt += 1;
+                    fail_cnt += 1; log_parse_fail(p);
                     continue;
                 }
                 cur_pkg = owner;
@@ -664,12 +676,12 @@ pub fn load_config(
             }
             OuterLine::Pending { pkg } => {
                 if !pending_pkg.is_empty() {
-                    fail_cnt += 1;
+                    fail_cnt += 1; log_parse_fail(p);
                 }
                 pending_pkg = pkg.to_string();
             }
             OuterLine::Junk => {
-                fail_cnt += 1;
+                fail_cnt += 1; log_parse_fail(p);
                 pending_pkg.clear();
             }
         }
@@ -677,6 +689,7 @@ pub fn load_config(
 
     if in_block || !pending_pkg.is_empty() {
         fail_cnt += 1;
+        log_parse_fail("(EOF: 未闭合块/悬挂 pending)");
     }
 
     *last_mtime = mtime;
