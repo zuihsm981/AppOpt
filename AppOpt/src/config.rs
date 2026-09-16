@@ -871,6 +871,8 @@ fn cpu_config_changed(old: &AppConfig, new: &AppConfig) -> bool {
             || a.thread != b.thread
             || a.cpuset_dir != b.cpuset_dir
             || a.cpus != b.cpus
+            || a.util_min != b.util_min
+            || a.util_max != b.util_max
     })
 }
 

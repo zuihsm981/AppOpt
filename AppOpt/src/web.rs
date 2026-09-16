@@ -325,10 +325,19 @@ fn rules_json() -> String {
             groups.push(json!({ "pkg": r.pkg, "items": [] }));
             groups.len() - 1
         });
+        // spec 携带 util token (util_min=/util_max=): 前端 parseSpec 提取回填 chips;
+        // 前端显示时再剥离 util 只显示 CPU 名。
+        let mut spec = spec_name(&r.cpus, &cfg.topo);
+        if r.util_min >= 0 {
+            spec.push_str(&format!(" util_min={}", r.util_min));
+        }
+        if r.util_max >= 0 {
+            spec.push_str(&format!(" util_max={}", r.util_max));
+        }
         groups[gi]["items"]
             .as_array_mut()
             .unwrap()
-            .push(json!({ "thread": r.thread, "spec": spec_name(&r.cpus, &cfg.topo) }));
+            .push(json!({ "thread": r.thread, "spec": spec }));
     }
     // 仅刷新率配置 (无 CPU 规则) 的应用也必须列出, 否则 web 规则项看不到它们
     for pkg in cfg.app_refresh_configs.keys() {
