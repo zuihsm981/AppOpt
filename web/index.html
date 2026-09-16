@@ -507,7 +507,7 @@ function grpInner(g,gi){
 ${g.items.map((it,ii)=>`
 <div class="rule-row">
 <span class="rule-name">${it.thread?esc(it.thread):'<span class="rule-sub">包级默认</span>'}</span>
-${chipHtml(it.spec)}
+${chipHtml(it.spec.replace(/\s*util_(min|max)=\d+/g,'')) /* 显示剥离 util, 仅 CPU 名 */}
 <button class="icon-btn" data-edit="${gi}:${ii}" title="${it.thread?'编辑线程规则':'编辑包级规则'}">${ICO_EDIT}</button>
 <button class="icon-btn danger" data-del="${gi}:${ii}" title="删除">${ICO_TRASH}</button>
 </div>`).join('')}
