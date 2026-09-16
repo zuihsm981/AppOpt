@@ -127,6 +127,13 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 .hero .ver{font-size:13px;color:var(--sub);margin-top:2px;font-family:var(--mono)}
 .text{font-size:13px;line-height:1.8;color:#3a3a3c;word-break:break-all}
 .text ol{padding-left:18px;display:grid;gap:4px}
+
+.rr-uclamp-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:4px}
+.rr-uclamp-row .label{font-size:12px;font-weight:600;color:var(--fg);white-space:nowrap}
+.uclamp-chips{display:flex;gap:8px;flex-wrap:wrap}
+.uclamp-chips button{padding:7px 12px;border-radius:999px;font-size:12px;background:rgba(118,118,128,.12);transition:all .15s;cursor:pointer;min-width:56px;text-align:center}
+.uclamp-chips button.on{background:var(--blue);color:#fff;font-weight:600}
+
 </style>
 </head>
 <body>
@@ -563,21 +570,36 @@ function semanticVisible(){
   return CORE_KEYS.filter(k=>multi&&(k!=='p-core'||(t.p&&t.p!==t.e&&t.p!==t.hp)));
 }
 function parseSpec(spec){
+  // 提取 uclamp token (util_min=/util_max=, 可为空=不设)
+  const u={uclampMin:null,uclampMax:null};
+  const um=spec.match(/util_min=(\d+)/);if(um)u.uclampMin=+um[1];
+  const ux=spec.match(/util_max=(\d+)/);if(ux)u.uclampMax=+ux[1];
+  const s=(um||ux)?spec.replace(/\s*util_(min|max)=\d+/g,'').trim():spec;
   const vis=semanticVisible();
-  const parts=spec.split(',').map(s=>s.trim()).filter(Boolean);
+  const parts=s.split(',').map(x=>x.trim()).filter(Boolean);
   const sem=parts.filter(p=>CORE_KEYS.includes(p)&&vis.includes(p));
-  if(spec==='all-core')return{sem:vis,all:true};
-  if(parts.length&&sem.length===parts.length)return{sem};
-  return{custom:true,customVal:spec};
+  if(s==='all-core')return{...u,sem:vis,all:true};
+  if(parts.length&&sem.length===parts.length)return{...u,sem};
+  return{...u,custom:true,customVal:s};
 }
-const mkRow=o=>({thread:'',sem:[],all:false,custom:false,customVal:'',...o});
+const mkRow=o=>({thread:'',sem:[],all:false,custom:false,customVal:'',uclampMin:null,uclampMax:null,...o});
 function specOf(r){
-  if(r.custom)return r.customVal.trim();
-  if(r.all)return 'all-core';
-  return r.sem.join(',');
+  let s=r.custom?r.customVal.trim():r.all?'all-core':r.sem.join(',');
+  const u=[];
+  if(r.uclampMin!==null&&r.uclampMin!=='')u.push('util_min='+r.uclampMin);
+  if(r.uclampMax!==null&&r.uclampMax!=='')u.push('util_max='+r.uclampMax);
+  return u.length?(s+' '+u.join(' ')):s;
 }
 const CHIP_HTML=[['e-core','e-core 小核'],['p-core','p-core 中核'],['hp-core','hp-core 大核'],['all-core','all-core 全部'],['自定义','自定义']]
   .map(([c,t])=>`<button data-core="${c}" title="${t}">${c}</button>`).join('');
+// uclamp 档位 chips (点击选中 / 再点取消=默认不设)
+const UCLAMP_OPTS=[0,128,256,512,768,1024];
+function renderUclampChips(el,r){
+  el.querySelectorAll('.uclamp-chips').forEach(box=>{
+    const k=box.dataset.uk==='max'?'uclampMax':'uclampMin';
+    box.innerHTML=UCLAMP_OPTS.map(v=>`<button data-v="${v}" class="${r[k]===v?'on':''}">${v}</button>`).join('');
+  });
+}
 function applyRowTopo(el){
   const vis=semanticVisible();
   el.querySelectorAll('.core-chips button').forEach(b=>{
@@ -588,6 +610,7 @@ function applyRowTopo(el){
 function updateRowChips(el,r){
   el.querySelectorAll('.core-chips button').forEach(b=>b.classList.toggle('on',b.dataset.core==='自定义'?r.custom:b.dataset.core==='all-core'?r.all:(!r.custom&&!r.all&&r.sem.includes(b.dataset.core))));
   el.querySelector('.rr-custom').hidden=!r.custom;
+  renderUclampChips(el,r);
 }
 let mrRows=[];
 function renderRows(){
@@ -599,6 +622,12 @@ ${r.pkgRow
   :`<div class="tr-head sg-wrap"><input class="rr-thread" placeholder="输入线程名" value="${esc(r.thread)}"><div class="sg-box" hidden></div>${tree?`<button class="icon-btn danger rr-del" title="删除该行">${ICO_TRASH}</button>`:''}</div>`}
 <div class="core-chips">${CHIP_HTML}</div>
 <input class="rr-custom" placeholder="CPU 范围，如 0-3,6" value="${esc(r.customVal||'')}" hidden>
+<div class="rr-uclamp-row">
+  <span class="label">sched_util_clamp_max</span>
+  <span class="uclamp-chips" data-uk="max"></span>
+  <span class="label">sched_util_clamp_min</span>
+  <span class="uclamp-chips" data-uk="min"></span>
+</div>
 </div>`).join('');
   mrRows.forEach((r,i)=>{
     const el=box.children[i];
@@ -609,6 +638,15 @@ ${r.pkgRow
 $('mr-rows').addEventListener('click',e=>{
   const del=e.target.closest('.rr-del');
   if(del){mrRows.splice(+del.closest('[data-ri]').dataset.ri,1);renderRows();return}
+  const ukb=e.target.closest('.uclamp-chips button');
+  if(ukb){
+    const el=ukb.closest('[data-ri]'),r=mrRows[+el.dataset.ri];
+    const k=ukb.closest('.uclamp-chips').dataset.uk==='max'?'uclampMax':'uclampMin';
+    const v=+ukb.dataset.v;
+    r[k]=r[k]===v?null:v; // 再点已选项 = 取消 (默认不设)
+    renderUclampChips(el,r);
+    return;
+  }
   const b=e.target.closest('.core-chips button');
   if(!b)return;
   const el=b.closest('[data-ri]'),r=mrRows[+el.dataset.ri],c=b.dataset.core;
