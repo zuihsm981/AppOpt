@@ -213,7 +213,7 @@ fn set_refresh_rate(state: &mut RefreshState, mode: i32) {
 
 fn apply_app_config(state: &mut RefreshState, pkg: &str) {
     // com.android.launcher3 是默认桌面, 始终绑定全局刷新率配置;
-    // 即使配置文件中残留同名 refresh_app 行，也不能把桌面切到应用级覆盖值。
+    // 即使配置文件中残留同名刷新率行，也不能把桌面切到应用级覆盖值。
     if pkg != crate::config::DEFAULT_REFRESH_PACKAGE {
         if let Some(cfg) = state.app_configs.get(pkg) {
             state.current_timeout = cfg.timeout;
@@ -596,16 +596,14 @@ pub fn refresh_get_apps() -> Vec<(String, i32, String, String)> {
         .collect()
 }
 
-/// 判断一行是否属于该包的刷新率配置 (新格式 pkg=refresh-*, 兼容旧格式
-/// refresh_app,<pkg>,… / <pkg>,t,a,i)
+/// 判断一行是否属于该包的刷新率配置 (新格式 pkg=refresh-*)
 fn is_refresh_pkg_line(line: &str, pkg: &str) -> bool {
     let t = line.trim();
     if let Some((k, v)) = t.split_once('=') {
         return k.trim() == pkg && v.starts_with("refresh-");
     }
     let fields: Vec<&str> = t.split(',').map(str::trim).collect();
-    (fields.len() == 5 && fields[0] == "refresh_app" && fields[1] == pkg)
-        || (fields.len() == 4 && fields[0] == pkg)
+    fields.len() == 4 && fields[0] == pkg
 }
 
 pub fn refresh_add_app(pkg: &str, timeout: i32, active: &str, idle: &str) {

@@ -277,7 +277,7 @@ fn add_rule(
 ///   refresh_timeout=30
 ///   refresh_active=120
 ///   refresh_idle=60
-///   refresh_app,com.example.game,30,120,60
+///   com.example.game=refresh-30-120-60
 ///
 /// 返回 true 表示该行是刷新率记录，调用方不应再把它当作 CPU 规则解析。
 pub fn is_refresh_config_line(line: &str) -> bool {
@@ -291,55 +291,40 @@ pub fn is_refresh_config_line(line: &str) -> bool {
             return true;
         }
     }
-    let parts: Vec<&str> = line.split(',').map(str::trim).collect();
-    parts.len() == 5 && parts[0] == "refresh_app"
+    false
 }
 
+/// 解析全局刷新率三字段 (refresh_timeout/active/idle)。
+/// 应用级刷新率 (pkg=refresh-<t>-<a>-<i>) 由 route_pkg_val_line 路由
+/// (load_config 主循环与 load_refresh_config 均如此; 旧 refresh_app,逗号 格式已废弃)。
 fn parse_refresh_config_line(
     line: &str,
     timeout: &mut i32,
     active: &mut i32,
     idle: &mut i32,
-    apps: &mut HashMap<String, (i32, i32, i32)>,
+    _apps: &mut HashMap<String, (i32, i32, i32)>,
 ) -> bool {
     let line = strip_comment(line).trim();
-    if let Some((key, value)) = line.split_once('=') {
-        match key.trim() {
-            "refresh_timeout" => {
-                if let Ok(value) = value.trim().parse::<i32>() {
-                    if value > 0 {
-                        *timeout = value;
-                    }
+    let Some((key, value)) = line.split_once('=') else { return false };
+    match key.trim() {
+        "refresh_timeout" => {
+            if let Ok(value) = value.trim().parse::<i32>() {
+                if value > 0 {
+                    *timeout = value;
                 }
-                return true;
             }
-            "refresh_active" => {
-                *active = parse_refresh_mode(value);
-                return true;
-            }
-            "refresh_idle" => {
-                *idle = parse_refresh_mode(value);
-                return true;
-            }
-            _ => {}
+            true
         }
+        "refresh_active" => {
+            *active = parse_refresh_mode(value);
+            true
+        }
+        "refresh_idle" => {
+            *idle = parse_refresh_mode(value);
+            true
+        }
+        _ => false,
     }
-
-    let parts: Vec<&str> = line.split(',').map(str::trim).collect();
-    let (pkg, timeout, active, idle) = if parts.len() == 5 && parts[0] == "refresh_app" {
-        (parts[1], parts[2], parts[3], parts[4])
-    } else {
-        return false;
-    };
-    if pkg.is_empty() {
-        return true;
-    }
-    let app_timeout = timeout.parse::<i32>().unwrap_or(30).max(1);
-    apps.insert(
-        pkg.to_string(),
-        (app_timeout, parse_refresh_mode(active), parse_refresh_mode(idle)),
-    );
-    true
 }
 
 /// pkg=refresh-<timeout>-<active>-<idle> 前缀路由
@@ -361,7 +346,7 @@ fn route_pkg_val_line(
     false
 }
 
-/// 包属性行所属包名: pkg=… / pkg,thread,cpus / refresh_app,<pkg>,… / 裸块 pkg {
+/// 包属性行所属包名: pkg=… / pkg,thread,cpus / 裸块 pkg {
 fn pkg_of_line(t: &str) -> Option<String> {
     let t = crate::config::strip_comment(t).trim();
     if let Some((k, _)) = t.split_once('=') {
@@ -371,9 +356,6 @@ fn pkg_of_line(t: &str) -> Option<String> {
         }
     }
     let fields: Vec<&str> = t.split(',').map(str::trim).collect();
-    if fields.len() >= 2 && fields[0] == "refresh_app" {
-        return Some(fields[1].to_string());
-    }
     if fields.len() >= 3 && !fields[0].is_empty() {
         return Some(fields[0].to_string());
     }
@@ -389,8 +371,7 @@ fn pkg_of_line(t: &str) -> Option<String> {
 /// 包属性行中“配置属性”(刷新率/移入cpuset), 排在同包规则行之后
 fn is_special_attr(line: &str) -> bool {
     let t = line.trim();
-    t.starts_with("refresh_app,")
-        || t.contains("=refresh-")
+    t.contains("=refresh-")
 }
 
 /// 空行/注释行 (load_config 主循环 / organize / pkg_set 共用)
@@ -535,13 +516,20 @@ pub fn load_refresh_config(config_file: &str) -> (i32, i32, i32, HashMap<String,
     let mut apps = HashMap::new();
     if let Ok(content) = fs::read_to_string(config_file) {
         for line in content.lines() {
-            let _ = parse_refresh_config_line(
+            if !parse_refresh_config_line(
                 line,
                 &mut timeout,
                 &mut active,
                 &mut idle,
                 &mut apps,
-            );
+            ) {
+                // 新格式 pkg=refresh-<t>-<a>-<i>: parse_refresh_config_line 不识别,
+                // 走 route_pkg_val_line 路由 (与 load_config 主循环一致)
+                let line = strip_comment(line).trim();
+                if let Some((k, v)) = line.split_once('=') {
+                    let _ = route_pkg_val_line(k.trim(), v.trim(), &mut apps);
+                }
+            }
         }
     }
     (timeout, active, idle, apps)

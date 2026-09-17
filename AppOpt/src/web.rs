@@ -28,7 +28,18 @@ fn cpuset_leaf() -> String {
     base_cpuset().rsplit('/').next().unwrap_or_default().to_string()
 }
 
+/// web 是否启用 (--no-web 时 false)
 pub static WEB_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// uclamp (sched_setattr util clamp) 是否可用: /proc/sys/kernel/sched_util_clamp_max 存在
+/// 表示内核支持 uclamp; 启动时检查一次, webui 据此决定是否显示 uclamp 配置 UI。
+pub static UCLAMP_SUPPORTED: AtomicBool = AtomicBool::new(false);
+pub fn init_uclamp_support() {
+    UCLAMP_SUPPORTED.store(
+        std::path::Path::new("/proc/sys/kernel/sched_util_clamp_max").exists(),
+        Ordering::Relaxed,
+    );
+}
 
 /// KPM 模式是否活跃 (main 在 ebpf_state 置位/卸载时更新)
 pub static KPM_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -308,6 +319,7 @@ fn status_json() -> String {
         "p_core": topo.map(|t| t.p_core.to_range_string()).unwrap_or_default(),
         "hp_core": topo.map(|t| t.hp_core.to_range_string()).unwrap_or_default(),
         "all_core": topo.map(|t| t.present_str.clone()).unwrap_or_default(),
+        "uclamp_supported": UCLAMP_SUPPORTED.load(Ordering::Relaxed),
         "cores": topo.map(|t| t.present_cpus.count()).unwrap_or(0),
         "cpuset_enabled": topo.is_some_and(|t| t.cpuset_enabled),
     })

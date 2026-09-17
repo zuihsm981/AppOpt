@@ -168,7 +168,7 @@ fn print_help(prog_name: &str) {
     println!("  refresh_timeout=30");
     println!("  refresh_active=120");
     println!("  refresh_idle=60");
-    println!("  refresh_app,com.example.game,30,120,60");
+    println!("  com.example.game=refresh-30-120-60");
 }
 
 fn main() {
@@ -232,6 +232,8 @@ fn main() {
     let st = settings_load(SETTINGS_FILE);
     let drive_mode = st.mode.clone();
     crate::web::set_drive_mode(&drive_mode);
+    // uclamp 支持探测 (webui 据此隐藏/显示 uclamp 配置)
+    crate::web::init_uclamp_support();
 
     // ================= 初始化并发: 独立无依赖项并行 =================
     // 提前创建 fd (不依赖 settings; 供各独立线程使用)
