@@ -99,11 +99,15 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 .sg-item{padding:9px 12px;font-size:13px;word-break:break-all}
 .sg-item.hl,.sg-item:active{background:rgba(0,122,255,.08)}
 .tree-row{margin-bottom:12px}
-.tree-row.branch{border-left:2px solid rgba(0,122,255,.25);padding-left:10px}
+/* 线程行: 蓝色竖线改为短竖线(只覆盖线程名输入行), 不再贯穿到 uclamp 区域 */
+.tree-row.branch{position:relative;border-left:none;padding-left:10px}
+.tree-row.branch::before{content:'';position:absolute;left:0;top:4px;width:2px;height:100px;background:rgba(0,122,255,.25);border-radius:1px}
 .tr-head{display:flex;align-items:center;gap:6px;margin-bottom:6px}
 .tr-head input{flex:1;width:auto;min-width:0;margin-bottom:0}
 .tr-tag{font-size:12px;font-weight:600;color:var(--fg)}
 .tr-sub{font-size:11px;color:var(--sub)}
+#mr-rows{margin-top:12px}
+#mr-rf-box{margin-top:12px} /* 与线程区同距, 无分隔横线 */
 #mr-rows .core-chips{margin-bottom:6px}
 #mr-rows .rr-custom{margin-bottom:0}
 #mr-addrow{width:100%;margin:0 0 4px}
@@ -128,7 +132,17 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 .text{font-size:13px;line-height:1.8;color:#3a3a3c;word-break:break-all}
 .text ol{padding-left:18px;display:grid;gap:4px}
 
-.rr-uclamp-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:4px}
+.rr-uclamp-fold{margin-top:4px}
+/* branch(线程)行: 抵消 padding-left:6px → 按钮左缘与弹窗级对齐, 宽度补回 */
+.tree-row.branch .rr-uclamp-fold{margin-left:-10px;width:calc(100% + 10px)}
+/* 与 #mr-addrow(＋ 线程规则) 完全一致: 全宽、无左右 margin */
+.uclamp-add-btn{display:flex;align-items:center;justify-content:center;gap:4px;width:100%;margin:0 0 4px;padding:9px 0;border:1px dashed var(--border);border-radius:10px;color:var(--sub);font-size:13px;background:none;cursor:pointer}
+
+.uclamp-add-btn:active{opacity:.5}
+.rr-uclamp-row{display:flex;flex-direction:column;gap:6px;margin-top:10px}
+.rr-uclamp-col{display:flex;flex-direction:column;gap:2px}
+.rr-uclamp-head{display:flex;align-items:center;gap:6px}
+.rr-uclamp-del{margin-left:auto}
 .rr-uclamp-row .label{font-size:12px;font-weight:600;color:var(--fg);white-space:nowrap}
 .uclamp-chips{display:flex;gap:8px;flex-wrap:wrap}
 .uclamp-chips button{padding:7px 12px;border-radius:999px;font-size:12px;background:rgba(118,118,128,.12);transition:all .15s;cursor:pointer;min-width:56px;text-align:center}
@@ -302,7 +316,6 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div id="mr-rows"></div>
 <button class="rule-add" id="mr-addrow" hidden>＋ 线程规则</button>
 <div id="mr-rf-box" hidden>
-<hr style="border:none;border-top:1px solid var(--border);margin:12px 0">
 <div class="tree-row">
 <div class="tr-head"><span class="tr-tag">最大刷新率·可选</span></div>
 <div class="core-chips" id="mr-rf-active-chips"></div>
@@ -460,6 +473,7 @@ async function refreshStat(){
     $('s-ecore').textContent=d.e_core||'无';
     $('s-pcore').textContent=d.p_core||'无';
     $('s-hcore').textContent=d.hp_core||'无';
+    if(typeof d.uclamp_supported==='boolean')uclampSupported=d.uclamp_supported;
     $('s-all').textContent=d.all_core||'-';
     topoCores=topoOf(d);
     const vis=semanticVisible();
@@ -612,8 +626,19 @@ function applyRowTopo(el){
 function updateRowChips(el,r){
   el.querySelectorAll('.core-chips button').forEach(b=>b.classList.toggle('on',b.dataset.core==='自定义'?r.custom:b.dataset.core==='all-core'?r.all:(!r.custom&&!r.all&&r.sem.includes(b.dataset.core))));
   el.querySelector('.rr-custom').hidden=!r.custom;
-  renderUclampChips(el,r);
+  if(uclampSupported){
+    const fold=el.querySelector('.rr-uclamp-fold');
+    if(fold){
+      const hasUtil=r.uclampMin!=null||r.uclampMax!=null;
+      const add=fold.querySelector('.uclamp-add-btn');
+      const row=fold.querySelector('.rr-uclamp-row');
+      if(add)add.hidden=hasUtil;
+      if(row)row.hidden=!hasUtil;
+      if(hasUtil)renderUclampChips(el,r);
+    }
+  }
 }
+let uclampSupported=true; // status 加载后按后端探测结果更新
 let mrRows=[];
 function renderRows(){
   const box=$('mr-rows'),tree=isTree();
@@ -624,12 +649,22 @@ ${r.pkgRow
   :`<div class="tr-head sg-wrap"><input class="rr-thread" placeholder="输入线程名" value="${esc(r.thread)}"><div class="sg-box" hidden></div>${tree?`<button class="icon-btn danger rr-del" title="删除该行">${ICO_TRASH}</button>`:''}</div>`}
 <div class="core-chips">${CHIP_HTML}</div>
 <input class="rr-custom" placeholder="CPU 范围，如 0-3,6" value="${esc(r.customVal||'')}" hidden>
-<div class="rr-uclamp-row">
-  <span class="label">sched_util_clamp_min</span>
-  <span class="uclamp-chips" data-uk="min"></span>
-  <span class="label">sched_util_clamp_max</span>
-  <span class="uclamp-chips" data-uk="max"></span>
-</div>
+${uclampSupported?`<div class="rr-uclamp-fold">
+  <button class="uclamp-add-btn" type="button">＋ 利用率规则</button>
+  <div class="rr-uclamp-row" hidden>
+    <div class="rr-uclamp-col">
+      <div class="rr-uclamp-head">
+        <span class="label">CPU最小利用率限制·可选</span>
+        <button class="icon-btn danger rr-uclamp-del" title="移除 利用率规则">${ICO_TRASH}</button>
+      </div>
+      <span class="uclamp-chips" data-uk="min"></span>
+    </div>
+    <div class="rr-uclamp-col">
+      <div class="rr-uclamp-head"><span class="label">CPU最大利用率限制·可选</span></div>
+      <span class="uclamp-chips" data-uk="max"></span>
+    </div>
+  </div>
+</div>`:''}
 </div>`).join('');
   mrRows.forEach((r,i)=>{
     const el=box.children[i];
@@ -640,6 +675,22 @@ ${r.pkgRow
 $('mr-rows').addEventListener('click',e=>{
   const del=e.target.closest('.rr-del');
   if(del){mrRows.splice(+del.closest('[data-ri]').dataset.ri,1);renderRows();return}
+  const add=e.target.closest('.uclamp-add-btn');
+  if(add){
+    const el=add.closest('[data-ri]'),r=mrRows[+el.dataset.ri];
+    const row=add.closest('.rr-uclamp-fold').querySelector('.rr-uclamp-row');
+    add.hidden=true;
+    row.hidden=false;
+    renderUclampChips(el,r);
+    return;
+  }
+  const udel=e.target.closest('.rr-uclamp-del');
+  if(udel){
+    const el=udel.closest('[data-ri]'),r=mrRows[+el.dataset.ri];
+    r.uclampMin=null;r.uclampMax=null; // 移除 uclamp 配置 → 回到 ＋ uclamp 规则 状态
+    updateRowChips(el,r);
+    return;
+  }
   const ukb=e.target.closest('.uclamp-chips button');
   if(ukb){
     const el=ukb.closest('[data-ri]'),r=mrRows[+el.dataset.ri];
