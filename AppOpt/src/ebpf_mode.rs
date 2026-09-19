@@ -1,12 +1,13 @@
 //! KPM 事件环模式 (KernelPatch KPM 内核模块, syscall 45 通信)
 //!
-//! 事件环仅承载 input 事件 (刷新率活动检测): ctl0 `shm_open <eventfd>` 让内核
-//! 把 256KB 事件环 remap 为共享内存 fd 并把 AppOpt 的 eventfd 注册为通知端;
-//! reader 线程 mmap 该 fd, 阻塞在 eventfd 上, 被内核 input kprobe eventfd_signal
-//! 唤醒后直接从共享环消费 (SPSC, acquire/release 同步), 零轮询。
+//! 事件环 (input 事件通道): ctl0 `shm_open <eventfd>` 让内核把 256KB 事件环
+//! remap 为共享内存 fd 并把 AppOpt 的 eventfd 注册为通知端; reader 线程 mmap
+//! 该 fd, 阻塞在 eventfd 上, 唤醒后直接从共享环消费 (SPSC, acquire/release
+//! 同步), 零轮询。input 检测已统一用户态 eventX (内核 input kprobe 不再武装,
+//! 本事件环保留备用); 退出清理走 pidfd, 不经事件环。
 //!
 //! CPU 亲和性/刷新率不再由进程事件驱动: binder 前台回调 (pid+uid) 由主线程
-//! 经 uid 静态表分发到 cpuset(按 uid 枚举应用) 与刷新率线程 (见 main.rs EV_FG,
+//! 经 uid 静态表分发到 cpuset(按 uid 取应用) 与刷新率线程 (见 main.rs EV_FG,
 //! cpu_affinity.rs, refresh.rs)。
 //!
 //! 控制面 (APPLIED 表 / start-stop / shm_open) 走 ctl0 supercall。
@@ -176,16 +177,9 @@ impl KpmHandle {
         self.cmd(&s);
     }
 
-    /// AppOpt 初始化完成后激活 KPM: start 武装 exit/setaffinity (input 检测统一走用户态 eventX)
+    /// AppOpt 初始化完成后激活 KPM: start 武装 setaffinity (input 检测统一走用户态 eventX)
     pub fn activate(&self) {
         self.cmd("start");
-    }
-
-    /// 标记规则应用主进程 tgid (内核退出探针只对主进程发布 EXIT 事件;
-    /// 子进程/线程退出被内核过滤)
-    pub(crate) fn applied_set_main(&self, pid: i32) {
-        let s = format!("applied_set_main {}", pid);
-        self.cmd(&s);
     }
 
     pub(crate) fn applied_clear(&self) {
@@ -201,7 +195,7 @@ impl KpmHandle {
         kpm_ctl0(&self.key, &c, &mut [])
     }
 
-    /// 解除内核侧 eventfd 通知绑定 (AppOpt 退出 / 降级 /proc 模式时调用)
+    /// 解除内核侧 eventfd 通知绑定 (AppOpt 退出时调用)
     fn shm_close(&self) {
         let c = cstr("shm_close");
         kpm_ctl0(&self.key, &c, &mut []);
@@ -358,7 +352,7 @@ pub fn ebpf_init(kpm_wake_fd: c_int, drive_mode: String) -> Option<EbpfState> {
         kpm_shm_reader(shm_ptr, map_len, evt_fd, tx, wakeup_fd, kpm_wake_fd);
     });
 
-    // 武装 exit/input/setaffinity (kprobe 路径; 模块仅在 6.6 加载)
+    // 武装 setaffinity (kprobe 路径; 模块仅在 6.6 加载)
     handle.activate();
 
     Some(EbpfState {
@@ -498,23 +492,14 @@ fn kpm_shm_reader(
     unsafe { libc::munmap(base, map_len); }
 }
 
-/// 事件派发 (input: 刷新率活动检测; EXIT: 规则应用主进程退出 → 清身份;
-/// CPU/刷新率主体由 binder 三线程驱动)
-pub const EBPF_EVENT_EXIT: u32 = 4;
+/// 事件派发 (input: 刷新率活动检测; 退出清理统一由用户态 pidfd 负责,
+/// 内核 EXIT 事件不再消费; CPU/刷新率主体由 binder 三线程驱动)
 pub fn event_dispatch(event: &EbpfProcEvent, _cfg: &AppConfig, _state: &mut EbpfState) {
     // CPU 亲和性已由 binder 触发的 CpuAffinity 模块负责 (cpu_affinity.rs):
-    // 进程事件不驱动 CPU 逻辑; input 仅用于刷新率活动检测。
+    // 进程事件不驱动 CPU 逻辑; input 仅用于刷新率活动检测;
+    // 退出清理走 pidfd (main EV_EXIT_PID → EvictUid), 内核 EXIT 事件忽略。
     if event.event_type == EBPF_EVENT_INPUT {
         crate::refresh::refresh_on_event(EBPF_EVENT_INPUT, 0);
-    } else if event.event_type == EBPF_EVENT_EXIT && event.tid == event.pid {
-        // 规则应用主进程退出 (内核已按 APPLIED+主进程标记过滤非规则应用/非主进程):
-        // 反查 uid → 通知 CPU worker 统一清身份 + managed → web 命中应用/绑定线程
-        // 立即归零 (事件驱动; 身份清理由 worker evict_uid 完成, 单一职责)。
-        if let Some(uid) = crate::cpu_affinity::cpu_known_pid_to_uid(event.pid) {
-            if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
-                let _ = tx.send(crate::cpu_affinity::CpuMsg::EvictUid(uid));
-            }
-        }
     }
 }
 

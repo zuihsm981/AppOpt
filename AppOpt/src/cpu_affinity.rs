@@ -3,19 +3,20 @@
 //! 设计:
 //!   - 触发: IProcessObserver binder 前台回调 (主线程 EV_FG 接收 pid+uid); 主线程查
 //!     cpu uid 表, 命中且冷启动时发 CpuMsg::ApplyPkg(pid, uid, pkg); ApplyAll = 启动/配置全量。
-//!   - 归因: 包名由主线程 cpu uid 表提供 (随 CpuMsg 消息携带); 枚举按 uid 读
+//!   - 归因: 包名由主线程 cpu uid 表提供 (随 CpuMsg 消息携带); 按 uid 读
 //!     /sys/fs/cgroup/apps/uid_<uid>/ 下 pid_* 目录 (Android cgroup apps 布局,
 //!     精确 O(该 uid 进程数), 含主进程与全部子进程; 布局缺失视为未运行)。
 //!   - 应用: 该 uid 全部进程的全部线程 (/proc/<pid>/task) → thread_affinity →
 //!     applied_set + affinity_set。
-//!   - 清理: APPLIED 条目由内核 EXIT 探针逐 tid 摘除 (退出即删, 防 tid 复用被
-//!     kprobe 误抓/错误覆盖新进程亲和性)。
-//!   - 内核只保留: applied 表 (ctl0) + sched_setaffinity kprobe 强制 +
-//!     input kprobe (刷新率)。进程事件探针对本模块无意义。
+//!   - 清理: APPLIED 条目由进程退出清理 (pidfd 事件 → EvictUid → 按 uid 摘除,
+//!     防 tid 复用被 kprobe 误抓/错误覆盖新进程亲和性)。
+//!   - 内核只保留: applied 表 (ctl0) + sched_setaffinity kprobe 强制;
+//!     input 检测已统一用户态 eventX (内核 input kprobe 不再依赖)。
+//!     进程事件探针对本模块无意义。
 //!
-//! 为什么按 uid: pid 归因对 zygote spawn 子进程 (pkg:child, 不同 tgid) 有结构性
-//! 盲区; 同一应用的主进程与所有子进程共享 uid, binder 回调直接携带 uid, 一次
-//! /proc 按 uid 过滤即完整覆盖, 无 pid 家族匹配/晚起子进程问题。
+//! 为什么按 uid + cgroup: zygote spawn 子进程 (pkg:child, 不同 tgid) 与主进程共享
+//! uid; /sys/fs/cgroup/apps/uid_<uid>/ 目录按 uid 归属全部进程 (主+子), 直接读 pid_*
+//! 即完整覆盖, 无 pid 家族匹配/晚起子进程问题。
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
@@ -30,7 +31,7 @@ use crate::cpuset::{CpuSet, CpuTopology};
 use crate::ebpf_mode::KpmHandle;
 
 /// 前台回调后延迟枚举时长: 冷启动子进程 (pkg:child) 常在回调后 0.5~2s 内 spawn,
-/// 延迟后按 uid 枚举一次覆盖冷启动窗口 (主进程回调时已在, 无影响)。
+/// 延迟后 cgroup 取一遍该 uid 全部 pid 覆盖冷启动窗口 (主进程回调时已在, 无影响)。
 /// 延迟值由 web 设置项「线程放置延迟」控制 (默认 2000ms)。
 fn enum_delay() -> Duration {
     Duration::from_millis(crate::web::AFFINITY_DELAY_MS.load(Ordering::Relaxed))
@@ -38,9 +39,9 @@ fn enum_delay() -> Duration {
 
 /// CPU worker 消息
 pub enum CpuMsg {
-    /// 主线程判定冷启动后, 下发 (主 pid, uid, 包名) → 延迟按 uid 枚举应用
+    /// 主线程判定冷启动后, 下发 (主 pid, uid, 包名) → 延迟按 uid 取该应用全部进程
     ApplyPkg(i32, i32, String),
-    /// 规则应用主进程退出 (EXIT 事件): 按 uid 清除该应用在 managed 的全部条目
+    /// 规则应用主进程退出 (pidfd 退出事件): 按 uid 清除该应用在 managed 的全部条目
     /// → web 命中归零 (按 uid 整清, 不依赖主线程 tid 是否在 managed)
     EvictUid(i32),
     /// 全量应用 (启动 / 配置变更): 携带 规则包→uid 表 (main 由 uid 表供给, worker 不读文件)
@@ -56,9 +57,8 @@ pub enum CpuMsg {
 /// 全局投递通道: 主线程 (main EV_FG) 转发前台回调 → CpuMsg 消息
 static CPU_FG_TX: OnceLock<Mutex<mpsc::Sender<CpuMsg>>> = OnceLock::new();
 
-/// 冷热身份: uid → (前台主 pid, 该 uid 全部 pid 列表); 主线程判冷热, CPU 线程回写
 /// 冷热身份: uid -> (前台主 pid, 该 uid 全部 pid 列表); 主线程每次 binder 前台
-/// 回调都读 (高频只读) -> RwLock, 仅冷启动/EXIT 时写
+/// 回调都读 (高频只读) -> RwLock, 仅冷启动/退出时写
 pub static CPU_KNOWN: std::sync::LazyLock<RwLock<HashMap<i32, (i32, Vec<i32>)>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
@@ -159,9 +159,6 @@ impl CpuAffinity {
         *crate::rw_write_ignore_poison(&CPU_STATS) = (thread_count, pkgs);
     }
 
-    /// 按 uid 枚举该应用全部进程 (主 + pkg: 子进程同 uid) → 应用全部线程。
-    /// uid 即应用身份: 精确、无 cmdline 归因竞态、多用户下不误捞其他实例。
-    /// 按 uid 精确枚举该应用全部 pid (cgroup apps; 供重放占位期现扫)
     /// 读 /sys/fs/cgroup/apps/uid_<uid>/ 下 pid_* 目录获取该 uid 全部 pid
     /// (Android cgroup apps 布局: 每个进程一个 pid_<pid> 目录, 归属精确,
     /// 含主进程与全部子进程)。失败 (布局不存在/目录缺失) 返回 None →
@@ -181,6 +178,8 @@ impl CpuAffinity {
         Some(pids)
     }
 
+    /// 应用已登记的前台应用: uid 目录直接取全部 pid, 再由 /proc/<pid>/task 取全部线程;
+    /// 无 /proc 全量 uid 扫描。
     fn on_uid(&mut self, uid: i32, pkg: &str, cfg: &AppConfig) -> Vec<i32> {
         // cgroup apps 精确枚举: uid_<uid> 不存在 (含 uid<=0/未运行) → None → 空, 天然短路
         let pids = Self::cgroup_apps_pids(uid).unwrap_or_default();
@@ -188,8 +187,9 @@ impl CpuAffinity {
         pids
     }
 
-    /// 全量重放规则亲和性 (启动 / 配置变更): 只设亲和性 —— uid 精确枚举 + 应用规则。
-    /// 不写身份 (CPU_KNOWN / applied_set_main): 身份仅由 binder 前台回调 (ApplyPkg)
+    /// 全量重放规则亲和性 (启动 / 配置变更): 只设亲和性 —— cgroup 按 uid 取全部 pid,
+    /// /proc/<pid>/task 取线程 → 应用规则。
+    /// 不写身份 (CPU_KNOWN): 身份仅由 binder 前台回调 (ApplyPkg)
     /// 产生, 因为只有它知道"谁是前台主进程"。
     pub fn apply_all(&mut self, cfg: &AppConfig, pkg_uids: HashMap<String, i32>) -> usize {
         let mut applied = 0usize;
@@ -200,7 +200,7 @@ impl CpuAffinity {
             }
             self.apply_tids(&pids, pkg, cfg);
             // 记录 uid→pkg 清理索引 (managed 按包名索引, 退出 evict_uid 需反查;
-            // 不写 CPU_KNOWN/applied_set_main —— 前台主 pid 身份仍只由 ApplyPkg 产生)
+            // 不写 CPU_KNOWN —— 前台主 pid 身份仍只由 ApplyPkg 产生)
             self.uid_pkg.insert(*uid, pkg.clone());
             applied += 1;
         }
@@ -211,8 +211,21 @@ impl CpuAffinity {
 
 
     /// 应用一个包的全部进程 (主进程 + pkg: 子进程) 的全部线程
-    /// 对给定进程集合的全部线程套用规则并应用
+    /// 对给定进程集合的全部线程套用规则并应用 (解析 → 亲和 → uclamp 三段)
     fn apply_tids(&mut self, pids: &[i32], pkg: &str, cfg: &AppConfig) {
+        let (set, aff, uclamps) = self.resolve_threads(pids, pkg, cfg);
+        self.apply_affinity_batch(&set, aff, cfg);
+        self.apply_uclamp_batch(uclamps);
+    }
+
+    /// 1) 解析: 遍历 pids × tids 套用规则, 收集 (bits 聚合的 applied_set,
+    ///    亲和任务, uclamp 任务), 同时登记 managed (web 命中统计)。
+    fn resolve_threads(
+        &mut self,
+        pids: &[i32],
+        pkg: &str,
+        cfg: &AppConfig,
+    ) -> (HashMap<u64, Vec<i32>>, Vec<(i32, CpuSet, String)>, Vec<(i32, i32, i32)>) {
         let has_thread_rules = cfg.has_thread_rules.contains(pkg);
         // 规则只有包名 (无线程规则): 包级规则一次取好, 所有线程统一应用,
         // 免去逐线程 thread_affinity / 读 comm 匹配。
@@ -258,12 +271,21 @@ impl CpuAffinity {
                 self.managed.entry(pkg.to_string()).or_default().insert(tid);
             }
         }
-        // 批量写内核 APPLIED 表 (每 bits 一次 supercall)
-        for (bits, tids) in &set {
+        (set, aff, uclamps)
+    }
+
+    /// 2) 应用亲和: 批量写内核 APPLIED 表 (每 bits 一次 supercall) + 按 cpuset_dir
+    ///    分组设 sched_setaffinity (主要手段), 仍不正确的 tid 走 cpuset tasks 迁移兜底。
+    fn apply_affinity_batch(
+        &self,
+        set: &HashMap<u64, Vec<i32>>,
+        aff: Vec<(i32, CpuSet, String)>,
+        cfg: &AppConfig,
+    ) {
+        for (bits, tids) in set {
             self.bpf.applied_set_many(*bits, tids);
         }
         // 按 cpuset_dir 分组: 每个目录只拼一次 tasks 路径, 再逐线程设置
-        // (cpuset_enabled) + sched_setaffinity (必要的每线程 syscall)
         let base = crate::cpuset::base_cpuset();
         let mut by_dir: HashMap<String, Vec<(i32, CpuSet)>> = HashMap::new();
         for (tid, cpus, cpuset_dir) in aff {
@@ -309,9 +331,12 @@ impl CpuAffinity {
                 }
             }
         }
-        // uclamp (sched_setattr): 逐 tid 应用 util_min/max (仅设了 uclamp 的 tid)
+    }
+
+    /// 3) 应用 uclamp (sched_setattr): 逐 tid 设 util_min/max (仅设了 uclamp 的 tid)
+    fn apply_uclamp_batch(&self, uclamps: Vec<(i32, i32, i32)>) {
         for (tid, mn, mx) in uclamps {
-            let _ = crate::apply_affinity::set_uclamp(tid, mn, mx);
+            crate::apply_affinity::set_uclamp(tid, mn, mx);
         }
     }
 
@@ -359,7 +384,8 @@ impl CpuAffinity {
         self.bpf.applied_clear();
     }
 
-    /// 应用已登记的前台应用 (到期执行): 枚举 uid 全部 pid 设亲和 + 回写身份
+    /// 应用已登记的前台应用 (到期执行): cgroup 取 uid 全部 pid → /proc/<pid>/task
+    /// 线程 → 设亲和 + 回写身份
     fn apply_pkg(&mut self, pid: i32, uid: i32, pkg: &str) {
         let Some(cfg) = crate::config::current_cfg() else {
             // 配置异常缺失: 清占位身份, 等下次前台回调重新触发
@@ -375,8 +401,6 @@ impl CpuAffinity {
         // 设置亲和性后: 该 uid 主进程+全部子进程 pid 列表写入 cpu_known
         // (供后续冷热判断/统计); pids 已消费完, 直接 move
         crate::rw_write_ignore_poison(&CPU_KNOWN).insert(uid, (pid, pids));
-        // 标记内核主进程 tgid: 退出探针只对该主进程发布 EXIT
-        self.bpf.applied_set_main(pid);
         // 记录 uid→pkg (退出时按 uid 整清 managed)
         self.uid_pkg.insert(uid, pkg.to_string());
     }

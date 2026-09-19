@@ -47,7 +47,10 @@ pub(crate) fn task_tids(pid: i32) -> Option<Vec<i32>> {
             .collect(),
     )
 }
-/// 内核 struct sched_attr (uapi/linux/sched.h, SCHED_ATTR_SIZE_VER0 = 48 字节)
+/// 内核 struct sched_attr 的 Rust 布局镜像 (uapi/linux/sched.h), #[repr(C)] 保证
+/// 字段顺序/对齐与内核一致, 直接作为 sched_setattr syscall 参数。注意: 内核
+/// SCHED_ATTR_SIZE_VER0 = 48B 是不含 util 字段的旧版本; 本结构含
+/// sched_util_min/max (5.3+), size 字段运行时取 size_of::<SchedAttr>() = 56。
 #[repr(C)]
 struct SchedAttr {
     size: u32,
@@ -64,10 +67,11 @@ struct SchedAttr {
 
 /// 设置线程 uclamp (sched_util_min/max, 0..=1024) via sched_setattr。
 /// flags = SCHED_FLAG_UTIL_CLAMP (0x60): 只更新 uclamp, 不动调度策略/参数。
-/// 内核需 CONFIG_UCLAMP_TASK; 失败静默 (uclamp 是增强, 不影响亲和性)。
-pub fn set_uclamp(tid: i32, util_min: i32, util_max: i32) -> bool {
+/// 内核需 CONFIG_UCLAMP_TASK; 失败静默 (uclamp 是增强, 不影响亲和性,
+/// 调用方不关心成败 —— 返回 () 而非 bool)。
+pub fn set_uclamp(tid: i32, util_min: i32, util_max: i32) {
     if util_min < 0 && util_max < 0 {
-        return false;
+        return;
     }
     const SCHED_FLAG_UTIL_CLAMP: u64 = 0x60; // MIN(0x20) | MAX(0x40)
     // size = 56 (含 sched_util_min/max 字段; 内核 5.3+ 才支持该字段, 4.19 无)
@@ -83,5 +87,5 @@ pub fn set_uclamp(tid: i32, util_min: i32, util_max: i32) -> bool {
         sched_util_min: util_min.clamp(0, 1024) as u32,
         sched_util_max: util_max.clamp(0, 1024) as u32,
     };
-    unsafe { libc::syscall(libc::SYS_sched_setattr, tid, &attr as *const SchedAttr, 0) == 0 }
+    unsafe { libc::syscall(libc::SYS_sched_setattr, tid, &attr as *const SchedAttr, 0) };
 }

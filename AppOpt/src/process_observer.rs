@@ -3,7 +3,7 @@
 //!
 //! 触发分离/数据共享（参考 优化.md）：
 //! Binder 回调提取 pid+uid, 经 socketpair(SOCK_DGRAM) 发送 8 字节 (pid+uid);
-//! 主线程据此查 uid 静态表并分发 CPU(按 uid 枚举)/刷新率(按包)线程。
+//! 主线程据此查 uid 静态表并分发 CPU(按 uid 取该应用全部进程)/刷新率(按包)线程。
 
 use std::ffi::c_void;
 use std::sync::{OnceLock};
@@ -155,8 +155,8 @@ extern "C" fn on_transact(
 
             if fg && pid > 0 {
                 // 触发分离：Binder 回调携带 pid + uid（8 字节）。
-                // 刷新率模块按 pid 解析包名; CPU 亲和性按 uid 枚举该应用全部进程
-                // (主进程 + pkg: 子进程共享 uid, 规避 pid 归因盲区)。
+                // 刷新率模块按 pid 解析包名; CPU 亲和性按 uid 取该应用全部进程
+                // (cgroup apps; 主进程 + pkg: 子进程共享 uid, 规避 pid 归因盲区)。
                 let fd = FG_SEND_FD.load(Ordering::Acquire);
                 if fd >= 0 {
                     let pkt = [pid, uid];

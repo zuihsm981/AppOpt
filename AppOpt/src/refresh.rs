@@ -115,7 +115,7 @@ pub struct RefreshStatus {
     pub available: Vec<i32>,
     /// 设备全部显示模式 (格式化: "id|WxH Hz"), 供 web 展示
     pub device_modes: std::sync::Arc<Vec<String>>,
-    /// 内核 input 触摸 kprobe 是否已武装
+    /// 用户态触摸监听是否就绪 (event_probe::TOUCH_LISTENING)
     pub input_hooked: bool,
     /// 距上次 input 事件秒数 (-1 = 无事件)
     pub last_input_secs: i64,
@@ -133,6 +133,13 @@ struct AppRefreshConfig {
     idle_mode: i32,
 }
 
+/// 刷新率三参数 (active/idle/timeout); global=全局默认, effective=当前生效 (应用级覆盖)
+struct RateConfig {
+    active: i32,
+    idle: i32,
+    timeout: i32,
+}
+
 struct RefreshState {
     /// 设备实际显示模式 id: [120Hz 模式, 90Hz 模式, 60Hz 模式]
     /// (binder 1035 的 i32 参数 = 显示模式 id; 由初始化 dumpsys 解析自动检测)
@@ -141,13 +148,11 @@ struct RefreshState {
     available_modes: [bool; 3],
     /// 设备全部显示模式 (格式化: "id|WxH Hz")
     device_modes: std::sync::Arc<Vec<String>>,
-    timeout_seconds: i32,
-    active_mode: i32,
-    idle_mode: i32,
+    /// 全局默认配置 (从 refresh_* 字段加载)
+    global: RateConfig,
     app_configs: HashMap<String, AppRefreshConfig>,
-    current_active: i32,
-    current_idle: i32,
-    current_timeout: i32,
+    /// 当前生效配置 (全局默认, 或被应用级配置覆盖)
+    effective: RateConfig,
     current_applied_mode: i32,
     is_paused: bool,
     timer_enabled: bool,
@@ -161,16 +166,16 @@ struct RefreshState {
 fn load_global_config(state: &mut RefreshState) {
     let cfg = crate::rw_read_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
     let Some(cfg) = cfg else { return };
-    state.timeout_seconds = cfg.refresh_timeout;
-    state.active_mode = cfg.refresh_active;
-    state.idle_mode = cfg.refresh_idle;
-    state.current_active = state.active_mode;
-    state.current_idle = state.idle_mode;
-    state.current_timeout = state.timeout_seconds;
-    state.timer_enabled = state.current_idle != state.current_active;
+    state.global.timeout = cfg.refresh_timeout;
+    state.global.active = cfg.refresh_active;
+    state.global.idle = cfg.refresh_idle;
+    state.effective.active = state.global.active;
+    state.effective.idle = state.global.idle;
+    state.effective.timeout = state.global.timeout;
+    state.timer_enabled = state.effective.idle != state.effective.active;
     // 用户态触摸监听按需启停: 活跃==空闲(无需 input 切换)暂停监听, 切换应用
     // 后按新规则恢复 (KPM 模式此开关同样生效, 避免双源)
-    crate::touch_probe::set_enabled(state.timer_enabled);
+    crate::event_probe::set_enabled(state.timer_enabled);
 }
 
 /// 从共享 CURRENT_CONFIG 读取按应用刷新率配置（统一加载）
@@ -216,22 +221,22 @@ fn apply_app_config(state: &mut RefreshState, pkg: &str) {
     // 即使配置文件中残留同名刷新率行，也不能把桌面切到应用级覆盖值。
     if pkg != crate::config::DEFAULT_REFRESH_PACKAGE {
         if let Some(cfg) = state.app_configs.get(pkg) {
-            state.current_timeout = cfg.timeout;
-            state.current_active = cfg.active_mode;
-            state.current_idle = cfg.idle_mode;
+            state.effective.timeout = cfg.timeout;
+            state.effective.active = cfg.active_mode;
+            state.effective.idle = cfg.idle_mode;
         } else {
-            state.current_timeout = state.timeout_seconds;
-            state.current_active = state.active_mode;
-            state.current_idle = state.idle_mode;
+            state.effective.timeout = state.global.timeout;
+            state.effective.active = state.global.active;
+            state.effective.idle = state.global.idle;
         }
     } else {
-        state.current_timeout = state.timeout_seconds;
-        state.current_active = state.active_mode;
-        state.current_idle = state.idle_mode;
+        state.effective.timeout = state.global.timeout;
+        state.effective.active = state.global.active;
+        state.effective.idle = state.global.idle;
     }
-    state.timer_enabled = state.current_idle != state.current_active;
+    state.timer_enabled = state.effective.idle != state.effective.active;
     // 同步触摸监听开关 (与 load_global_config 一致): 应用级配置切换后保持状态同步
-    crate::touch_probe::set_enabled(state.timer_enabled);
+    crate::event_probe::set_enabled(state.timer_enabled);
 }
 
 fn timerfd_set(fd: i32, seconds: i32) {
@@ -262,17 +267,17 @@ fn reset_timer(state: &mut RefreshState, force: bool) {
     }
     let now = Instant::now();
     if !force
-        && state.current_applied_mode == state.current_active
-        && state.current_active != state.current_idle
+        && state.current_applied_mode == state.effective.active
+        && state.effective.active != state.effective.idle
     {
-        let debounce = std::time::Duration::from_secs((state.current_timeout - 10).max(0) as u64);
+        let debounce = std::time::Duration::from_secs((state.effective.timeout - 10).max(0) as u64);
         if let Some(last) = state.last_reset_time {
             if now - last < debounce {
                 return;
             }
         }
     }
-    timerfd_set(state.timer_fd, state.current_timeout);
+    timerfd_set(state.timer_fd, state.effective.timeout);
     state.last_reset_time = Some(now);
 }
 
@@ -280,7 +285,7 @@ fn switch_to_idle(state: &mut RefreshState) {
     if !state.timer_enabled {
         return;
     }
-    set_refresh_rate(state, state.current_idle);
+    set_refresh_rate(state, state.effective.idle);
     state.is_paused = true;
     timerfd_cancel(state.timer_fd);
     state.last_reset_time = None;
@@ -294,7 +299,7 @@ fn try_apply_fg_pkg(state: &mut RefreshState, pkg: &str) -> bool {
     }
     state.current_package = pkg.to_string();
     apply_app_config(state, pkg);
-    set_refresh_rate(state, state.current_active);
+    set_refresh_rate(state, state.effective.active);
     reset_timer(state, true);
     true
 }
@@ -312,7 +317,7 @@ fn handle_input(state: &mut RefreshState) {
 
     if state.last_reset_time.is_none() {
         // 计时器已停止（空闲状态）：切回活跃刷新率 + 重启计时器
-        set_refresh_rate(state, state.current_active);
+        set_refresh_rate(state, state.effective.active);
         state.is_paused = false;
         reset_timer(state, true);
     } else {
@@ -327,7 +332,7 @@ fn check_config(state: &mut RefreshState) {
         load_app_configs(state);
         let current_pkg = state.current_package.clone();
         apply_app_config(state, &current_pkg);
-        set_refresh_rate(state, state.current_active);
+        set_refresh_rate(state, state.effective.active);
         if state.last_reset_time.is_some() {
             reset_timer(state, true);
         }
@@ -341,9 +346,9 @@ fn update_status(state: &RefreshState) {
         timer_enabled: state.timer_enabled,
         timer_running: state.last_reset_time.is_some(),
         current_package: state.current_package.clone(),
-        timeout: state.current_timeout,
-        active_mode: state.current_active,
-        idle_mode: state.current_idle,
+        timeout: state.effective.timeout,
+        active_mode: state.effective.active,
+        idle_mode: state.effective.idle,
         available: {
             let mut v = Vec::new();
             if state.available_modes[0] { v.push(120); }
@@ -352,7 +357,7 @@ fn update_status(state: &RefreshState) {
             v
         },
         device_modes: std::sync::Arc::clone(&state.device_modes),
-        input_hooked: crate::touch_probe::TOUCH_LISTENING.load(Ordering::Relaxed),
+        input_hooked: crate::event_probe::TOUCH_LISTENING.load(Ordering::Relaxed),
         last_input_secs: state
             .last_input_time
             .map(|t| t.elapsed().as_secs() as i64)
@@ -390,13 +395,9 @@ pub fn refresh_init(display_modes: std::thread::JoinHandle<Vec<(u32, u32, u32, f
     // 初始化一次性解析 dumpsys display 的显示模式: 已在 L1 并发线程完成, join 取结果
     let device_modes_raw = display_modes.join().unwrap_or_default();
     let mut state = RefreshState {
-        timeout_seconds: 30,
-        active_mode: MODE_120,
-        idle_mode: MODE_60,
+        global: RateConfig { active: MODE_120, idle: MODE_60, timeout: 30 },
         app_configs: HashMap::new(),
-        current_active: MODE_120,
-        current_idle: MODE_60,
-        current_timeout: 30,
+        effective: RateConfig { active: MODE_120, idle: MODE_60, timeout: 30 },
         current_applied_mode: -1,
         rate_args: detect_rate_args(&device_modes_raw),
         available_modes: detect_available_modes(&device_modes_raw),
@@ -423,7 +424,7 @@ pub fn refresh_init(display_modes: std::thread::JoinHandle<Vec<(u32, u32, u32, f
 
         // 初始化先应用一次全局 active 刷新率 (异步: 在后台线程执行 SF binder,
         // 不阻塞主初始化; launcher 的全局刷新率绑定由主线程 uid 表驱动。
-        let active = state.current_active;
+        let active = state.effective.active;
         set_refresh_rate(&mut state, active);
 
         let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
@@ -671,8 +672,6 @@ pub fn refresh_get_status() -> Option<RefreshStatus> {
     crate::lock_ignore_poison(&REFRESH_STATUS).clone()
 }
 
-/// 解析 `dumpsys display` 支持的显示模式 (display_modes.sh v3/v2 同款文本解析):
-/// 返回 (mode_id, width, height, fps)。失败/无输出返回空表。
 /// 解析 `dumpsys display` 的显示模式 (模仿命令行):
 ///   dumpsys display | grep 'DisplayMode{id=' | awk -F'[,{}]' '{... peakRefreshRate= ...}'
 /// 即: 只处理含 `DisplayMode{id=` 的行; 以 `,` `{` `}` 为分隔符切分整行;

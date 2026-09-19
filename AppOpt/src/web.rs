@@ -44,7 +44,7 @@ pub fn init_uclamp_support() {
 /// KPM 模式是否活跃 (main 在 ebpf_state 置位/卸载时更新)
 pub static KPM_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// 线程放置延迟 (ms): 冷启动 ApplyPkg 后延迟枚举 uid 全部 pid 设亲和的时间
+/// 线程放置延迟 (ms): 冷启动 ApplyPkg 后延迟取该 uid 全部 pid (cgroup) 设亲和的时间
 /// (默认 2000 = 原 ENUM_DELAY 2s), web 设置项可调, 持久化于 AppOpt.json
 pub static AFFINITY_DELAY_MS: AtomicU64 = AtomicU64::new(2000);
 
@@ -261,69 +261,85 @@ fn spec_name(cpus: &CpuSet, topo: &CpuTopology) -> String {
     cpus.to_range_string()
 }
 
+/// /api/status 快照: 设备信息 / CPU 统计 / 刷新率统计 三段拼装
 fn status_json() -> String {
     let cfg = crate::config::current_cfg();
     let topo = cfg.as_ref().map(|c| &c.topo);
-    // 仅 KPM 模式: 前端轮询即实时读 CPU worker 发布的 CPU_STATS
+    let mut j = serde_json::Map::new();
+    j.extend(device_info(topo));
+    j.extend(cpu_stats(cfg.as_deref()));
+    j.extend(rf_stats(cfg.as_deref()));
+    serde_json::Value::Object(j).to_string()
+}
+
+/// 段 1: 设备/连接信息 (mode / 触摸监听 / 拓扑 / uclamp 支持)
+fn device_info(topo: Option<&crate::cpuset::CpuTopology>) -> serde_json::Map<String, serde_json::Value> {
     let connected = KPM_ACTIVE.load(Ordering::Relaxed);
+    let uptime = START.get().map(|t| t.elapsed().as_secs()).unwrap_or(0);
+    let mut m = serde_json::Map::new();
+    m.insert("version".into(), json!(env!("CARGO_PKG_VERSION")));
+    m.insert("mode".into(), json!(drive_mode()));
+    m.insert("connected".into(), json!(connected));
+    m.insert("touch_listening".into(), json!(crate::event_probe::TOUCH_LISTENING.load(Ordering::Relaxed)));
+    m.insert("touch_event".into(), json!(crate::event_probe::touch_event_name()));
+    // 直接读原子量 (与 refresh::update_status 的 input_hooked 同源),
+    // 避免 /api/status 第二次触发 refresh_get_status (STATUS_REQ+wake)
+    m.insert("input_hooked".into(), json!(crate::event_probe::TOUCH_LISTENING.load(Ordering::Relaxed)));
+    m.insert("uptime".into(), json!(uptime));
+    m.insert("e_core".into(), json!(topo.map(|t| t.e_core.to_range_string()).unwrap_or_default()));
+    m.insert("p_core".into(), json!(topo.map(|t| t.p_core.to_range_string()).unwrap_or_default()));
+    m.insert("hp_core".into(), json!(topo.map(|t| t.hp_core.to_range_string()).unwrap_or_default()));
+    m.insert("all_core".into(), json!(topo.map(|t| t.present_str.clone()).unwrap_or_default()));
+    m.insert("uclamp_supported".into(), json!(UCLAMP_SUPPORTED.load(Ordering::Relaxed)));
+    m.insert("cores".into(), json!(topo.map(|t| t.present_cpus.count()).unwrap_or(0)));
+    m.insert("cpuset_enabled".into(), json!(topo.is_some_and(|t| t.cpuset_enabled)));
+    m
+}
+
+/// 段 2: CPU 运行统计 (规则数 / 命中应用 / 绑定线程 / parse_fail)
+fn cpu_stats(cfg: Option<&crate::config::AppConfig>) -> serde_json::Map<String, serde_json::Value> {
+    // 仅 KPM 模式: 前端轮询即实时读 CPU worker 发布的 CPU_STATS
     let (threads, hit_pkgs, hit_list) = crate::cpu_affinity::cpu_stats();
-    let (rules, pkgs) = match cfg.as_ref() {
+    let (rules, pkgs) = match cfg {
         Some(c) => (c.rules.len(), c.pkgs.len()),
         None => (0, 0),
     };
-    let uptime = START.get().map(|t| t.elapsed().as_secs()).unwrap_or(0);
-    // 刷新率状态专用统计: 只统计有刷新率配置的应用 (只有线程规则且无刷新率
-    // 配置的应用不影响刷新率, 不计入)
-    let (rf_rules, rf_hit_pkgs, rf_hit_list) = {
-        let rf_apps: HashSet<&str> = cfg
-            .as_ref()
-            .map(|c| c.app_refresh_configs.keys().map(String::as_str).collect())
-            .unwrap_or_default();
-        let rf_rules = rf_apps.len();
-        // 刷新率命中不能从 CPU hit_list 派生 (仅刷新率应用不在 CPU 命中里, 恒空);
-        // 取 refresh 状态当前被应用级配置驱动的前台包 (launcher 用全局 → 不计)
-        let cur = crate::refresh::refresh_get_status()
-            .map(|s| s.current_package)
-            .unwrap_or_default();
-        let rf_hit_list: Vec<String> = if cur.is_empty()
-            || cur == crate::config::DEFAULT_REFRESH_PACKAGE
-            || !rf_apps.contains(cur.as_str())
-        {
-            Vec::new()
-        } else {
-            vec![cur]
-        };
-        (rf_rules, rf_hit_list.len(), rf_hit_list)
+    let mut m = serde_json::Map::new();
+    m.insert("rules".into(), json!(rules));
+    m.insert("pkgs".into(), json!(pkgs));
+    m.insert("parse_fail".into(), json!(PARSE_FAILS.load(Ordering::Relaxed)));
+    m.insert("hit_pkgs".into(), json!(hit_pkgs));
+    m.insert("hit_list".into(), json!(hit_list));
+    m.insert("threads".into(), json!(threads));
+    m.insert("total_procs".into(), json!(sys_procs()));
+    m
+}
+
+/// 段 3: 刷新率统计 (只统计有刷新率配置的应用; 只有线程规则且无刷新率
+/// 配置的应用不影响刷新率, 不计入)
+fn rf_stats(cfg: Option<&crate::config::AppConfig>) -> serde_json::Map<String, serde_json::Value> {
+    let rf_apps: HashSet<&str> = cfg
+        .map(|c| c.app_refresh_configs.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    let rf_rules = rf_apps.len();
+    // 刷新率命中不能从 CPU hit_list 派生 (仅刷新率应用不在 CPU 命中里, 恒空);
+    // 取 refresh 状态当前被应用级配置驱动的前台包 (launcher 用全局 → 不计)
+    let cur = crate::refresh::refresh_get_status()
+        .map(|s| s.current_package)
+        .unwrap_or_default();
+    let rf_hit_list: Vec<String> = if cur.is_empty()
+        || cur == crate::config::DEFAULT_REFRESH_PACKAGE
+        || !rf_apps.contains(cur.as_str())
+    {
+        Vec::new()
+    } else {
+        vec![cur]
     };
-    json!({
-        "version": env!("CARGO_PKG_VERSION"),
-        "mode": drive_mode(),
-        "connected": connected,
-        "touch_listening": crate::touch_probe::TOUCH_LISTENING.load(Ordering::Relaxed),
-        "touch_event": crate::touch_probe::touch_event_name(),
-        // 直接读原子量 (与 refresh::update_status 的 input_hooked 同源),
-        // 避免 /api/status 第二次触发 refresh_get_status (STATUS_REQ+wake)
-        "input_hooked": crate::touch_probe::TOUCH_LISTENING.load(Ordering::Relaxed),
-        "uptime": uptime,
-        "rules": rules,
-        "pkgs": pkgs,
-        "parse_fail": PARSE_FAILS.load(Ordering::Relaxed),
-        "hit_pkgs": hit_pkgs,
-        "hit_list": hit_list,
-        "threads": threads,
-        "total_procs": sys_procs(),
-        "rf_rules": rf_rules,
-        "rf_hit_pkgs": rf_hit_pkgs,
-        "rf_hit_list": rf_hit_list,
-        "e_core": topo.map(|t| t.e_core.to_range_string()).unwrap_or_default(),
-        "p_core": topo.map(|t| t.p_core.to_range_string()).unwrap_or_default(),
-        "hp_core": topo.map(|t| t.hp_core.to_range_string()).unwrap_or_default(),
-        "all_core": topo.map(|t| t.present_str.clone()).unwrap_or_default(),
-        "uclamp_supported": UCLAMP_SUPPORTED.load(Ordering::Relaxed),
-        "cores": topo.map(|t| t.present_cpus.count()).unwrap_or(0),
-        "cpuset_enabled": topo.is_some_and(|t| t.cpuset_enabled),
-    })
-    .to_string()
+    let mut m = serde_json::Map::new();
+    m.insert("rf_rules".into(), json!(rf_rules));
+    m.insert("rf_hit_pkgs".into(), json!(rf_hit_list.len()));
+    m.insert("rf_hit_list".into(), json!(rf_hit_list));
+    m
 }
 
 fn rules_json() -> String {
@@ -360,7 +376,6 @@ fn rules_json() -> String {
     json!({ "rules": groups }).to_string()
 }
 
-/// 名称校验
 fn token_ok(s: &str, max: usize) -> bool {
     let t = s.trim();
     !t.is_empty()
