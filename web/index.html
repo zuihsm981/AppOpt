@@ -148,6 +148,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 .uclamp-chips{display:flex;gap:8px;flex-wrap:wrap}
 .uclamp-chips button{padding:7px 12px;border-radius:999px;font-size:12px;background:rgba(118,118,128,.12);transition:all .15s;cursor:pointer;min-width:56px;text-align:center}
 .uclamp-chips button.on{background:var(--blue);color:#fff;font-weight:600}
+.uclamp-custom{width:110px;padding:7px 10px;border-radius:999px;font-size:12px;background:var(--bg);border:1px solid var(--border);outline:none;font-family:inherit;color:var(--fg);text-align:center}
 
 </style>
 </head>
@@ -604,12 +605,18 @@ function specOf(r){
 }
 const CHIP_HTML=[['e-core','e-core 小核'],['p-core','p-core 中核'],['hp-core','hp-core 大核'],['all-core','all-core 全部'],['自定义','自定义']]
   .map(([c,t])=>`<button data-core="${c}" title="${t}">${c}</button>`).join('');
-// uclamp 档位 chips (点击选中 / 再点取消=默认不设)
-const UCLAMP_OPTS=[0,128,256,512,768,1024];
+// uclamp 档位 chips (百分比: 0/25/50/75/100% + 自定义; 点击选中 / 再点取消=默认不设)
+// 显示层用百分比, 存储层仍是 0-1024 数值: 百分比 = 数值÷1024×100%
+const UCLAMP_OPTS=[0,256,512,768,1024];
+const pctOf=v=>v==null?'':Math.round(v/1024*100)+'%';
 function renderUclampChips(el,r){
   el.querySelectorAll('.uclamp-chips').forEach(box=>{
     const k=box.dataset.uk==='max'?'uclampMax':'uclampMin';
-    box.innerHTML=UCLAMP_OPTS.map(v=>`<button data-v="${v}" class="${r[k]===v?'on':''}">${v}</button>`).join('');
+    const v=r[k];
+    const customSel=v!=null&&!UCLAMP_OPTS.includes(v);
+    box.innerHTML=UCLAMP_OPTS.map(x=>`<button data-v="${x}" class="${v===x?'on':''}">${pctOf(x)}</button>`).join('')
+      +`<button data-v="custom" class="${customSel?'on':''}">自定义</button>`
+      +`<input class="uclamp-custom" placeholder="如 55%" value="${customSel?Math.round(v/1024*100):''}" ${customSel?'':'hidden'}>`;
   });
 }
 function applyRowTopo(el){
@@ -691,6 +698,15 @@ $('mr-rows').addEventListener('click',e=>{
   if(ukb){
     const el=ukb.closest('[data-ri]'),r=mrRows[+el.dataset.ri];
     const k=ukb.closest('.uclamp-chips').dataset.uk==='max'?'uclampMax':'uclampMin';
+    if(ukb.dataset.v==='custom'){
+      // 自定义: 显示内联输入框 (预填当前百分比), 输入实时换算 0-1024
+      const input=ukb.closest('.uclamp-chips').querySelector('.uclamp-custom');
+      const cur=r[k];
+      ukb.classList.add('on'); // 立即高亮 (像线程配置; 输入后 render 按 customSel 保持)
+      input.value=cur==null?'':String(Math.round(cur/1024*100));
+      input.hidden=false;
+      return;
+    }
     const v=+ukb.dataset.v;
     r[k]=r[k]===v?null:v; // 再点已选项 = 取消 (默认不设)
     renderUclampChips(el,r);
@@ -713,6 +729,13 @@ $('mr-rows').addEventListener('input',e=>{
   if(!r)return;
   if(e.target.classList.contains('rr-thread'))r.thread=e.target.value.trim();
   if(e.target.classList.contains('rr-custom'))r.customVal=e.target.value;
+  if(e.target.classList.contains('uclamp-custom')){
+    // 百分比输入 → 忽略小数点 + 钳制 0-100 → 换算 0-1024 数值
+    const box=e.target.closest('.uclamp-chips');
+    const k=box.dataset.uk==='max'?'uclampMax':'uclampMin';
+    const raw=parseInt(e.target.value,10);
+    r[k]=Number.isNaN(raw)?null:Math.round(Math.min(100,Math.max(0,raw))/1024*100);
+  }
 });
 $('mr-addrow').onclick=()=>{mrRows.push(mkRow({}));renderRows();const m=$('mr-addrow').closest('.modal');m.scrollTop=m.scrollHeight};
 let mrMode='add-pkg',mrOldThread='',mrOldPkg='',mrOldThreads=new Set(),mrHadPkgRule=false;
