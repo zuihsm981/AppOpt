@@ -5,33 +5,33 @@ on:
 
 jobs:
   build-android-arm64:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      
+
       - uses: dtolnay/rust-toolchain@nightly
         with:
           targets: aarch64-linux-android
-          
+
       # 【彻底替换 cross】：使用 cargo-ndk，这是目前 Rust 编译 Android 最标准的方案
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-ndk
-          
+
       # 【彻底解决 -lunwind 缺失】：安装最新版 NDK r26b
       - name: Install Android NDK
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r26b
-          
+
       # 【修复 web 目录缺失】：复制 web 文件夹到 AppOpt 内部
       - name: Copy web directory
         run: cp -r web AppOpt/web
-        
+
       - name: Build for Android
         # cargo ndk 会自动处理所有 sysroot 和链接器参数，无需手动配置 .cargo/config.toml
         run: cd AppOpt && cargo ndk -t arm64-v8a build --release
-        
+
       # 【修复 path 缺失】：确保 path 参数存在且缩进严格为 10 个空格
       - uses: actions/upload-artifact@v4
         with:
