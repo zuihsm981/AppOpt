@@ -211,15 +211,11 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="card">
 <div class="card-title">全局配置</div>
 <div class="row"><span class="label">最大刷新率</span>
-<select id="rf-active" style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:14px;font-family:inherit">
-<option value="120">120Hz</option><option value="90">90Hz</option><option value="60">60Hz</option>
-</select></div>
+<div class="core-chips" id="rf-active-chips"></div></div>
 <div class="row"><span class="label">空闲刷新率</span>
-<select id="rf-idle" style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:14px;font-family:inherit">
-<option value="120">120Hz</option><option value="90">90Hz</option><option value="60">60Hz</option>
-</select></div>
+<div class="core-chips" id="rf-idle-chips"></div></div>
 <div class="row"><span class="label">空闲超时(秒)</span><input id="rf-timeout" type="number" min="1" max="3600" style="width:80px;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:14px;font-family:inherit"></div>
-<div style="margin-top:10px;text-align:right"><button class="btn" id="rf-save">保存全局配置</button></div>
+<div style="margin-top:10px;text-align:right"><button class="btn" id="rf-save">保存配置</button></div>
 </div>
 </div>
 </section>
@@ -255,7 +251,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="card">
 <div class="card-title">线程延迟放置</div>
 <div class="field"><input id="c-delay" type="number" min="0" max="60000" step="100" placeholder="2000"><button class="btn" id="c-delay-save">保存</button></div>
-<div class="hint">应用刚启动的时候出现部分线程没有正确设置cpus时调整，默认：2000  单位：ms</div>
+<div class="hint">如果出现部分线程没有正确设置时尝试调整<br>默认：2000ms</div>
 </div>
 <div class="card">
 <div class="card-title">关于</div>
@@ -415,8 +411,7 @@ async function loadRefreshOnce(){
     rfAvail=cfg.available&&cfg.available.length?cfg.available:[120,90,60];
     lastRefreshCfg=cfg;
     renderDeviceRates(cfg);
-    applyRateOptions($('rf-active'),rfAvail,cfg.active);
-    applyRateOptions($('rf-idle'),rfAvail,cfg.idle);
+    applyGlobalRfChips(cfg.active,cfg.idle);
   }catch(e){}
 }
 // 轮询可见性管理: 仅前端打开/可见时轮询; 隐藏/失焦/关闭页面即停止
@@ -651,17 +646,17 @@ ${r.pkgRow
 <div class="core-chips">${CHIP_HTML}</div>
 <input class="rr-custom" placeholder="CPU 范围，如 0-3,6" value="${esc(r.customVal||'')}" hidden>
 ${uclampSupported?`<div class="rr-uclamp-fold">
-  <button class="uclamp-add-btn" type="button">＋ 利用率规则</button>
+  <button class="uclamp-add-btn" type="button">＋ 利用率钳制规则</button>
   <div class="rr-uclamp-row" hidden>
     <div class="rr-uclamp-col">
       <div class="rr-uclamp-head">
-        <span class="label">CPU最小利用率限制·可选</span>
-        <button class="icon-btn danger rr-uclamp-del" title="移除 利用率规则">${ICO_TRASH}</button>
+        <span class="label">CPU最小利用率钳制·可选</span>
+        <button class="icon-btn danger rr-uclamp-del" title="移除 利用率钳制规则">${ICO_TRASH}</button>
       </div>
       <span class="uclamp-chips" data-uk="min"></span>
     </div>
     <div class="rr-uclamp-col">
-      <div class="rr-uclamp-head"><span class="label">CPU最大利用率限制·可选</span></div>
+      <div class="rr-uclamp-head"><span class="label">CPU最大利用率钳制·可选</span></div>
       <span class="uclamp-chips" data-uk="max"></span>
     </div>
   </div>
@@ -1013,8 +1008,7 @@ async function loadRefresh(){
     rfAvail=cfg.available&&cfg.available.length?cfg.available:[120,90,60];
     lastRefreshCfg=cfg;
     renderDeviceRates(cfg);
-    applyRateOptions($('rf-active'),rfAvail,cfg.active);
-    applyRateOptions($('rf-idle'),rfAvail,cfg.idle);
+    applyGlobalRfChips(cfg.active,cfg.idle);
     rfTimer=setInterval(async()=>{
       try{
         const[s,st0]=await Promise.all([api('/api/refresh/status'),api('/api/status')]);
@@ -1051,16 +1045,36 @@ function renderDeviceRates(cfg){
   if(rfDeviceExpanded&&details.length)el.innerHTML=details.map(esc).join('<br>');
   else el.textContent=rates.map(r=>r+'Hz').join(' / ');
 }
-// 按可用刷新率过滤 <select> 选项; keep 存在且可用则选中, 否则选第一项
-function applyRateOptions(sel,avail,keep){
-  if(!Array.isArray(avail)||!avail.length)return;
-  [...sel.options].forEach(o=>{if(!avail.includes(Number(o.value)))o.remove()});
-  if(keep!==undefined&&[...sel.options].some(o=>o.value===String(keep)))sel.value=String(keep);
-  else if(sel.options.length)sel.value=sel.options[0].value;
+// 全局刷新率 chips: 按设备可用刷新率 (rfAvail) 渲染; 单选强制 (点选切换, 不允许取消)
+let rfActive=120, rfIdle=60;
+function applyGlobalRfChips(active,idle){
+  const av=rfAvail&&rfAvail.length?rfAvail:[120,90,60];
+  rfActive=av.includes(+active)?+active:av[0];
+  rfIdle=av.includes(+idle)?+idle:av[0];
+  renderGlobalRfChips();
 }
+function renderGlobalRfChips(){
+  const av=rfAvail&&rfAvail.length?rfAvail:[120,90,60];
+  $('rf-active-chips').innerHTML=av.map(r=>`<button data-rf="${r}" class="${rfActive===r?'on':''}">${r}Hz</button>`).join('');
+  $('rf-idle-chips').innerHTML=av.map(r=>`<button data-rf="${r}" class="${rfIdle===r?'on':''}">${r}Hz</button>`).join('');
+}
+function bindGlobalRfChips(){
+  $('rf-active-chips').addEventListener('click',e=>{
+    const b=e.target.closest('[data-rf]');if(!b)return;
+    const r=+b.dataset.rf;
+    if(rfActive!==r){rfActive=r;renderGlobalRfChips();}
+  });
+  $('rf-idle-chips').addEventListener('click',e=>{
+    const b=e.target.closest('[data-rf]');if(!b)return;
+    const r=+b.dataset.rf;
+    if(rfIdle!==r){rfIdle=r;renderGlobalRfChips();}
+  });
+}
+bindGlobalRfChips();
+renderGlobalRfChips(); // 初始渲染 (预览/无后端时用默认 [120,90,60]); loadRefresh 成功后回填选中值
 $('rf-device-wrap').onclick=()=>{rfDeviceExpanded=!rfDeviceExpanded;renderDeviceRates(lastRefreshCfg)};
 $('rf-save').onclick=async()=>{
-  try{await api('/api/refresh/config',{timeout:Math.max(1,+$('rf-timeout').value||30),active:$('rf-active').value,idle:$('rf-idle').value});toast('已保存');loadRefresh()}
+  try{await api('/api/refresh/config',{timeout:Math.max(1,+$('rf-timeout').value||30),active:String(rfActive),idle:String(rfIdle)});toast('已保存');loadRefresh()}
   catch(e){toast(e.message)}
 };
 startStat();
