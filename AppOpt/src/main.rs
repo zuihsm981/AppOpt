@@ -316,6 +316,8 @@ struct AppState {
     pkg_uid: HashMap<String, i32>,
     cpu_pkgs_set: HashSet<String>,
     rfr_pkgs_set: HashSet<String>,
+    /// 已下发给内核的 service list 伪装开关 (差量下发, 仅应用切换时调整)
+    srv_active_cur: bool,
 }
 
 impl AppState {
@@ -337,12 +339,40 @@ impl AppState {
             pkg_uid,
             cpu_pkgs_set,
             rfr_pkgs_set,
+            srv_active_cur: false,
         }
     }
 
     /// 配置重载 (EV_INOTIFY / EV_CONFIG 共用): 重载配置 → 应用到当前模式 →
     /// 仅"规则应用集合"变更时重建 uid 表 (调整数值不重建)
+    /// KPM 武装/解除 (拦截页连接/断开): start=武装全功能, stop=解除
+    fn set_kpm_arm(&self, arm: bool) {
+        if let Some(es) = self.ebpf_state.as_ref() {
+            if arm {
+                es.bpf.arm();
+            } else {
+                es.bpf.disarm();
+            }
+            crate::web::KPM_ARMED.store(arm, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     fn reload(&mut self) {
+        // 拦截页连接/断开: 武装请求 (在模块加载/激活前提下执行)
+        match crate::config::take_kpm_arm_req() {
+            1 => self.set_kpm_arm(true),
+            -1 => self.set_kpm_arm(false),
+            _ => {}
+        }
+        // waylay 配置保存 (web /api/waylay): 同步替换字符到内核 (目标 uid 集合已由
+        // save_waylay 更新静态, 下一次前台回调差量生效)
+        if crate::config::take_waylay_changed() {
+            if let Some(es) = self.ebpf_state.as_ref() {
+                let f = crate::rw_read_ignore_poison(&crate::config::WAYLAY_FROM).clone();
+                let t = crate::rw_read_ignore_poison(&crate::config::WAYLAY_TO).clone();
+                es.bpf.srv_set(&f, &t);
+            }
+        }
         let cpu_changed = crate::config::take_cpu_rules_changed();
         self.cfg = rw_read_ignore_poison(&CURRENT_CONFIG).clone();
         // 先重建 uid 表 (新加规则包的 uid 进 pkg_uid), 再重放/全量 ——
@@ -376,7 +406,18 @@ impl AppState {
 
     /// binder 前台回调 (pid+uid): 查 uid 表分发 CPU (冷启动 ApplyPkg + pidfd watch)
     /// 与刷新率 (包名) —— 原 EV_FG 分支主体
-    fn on_fg(&self, pid: i32, uid: i32) {
+    fn on_fg(&mut self, pid: i32, uid: i32) {
+        // service list 伪装: 前台回调驱动开关 —— 前台 uid 命中 waylay 目标应用集
+        // (waylay.conf, 默认空 → 不激活), 命中则激活无差别替换, 否则关闭;
+        // 差量下发: 仅状态变化才发 supercall (幂等, 避免每次回调冗余往返);
+        // 时机先于应用的业务查询, 不晚
+        let want = crate::rw_read_ignore_poison(&crate::config::WAYLAY_UIDS).contains(&uid);
+        if want != self.srv_active_cur {
+            self.srv_active_cur = want;
+            if let Some(es) = self.ebpf_state.as_ref() {
+                es.bpf.srv_active(want);
+            }
+        }
         let Some(e) = self.uid_map.get(&uid) else { return };
         // CPU 规则: 冷热判断 (cpu_known 中 uid+pid 一致=热)
         if e.cpu {
@@ -544,6 +585,9 @@ fn main() {
     }
 
     init_inotify(&config_file);
+
+    // waylay (service list 拦截伪装) 独立配置: 启动加载 (字符 + 目标应用 uid 集合)
+    crate::config::waylay_load_static();
 
     if web_enable {
         web_start();

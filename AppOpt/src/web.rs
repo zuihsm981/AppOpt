@@ -43,6 +43,8 @@ pub fn init_uclamp_support() {
 
 /// KPM 模式是否活跃 (main 在 ebpf_state 置位/卸载时更新)
 pub static KPM_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// KPM 模块是否已武装 (拦截页 连接/断开 控制; start/stop)
+pub static KPM_ARMED: AtomicBool = AtomicBool::new(false);
 
 /// 线程放置延迟 (ms): 冷启动 ApplyPkg 后延迟取该 uid 全部 pid (cgroup) 设亲和的时间
 /// (默认 2000 = 原 ENUM_DELAY 2s), web 设置项可调, 持久化于 AppOpt.json
@@ -215,6 +217,8 @@ fn dispatch(out: &mut TcpStream, req: &Request) {
         ("GET", "/api/refresh/status") => (200, refresh_status_json()),
         ("GET", "/api/refresh/config") => (200, refresh_config_json()),
         ("POST", "/api/refresh/config") => refresh_config_set_api(req),
+        ("GET", "/api/waylay") => (200, waylay_json()),
+        ("POST", "/api/waylay") => waylay_set_api(req),
         ("GET", "/api/refresh/apps") => (200, refresh_apps_json()),
         ("POST", "/api/refresh/app") => refresh_app_add_api(req),
         ("POST", "/api/refresh/app/del") => refresh_app_del_api(req),
@@ -278,7 +282,11 @@ fn device_info(topo: Option<&crate::cpuset::CpuTopology>) -> serde_json::Map<Str
     let uptime = START.get().map(|t| t.elapsed().as_secs()).unwrap_or(0);
     let mut m = serde_json::Map::new();
     m.insert("version".into(), json!(env!("CARGO_PKG_VERSION")));
-    m.insert("mode".into(), json!(drive_mode()));
+    // 工作模式 = 实际武装状态 (设置项模式已移除): KPM 已武装 → kpm, 否则用户态
+    m.insert(
+        "mode".into(),
+        json!(if KPM_ARMED.load(Ordering::Relaxed) { "kpm" } else { "userspace" }),
+    );
     m.insert("connected".into(), json!(connected));
     m.insert("touch_listening".into(), json!(crate::event_probe::TOUCH_LISTENING.load(Ordering::Relaxed)));
     m.insert("touch_event".into(), json!(crate::event_probe::touch_event_name()));
@@ -811,6 +819,63 @@ pub fn settings_save() {
         affinity_delay_ms: AFFINITY_DELAY_MS.load(Ordering::Relaxed),
     }
     .save(SETTINGS_FILE);
+}
+
+// ===== waylay (service list 拦截伪装) Web API =====
+
+/// GET /api/waylay: 当前配置 + KPM 连接状态
+fn waylay_json() -> String {
+    let from = crate::rw_read_ignore_poison(&crate::config::WAYLAY_FROM).clone();
+    let to = crate::rw_read_ignore_poison(&crate::config::WAYLAY_TO).clone();
+    let apps = crate::rw_read_ignore_poison(&crate::config::WAYLAY_APPS).clone();
+    json!({
+        // 已连接 = KPM 模块已武装 (拦截功能随 start/stop)
+        "connected": KPM_ARMED.load(Ordering::Relaxed),
+        "from": from,
+        "to": to,
+        "apps": apps,
+    })
+    .to_string()
+}
+
+/// POST /api/waylay: 保存配置 (拦截字符/替换字符各 7 ASCII + 目标应用列表)
+fn waylay_set_api(req: &Request) -> (u16, String) {
+    let v: serde_json::Value = match serde_json::from_slice(&req.body) {
+        Ok(v) => v,
+        Err(_) => return err_json(400, "invalid json"),
+    };
+    // 连接/断开 (arm 字段非 null 时执行; 独立于配置校验, 由主循环消费 KPM_ARM_REQ)
+    if v.get("arm").is_some() && v["arm"].is_boolean() {
+        crate::config::set_kpm_arm_req(v["arm"].as_bool().unwrap_or(false));
+    }
+    let from = v["from"].as_str().unwrap_or("").to_string();
+    let to = v["to"].as_str().unwrap_or("").to_string();
+    // 等长替换: 拦截与替换字符数须一致 (非空, ≤32, ASCII)
+    if from.is_empty() || from.len() != to.len() || from.len() > 32
+        || !from.is_ascii() || !to.is_ascii()
+    {
+        return err_json(400, "拦截与替换字符数需一致 (ASCII, ≤32)");
+    }
+    let apps: Vec<String> = v["apps"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty() && !s.starts_with(&['#', '/']))
+                .collect()
+        })
+        .unwrap_or_default();
+    for a in &apps {
+        if a.len() > MAX_PKG_LEN {
+            return err_json(400, &format!("包名过长: {}", a));
+        }
+    }
+    if let Err(e) = crate::config::save_waylay(&from, &to, &apps) {
+        return err_json(500, &format!("保存失败: {}", e));
+    }
+    // 唤醒主循环: reload 消费 WAYLAY_CHANGED → 同步内核 srv_set (字符)
+    crate::config::request_config_reload();
+    (200, json!({"ok": true}).to_string())
 }
 
 // ===== 刷新率 Web API =====

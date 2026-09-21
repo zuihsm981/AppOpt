@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicI8, AtomicI32, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::UNIX_EPOCH;
 
 use crate::{lock_ignore_poison, rw_read_ignore_poison, rw_write_ignore_poison, MAX_PKG_LEN, MAX_THREAD_LEN};
@@ -38,6 +38,114 @@ pub fn request_config_reload() {
         // fd 尚未初始化 (启动早期): 直接重载
         config_reload_now();
     }
+}
+
+/* ================= waylay (service list 拦截伪装) 配置 =================
+ * 独立配置文件 waylay.conf (与 applist.conf 同目录):
+ *   srv_from=lineage    拦截目标字符 (7 字符)
+ *   srv_to=opluseu      替换字符 (7 字符, 等长)
+ *   包名一行一个        目标应用 (前台时激活拦截)
+ */
+pub const WAYLAY_FILE: &str = "waylay.conf";
+/// 拦截目标字符 (7 字符)
+pub static WAYLAY_FROM: LazyLock<RwLock<String>> =
+    LazyLock::new(|| RwLock::new("lineage".to_string()));
+/// 替换字符 (7 字符)
+pub static WAYLAY_TO: LazyLock<RwLock<String>> =
+    LazyLock::new(|| RwLock::new("opluseu".to_string()));
+/// 目标应用列表 (waylay.conf)
+pub static WAYLAY_APPS: LazyLock<RwLock<Vec<String>>> = LazyLock::new(|| RwLock::new(Vec::new()));
+/// 目标应用 uid 集合 (查 packages.list; 前台回调据此激活拦截)
+pub static WAYLAY_UIDS: LazyLock<RwLock<HashSet<i32>>> = LazyLock::new(|| RwLock::new(HashSet::new()));
+/// waylay 配置已变更 (web 保存后置位; 主循环 EV_CONFIG 分支消费并同步内核)
+pub static WAYLAY_CHANGED: AtomicBool = AtomicBool::new(false);
+/// KPM 武装请求 (拦截页连接/断开): 1=武装(start), -1=解除(stop), 0=无
+pub static KPM_ARM_REQ: AtomicI8 = AtomicI8::new(0);
+
+pub fn set_kpm_arm_req(arm: bool) {
+    KPM_ARM_REQ.store(if arm { 1 } else { -1 }, Ordering::Release);
+    request_config_reload();
+}
+
+pub fn take_kpm_arm_req() -> i8 {
+    KPM_ARM_REQ.swap(0, Ordering::AcqRel)
+}
+
+/// 解析 waylay.conf (不存在时用默认 lineage→opluseu + 空应用表)
+pub fn load_waylay() -> (String, String, Vec<String>) {
+    let mut from = "lineage".to_string();
+    let mut to = "opluseu".to_string();
+    let mut apps: Vec<String> = Vec::new();
+    if let Ok(content) = std::fs::read_to_string(WAYLAY_FILE) {
+        for line in content.lines() {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') || t.starts_with("//") {
+                continue;
+            }
+            if let Some(v) = t.strip_prefix("srv_from=") {
+                from = v.trim().to_string();
+            } else if let Some(v) = t.strip_prefix("srv_to=") {
+                to = v.trim().to_string();
+            } else if !t.starts_with("srv_") {
+                apps.push(t.to_string());
+            }
+        }
+    }
+    (from, to, apps)
+}
+
+/// 目标应用 → uid 集合 (查 packages.list; 未安装跳过)
+pub fn build_waylay_uids(apps: &[String]) -> HashSet<i32> {
+    let mut uids = HashSet::new();
+    if let Ok(content) = std::fs::read_to_string("/data/system/packages.list") {
+        for line in content.lines() {
+            let mut it = line.split_whitespace();
+            let (Some(pkg), Some(uid_s)) = (it.next(), it.next()) else { continue };
+            let Ok(uid) = uid_s.parse::<i32>() else { continue };
+            if uid >= 100000 {
+                continue;
+            }
+            if apps.iter().any(|a| a == pkg) {
+                uids.insert(uid);
+            }
+        }
+    }
+    uids
+}
+
+/// 保存 waylay.conf (tmp+rename 原子写), 更新静态并置变更标志
+pub fn save_waylay(from: &str, to: &str, apps: &[String]) -> io::Result<()> {
+    let mut out = String::from("# waylay: service list 拦截伪装配置\n");
+    out.push_str("# srv_from=拦截目标字符(7)  srv_to=替换字符(7, 等长)\n");
+    out.push_str(&format!("srv_from={}\n", from.trim()));
+    out.push_str(&format!("srv_to={}\n", to.trim()));
+    out.push_str("# 目标应用 (前台时激活拦截), 包名一行一个\n");
+    for a in apps {
+        out.push_str(&format!("{}\n", a.trim()));
+    }
+    let tmp = format!("{}.tmp", WAYLAY_FILE);
+    fs::write(&tmp, out.as_bytes())?;
+    fs::rename(&tmp, WAYLAY_FILE)?;
+    *rw_write_ignore_poison(&WAYLAY_FROM) = from.trim().to_string();
+    *rw_write_ignore_poison(&WAYLAY_TO) = to.trim().to_string();
+    *rw_write_ignore_poison(&WAYLAY_APPS) = apps.to_vec();
+    *rw_write_ignore_poison(&WAYLAY_UIDS) = build_waylay_uids(apps);
+    WAYLAY_CHANGED.store(true, Ordering::Release);
+    Ok(())
+}
+
+/// 取出并复位 waylay 变更标志
+pub fn take_waylay_changed() -> bool {
+    WAYLAY_CHANGED.swap(false, Ordering::AcqRel)
+}
+
+/// 启动/重载时把 waylay.conf 加载进静态 (默认 lineage→opluseu + 空应用表兜底)
+pub fn waylay_load_static() {
+    let (f, t, a) = load_waylay();
+    *rw_write_ignore_poison(&WAYLAY_FROM) = f;
+    *rw_write_ignore_poison(&WAYLAY_TO) = t;
+    *rw_write_ignore_poison(&WAYLAY_APPS) = a.clone();
+    *rw_write_ignore_poison(&WAYLAY_UIDS) = build_waylay_uids(&a);
 }
 pub static CONFIG_FILE: Mutex<String> = Mutex::new(String::new());
 

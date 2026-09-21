@@ -165,6 +165,28 @@ impl KpmHandle {
         kpm_ctl0(&self.key, &c, &mut [])
     }
 
+    /// service list 伪装开关 (前台回调驱动): on=true 激活(无差别替换 listServices)
+    pub(crate) fn srv_active(&self, on: bool) {
+        let args = format!("srv_active {}", if on { 1 } else { 0 });
+        self.cmd(&args);
+    }
+
+    /// 设置等长替换字符 (waylay.conf 同步; 各 7 字符, from→to)
+    pub(crate) fn srv_set(&self, from: &str, to: &str) {
+        let args = format!("srv_set {} {}", from, to);
+        self.cmd(&args);
+    }
+
+    /// 武装 KPM (start: affinity 拦截 + 清理探针 + service list 伪装)
+    pub(crate) fn arm(&self) {
+        self.cmd("start");
+    }
+
+    /// 解除武装 (stop: 摘除全部业务探针)
+    pub(crate) fn disarm(&self) {
+        self.cmd("stop");
+    }
+
     /// 批量写 APPLIED 表: 相同 bits 的一批 tid 一次 supercall (替代逐 tid ctl0)
     pub(crate) fn applied_set_many(&self, bits: u64, tids: &[i32]) {
         use std::fmt::Write as _;
@@ -175,11 +197,6 @@ impl KpmHandle {
             let _ = write!(s, " {}", t);
         }
         self.cmd(&s);
-    }
-
-    /// AppOpt 初始化完成后激活 KPM: start 武装 setaffinity (input 检测统一走用户态 eventX)
-    pub fn activate(&self) {
-        self.cmd("start");
     }
 
     pub(crate) fn applied_clear(&self) {
@@ -352,8 +369,8 @@ pub fn ebpf_init(kpm_wake_fd: c_int, drive_mode: String) -> Option<EbpfState> {
         kpm_shm_reader(shm_ptr, map_len, evt_fd, tx, wakeup_fd, kpm_wake_fd);
     });
 
-    // 武装 setaffinity (kprobe 路径; 模块仅在 6.6 加载)
-    handle.activate();
+    // 不自动武装 (start): 初始化只加载/握手; 武装由 webui 拦截页「连接」触发
+    // (KpmHandle::arm → start; affinity 拦截 + 清理探针 + service list 伪装随武装启用)
 
     Some(EbpfState {
         event_rx: rx,
