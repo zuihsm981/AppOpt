@@ -823,16 +823,14 @@ pub fn settings_save() {
 
 // ===== waylay (service list 拦截伪装) Web API =====
 
-/// GET /api/waylay: 当前配置 + KPM 连接状态
+/// GET /api/waylay: 当前配置 (多组规则) + KPM 连接状态
 fn waylay_json() -> String {
-    let from = crate::rw_read_ignore_poison(&crate::config::WAYLAY_FROM).clone();
-    let to = crate::rw_read_ignore_poison(&crate::config::WAYLAY_TO).clone();
+    let rules = crate::rw_read_ignore_poison(&crate::config::WAYLAY_RULES).clone();
     let apps = crate::rw_read_ignore_poison(&crate::config::WAYLAY_APPS).clone();
     json!({
         // 已连接 = KPM 模块已武装 (拦截功能随 start/stop)
         "connected": KPM_ARMED.load(Ordering::Relaxed),
-        "from": from,
-        "to": to,
+        "rules": rules.iter().map(|(f, t)| json!({"from": f, "to": t})).collect::<Vec<_>>(),
         "apps": apps,
     })
     .to_string()
@@ -848,13 +846,22 @@ fn waylay_set_api(req: &Request) -> (u16, String) {
     if v.get("arm").is_some() && v["arm"].is_boolean() {
         crate::config::set_kpm_arm_req(v["arm"].as_bool().unwrap_or(false));
     }
-    let from = v["from"].as_str().unwrap_or("").to_string();
-    let to = v["to"].as_str().unwrap_or("").to_string();
-    // 等长替换: 拦截与替换字符数须一致 (非空, ≤32, ASCII)
-    if from.is_empty() || from.len() != to.len() || from.len() > 32
-        || !from.is_ascii() || !to.is_ascii()
-    {
-        return err_json(400, "拦截与替换字符数需一致 (ASCII, ≤32)");
+    // 多组规则: [{from, to}] 每组字符数一致 (非空, ≤32, ASCII)
+    let mut rules: Vec<(String, String)> = Vec::new();
+    if let Some(arr) = v["rules"].as_array() {
+        for r in arr {
+            let f = r["from"].as_str().unwrap_or("").to_string();
+            let t = r["to"].as_str().unwrap_or("").to_string();
+            if f.is_empty() || f.len() != t.len() || f.len() > 32
+                || !f.is_ascii() || !t.is_ascii()
+            {
+                return err_json(400, "拦截与替换字符数需一致 (ASCII, ≤32)");
+            }
+            rules.push((f, t));
+        }
+    }
+    if rules.is_empty() {
+        return err_json(400, "至少需要一组拦截规则");
     }
     let apps: Vec<String> = v["apps"]
         .as_array()
@@ -870,10 +877,10 @@ fn waylay_set_api(req: &Request) -> (u16, String) {
             return err_json(400, &format!("包名过长: {}", a));
         }
     }
-    if let Err(e) = crate::config::save_waylay(&from, &to, &apps) {
+    if let Err(e) = crate::config::save_waylay(&rules, &apps) {
         return err_json(500, &format!("保存失败: {}", e));
     }
-    // 唤醒主循环: reload 消费 WAYLAY_CHANGED → 同步内核 srv_set (字符)
+    // 唤醒主循环: reload 消费 WAYLAY_CHANGED → 同步内核规则 (srv_clear + 逐组 srv_rule)
     crate::config::request_config_reload();
     (200, json!({"ok": true}).to_string())
 }

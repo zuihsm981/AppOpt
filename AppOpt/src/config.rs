@@ -47,12 +47,9 @@ pub fn request_config_reload() {
  *   包名一行一个        目标应用 (前台时激活拦截)
  */
 pub const WAYLAY_FILE: &str = "waylay.conf";
-/// 拦截目标字符 (7 字符)
-pub static WAYLAY_FROM: LazyLock<RwLock<String>> =
-    LazyLock::new(|| RwLock::new("lineage".to_string()));
-/// 替换字符 (7 字符)
-pub static WAYLAY_TO: LazyLock<RwLock<String>> =
-    LazyLock::new(|| RwLock::new("opluseu".to_string()));
+/// 拦截规则列表 (from→to 多组, from/to 等长)
+pub static WAYLAY_RULES: LazyLock<RwLock<Vec<(String, String)>>> =
+    LazyLock::new(|| RwLock::new(vec![("lineage".to_string(), "opluseu".to_string())]));
 /// 目标应用列表 (waylay.conf)
 pub static WAYLAY_APPS: LazyLock<RwLock<Vec<String>>> = LazyLock::new(|| RwLock::new(Vec::new()));
 /// 目标应用 uid 集合 (查 packages.list; 前台回调据此激活拦截)
@@ -71,10 +68,10 @@ pub fn take_kpm_arm_req() -> i8 {
     KPM_ARM_REQ.swap(0, Ordering::AcqRel)
 }
 
-/// 解析 waylay.conf (不存在时用默认 lineage→opluseu + 空应用表)
-pub fn load_waylay() -> (String, String, Vec<String>) {
-    let mut from = "lineage".to_string();
-    let mut to = "opluseu".to_string();
+/// 解析 waylay.conf (不存在时默认 lineage→opluseu 一组 + 空应用表):
+/// 格式: srv_set <from> <to> 每组一行; 非 srv_ 行为目标应用包名
+pub fn load_waylay() -> (Vec<(String, String)>, Vec<String>) {
+    let mut rules: Vec<(String, String)> = Vec::new();
     let mut apps: Vec<String> = Vec::new();
     if let Ok(content) = std::fs::read_to_string(WAYLAY_FILE) {
         for line in content.lines() {
@@ -82,16 +79,20 @@ pub fn load_waylay() -> (String, String, Vec<String>) {
             if t.is_empty() || t.starts_with('#') || t.starts_with("//") {
                 continue;
             }
-            if let Some(v) = t.strip_prefix("srv_from=") {
-                from = v.trim().to_string();
-            } else if let Some(v) = t.strip_prefix("srv_to=") {
-                to = v.trim().to_string();
+            if let Some(rest) = t.strip_prefix("srv_set ") {
+                let mut it = rest.split_whitespace();
+                if let (Some(f), Some(to)) = (it.next(), it.next()) {
+                    rules.push((f.to_string(), to.to_string()));
+                }
             } else if !t.starts_with("srv_") {
                 apps.push(t.to_string());
             }
         }
     }
-    (from, to, apps)
+    if rules.is_empty() {
+        rules.push(("lineage".to_string(), "opluseu".to_string()));
+    }
+    (rules, apps)
 }
 
 /// 目标应用 → uid 集合 (查 packages.list; 未安装跳过)
@@ -114,11 +115,12 @@ pub fn build_waylay_uids(apps: &[String]) -> HashSet<i32> {
 }
 
 /// 保存 waylay.conf (tmp+rename 原子写), 更新静态并置变更标志
-pub fn save_waylay(from: &str, to: &str, apps: &[String]) -> io::Result<()> {
+pub fn save_waylay(rules: &[(String, String)], apps: &[String]) -> io::Result<()> {
     let mut out = String::from("# waylay: service list 拦截伪装配置\n");
-    out.push_str("# srv_from=拦截目标字符(7)  srv_to=替换字符(7, 等长)\n");
-    out.push_str(&format!("srv_from={}\n", from.trim()));
-    out.push_str(&format!("srv_to={}\n", to.trim()));
+    out.push_str("# srv_set <拦截> <替换> 每组一行 (字符数一致)\n");
+    for (f, t) in rules {
+        out.push_str(&format!("srv_set {} {}\n", f.trim(), t.trim()));
+    }
     out.push_str("# 目标应用 (前台时激活拦截), 包名一行一个\n");
     for a in apps {
         out.push_str(&format!("{}\n", a.trim()));
@@ -126,8 +128,7 @@ pub fn save_waylay(from: &str, to: &str, apps: &[String]) -> io::Result<()> {
     let tmp = format!("{}.tmp", WAYLAY_FILE);
     fs::write(&tmp, out.as_bytes())?;
     fs::rename(&tmp, WAYLAY_FILE)?;
-    *rw_write_ignore_poison(&WAYLAY_FROM) = from.trim().to_string();
-    *rw_write_ignore_poison(&WAYLAY_TO) = to.trim().to_string();
+    *rw_write_ignore_poison(&WAYLAY_RULES) = rules.to_vec();
     *rw_write_ignore_poison(&WAYLAY_APPS) = apps.to_vec();
     *rw_write_ignore_poison(&WAYLAY_UIDS) = build_waylay_uids(apps);
     WAYLAY_CHANGED.store(true, Ordering::Release);
@@ -139,11 +140,10 @@ pub fn take_waylay_changed() -> bool {
     WAYLAY_CHANGED.swap(false, Ordering::AcqRel)
 }
 
-/// 启动/重载时把 waylay.conf 加载进静态 (默认 lineage→opluseu + 空应用表兜底)
+/// 启动/重载时把 waylay.conf 加载进静态 (默认 lineage→opluseu 一组 + 空应用表兜底)
 pub fn waylay_load_static() {
-    let (f, t, a) = load_waylay();
-    *rw_write_ignore_poison(&WAYLAY_FROM) = f;
-    *rw_write_ignore_poison(&WAYLAY_TO) = t;
+    let (rules, a) = load_waylay();
+    *rw_write_ignore_poison(&WAYLAY_RULES) = rules;
     *rw_write_ignore_poison(&WAYLAY_APPS) = a.clone();
     *rw_write_ignore_poison(&WAYLAY_UIDS) = build_waylay_uids(&a);
 }

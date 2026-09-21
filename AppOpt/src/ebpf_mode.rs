@@ -171,9 +171,14 @@ impl KpmHandle {
         self.cmd(&args);
     }
 
-    /// 设置等长替换字符 (waylay.conf 同步; 各 7 字符, from→to)
-    pub(crate) fn srv_set(&self, from: &str, to: &str) {
-        let args = format!("srv_set {} {}", from, to);
+    /// 清空全部替换规则 (waylay.conf 重载前)
+    pub(crate) fn srv_clear(&self) {
+        self.cmd("srv_clear");
+    }
+
+    /// 设置第 idx 组等长替换规则 (from→to, 字符数一致)
+    pub(crate) fn srv_rule(&self, idx: usize, from: &str, to: &str) {
+        let args = format!("srv_rule {} {} {}", idx, from, to);
         self.cmd(&args);
     }
 

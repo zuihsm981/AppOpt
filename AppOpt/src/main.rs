@@ -368,9 +368,11 @@ impl AppState {
         // save_waylay 更新静态, 下一次前台回调差量生效)
         if crate::config::take_waylay_changed() {
             if let Some(es) = self.ebpf_state.as_ref() {
-                let f = crate::rw_read_ignore_poison(&crate::config::WAYLAY_FROM).clone();
-                let t = crate::rw_read_ignore_poison(&crate::config::WAYLAY_TO).clone();
-                es.bpf.srv_set(&f, &t);
+                let rules = crate::rw_read_ignore_poison(&crate::config::WAYLAY_RULES).clone();
+                es.bpf.srv_clear();
+                for (i, (f, t)) in rules.iter().enumerate() {
+                    es.bpf.srv_rule(i, f, t);
+                }
             }
         }
         let cpu_changed = crate::config::take_cpu_rules_changed();
