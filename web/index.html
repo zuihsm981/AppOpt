@@ -247,7 +247,9 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="card-title">拦截配置</div>
 <div class="field"><span class="label" style="white-space:nowrap">拦截字符</span><input id="w-from" maxlength="32" placeholder="lineage"></div>
 <div class="field"><span class="label" style="white-space:nowrap">替换字符</span><input id="w-to" maxlength="32" placeholder="opluseu"></div>
-<div class="hint">拦截与替换字符数需一致 (ASCII, ≤32)<br>如 lineage → opluseu</div>
+<button class="btn" id="w-rule-add" style="width:100%;margin-top:8px">＋ 添加规则</button>
+<div class="hint">拦截与替换字符数需一致 (ASCII, ≤32), 可添加多组</div>
+<div id="w-rules" style="margin-top:8px"></div>
 <div style="margin-top:10px;text-align:right"><button class="btn" id="w-save">保存拦截配置</button></div>
 </div>
 <div class="card">
@@ -406,6 +408,23 @@ document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{
 
 // ===== 拦截 (waylay) 页 =====
 let wlApps=[];
+let wlRules=[{from:'lineage',to:'opluseu'}];
+function renderWaylayRules(){
+  if(!wlRules.length){$('w-rules').innerHTML='<div class="hint">未添加拦截规则</div>';return}
+  $('w-rules').innerHTML=wlRules.map((r,i)=>`<div class="row" style="margin-bottom:4px"><span class="mono">${esc(r.from)} → ${esc(r.to)}</span><button class="icon-btn danger" data-i="${i}" title="删除规则">${ICO_TRASH}</button></div>`).join('');
+}
+$('w-rules').addEventListener('click',e=>{
+  const b=e.target.closest('[data-i]');
+  if(!b)return;
+  wlRules.splice(+b.dataset.i,1);renderWaylayRules();
+});
+$('w-rule-add').onclick=()=>{
+  const f=$('w-from').value.trim(), t=$('w-to').value.trim();
+  if(!f.length||f.length!==t.length){toast('拦截与替换字符数需一致');return}
+  wlRules.push({from:f,to:t});
+  $('w-from').value='';$('w-to').value='';
+  renderWaylayRules();
+};
 function renderWaylayApps(){
   if(!wlApps.length){$('w-apps').innerHTML='<div class="hint">未添加目标应用 (前台不激活拦截)</div>';return}
   $('w-apps').innerHTML=wlApps.map((a,i)=>`<div class="row" style="margin-bottom:4px"><span class="mono">${esc(a)}</span><button class="icon-btn danger" data-i="${i}" title="移除">${ICO_TRASH}</button></div>`).join('');
@@ -419,9 +438,10 @@ async function loadWaylay(){
   try{
     const d=await api('/api/waylay');
     wlApps=d.apps||[];
-    $('w-from').value=d.from; $('w-to').value=d.to;
+    wlRules=(d.rules&&d.rules.length)?d.rules:[{from:'lineage',to:'opluseu'}];
     renderWaylayConn(!!d.connected);
     renderWaylayApps();
+    renderWaylayRules();
   }catch(e){toast(e.message)}
 }
 $('w-apps').addEventListener('click',e=>{
@@ -444,16 +464,15 @@ $('w-conn-chips').addEventListener('click',async e=>{
   const b=e.target.closest('button');if(!b)return;
   const on=b.dataset.v==='1';
   try{
-    await api('/api/waylay',{arm:on,from:$('w-from').value.trim(),to:$('w-to').value.trim(),apps:wlApps});
+    await api('/api/waylay',{arm:on,rules:wlRules,apps:wlApps});
     await loadWaylay();
     toast(on?'已连接 (模块已武装)':'已断开 (模块已解除)');
   }catch(e){toast(e.message)}
 });
 $('w-save').onclick=async()=>{
   try{
-    const from=$('w-from').value.trim(), to=$('w-to').value.trim();
-    if(!from.length||from.length!==to.length){toast('拦截与替换字符数需一致');return}
-    await api('/api/waylay',{from,to,apps:wlApps});
+    if(!wlRules.length){toast('至少需要一组拦截规则');return}
+    await api('/api/waylay',{rules:wlRules,apps:wlApps});
     toast('已保存');
   }catch(e){toast(e.message)}
 };
