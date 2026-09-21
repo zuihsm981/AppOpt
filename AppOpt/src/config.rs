@@ -116,7 +116,8 @@ pub fn build_waylay_uids(apps: &[String]) -> HashSet<i32> {
 
 /// 保存 waylay.conf (tmp+rename 原子写), 更新静态并置变更标志
 pub fn save_waylay(rules: &[(String, String)], apps: &[String]) -> io::Result<()> {
-    let mut out = String::from("# waylay: service list 拦截伪装配置\n");
+    let mut out = String::from("# 注意:手动添加不生效，需要在webui中添加\n");
+    out.push_str("# waylay: service list 拦截伪装配置\n");
     out.push_str("# srv_set <拦截> <替换> 每组一行 (字符数一致)\n");
     for (f, t) in rules {
         out.push_str(&format!("srv_set {} {}\n", f.trim(), t.trim()));
@@ -138,6 +139,40 @@ pub fn save_waylay(rules: &[(String, String)], apps: &[String]) -> io::Result<()
 /// 取出并复位 waylay 变更标志
 pub fn take_waylay_changed() -> bool {
     WAYLAY_CHANGED.swap(false, Ordering::AcqRel)
+}
+
+/// 校验并清理规则 (供同步内核前调用): 返回合法规则 (非空/字符数一致/≤32/ASCII);
+/// 有错误行时从 WAYLAY_RULES 移除并重写 waylay.conf (不置 CHANGED, 避免循环)
+pub fn waylay_sanitize_rules() -> Vec<(String, String)> {
+    let valid = |f: &str, t: &str| {
+        !f.is_empty() && f.len() == t.len() && f.len() <= 32 && f.is_ascii() && t.is_ascii()
+    };
+    let apps = rw_read_ignore_poison(&WAYLAY_APPS).clone();
+    let dirty = rw_read_ignore_poison(&WAYLAY_RULES).clone();
+    let clean: Vec<(String, String)> = dirty
+        .iter()
+        .filter(|(f, t)| valid(f, t))
+        .cloned()
+        .collect();
+    if clean.len() != dirty.len() {
+        *rw_write_ignore_poison(&WAYLAY_RULES) = clean.clone();
+        // 重写 waylay.conf (移除错误行): 复用保存逻辑但不置 CHANGED/不重建 UIDS
+        let mut out = String::from("# 注意:手动添加不生效，需要在webui中添加\n");
+        out.push_str("# waylay: service list 拦截伪装配置\n");
+        out.push_str("# srv_set <拦截> <替换> 每组一行 (字符数一致)\n");
+        for (f, t) in &clean {
+            out.push_str(&format!("srv_set {} {}\n", f.trim(), t.trim()));
+        }
+        out.push_str("# 目标应用 (前台时激活拦截), 包名一行一个\n");
+        for a in &apps {
+            out.push_str(&format!("{}\n", a.trim()));
+        }
+        let tmp = format!("{}.tmp", WAYLAY_FILE);
+        if fs::write(&tmp, out.as_bytes()).is_ok() {
+            let _ = fs::rename(&tmp, WAYLAY_FILE);
+        }
+    }
+    clean
 }
 
 /// 启动/重载时把 waylay.conf 加载进静态 (默认 lineage→opluseu 一组 + 空应用表兜底)

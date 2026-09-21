@@ -345,15 +345,29 @@ impl AppState {
 
     /// 配置重载 (EV_INOTIFY / EV_CONFIG 共用): 重载配置 → 应用到当前模式 →
     /// 仅"规则应用集合"变更时重建 uid 表 (调整数值不重建)
-    /// KPM 武装/解除 (拦截页连接/断开): start=武装全功能, stop=解除
+    /// KPM 武装/解除 (拦截页连接/断开): start=武装全功能, stop=解除;
+    /// 武装后立即同步 waylay 规则 (清理后的合法规则)
     fn set_kpm_arm(&self, arm: bool) {
         if let Some(es) = self.ebpf_state.as_ref() {
             if arm {
                 es.bpf.arm();
+                self.sync_waylay_rules();
             } else {
                 es.bpf.disarm();
             }
             crate::web::KPM_ARMED.store(arm, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// 同步 waylay 规则到内核: 同步前校验并移除错误行 (手动编辑 waylay.conf 的
+    /// 错误配置行不会下发; 自动保存路径同样经此兜底)
+    fn sync_waylay_rules(&self) {
+        if let Some(es) = self.ebpf_state.as_ref() {
+            let rules = crate::config::waylay_sanitize_rules();
+            es.bpf.srv_clear();
+            for (i, (f, t)) in rules.iter().enumerate() {
+                es.bpf.srv_rule(i, f, t);
+            }
         }
     }
 
@@ -367,13 +381,7 @@ impl AppState {
         // waylay 配置保存 (web /api/waylay): 同步替换字符到内核 (目标 uid 集合已由
         // save_waylay 更新静态, 下一次前台回调差量生效)
         if crate::config::take_waylay_changed() {
-            if let Some(es) = self.ebpf_state.as_ref() {
-                let rules = crate::rw_read_ignore_poison(&crate::config::WAYLAY_RULES).clone();
-                es.bpf.srv_clear();
-                for (i, (f, t)) in rules.iter().enumerate() {
-                    es.bpf.srv_rule(i, f, t);
-                }
-            }
+            self.sync_waylay_rules();
         }
         let cpu_changed = crate::config::take_cpu_rules_changed();
         self.cfg = rw_read_ignore_poison(&CURRENT_CONFIG).clone();
