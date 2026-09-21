@@ -21,7 +21,7 @@
 
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
-use std::sync::atomic::{AtomicU32, Ordering};
+// use std::sync::atomic::{AtomicU32, Ordering};  // 事件环停用, 临时注释
 use std::sync::mpsc;
 use std::thread;
 
@@ -42,16 +42,10 @@ pub struct EbpfProcEvent {
     pub event_type: u32,
 }
 
-/// 事件环当前只流动 INPUT (CPU/刷新率由 binder 三线程驱动, 无进程事件)
-pub const EBPF_EVENT_INPUT: u32 = 5;
+/* 事件环当前只流动 INPUT (内核事件已停用, 临时注释)
+pub const EBPF_EVENT_INPUT: u32 = 5;*/
 
-/* ================= mmap 共享内存事件环 (与内核 appopt_shm_t 布局一致) =================
- * 见 AppOpt-kpm/appopt_kpm.h。head/tail 是 32 位字节游标, 按 ring_size(2 的幂)回绕:
- *   内核 = 唯一生产者: 写 data[] 后以 release 发布 tail, 再写 eventfd 通知;
- *   AppOpt = 唯一消费者: 以 acquire 读 tail, 直接消费 data[head..tail),
- *           以 release 推进 head; 阻塞在 eventfd 上, 不再周期 supercall drain。
- * Rust 侧只写 head/读 tail; magic/version/event_size/ring_size 仅启动时校验。
- * 字段顺序与 C 端一致, 不能增删 (data[] 起始 = size_of::<ShmRing>() = 48)。 */
+/* ================= mmap 共享内存事件环 (临时注释: 内核事件停用) =================
 #[repr(C)]
 pub struct ShmRing {
     pub magic: u32,
@@ -66,10 +60,10 @@ pub struct ShmRing {
 
 pub const APPOPT_SHM_MAGIC: u32 = 0x4150_5054; // "APPT"
 pub const APPOPT_SHM_VERSION: u32 = 1;
-pub const APPOPT_SHM_HDR_SIZE: usize = 48; // size_of::<ShmRing>(), data[] 偏移
+pub const APPOPT_SHM_HDR_SIZE: usize = 48;
 pub const APPOPT_EVENT_RING_SIZE: u32 = 256 * 1024;
 pub const APPOPT_RING_MASK: u32 = APPOPT_EVENT_RING_SIZE - 1;
-pub const APPOPT_EVENT_SZ: u32 = 28; // size_of::<EbpfProcEvent>()
+pub const APPOPT_EVENT_SZ: u32 = 28;*/
 
 /* ================= KernelPatch SuperCall 传输 ================= */
 
@@ -208,20 +202,19 @@ impl KpmHandle {
         self.cmd("clear_applied");
     }
 
-    /// 建立 mmap 共享环 + eventfd 通知 (ctl0 `shm_open <eventfd_fd>`)。
-    /// 成功返回内核在当前进程 fd 表安装的可 mmap anon inode fd (正数);
-    /// 失败返回负错误码。须在 activate()/start 之前调用, 以免漏事件。
+    /* ---- 事件环通道 (shm_open/shm_close): 临时注释 —— 内核已无事件生产者,
+     * 不再建立/解除事件通道 (见 kpm_shm_reader 注释) ----
     fn shm_open(&self, evt_fd: c_int) -> i64 {
         let s = format!("shm_open {}", evt_fd);
         let c = cstr(&s);
         kpm_ctl0(&self.key, &c, &mut [])
     }
 
-    /// 解除内核侧 eventfd 通知绑定 (AppOpt 退出时调用)
     fn shm_close(&self) {
         let c = cstr("shm_close");
         kpm_ctl0(&self.key, &c, &mut []);
     }
+    */
 
 }
 
@@ -244,7 +237,8 @@ pub struct EbpfState {
 impl Drop for EbpfState {
     fn drop(&mut self) {
         // 通知内核解除 eventfd 绑定 (best-effort; 模块可能已被卸载)
-        self.bpf.shm_close();
+        // 临时注释: 事件通道已停用 (shm_open/shm_close 注释)
+        // self.bpf.shm_close();
         // 写 eventfd 唤醒 reader 线程后 join
         if self.wakeup_fd >= 0 {
             let val: u64 = 1;
@@ -304,35 +298,28 @@ pub fn ebpf_init(kpm_wake_fd: c_int, drive_mode: String) -> Option<EbpfState> {
     }
 
     // 配置 input 节流 (与 eBPF 默认 1s 一致)
-    handle.cmd("input_ms 1000");
+    // 临时注释: 内核无 input_ms 命令 (input 已用户态 eventX)
+    // handle.cmd("input_ms 1000");
 
-    // ---- 建立事件传输通道: mmap 共享环 + eventfd 通知 (仅此一种, 无 drain 回退) ----
+    /* ---- 事件传输通道 (mmap 共享环 + eventfd + reader 线程): 临时注释 ----
+     * 内核已无事件生产者 (input/exit 事件已移除, SRV 替换纯内核不发事件),
+     * 不再建立事件环通道。主循环 EV_KPM 因 kpm_wake_fd 无写者而空转;
+     * kpm_died 断开检测随之停用 (临时取舍)。
+     * ---- 取消注释即恢复事件环 ----
     let evt_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     if evt_fd < 0 {
         return None;
     }
-
-    // ---- 事件通道: mmap 共享环 + eventfd 通知 (零 supercall 消费) ----
-    // ctl0 shm_open: 绑定 evt_fd(通知端) + 在当前进程安装可 mmap 的 anon fd
     let shm_fd = handle.shm_open(evt_fd);
     if shm_fd < 0 || shm_fd > i64::from(i32::MAX) {
         unsafe { libc::close(evt_fd); }
         return None;
     }
     let shm_fd = shm_fd as c_int;
-
-    // 立即 mmap 并校验共享环头; 校验失败视为模块/客户端不匹配
-    // (kprobe 路径 mmap 必然成功; 失败直接放弃, 不兜底)
     let map_len = APPOPT_SHM_HDR_SIZE + APPOPT_EVENT_RING_SIZE as usize;
     let shm_base = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            map_len,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED,
-            shm_fd,
-            0,
-        )
+        libc::mmap(std::ptr::null_mut(), map_len, libc::PROT_READ | libc::PROT_WRITE,
+                   libc::MAP_SHARED, shm_fd, 0)
     };
     if shm_base == libc::MAP_FAILED {
         unsafe { libc::close(evt_fd); }
@@ -342,8 +329,7 @@ pub fn ebpf_init(kpm_wake_fd: c_int, drive_mode: String) -> Option<EbpfState> {
     {
         let hdr = shm_base as *const ShmRing;
         let ok = unsafe {
-            (*hdr).magic == APPOPT_SHM_MAGIC
-                && (*hdr).version == APPOPT_SHM_VERSION
+            (*hdr).magic == APPOPT_SHM_MAGIC && (*hdr).version == APPOPT_SHM_VERSION
                 && (*hdr).event_size == APPOPT_EVENT_SZ
                 && (*hdr).ring_size == APPOPT_EVENT_RING_SIZE
         };
@@ -351,43 +337,43 @@ pub fn ebpf_init(kpm_wake_fd: c_int, drive_mode: String) -> Option<EbpfState> {
             unsafe { libc::munmap(shm_base, map_len); }
             unsafe { libc::close(evt_fd); }
             unsafe { libc::close(shm_fd); }
-            handle.shm_close(); // 释放内核侧 eventfd 绑定
+            handle.shm_close();
             return None;
         }
     }
-
     let (tx, rx) = mpsc::channel::<EbpfProcEvent>();
     let wakeup_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     if wakeup_fd < 0 {
         unsafe { libc::munmap(shm_base, map_len); }
         unsafe { libc::close(evt_fd); }
         unsafe { libc::close(shm_fd); }
-        handle.shm_close(); // 释放内核侧 eventfd 绑定
+        handle.shm_close();
         return None;
     }
-
-    // reader 线程: 阻塞在 evt_fd(内核 eventfd 通知) + wakeup_fd(退出信号),
-    // 直接消费 mmap 共享环, 收到后写 kpm_wake_fd 唤醒主循环。
-    // 注意: 共享环指针以 usize 传入 move 闭包 (裸指针非 Send)。
     let shm_ptr = shm_base as usize;
     let reader_thread = thread::spawn(move || {
         kpm_shm_reader(shm_ptr, map_len, evt_fd, tx, wakeup_fd, kpm_wake_fd);
     });
+    */
+
+    // 事件环停用: 仅保留空事件接收端 (主循环 EV_KPM try_recv 恒 Empty, 空转)
+    let (_tx, rx) = mpsc::channel::<EbpfProcEvent>();
 
     // 不自动武装 (start): 初始化只加载/握手; 武装由 webui 拦截页「连接」触发
     // (KpmHandle::arm → start; affinity 拦截 + 清理探针 + service list 伪装随武装启用)
 
     Some(EbpfState {
         event_rx: rx,
-        reader_thread: Some(reader_thread),
+        reader_thread: None,
         bpf: handle,
-        wakeup_fd,
+        wakeup_fd: -1,
         kpm_wake_fd,
-        evt_fd,
-        shm_fd,
+        evt_fd: -1,
+        shm_fd: -1,
     })
 }
 
+/* ===== 事件环消费者线程: 临时注释 (内核无事件生产者) =====
 /// mmap 共享环消费者线程 (替代原 supercall drain 轮询):
 /// 阻塞在 evt_fd(内核 eventfd 通知) 上; 唤醒后直接从共享环消费事件,
 /// 以 release 推进 head 让内核回收空间, 再写 kpm_wake_fd 唤醒主循环。
@@ -513,16 +499,13 @@ fn kpm_shm_reader(
     unsafe { libc::close(epfd); }
     unsafe { libc::munmap(base, map_len); }
 }
+*/
 
 /// 事件派发 (input: 刷新率活动检测; 退出清理统一由用户态 pidfd 负责,
 /// 内核 EXIT 事件不再消费; CPU/刷新率主体由 binder 三线程驱动)
-pub fn event_dispatch(event: &EbpfProcEvent, _cfg: &AppConfig, _state: &mut EbpfState) {
-    // CPU 亲和性已由 binder 触发的 CpuAffinity 模块负责 (cpu_affinity.rs):
-    // 进程事件不驱动 CPU 逻辑; input 仅用于刷新率活动检测;
-    // 退出清理走 pidfd (main EV_EXIT_PID → EvictUid), 内核 EXIT 事件忽略。
-    if event.event_type == EBPF_EVENT_INPUT {
-        crate::refresh::refresh_on_event(EBPF_EVENT_INPUT, 0);
-    }
+pub fn event_dispatch(event: &EbpfProcEvent, _cfg: &AppConfig, _state: &mut EbpfState)  {
+    /* 临时注释: 事件环已停用, 内核不发事件 (input 用户态, SRV 纯内核) */
+    let _ = event;
 }
 
 
