@@ -248,9 +248,8 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="field"><span class="label" style="white-space:nowrap">拦截字符</span><input id="w-from" maxlength="32" placeholder="lineage"></div>
 <div class="field"><span class="label" style="white-space:nowrap">替换字符</span><input id="w-to" maxlength="32" placeholder="opluseu"></div>
 <button class="btn" id="w-rule-add" style="width:100%;margin-top:8px">＋ 添加规则</button>
-<div class="hint">拦截与替换字符数需一致 (ASCII, ≤32), 可添加多组</div>
+<div class="hint">拦截与替换字符数需一致 (ASCII, ≤32), 可添加多组; 添加/删除即保存</div>
 <div id="w-rules" style="margin-top:8px"></div>
-<div style="margin-top:10px;text-align:right"><button class="btn" id="w-save">保存拦截配置</button></div>
 </div>
 <div class="card">
 <div class="card-title">目标应用 <span class="hint" style="font-weight:400">(前台时激活拦截)</span></div>
@@ -417,6 +416,7 @@ $('w-rules').addEventListener('click',e=>{
   const b=e.target.closest('[data-i]');
   if(!b)return;
   wlRules.splice(+b.dataset.i,1);renderWaylayRules();
+  wlSaveNow();
 });
 $('w-rule-add').onclick=()=>{
   const f=$('w-from').value.trim(), t=$('w-to').value.trim();
@@ -424,6 +424,7 @@ $('w-rule-add').onclick=()=>{
   wlRules.push({from:f,to:t});
   $('w-from').value='';$('w-to').value='';
   renderWaylayRules();
+  wlSaveNow();  // 符合规则即保存
 };
 function renderWaylayApps(){
   if(!wlApps.length){$('w-apps').innerHTML='<div class="hint">未添加目标应用 (前台不激活拦截)</div>';return}
@@ -448,6 +449,7 @@ $('w-apps').addEventListener('click',e=>{
   const b=e.target.closest('[data-i]');
   if(!b)return;
   wlApps.splice(+b.dataset.i,1);renderWaylayApps();
+  wlSaveNow();
 });
 function wlAddApp(pkg){
   pkg=(pkg||'').trim();
@@ -456,6 +458,21 @@ function wlAddApp(pkg){
   $('w-app').value='';
   $('w-sg').hidden=true;
   renderWaylayApps();
+  wlSaveNow();  // 选择建议后立即保存到配置
+}
+// 自动保存 (规则+应用), 失败仅提示 (不阻塞交互)
+// 统一切口: 任何保存前校验所有规则 from/to 字符数一致
+let wlSaveTimer=null;
+function wlSaveNow(){
+  clearTimeout(wlSaveTimer);
+  wlSaveTimer=setTimeout(async()=>{
+    if(!wlRules.length){toast('至少需要一组拦截规则');return}
+    for(const r of wlRules){
+      if(!r.from||!r.to||r.from.length!==r.to.length){toast('拦截与替换字符数需一致');return}
+    }
+    try{await api('/api/waylay',{rules:wlRules,apps:wlApps})}
+    catch(e){toast(e.message)}
+  },200);
 }
 $('w-add').onclick=()=>wlAddApp($('w-app').value);
 suggest_bind($('w-app'),$('w-sg'),{onpick:wlAddApp});
@@ -469,13 +486,6 @@ $('w-conn-chips').addEventListener('click',async e=>{
     toast(on?'已连接 (模块已武装)':'已断开 (模块已解除)');
   }catch(e){toast(e.message)}
 });
-$('w-save').onclick=async()=>{
-  try{
-    if(!wlRules.length){toast('至少需要一组拦截规则');return}
-    await api('/api/waylay',{rules:wlRules,apps:wlApps});
-    toast('已保存');
-  }catch(e){toast(e.message)}
-};
 
 // ===== 状态页: 线程状态 / 刷新率状态 切换 =====
 let statusSeg='thread';
