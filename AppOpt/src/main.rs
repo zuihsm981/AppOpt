@@ -347,13 +347,16 @@ impl AppState {
     /// 仅"规则应用集合"变更时重建 uid 表 (调整数值不重建)
     /// KPM 武装/解除 (拦截页连接/断开): start=武装全功能, stop=解除;
     /// 武装后立即同步 waylay 规则 (清理后的合法规则)
-    fn set_kpm_arm(&self, arm: bool) {
+    fn set_kpm_arm(&mut self, arm: bool) {
         if let Some(es) = self.ebpf_state.as_ref() {
             if arm {
                 es.bpf.arm();
                 self.sync_waylay_rules();
             } else {
                 es.bpf.disarm();
+                // 断开把探针摘除 (srv_remove); 重置激活记录 → 下次前台回调重新下发
+                // 激活状态 (差量防漏: 否则内核探针不存在而用户态以为已激活)
+                self.srv_active_cur = false;
             }
             crate::web::KPM_ARMED.store(arm, std::sync::atomic::Ordering::Relaxed);
         }

@@ -282,9 +282,9 @@ pub fn kpm_probe() -> bool {
 /// 初始化 KPM 事件驱动。drive_mode: "userspace" 直接纯用户态(不依赖 KPM);
 /// "auto" ping 失败快速回退纯用户态; "kpm" 等待模块长时间重试。
 pub fn ebpf_init(kpm_wake_fd: c_int, drive_mode: String) -> Option<EbpfState> {
-    if drive_mode == "userspace" {
-        return None;
-    }
+    // 设置项工作模式 UI 已移除: 不再因 userspace 直退 —— 只要模块加载 (ping 成功)
+    // 即可用 KPM (连接由拦截页控制); drive_mode 仅保留签名兼容。
+    let _ = drive_mode;
 
     // 不重试: 连接不上 KPM 就直接回退用户态模式 (4.19 常无 KPM/或 KP hook 不可用)
     let key = kpm_key();
