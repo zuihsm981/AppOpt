@@ -186,22 +186,6 @@ impl KpmHandle {
         self.cmd("stop");
     }
 
-    /// 批量写 APPLIED 表: 相同 bits 的一批 tid 一次 supercall (替代逐 tid ctl0)
-    pub(crate) fn applied_set_many(&self, bits: u64, tids: &[i32]) {
-        use std::fmt::Write as _;
-        // 预分配容量, 避免逐个 t.to_string() 的临时分配
-        let mut s = String::with_capacity(32 + tids.len() * 8);
-        let _ = write!(s, "applied_set_many {:x}", bits);
-        for t in tids {
-            let _ = write!(s, " {}", t);
-        }
-        self.cmd(&s);
-    }
-
-    pub(crate) fn applied_clear(&self) {
-        self.cmd("clear_applied");
-    }
-
     /* ---- 事件环通道 (shm_open/shm_close): 临时注释 —— 内核已无事件生产者,
      * 不再建立/解除事件通道 (见 kpm_shm_reader 注释) ----
     fn shm_open(&self, evt_fd: c_int) -> i64 {

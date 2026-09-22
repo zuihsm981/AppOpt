@@ -28,7 +28,6 @@ use std::time::Duration;
 
 use crate::config::AppConfig;
 use crate::cpuset::{CpuSet, CpuTopology};
-use crate::ebpf_mode::KpmHandle;
 
 /// 前台回调后延迟枚举时长: 冷启动子进程 (pkg:child) 常在回调后 0.5~2s 内 spawn,
 /// 延迟后 cgroup 取一遍该 uid 全部 pid 覆盖冷启动窗口 (主进程回调时已在, 无影响)。
@@ -117,7 +116,6 @@ struct PendingTask {
 
 /// CPU 亲和性执行器 (worker 线程独占)
 pub struct CpuAffinity {
-    bpf: KpmHandle,
     /// 已管理线程 tid → 包名 (用于清理已退出线程)
     /// 已应用包 → 绑定 tid 集合 (退出按 uid 反查 pkg 后 O(1) 整清)
     managed: HashMap<String, HashSet<i32>>,
@@ -133,7 +131,6 @@ pub struct CpuAffinity {
 impl CpuAffinity {
     pub fn new() -> Self {
         Self {
-            bpf: KpmHandle::new(),
             managed: HashMap::new(),
             uid_pkg: HashMap::new(),
             cpuset_cache: HashMap::new(),
@@ -213,19 +210,19 @@ impl CpuAffinity {
     /// 应用一个包的全部进程 (主进程 + pkg: 子进程) 的全部线程
     /// 对给定进程集合的全部线程套用规则并应用 (解析 → 亲和 → uclamp 三段)
     fn apply_tids(&mut self, pids: &[i32], pkg: &str, cfg: &AppConfig) {
-        let (set, aff, uclamps) = self.resolve_threads(pids, pkg, cfg);
-        self.apply_affinity_batch(&set, aff, cfg);
+        let (aff, uclamps) = self.resolve_threads(pids, pkg, cfg);
+        self.apply_affinity_batch(aff, cfg);
         self.apply_uclamp_batch(uclamps);
     }
 
-    /// 1) 解析: 遍历 pids × tids 套用规则, 收集 (bits 聚合的 applied_set,
-    ///    亲和任务, uclamp 任务), 同时登记 managed (web 命中统计)。
+    /// 1) 解析: 遍历 pids × tids 套用规则, 收集 (亲和任务, uclamp 任务),
+    ///    同时登记 managed (web 命中统计)。
     fn resolve_threads(
         &mut self,
         pids: &[i32],
         pkg: &str,
         cfg: &AppConfig,
-    ) -> (HashMap<u64, Vec<i32>>, Vec<(i32, CpuSet, String)>, Vec<(i32, i32, i32)>) {
+    ) -> (Vec<(i32, CpuSet, String)>, Vec<(i32, i32, i32)>) {
         let has_thread_rules = cfg.has_thread_rules.contains(pkg);
         // 规则只有包名 (无线程规则): 包级规则一次取好, 所有线程统一应用,
         // 免去逐线程 thread_affinity / 读 comm 匹配。
@@ -234,8 +231,6 @@ impl CpuAffinity {
         } else {
             crate::rule_match::thread_affinity(pkg, "", cfg)
         };
-        // 批量 applied_set: 相同 bits 的 tid 聚合, 每个 bits 一次 supercall
-        let mut set: HashMap<u64, Vec<i32>> = HashMap::new();
         let mut aff: Vec<(i32, CpuSet, String)> = Vec::new();
         let mut uclamps: Vec<(i32, i32, i32)> = Vec::new();
         for p in pids {
@@ -253,8 +248,6 @@ impl CpuAffinity {
                 let Some(rule) = rule else {
                     continue;
                 };
-                let bits = rule.cpus.bits[0];
-                set.entry(bits).or_default().push(tid);
                 // 只有 uclamp (cpus 空): 不设亲和, 仅收集 uclamp
                 if rule.cpus.count() > 0 {
                     // cpuset 目录: 配置自带优先, 否则按合并 CPU 集合缓存 ensure
@@ -271,20 +264,12 @@ impl CpuAffinity {
                 self.managed.entry(pkg.to_string()).or_default().insert(tid);
             }
         }
-        (set, aff, uclamps)
+        (aff, uclamps)
     }
 
-    /// 2) 应用亲和: 批量写内核 APPLIED 表 (每 bits 一次 supercall) + 按 cpuset_dir
-    ///    分组设 sched_setaffinity (主要手段), 仍不正确的 tid 走 cpuset tasks 迁移兜底。
-    fn apply_affinity_batch(
-        &self,
-        set: &HashMap<u64, Vec<i32>>,
-        aff: Vec<(i32, CpuSet, String)>,
-        cfg: &AppConfig,
-    ) {
-        for (bits, tids) in set {
-            self.bpf.applied_set_many(*bits, tids);
-        }
+    /// 2) 应用亲和: 按 cpuset_dir 分组设 sched_setaffinity (主要手段),
+    ///    仍不正确的 tid 走 cpuset tasks 迁移兜底。
+    fn apply_affinity_batch(&self, aff: Vec<(i32, CpuSet, String)>, cfg: &AppConfig) {
         // 按 cpuset_dir 分组: 每个目录只拼一次 tasks 路径, 再逐线程设置
         let base = crate::cpuset::base_cpuset();
         let mut by_dir: HashMap<String, Vec<(i32, CpuSet)>> = HashMap::new();
@@ -381,7 +366,6 @@ impl CpuAffinity {
                 self.apply_pkg(t.pid, t.uid, &t.pkg);
             }
         }
-        self.bpf.applied_clear();
     }
 
     /// 应用已登记的前台应用 (到期执行): cgroup 取 uid 全部 pid → /proc/<pid>/task
@@ -476,8 +460,8 @@ pub fn start() {
         return;
     }
     // 用户态与 KPM 模式统一启动 CPU worker: 身份记录/进程枚举/亲和性施加全部经
-    // ApplyPkg 消息驱动; KPM 不可用时 bpf ctl0 调用仅失败无副作用 (用户态由
-    // apply_affinity::affinity_set 真正施加 sched_setaffinity)。
+    // ApplyPkg 消息驱动; 亲和完全由用户态 apply_affinity::affinity_set 施加
+    // (内核 KPM 只做 service list 替换, 不参与亲和)。
     let (tx, rx) = mpsc::channel::<CpuMsg>();
     let _ = CPU_FG_TX.set(Mutex::new(tx));
     let cpu = CpuAffinity::new();
