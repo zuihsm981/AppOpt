@@ -318,6 +318,8 @@ struct AppState {
     rfr_pkgs_set: HashSet<String>,
     /// 已下发给内核的 service list 伪装开关 (差量下发, 仅应用切换时调整)
     srv_active_cur: bool,
+    /// 主循环事件通知 fd (EV_KPM): 连接时重新初始化 ebpf 用
+    kpm_wake_fd: libc::c_int,
 }
 
 impl AppState {
@@ -340,6 +342,7 @@ impl AppState {
             cpu_pkgs_set,
             rfr_pkgs_set,
             srv_active_cur: false,
+            kpm_wake_fd: -1,
         }
     }
 
@@ -348,6 +351,12 @@ impl AppState {
     /// KPM 武装/解除 (拦截页连接/断开): start=武装全功能, stop=解除;
     /// 武装后立即同步 waylay 规则 (清理后的合法规则)
     fn set_kpm_arm(&mut self, arm: bool) {
+        // 连接且 KPM 未就绪: 模块可能后加载 (AppOpt 先启动) —— 重试初始化
+        if arm && self.ebpf_state.is_none() && self.kpm_wake_fd >= 0 {
+            if let Some(es) = crate::ebpf_mode::ebpf_init(self.kpm_wake_fd, String::new()) {
+                self.ebpf_state = Some(es);
+            }
+        }
         if let Some(es) = self.ebpf_state.as_ref() {
             if arm {
                 es.bpf.arm();
@@ -612,6 +621,7 @@ fn main() {
     // 主循环共享状态: uid 表 / 规则包集合 / 当前配置 (ebpf_state 稍后 join 填入)
     let mut state = AppState::new();
     // ebpf_init 线程: KPM 加载+激活已并行完成, join 拿 EbpfState
+    state.kpm_wake_fd = kpm_wake_fd;
     state.ebpf_state = ebpf_thread.join().ok().flatten();
     if state.ebpf_state.is_some() {
         crate::web::KPM_ACTIVE.store(true, Ordering::Relaxed);
