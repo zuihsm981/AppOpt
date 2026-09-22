@@ -443,7 +443,8 @@ async function loadWaylay(){
     renderWaylayConn(!!d.connected);
     renderWaylayApps();
     renderWaylayRules();
-  }catch(e){toast(e.message)}
+    return !!d.connected;
+  }catch(e){toast(e.message);return false}
 }
 $('w-apps').addEventListener('click',e=>{
   const b=e.target.closest('[data-i]');
@@ -482,8 +483,9 @@ $('w-conn-chips').addEventListener('click',async e=>{
   const on=b.dataset.v==='1';
   try{
     await api('/api/waylay',{arm:on,rules:wlRules,apps:wlApps});
-    await loadWaylay();
-    toast(on?'已连接 (模块已武装)':'已断开 (模块已解除)');
+    const conn=await loadWaylay();   // 回读后端真实连接状态
+    if(on) toast(conn?'已连接 (模块已武装)':'未连接: KPM 未就绪');
+    else toast('已断开 (模块已解除)');
   }catch(e){toast(e.message)}
 });
 
