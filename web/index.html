@@ -508,7 +508,7 @@ async function loadWaylay(){
   try{
     const d=await api('/api/waylay');
     wlApps=d.apps||[];
-    wlRules=(d.rules&&d.rules.length)?d.rules:[{from:'lineage',to:'opluseu'}];
+    wlRules=(d.rules&&d.rules.length)?d.rules:[];
     wlPropRules=d.propRules||[];
     wlPropApps=d.propApps||[];
     renderWaylayConn(!!d.connected);
@@ -540,7 +540,6 @@ let wlSaveTimer=null;
 function wlSaveNow(){
   clearTimeout(wlSaveTimer);
   wlSaveTimer=setTimeout(async()=>{
-    if(!wlRules.length&&!wlPropRules.length){toast('至少需要一组拦截规则');return}
     for(const r of wlRules){
       if(!r.from||!r.to||r.from.length!==r.to.length){toast('拦截与替换字符数需一致');return}
     }
@@ -559,7 +558,7 @@ $('w-conn-chips').addEventListener('click',async e=>{
   const b=e.target.closest('button');if(!b)return;
   const on=b.dataset.v==='1';
   try{
-    await api('/api/waylay',{arm:on,rules:wlRules,apps:wlApps});
+    await api('/api/waylay',{arm:on,rules:wlRules,apps:wlApps,propRules:wlPropRules,propApps:wlPropApps});
     const conn=await loadWaylay();   // 回读后端真实连接状态
     if(on) toast(conn?'已连接 (模块已武装)':'未连接: KPM 未就绪');
     else toast('已断开 (模块已解除)');
