@@ -226,7 +226,7 @@ impl KpmHandle {
                 if len == 0 { continue; }
                 let pr = unsafe {
                     libc::mmap(std::ptr::null_mut(),
-                               len as usize & !0xFFF + 4096,
+                               (len as usize & !0xFFF) + 4096,
                                libc::PROT_READ, libc::MAP_SHARED, f.as_raw_fd(), 0)
                 };
                 if pr != libc::MAP_FAILED {
