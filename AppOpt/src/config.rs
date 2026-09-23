@@ -61,6 +61,10 @@ pub static WAYLAY_PROP_RULES: LazyLock<RwLock<Vec<(String, String)>>> =
 /// 激活 property 区替换 (独立于 service list 目标应用, 见 WAYLAY_* 同名)
 pub static WAYLAY_PROP_APPS: LazyLock<RwLock<Vec<String>>> =
     LazyLock::new(|| RwLock::new(Vec::new()));
+/// prop 规则 → selinux context 缓存 (原属性名 → context): 初始化/保存时由
+/// property_contexts 解析一次, prop_apply 直接使用 (不再每次读上下文文件)
+pub static WAYLAY_PROP_CTX: LazyLock<RwLock<Vec<(String, String)>>> =
+    LazyLock::new(|| RwLock::new(Vec::new()));
 /// property 目标应用 uid 集合 (前台回调据此激活 property 替换)
 pub static WAYLAY_PROP_UIDS: LazyLock<RwLock<HashSet<i32>>> =
     LazyLock::new(|| RwLock::new(HashSet::new()));
@@ -125,9 +129,7 @@ pub fn load_waylay() -> (
             }
         }
     }
-    if rules.is_empty() {
-        rules.push(("lineage".to_string(), "opluseu".to_string()));
-    }
+    // 允许全空: 不做默认补全 (空配置 = 不启用拦截)
     (rules, apps, prop_rules, prop_apps)
 }
 
@@ -188,6 +190,7 @@ pub fn save_waylay(
     *rw_write_ignore_poison(&WAYLAY_PROP_APPS) = prop_apps.to_vec();
     *rw_write_ignore_poison(&WAYLAY_PROP_UIDS) = build_waylay_uids(prop_apps);
     *rw_write_ignore_poison(&WAYLAY_UIDS) = build_waylay_uids(apps);
+    rebuild_prop_ctx_cache();
     WAYLAY_CHANGED.store(true, Ordering::Release);
     Ok(())
 }
@@ -277,7 +280,52 @@ pub fn waylay_load_static() {
     *rw_write_ignore_poison(&WAYLAY_PROP_APPS) = prop_apps.clone();
     *rw_write_ignore_poison(&WAYLAY_PROP_UIDS) = build_waylay_uids(&prop_apps);
     *rw_write_ignore_poison(&WAYLAY_UIDS) = build_waylay_uids(&a);
+    rebuild_prop_ctx_cache();
 }
+/// 属性名 → selinux context: 读各 property_contexts 取最长匹配前缀的 context
+fn prop_context_for(name: &str) -> Option<String> {
+    const FILES: &[&str] = &[
+        "/system/etc/selinux/plat_property_contexts",
+        "/vendor/etc/selinux/vendor_property_contexts",
+        "/odm/etc/selinux/odm_property_contexts",
+        "/system_ext/etc/selinux/system_ext_property_contexts",
+        "/product/etc/selinux/product_property_contexts",
+    ];
+    let mut best: Option<(usize, String)> = None;
+    for f in FILES {
+        if let Ok(c) = std::fs::read_to_string(f) {
+            for line in c.lines() {
+                let t = line.trim();
+                if t.is_empty() || t.starts_with('#') {
+                    continue;
+                }
+                let mut it = t.split_whitespace();
+                let (Some(pre), Some(ctx)) = (it.next(), it.next()) else { continue };
+                if name.starts_with(pre) {
+                    let l = pre.len();
+                    if best.as_ref().map(|(bl, _)| l > *bl).unwrap_or(true) {
+                        best = Some((l, ctx.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    best.map(|(_, c)| c)
+}
+
+/// 解析并缓存 prop 规则 → context 映射 (WAYLAY_PROP_CTX): 初始化/保存配置后
+/// 调用一次, prop_apply 直接消费缓存
+pub fn rebuild_prop_ctx_cache() {
+    let rules = rw_read_ignore_poison(&WAYLAY_PROP_RULES).clone();
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (from, _) in &rules {
+        if let Some(ctx) = prop_context_for(from) {
+            out.push((from.clone(), ctx));
+        }
+    }
+    *rw_write_ignore_poison(&WAYLAY_PROP_CTX) = out;
+}
+
 pub static CONFIG_FILE: Mutex<String> = Mutex::new(String::new());
 
 #[derive(Clone)]

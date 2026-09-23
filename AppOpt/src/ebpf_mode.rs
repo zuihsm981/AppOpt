@@ -28,6 +28,11 @@ use std::thread;
 use crate::config::AppConfig;
 
 /// 安全构造 CString (输入受控/常量; 无 NUL 时保底空串, 避免 panic)
+/// KPM 模块可用性探测 (状态页 kpm_available 用): KP 就绪 + 握手
+pub(crate) fn kpm_probe() -> bool {
+    kp_ready(&kpm_key())
+}
+
 fn cstr(s: &str) -> CString {
     CString::new(s).unwrap_or_default()
 }
@@ -137,10 +142,6 @@ pub struct KpmHandle {
 }
 
 impl KpmHandle {
-    pub fn new() -> Self {
-        Self { key: kpm_key() }
-    }
-
     /// 确认模块已加载: ping 成功即视为已加载
     fn ping(&self) -> bool {
         let args = cstr("ping");
@@ -197,24 +198,56 @@ impl KpmHandle {
         self.cmd(&s);
     }
 
-    /// 内核态 property 区等长替换 (lineage<->hyperos): 解析本进程 maps 中
-    /// /dev/__properties__/ 共享 vma 地址, 交内核 access_process_vm 写穿
-    /// (共享物理页 → 全部进程生效)。on=true 替换 lineage→hyperos, false 恢复。
+    /// 内核态 property 区属性名替换 (精准定位): 使用 config 在初始化/保存时
+    /// 解析缓存的 原属性名→selinux context (WAYLAY_PROP_CTX), 只 mmap/替换
+    /// 主区对应 context 文件 (主区共享页写穿 → 全局生效)。不做每次读
+    /// property_contexts 的重复解析。
     pub(crate) fn prop_apply(&self, on: bool) {
         use std::fmt::Write as _;
+        let ctxs = crate::rw_read_ignore_poison(&crate::config::WAYLAY_PROP_CTX).clone();
+        let mut paths: Vec<std::path::PathBuf> = Vec::new();
+        for (_, ctx) in &ctxs {
+            let f = std::path::PathBuf::from(format!("/dev/__properties__/{}", ctx));
+            if f.exists() {
+                paths.push(f);
+            }
+        }
+        // mmap 目标文件 (保持存活防回收), 记录 (basename, vma)
+        static KEPT: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+        let mut want: Vec<String> = Vec::new();
+        {
+            let mut kept = KEPT.lock().unwrap();
+            kept.clear();
+            for p in paths {
+                use std::os::unix::io::AsRawFd;
+                let Ok(f) = std::fs::File::open(&p) else { continue };
+                let Ok(md) = f.metadata() else { continue };
+                let len = md.len();
+                if len == 0 { continue; }
+                let pr = unsafe {
+                    libc::mmap(std::ptr::null_mut(),
+                               len as usize & !0xFFF + 4096,
+                               libc::PROT_READ, libc::MAP_SHARED, f.as_raw_fd(), 0)
+                };
+                if pr != libc::MAP_FAILED {
+                    kept.push(pr as usize);
+                    if let Some(bn) = p.file_name().and_then(|x| x.to_str()) {
+                        if !want.contains(&bn.to_string()) { want.push(bn.to_string()); }
+                    }
+                }
+            }
+        }
         let mut s = String::from(if on { "prop_apply 1" } else { "prop_apply 0" });
         if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
             for line in maps.lines() {
-                if !line.contains("__properties__") {
+                if !want.iter().any(|bn| line.contains(bn.as_str())) {
                     continue;
                 }
                 let mut it = line.split_whitespace();
                 let (Some(rng), Some(_perm)) = (it.next(), it.next()) else { continue };
                 let Some((st, en)) = rng.split_once('-') else { continue };
-                if let (Ok(a), Ok(b)) = (
-                    u64::from_str_radix(st, 16),
-                    u64::from_str_radix(en, 16),
-                ) {
+                if let (Ok(a), Ok(b)) = (u64::from_str_radix(st, 16),
+                                        u64::from_str_radix(en, 16)) {
                     if b > a {
                         let _ = write!(s, " {:x} {:x}", a, b - a);
                     }
@@ -224,44 +257,25 @@ impl KpmHandle {
         self.cmd(&s);
     }
 
-    /* ---- 事件环通道 (shm_open/shm_close): 临时注释 —— 内核已无事件生产者,
-     * 不再建立/解除事件通道 (见 kpm_shm_reader 注释) ----
-    fn shm_open(&self, evt_fd: c_int) -> i64 {
-        let s = format!("shm_open {}", evt_fd);
-        let c = cstr(&s);
-        kpm_ctl0(&self.key, &c, &mut [])
-    }
-
-    fn shm_close(&self) {
-        let c = cstr("shm_close");
-        kpm_ctl0(&self.key, &c, &mut []);
-    }
-    */
-
 }
 
-/// 将内核 comm 截断于首个 NUL 并 trim 尾部空白
+/// KPM 初始化状态 (由 ebpf_init 创建; 事件环通道已移除)
 pub struct EbpfState {
     pub event_rx: mpsc::Receiver<EbpfProcEvent>,
     pub reader_thread: Option<thread::JoinHandle<()>>,
     /// KPM 传输句柄 (ctl0 supercall 通道); 字段名 bpf 沿用历史
     pub bpf: KpmHandle,
     pub wakeup_fd: c_int,
-    /// 事件到达通知 fd (eventfd): reader 收到事件后写入, 唤醒主循环 epoll
-    pub kpm_wake_fd: c_int,
-    /// 内核共享环事件通知 fd: AppOpt 创建的 eventfd, ctl0 shm_open 注册给内核;
-    /// 内核探针写入事件后 signal 之, reader 阻塞在此 fd 上 (替代 drain 轮询)
+    /// 兼容保留 (事件环已移除, 恒 -1)
     pub evt_fd: c_int,
-    /// ctl0 shm_open 返回的可 mmap 共享环 fd (内核 anon inode)
     pub shm_fd: c_int,
 }
 
 impl Drop for EbpfState {
     fn drop(&mut self) {
-        // 通知内核解除 eventfd 绑定 (best-effort; 模块可能已被卸载)
-        // 临时注释: 事件通道已停用 (shm_open/shm_close 注释)
-        // self.bpf.shm_close();
-        // 写 eventfd 唤醒 reader 线程后 join
+        // 事件环已停用: 无需 shm_close/evt_fd 解除 (模块可能已被卸载)
+        if Some(true) == None { unreachable!() }
+        // 写 eventfd 唤醒 reader 线程后 join (reader 线程已停用)
         if self.wakeup_fd >= 0 {
             let val: u64 = 1;
             unsafe {
@@ -274,122 +288,33 @@ impl Drop for EbpfState {
         if self.wakeup_fd >= 0 {
             unsafe { libc::close(self.wakeup_fd); }
         }
-        // evt_fd/shm_fd 为本模块创建; reader 已退出 (mmap 已由 reader 解除)
-        if self.evt_fd >= 0 {
-            unsafe { libc::close(self.evt_fd); }
-        }
-        if self.shm_fd >= 0 {
-            unsafe { libc::close(self.shm_fd); }
-        }
-        // kpm_wake_fd 由主循环创建并管理生命周期, Drop 不关闭
-        self.kpm_wake_fd = -1;
+        // evt_fd/shm_fd 兼容字段: 恒 -1
         self.evt_fd = -1;
         self.shm_fd = -1;
     }
 }
 
-/// KPM 探测: KernelPatch 就绪 且 模块可通信 (ping)
-pub fn kpm_probe() -> bool {
-    let key = kpm_key();
-    if !kp_ready(&key) {
-        return false;
-    }
-    let handle = KpmHandle::new();
-    handle.ping()
-}
-
-/// 初始化 KPM 事件驱动: 确保模块加载, 启动 reader 线程
-/// 失败返回 None, 由调用方回退纯用户态事件驱动 (binder+pidfd+触摸, 无 /proc 轮询)。
-/// kpm_wake_fd 由主循环创建并注册 epoll, reader 收到事件后写入以唤醒主循环。
-/// 初始化 KPM 事件驱动。drive_mode: "userspace" 直接纯用户态(不依赖 KPM);
-/// "auto" ping 失败快速回退纯用户态; "kpm" 等待模块长时间重试。
-pub fn ebpf_init(kpm_wake_fd: c_int, drive_mode: String) -> Option<EbpfState> {
-    // 设置项工作模式 UI 已移除: 不再因 userspace 直退 —— 只要模块加载 (ping 成功)
-    // 即可用 KPM (连接由拦截页控制); drive_mode 仅保留签名兼容。
+/// 初始化 KPM: 握手 + 校验; 事件环通道已移除 (内核无事件生产者), 只保留
+/// 空事件接收端 (主循环 EV_KPM try_recv 恒 Empty, 空转); 不自动武装 (start),
+/// 武装由 webui 拦截页「连接」触发。
+pub fn ebpf_init(_kpm_wake_fd: c_int, drive_mode: String) -> Option<EbpfState> {
+    // 设置项工作模式 UI 已移除: 只要模块加载 (ping 成功) 即可用 KPM
     let _ = drive_mode;
-
-    // 不重试: 连接不上 KPM 就直接回退用户态模式 (4.19 常无 KPM/或 KP hook 不可用)
     let key = kpm_key();
     if !kp_ready(&key) {
         return None;
     }
-
     let handle = KpmHandle { key };
     if !handle.verify_loaded() {
         return None;
     }
-
-    // 配置 input 节流 (与 eBPF 默认 1s 一致)
-    // 临时注释: 内核无 input_ms 命令 (input 已用户态 eventX)
-    // handle.cmd("input_ms 1000");
-
-    /* ---- 事件传输通道 (mmap 共享环 + eventfd + reader 线程): 临时注释 ----
-     * 内核已无事件生产者 (input/exit 事件已移除, SRV 替换纯内核不发事件),
-     * 不再建立事件环通道。主循环 EV_KPM 因 kpm_wake_fd 无写者而空转;
-     * kpm_died 断开检测随之停用 (临时取舍)。
-     * ---- 取消注释即恢复事件环 ----
-    let evt_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-    if evt_fd < 0 {
-        return None;
-    }
-    let shm_fd = handle.shm_open(evt_fd);
-    if shm_fd < 0 || shm_fd > i64::from(i32::MAX) {
-        unsafe { libc::close(evt_fd); }
-        return None;
-    }
-    let shm_fd = shm_fd as c_int;
-    let map_len = APPOPT_SHM_HDR_SIZE + APPOPT_EVENT_RING_SIZE as usize;
-    let shm_base = unsafe {
-        libc::mmap(std::ptr::null_mut(), map_len, libc::PROT_READ | libc::PROT_WRITE,
-                   libc::MAP_SHARED, shm_fd, 0)
-    };
-    if shm_base == libc::MAP_FAILED {
-        unsafe { libc::close(evt_fd); }
-        unsafe { libc::close(shm_fd); }
-        return None;
-    }
-    {
-        let hdr = shm_base as *const ShmRing;
-        let ok = unsafe {
-            (*hdr).magic == APPOPT_SHM_MAGIC && (*hdr).version == APPOPT_SHM_VERSION
-                && (*hdr).event_size == APPOPT_EVENT_SZ
-                && (*hdr).ring_size == APPOPT_EVENT_RING_SIZE
-        };
-        if !ok {
-            unsafe { libc::munmap(shm_base, map_len); }
-            unsafe { libc::close(evt_fd); }
-            unsafe { libc::close(shm_fd); }
-            handle.shm_close();
-            return None;
-        }
-    }
-    let (tx, rx) = mpsc::channel::<EbpfProcEvent>();
-    let wakeup_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-    if wakeup_fd < 0 {
-        unsafe { libc::munmap(shm_base, map_len); }
-        unsafe { libc::close(evt_fd); }
-        unsafe { libc::close(shm_fd); }
-        handle.shm_close();
-        return None;
-    }
-    let shm_ptr = shm_base as usize;
-    let reader_thread = thread::spawn(move || {
-        kpm_shm_reader(shm_ptr, map_len, evt_fd, tx, wakeup_fd, kpm_wake_fd);
-    });
-    */
-
-    // 事件环停用: 仅保留空事件接收端 (主循环 EV_KPM try_recv 恒 Empty, 空转)
+    // 事件环停用: 仅保留空事件接收端
     let (_tx, rx) = mpsc::channel::<EbpfProcEvent>();
-
-    // 不自动武装 (start): 初始化只加载/握手; 武装由 webui 拦截页「连接」触发
-    // (KpmHandle::arm → start; affinity 拦截 + 清理探针 + service list 伪装随武装启用)
-
     Some(EbpfState {
         event_rx: rx,
         reader_thread: None,
         bpf: handle,
         wakeup_fd: -1,
-        kpm_wake_fd,
         evt_fd: -1,
         shm_fd: -1,
     })

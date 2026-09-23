@@ -865,13 +865,7 @@ fn waylay_set_api(req: &Request) -> (u16, String) {
             rules.push((f, t));
         }
     }
-    let has_prop_rules = v["propRules"]
-        .as_array()
-        .map(|a| !a.is_empty())
-        .unwrap_or(false);
-    if rules.is_empty() && !has_prop_rules {
-        return err_json(400, "至少需要一组拦截规则");
-    }
+    // 允许全空保存: 两个 tab 都可清空 (内核空规则短路不替换)
     // property 区伪装规则 (同校验: 非空/等长/≤32/ASCII), 可空
     let mut prop_rules: Vec<(String, String)> = Vec::new();
     if let Some(arr) = v["propRules"].as_array() {
