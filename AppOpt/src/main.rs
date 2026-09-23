@@ -375,10 +375,19 @@ impl AppState {
     /// 错误配置行不会下发; 自动保存路径同样经此兜底)
     fn sync_waylay_rules(&self) {
         if let Some(es) = self.ebpf_state.as_ref() {
-            let rules = crate::config::waylay_sanitize_rules();
+            let (rules, prop_rules, prop_targets) = crate::config::waylay_sanitize_rules();
             es.bpf.srv_clear();
             for (i, (f, t)) in rules.iter().enumerate() {
                 es.bpf.srv_rule(i, f, t);
+            }
+            // property 区伪装规则 (from→to) + 目标属性 (非空=目标属性替换)
+            es.bpf.prop_clear();
+            for (i, (f, t)) in prop_rules.iter().enumerate() {
+                es.bpf.prop_rule(i, f, t);
+            }
+            es.bpf.prop_target_clear();
+            for n in prop_targets.iter() {
+                es.bpf.prop_target(n);
             }
         }
     }
@@ -438,6 +447,8 @@ impl AppState {
             self.srv_active_cur = want;
             if let Some(es) = self.ebpf_state.as_ref() {
                 es.bpf.srv_active(want);
+                // property 区伪装: 目标应用前台替换 lineage→hyperos, 切走恢复
+                es.bpf.prop_apply(want);
             }
         }
         let Some(e) = self.uid_map.get(&uid) else { return };

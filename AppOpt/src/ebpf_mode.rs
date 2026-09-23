@@ -186,6 +186,55 @@ impl KpmHandle {
         self.cmd("stop");
     }
 
+    /// 清空内核 property 替换规则表 (waylay.conf [prop] 段重载前调用)
+    pub(crate) fn prop_clear(&self) {
+        self.cmd("prop_clear");
+    }
+
+    /// 设置第 i 组 property 替换规则 (from→to, 等长 ASCII ≤32)
+    pub(crate) fn prop_rule(&self, i: usize, from: &str, to: &str) {
+        let s = format!("prop_rule {} {} {}", i, from, to);
+        self.cmd(&s);
+    }
+
+    /// 清空内核 property 目标属性名表
+    pub(crate) fn prop_target_clear(&self) {
+        self.cmd("prop_target_clear");
+    }
+
+    /// 追加一个目标属性名 (非空表 = 目标属性替换模式, 仅这些属性生效)
+    pub(crate) fn prop_target(&self, name: &str) {
+        let s = format!("prop_target {}", name);
+        self.cmd(&s);
+    }
+
+    /// 内核态 property 区等长替换 (lineage<->hyperos): 解析本进程 maps 中
+    /// /dev/__properties__/ 共享 vma 地址, 交内核 access_process_vm 写穿
+    /// (共享物理页 → 全部进程生效)。on=true 替换 lineage→hyperos, false 恢复。
+    pub(crate) fn prop_apply(&self, on: bool) {
+        use std::fmt::Write as _;
+        let mut s = String::from(if on { "prop_apply 1" } else { "prop_apply 0" });
+        if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
+            for line in maps.lines() {
+                if !line.contains("__properties__") {
+                    continue;
+                }
+                let mut it = line.split_whitespace();
+                let (Some(rng), Some(_perm)) = (it.next(), it.next()) else { continue };
+                let Some((st, en)) = rng.split_once('-') else { continue };
+                if let (Ok(a), Ok(b)) = (
+                    u64::from_str_radix(st, 16),
+                    u64::from_str_radix(en, 16),
+                ) {
+                    if b > a {
+                        let _ = write!(s, " {:x} {:x}", a, b - a);
+                    }
+                }
+            }
+        }
+        self.cmd(&s);
+    }
+
     /* ---- 事件环通道 (shm_open/shm_close): 临时注释 —— 内核已无事件生产者,
      * 不再建立/解除事件通道 (见 kpm_shm_reader 注释) ----
     fn shm_open(&self, evt_fd: c_int) -> i64 {
