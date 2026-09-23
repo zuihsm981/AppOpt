@@ -277,6 +277,12 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <button class="btn" id="wp-target-add" style="width:100%;margin-top:8px">＋ 添加目标属性</button>
 <div id="wp-targets" style="margin-top:8px"></div>
 </div>
+<div class="card">
+<div class="card-title">目标应用 <span class="hint" style="font-weight:400">(prop 伪装独立目标; 前台时激活/切走恢复)</span></div>
+<div class="sg-wrap"><input id="wp-app" placeholder="输入包名添加目标应用"><div class="sg-box" id="wp-sg" hidden></div></div>
+<button class="btn" id="wp-add-app" style="width:100%;margin-top:8px">＋ 添加应用</button>
+<div id="wp-apps" style="margin-top:8px"></div>
+</div>
 </div>
 </section>
 
@@ -431,6 +437,27 @@ let wlApps=[];
 let wlRules=[{from:'lineage',to:'opluseu'}];
 let wlPropRules=[];
 let wlPropTargets=[];
+let wlPropApps=[];
+function renderWpApps(){
+  if(!wlPropApps.length){$('wp-apps').innerHTML='<div class="hint">未添加目标应用 (prop 前台不激活替换)</div>';return}
+  $('wp-apps').innerHTML=wlPropApps.map((a,i)=>`<div class="row" style="margin-bottom:4px"><span class="mono">${esc(a)}</span><button class="icon-btn danger" data-i="${i}" title="移除">${ICO_TRASH}</button></div>`).join('');
+}
+$('wp-apps').addEventListener('click',e=>{
+  const b=e.target.closest('[data-i]');
+  if(!b)return;
+  wlPropApps.splice(+b.dataset.i,1);renderWpApps();
+  wlSaveNow();
+});
+function wpAddApp(pkg){
+  pkg=(pkg||'').trim();
+  if(!pkg)return;
+  if(!wlPropApps.includes(pkg))wlPropApps.push(pkg);
+  $('wp-app').value='';
+  $('wp-sg').hidden=true;
+  renderWpApps();
+  wlSaveNow();
+}
+$('wp-add-app').onclick=()=>wpAddApp($('wp-app').value);
 function renderWpTargets(){
   if(!wlPropTargets.length){$('wp-targets').innerHTML='<div class="hint">未添加目标属性 (当前为全部替换)</div>';return}
   $('wp-targets').innerHTML=wlPropTargets.map((n,i)=>`<div class="row" style="margin-bottom:4px"><span class="mono">${esc(n)}</span><button class="icon-btn danger" data-i="${i}" title="移除">${ICO_TRASH}</button></div>`).join('');
@@ -509,11 +536,13 @@ async function loadWaylay(){
     wlRules=(d.rules&&d.rules.length)?d.rules:[{from:'lineage',to:'opluseu'}];
     wlPropRules=d.propRules||[];
     wlPropTargets=d.propTargets||[];
+    wlPropApps=d.propApps||[];
     renderWaylayConn(!!d.connected);
     renderWaylayApps();
     renderWaylayRules();
     renderWpRules();
     renderWpTargets();
+    renderWpApps();
     return !!d.connected;
   }catch(e){toast(e.message);return false}
 }
@@ -542,12 +571,13 @@ function wlSaveNow(){
     for(const r of wlRules){
       if(!r.from||!r.to||r.from.length!==r.to.length){toast('拦截与替换字符数需一致');return}
     }
-    try{await api('/api/waylay',{rules:wlRules,apps:wlApps,propRules:wlPropRules,propTargets:wlPropTargets})}
+    try{await api('/api/waylay',{rules:wlRules,apps:wlApps,propRules:wlPropRules,propTargets:wlPropTargets,propApps:wlPropApps})}
     catch(e){toast(e.message)}
   },200);
 }
 $('w-add').onclick=()=>wlAddApp($('w-app').value);
 suggest_bind($('w-app'),$('w-sg'),{onpick:wlAddApp});
+suggest_bind($('wp-app'),$('wp-sg'),{onpick:wpAddApp});
 // chips: 连接=武装 KPM (start) / 断开=解除 (stop); 顺带保存当前字符与应用
 $('w-conn-chips').addEventListener('click',async e=>{
   const b=e.target.closest('button');if(!b)return;
