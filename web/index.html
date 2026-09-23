@@ -243,6 +243,10 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <button data-v="1">连接</button><button data-v="0">断开</button>
 </div>
 </div>
+<div class="uclamp-chips" id="w-seg" style="margin-bottom:8px">
+<button data-v="srv" class="on">service list 配置</button><button data-v="prop">prop 伪装配置</button>
+</div>
+<div id="w-srv-pane">
 <div class="card">
 <div class="card-title">拦截配置</div>
 <div class="field"><span class="label" style="white-space:nowrap">拦截字符</span><input id="w-from" maxlength="32" placeholder="lineage"></div>
@@ -256,6 +260,23 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="sg-wrap"><input id="w-app" placeholder="输入包名添加目标应用"><div class="sg-box" id="w-sg" hidden></div></div>
 <button class="btn" id="w-add" style="width:100%;margin-top:8px">＋ 添加应用</button>
 <div id="w-apps" style="margin-top:8px"></div>
+</div>
+</div>
+<div id="w-prop-pane" hidden>
+<div class="card">
+<div class="card-title">prop 伪装配置 <span class="hint" style="font-weight:400">(目标应用前台时 property 区等长替换, 切走恢复)</span></div>
+<div class="field"><span class="label" style="white-space:nowrap">拦截字符</span><input id="wp-from" maxlength="32" placeholder="lineage"></div>
+<div class="field"><span class="label" style="white-space:nowrap">替换字符</span><input id="wp-to" maxlength="32" placeholder="hyperos"></div>
+<button class="btn" id="wp-add" style="width:100%;margin-top:8px">＋ 添加规则</button>
+<div class="hint">拦截与替换字符数需一致 (ASCII, ≤32), 可添加多组; 添加/删除即保存</div>
+<div id="wp-rules" style="margin-top:8px"></div>
+</div>
+<div class="card">
+<div class="card-title">目标属性替换 <span class="hint" style="font-weight:400">(填写后仅这些属性的条目被替换; 留空 = 全部替换)</span></div>
+<div class="sg-wrap"><input id="wp-target" placeholder="输入属性名 (如 ro.build.flavor)"><div class="sg-box" id="wp-sg" hidden></div></div>
+<button class="btn" id="wp-target-add" style="width:100%;margin-top:8px">＋ 添加目标属性</button>
+<div id="wp-targets" style="margin-top:8px"></div>
+</div>
 </div>
 </section>
 
@@ -408,6 +429,52 @@ document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{
 // ===== 拦截 (waylay) 页 =====
 let wlApps=[];
 let wlRules=[{from:'lineage',to:'opluseu'}];
+let wlPropRules=[];
+let wlPropTargets=[];
+function renderWpTargets(){
+  if(!wlPropTargets.length){$('wp-targets').innerHTML='<div class="hint">未添加目标属性 (当前为全部替换)</div>';return}
+  $('wp-targets').innerHTML=wlPropTargets.map((n,i)=>`<div class="row" style="margin-bottom:4px"><span class="mono">${esc(n)}</span><button class="icon-btn danger" data-i="${i}" title="移除">${ICO_TRASH}</button></div>`).join('');
+}
+$('wp-targets').addEventListener('click',e=>{
+  const b=e.target.closest('[data-i]');
+  if(!b)return;
+  wlPropTargets.splice(+b.dataset.i,1);renderWpTargets();
+  wlSaveNow();
+});
+$('wp-target-add').onclick=()=>{
+  const n=$('wp-target').value.trim();
+  if(!n.length){toast('请输入属性名');return}
+  if(!wlPropTargets.includes(n))wlPropTargets.push(n);
+  $('wp-target').value='';
+  renderWpTargets();
+  wlSaveNow();
+};
+function renderWpRules(){
+  if(!wlPropRules.length){$('wp-rules').innerHTML='<div class="hint">未添加 prop 伪装规则</div>';return}
+  $('wp-rules').innerHTML=wlPropRules.map((r,i)=>`<div class="row" style="margin-bottom:4px"><span class="mono">${esc(r.from)} → ${esc(r.to)}</span><button class="icon-btn danger" data-i="${i}" title="删除规则">${ICO_TRASH}</button></div>`).join('');
+}
+$('wp-rules').addEventListener('click',e=>{
+  const b=e.target.closest('[data-i]');
+  if(!b)return;
+  wlPropRules.splice(+b.dataset.i,1);renderWpRules();
+  wlSaveNow();
+});
+$('wp-add').onclick=()=>{
+  const f=$('wp-from').value.trim(), t=$('wp-to').value.trim();
+  if(!f.length||f.length!==t.length){toast('拦截与替换字符数需一致');return}
+  wlPropRules.push({from:f,to:t});
+  $('wp-from').value='';$('wp-to').value='';
+  renderWpRules();
+  wlSaveNow();
+};
+// 拦截页顶部 tab: service list / prop 伪装
+$('w-seg').addEventListener('click',e=>{
+  const b=e.target.closest('button');if(!b)return;
+  const v=b.dataset.v;
+  $('w-seg').querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));
+  $('w-srv-pane').hidden=v!=='srv';
+  $('w-prop-pane').hidden=v!=='prop';
+});
 function renderWaylayRules(){
   if(!wlRules.length){$('w-rules').innerHTML='<div class="hint">未添加拦截规则</div>';return}
   $('w-rules').innerHTML=wlRules.map((r,i)=>`<div class="row" style="margin-bottom:4px"><span class="mono">${esc(r.from)} → ${esc(r.to)}</span><button class="icon-btn danger" data-i="${i}" title="删除规则">${ICO_TRASH}</button></div>`).join('');
@@ -440,9 +507,13 @@ async function loadWaylay(){
     const d=await api('/api/waylay');
     wlApps=d.apps||[];
     wlRules=(d.rules&&d.rules.length)?d.rules:[{from:'lineage',to:'opluseu'}];
+    wlPropRules=d.propRules||[];
+    wlPropTargets=d.propTargets||[];
     renderWaylayConn(!!d.connected);
     renderWaylayApps();
     renderWaylayRules();
+    renderWpRules();
+    renderWpTargets();
     return !!d.connected;
   }catch(e){toast(e.message);return false}
 }
@@ -471,7 +542,7 @@ function wlSaveNow(){
     for(const r of wlRules){
       if(!r.from||!r.to||r.from.length!==r.to.length){toast('拦截与替换字符数需一致');return}
     }
-    try{await api('/api/waylay',{rules:wlRules,apps:wlApps})}
+    try{await api('/api/waylay',{rules:wlRules,apps:wlApps,propRules:wlPropRules,propTargets:wlPropTargets})}
     catch(e){toast(e.message)}
   },200);
 }
