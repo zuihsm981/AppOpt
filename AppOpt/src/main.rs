@@ -318,6 +318,8 @@ struct AppState {
     rfr_pkgs_set: HashSet<String>,
     /// 已下发给内核的 service list 伪装开关 (差量下发, 仅应用切换时调整)
     srv_active_cur: bool,
+    /// 已下发给内核的 property 区伪装开关 (独立目标应用集)
+    prop_active_cur: bool,
     /// 主循环事件通知 fd (EV_KPM): 连接时重新初始化 ebpf 用
     kpm_wake_fd: libc::c_int,
 }
@@ -342,6 +344,7 @@ impl AppState {
             cpu_pkgs_set,
             rfr_pkgs_set,
             srv_active_cur: false,
+            prop_active_cur: false,
             kpm_wake_fd: -1,
         }
     }
@@ -375,7 +378,8 @@ impl AppState {
     /// 错误配置行不会下发; 自动保存路径同样经此兜底)
     fn sync_waylay_rules(&self) {
         if let Some(es) = self.ebpf_state.as_ref() {
-            let (rules, prop_rules, prop_targets) = crate::config::waylay_sanitize_rules();
+            let (rules, prop_rules, prop_targets, _prop_apps) =
+                crate::config::waylay_sanitize_rules();
             es.bpf.srv_clear();
             for (i, (f, t)) in rules.iter().enumerate() {
                 es.bpf.srv_rule(i, f, t);
@@ -447,8 +451,15 @@ impl AppState {
             self.srv_active_cur = want;
             if let Some(es) = self.ebpf_state.as_ref() {
                 es.bpf.srv_active(want);
-                // property 区伪装: 目标应用前台替换 lineage→hyperos, 切走恢复
-                es.bpf.prop_apply(want);
+            }
+        }
+        // property 区伪装: 独立目标应用集 (prop 目标应用前台替换, 切走恢复)
+        let want_prop =
+            crate::rw_read_ignore_poison(&crate::config::WAYLAY_PROP_UIDS).contains(&uid);
+        if want_prop != self.prop_active_cur {
+            self.prop_active_cur = want_prop;
+            if let Some(es) = self.ebpf_state.as_ref() {
+                es.bpf.prop_apply(want_prop);
             }
         }
         let Some(e) = self.uid_map.get(&uid) else { return };

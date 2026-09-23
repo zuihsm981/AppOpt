@@ -62,6 +62,13 @@ pub static WAYLAY_PROP_RULES: LazyLock<RwLock<Vec<(String, String)>>> =
 /// 只替换这些属性的条目 (目标属性替换); 空 = 全部替换
 pub static WAYLAY_PROP_TARGETS: LazyLock<RwLock<Vec<String>>> =
     LazyLock::new(|| RwLock::new(Vec::new()));
+/// property 伪装目标应用列表 (waylay.conf [prop] 段 prop_app): 前台命中时
+/// 激活 property 区替换 (独立于 service list 目标应用, 见 WAYLAY_* 同名)
+pub static WAYLAY_PROP_APPS: LazyLock<RwLock<Vec<String>>> =
+    LazyLock::new(|| RwLock::new(Vec::new()));
+/// property 目标应用 uid 集合 (前台回调据此激活 property 替换)
+pub static WAYLAY_PROP_UIDS: LazyLock<RwLock<HashSet<i32>>> =
+    LazyLock::new(|| RwLock::new(HashSet::new()));
 /// 目标应用 uid 集合 (查 packages.list; 前台回调据此激活拦截)
 pub static WAYLAY_UIDS: LazyLock<RwLock<HashSet<i32>>> = LazyLock::new(|| RwLock::new(HashSet::new()));
 /// waylay 配置已变更 (web 保存后置位; 主循环 EV_CONFIG 分支消费并同步内核)
@@ -86,11 +93,13 @@ pub fn load_waylay() -> (
     Vec<String>,
     Vec<(String, String)>,
     Vec<String>,
+    Vec<String>,
 ) {
     let mut rules: Vec<(String, String)> = Vec::new();
     let mut apps: Vec<String> = Vec::new();
     let mut prop_rules: Vec<(String, String)> = Vec::new();
     let mut prop_targets: Vec<String> = Vec::new();
+    let mut prop_apps: Vec<String> = Vec::new();
     let mut in_prop = false;
     if let Ok(content) = std::fs::read_to_string(WAYLAY_FILE) {
         for line in content.lines() {
@@ -117,6 +126,11 @@ pub fn load_waylay() -> (
                 if !name.is_empty() {
                     prop_targets.push(name);
                 }
+            } else if let Some(rest) = t.strip_prefix("prop_app ") {
+                let pkg = rest.trim().to_string();
+                if !pkg.is_empty() {
+                    prop_apps.push(pkg);
+                }
             } else if in_prop {
                 // [prop] 段内未知行忽略 (段边界)
             } else if !t.starts_with("srv_") {
@@ -127,7 +141,7 @@ pub fn load_waylay() -> (
     if rules.is_empty() {
         rules.push(("lineage".to_string(), "opluseu".to_string()));
     }
-    (rules, apps, prop_rules, prop_targets)
+    (rules, apps, prop_rules, prop_targets, prop_apps)
 }
 
 /// 目标应用 → uid 集合 (查 packages.list; 未安装跳过)
@@ -155,6 +169,7 @@ pub fn save_waylay(
     apps: &[String],
     prop_rules: &[(String, String)],
     prop_targets: &[String],
+    prop_apps: &[String],
 ) -> io::Result<()> {
     let mut out = String::from("# 注意:手动添加不生效，需要在webui中添加\n");
     out.push_str("# waylay: service list / prop 伪装配置\n");
@@ -177,6 +192,12 @@ pub fn save_waylay(
                 out.push_str(&format!("prop_target {}\n", n.trim()));
             }
         }
+        if !prop_apps.is_empty() {
+            out.push_str("# prop 目标应用 (前台时激活 prop 替换), 包名一行一个\n");
+            for a in prop_apps {
+                out.push_str(&format!("prop_app {}\n", a.trim()));
+            }
+        }
     }
     let tmp = format!("{}.tmp", WAYLAY_FILE);
     fs::write(&tmp, out.as_bytes())?;
@@ -185,6 +206,8 @@ pub fn save_waylay(
     *rw_write_ignore_poison(&WAYLAY_APPS) = apps.to_vec();
     *rw_write_ignore_poison(&WAYLAY_PROP_RULES) = prop_rules.to_vec();
     *rw_write_ignore_poison(&WAYLAY_PROP_TARGETS) = prop_targets.to_vec();
+    *rw_write_ignore_poison(&WAYLAY_PROP_APPS) = prop_apps.to_vec();
+    *rw_write_ignore_poison(&WAYLAY_PROP_UIDS) = build_waylay_uids(prop_apps);
     *rw_write_ignore_poison(&WAYLAY_UIDS) = build_waylay_uids(apps);
     WAYLAY_CHANGED.store(true, Ordering::Release);
     Ok(())
@@ -202,6 +225,7 @@ pub fn waylay_sanitize_rules() -> (
     Vec<(String, String)>,
     Vec<(String, String)>,
     Vec<String>,
+    Vec<String>,
 ) {
     let valid = |f: &str, t: &str| {
         !f.is_empty() && f.len() == t.len() && f.len() <= 32 && f.is_ascii() && t.is_ascii()
@@ -210,6 +234,7 @@ pub fn waylay_sanitize_rules() -> (
     let dirty = rw_read_ignore_poison(&WAYLAY_RULES).clone();
     let dprop = rw_read_ignore_poison(&WAYLAY_PROP_RULES).clone();
     let dtargets = rw_read_ignore_poison(&WAYLAY_PROP_TARGETS).clone();
+    let dpropapps = rw_read_ignore_poison(&WAYLAY_PROP_APPS).clone();
     let clean: Vec<(String, String)> = dirty
         .iter()
         .filter(|(f, t)| valid(f, t))
@@ -225,13 +250,20 @@ pub fn waylay_sanitize_rules() -> (
         .filter(|n| !n.trim().is_empty() && n.len() <= 92 && n.is_ascii())
         .map(|n| n.trim().to_string())
         .collect();
+    let clean_prop_apps: Vec<String> = dpropapps
+        .iter()
+        .filter(|p| !p.trim().is_empty() && p.len() <= 256)
+        .map(|p| p.trim().to_string())
+        .collect();
     if clean.len() != dirty.len()
         || clean_prop.len() != dprop.len()
         || clean_targets.len() != dtargets.len()
+        || clean_prop_apps.len() != dpropapps.len()
     {
         *rw_write_ignore_poison(&WAYLAY_RULES) = clean.clone();
         *rw_write_ignore_poison(&WAYLAY_PROP_RULES) = clean_prop.clone();
         *rw_write_ignore_poison(&WAYLAY_PROP_TARGETS) = clean_targets.clone();
+        *rw_write_ignore_poison(&WAYLAY_PROP_APPS) = clean_prop_apps.clone();
         // 重写 waylay.conf (移除错误行): 不置 CHANGED/不重建 UIDS
         let mut out = String::from("# 注意:手动添加不生效，需要在webui中添加\n");
         out.push_str("# waylay: service list / prop 伪装配置\n");
@@ -254,22 +286,30 @@ pub fn waylay_sanitize_rules() -> (
                     out.push_str(&format!("prop_target {}\n", n.trim()));
                 }
             }
+            if !clean_prop_apps.is_empty() {
+                out.push_str("# prop 目标应用 (前台时激活 prop 替换), 包名一行一个\n");
+                for a in &clean_prop_apps {
+                    out.push_str(&format!("prop_app {}\n", a.trim()));
+                }
+            }
         }
         let tmp = format!("{}.tmp", WAYLAY_FILE);
         if fs::write(&tmp, out.as_bytes()).is_ok() {
             let _ = fs::rename(&tmp, WAYLAY_FILE);
         }
     }
-    (clean, clean_prop, clean_targets)
+    (clean, clean_prop, clean_targets, clean_prop_apps)
 }
 
 /// 启动/重载时把 waylay.conf 加载进静态 (默认 lineage→opluseu 一组 + 空应用表兜底)
 pub fn waylay_load_static() {
-    let (rules, a, prop_rules, prop_targets) = load_waylay();
+    let (rules, a, prop_rules, prop_targets, prop_apps) = load_waylay();
     *rw_write_ignore_poison(&WAYLAY_RULES) = rules;
     *rw_write_ignore_poison(&WAYLAY_APPS) = a.clone();
     *rw_write_ignore_poison(&WAYLAY_PROP_RULES) = prop_rules;
     *rw_write_ignore_poison(&WAYLAY_PROP_TARGETS) = prop_targets;
+    *rw_write_ignore_poison(&WAYLAY_PROP_APPS) = prop_apps.clone();
+    *rw_write_ignore_poison(&WAYLAY_PROP_UIDS) = build_waylay_uids(&prop_apps);
     *rw_write_ignore_poison(&WAYLAY_UIDS) = build_waylay_uids(&a);
 }
 pub static CONFIG_FILE: Mutex<String> = Mutex::new(String::new());

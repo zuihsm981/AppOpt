@@ -831,12 +831,14 @@ fn waylay_json() -> String {
         crate::rw_read_ignore_poison(&crate::config::WAYLAY_PROP_RULES).clone();
     let prop_targets =
         crate::rw_read_ignore_poison(&crate::config::WAYLAY_PROP_TARGETS).clone();
+    let prop_apps = crate::rw_read_ignore_poison(&crate::config::WAYLAY_PROP_APPS).clone();
     json!({
         // 已连接 = KPM 模块已武装 (拦截功能随 start/stop)
         "connected": KPM_ARMED.load(Ordering::Relaxed),
         "rules": rules.iter().map(|(f, t)| json!({"from": f, "to": t})).collect::<Vec<_>>(),
         "propRules": prop_rules.iter().map(|(f, t)| json!({"from": f, "to": t})).collect::<Vec<_>>(),
         "propTargets": prop_targets,
+        "propApps": prop_apps,
         "apps": apps,
     })
     .to_string()
@@ -895,6 +897,18 @@ fn waylay_set_api(req: &Request) -> (u16, String) {
             }
         }
     }
+    // property 伪装目标应用 (前台命中时激活 prop 替换; 独立于 srv 目标应用)
+    let mut prop_apps: Vec<String> = Vec::new();
+    if let Some(arr) = v["propApps"].as_array() {
+        for x in arr {
+            if let Some(p) = x.as_str() {
+                let p = p.trim().to_string();
+                if !p.is_empty() && p.len() <= 256 && !p.starts_with(&['#', '/']) {
+                    prop_apps.push(p);
+                }
+            }
+        }
+    }
     let apps: Vec<String> = v["apps"]
         .as_array()
         .map(|a| {
@@ -909,7 +923,9 @@ fn waylay_set_api(req: &Request) -> (u16, String) {
             return err_json(400, &format!("包名过长: {}", a));
         }
     }
-    if let Err(e) = crate::config::save_waylay(&rules, &apps, &prop_rules, &prop_targets) {
+    if let Err(e) =
+        crate::config::save_waylay(&rules, &apps, &prop_rules, &prop_targets, &prop_apps)
+    {
         return err_json(500, &format!("保存失败: {}", e));
     }
     // 唤醒主循环: reload 消费 WAYLAY_CHANGED → 同步内核规则 (srv_clear + 逐组 srv_rule)
