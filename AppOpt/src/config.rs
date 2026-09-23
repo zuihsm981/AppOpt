@@ -45,9 +45,8 @@ pub fn request_config_reload() {
  *   srv_set <f> <t>      service list 拦截字符/替换字符 (多组, 等长)
  *   包名一行一个         目标应用 (前台时激活拦截)
  *   [prop] 段:
- *     prop_set <f> <t>     全部替换规则 (多组, 等长 ASCII)
- *     prop_target <name>   目标属性名 (配置后=目标属性替换: 仅这些属性的
- *                          条目生效; 不配置=全部替换)
+ *     prop_set <f> <t>     属性名替换对: 原属性名 → 新属性名 (完整名, 等长
+ *                          ASCII ≤92, 每 pair 一行)
  */
 pub const WAYLAY_FILE: &str = "waylay.conf";
 /// 拦截规则列表 (from→to 多组, from/to 等长)
@@ -57,10 +56,6 @@ pub static WAYLAY_RULES: LazyLock<RwLock<Vec<(String, String)>>> =
 pub static WAYLAY_APPS: LazyLock<RwLock<Vec<String>>> = LazyLock::new(|| RwLock::new(Vec::new()));
 /// property 区伪装规则列表 (waylay.conf [prop] 段: from→to 等长 ASCII)
 pub static WAYLAY_PROP_RULES: LazyLock<RwLock<Vec<(String, String)>>> =
-    LazyLock::new(|| RwLock::new(Vec::new()));
-/// property 目标属性名列表 (waylay.conf [prop] 段 prop_target): 非空时
-/// 只替换这些属性的条目 (目标属性替换); 空 = 全部替换
-pub static WAYLAY_PROP_TARGETS: LazyLock<RwLock<Vec<String>>> =
     LazyLock::new(|| RwLock::new(Vec::new()));
 /// property 伪装目标应用列表 (waylay.conf [prop] 段 prop_app): 前台命中时
 /// 激活 property 区替换 (独立于 service list 目标应用, 见 WAYLAY_* 同名)
@@ -86,19 +81,16 @@ pub fn take_kpm_arm_req() -> i8 {
 }
 
 /// 解析 waylay.conf: srv_set <f> <t> 多组; 非 srv_ 行为目标应用包名;
-/// [prop] 段后 prop_set <f> <t> 为 property 区伪装规则, prop_target <name>
-/// 为目标属性名 (存在=目标属性替换模式, 空=全部替换)
+/// [prop] 段后 prop_set <f> <t> 为属性名替换对 (原属性名→新属性名, 等长)
 pub fn load_waylay() -> (
     Vec<(String, String)>,
     Vec<String>,
     Vec<(String, String)>,
     Vec<String>,
-    Vec<String>,
 ) {
     let mut rules: Vec<(String, String)> = Vec::new();
     let mut apps: Vec<String> = Vec::new();
     let mut prop_rules: Vec<(String, String)> = Vec::new();
-    let mut prop_targets: Vec<String> = Vec::new();
     let mut prop_apps: Vec<String> = Vec::new();
     let mut in_prop = false;
     if let Ok(content) = std::fs::read_to_string(WAYLAY_FILE) {
@@ -121,11 +113,6 @@ pub fn load_waylay() -> (
                 if let (Some(f), Some(to)) = (it.next(), it.next()) {
                     prop_rules.push((f.to_string(), to.to_string()));
                 }
-            } else if let Some(rest) = t.strip_prefix("prop_target ") {
-                let name = rest.trim().to_string();
-                if !name.is_empty() {
-                    prop_targets.push(name);
-                }
             } else if let Some(rest) = t.strip_prefix("prop_app ") {
                 let pkg = rest.trim().to_string();
                 if !pkg.is_empty() {
@@ -141,7 +128,7 @@ pub fn load_waylay() -> (
     if rules.is_empty() {
         rules.push(("lineage".to_string(), "opluseu".to_string()));
     }
-    (rules, apps, prop_rules, prop_targets, prop_apps)
+    (rules, apps, prop_rules, prop_apps)
 }
 
 /// 目标应用 → uid 集合 (查 packages.list; 未安装跳过)
@@ -168,7 +155,6 @@ pub fn save_waylay(
     rules: &[(String, String)],
     apps: &[String],
     prop_rules: &[(String, String)],
-    prop_targets: &[String],
     prop_apps: &[String],
 ) -> io::Result<()> {
     let mut out = String::from("# 注意:手动添加不生效，需要在webui中添加\n");
@@ -182,15 +168,9 @@ pub fn save_waylay(
         out.push_str(&format!("{}\n", a.trim()));
     }
     if !prop_rules.is_empty() {
-        out.push_str("# [prop] property 区伪装 (等长 ASCII)\n[prop]\n");
+        out.push_str("# [prop] 属性名替换对: prop_set <原属性名> <新属性名> (完整名, 等长 ASCII)\n[prop]\n");
         for (f, t) in prop_rules {
             out.push_str(&format!("prop_set {} {}\n", f.trim(), t.trim()));
-        }
-        if !prop_targets.is_empty() {
-            out.push_str("# 目标属性替换: 仅以下属性生效 (留空=全部替换)\n");
-            for n in prop_targets {
-                out.push_str(&format!("prop_target {}\n", n.trim()));
-            }
         }
         if !prop_apps.is_empty() {
             out.push_str("# prop 目标应用 (前台时激活 prop 替换), 包名一行一个\n");
@@ -205,7 +185,6 @@ pub fn save_waylay(
     *rw_write_ignore_poison(&WAYLAY_RULES) = rules.to_vec();
     *rw_write_ignore_poison(&WAYLAY_APPS) = apps.to_vec();
     *rw_write_ignore_poison(&WAYLAY_PROP_RULES) = prop_rules.to_vec();
-    *rw_write_ignore_poison(&WAYLAY_PROP_TARGETS) = prop_targets.to_vec();
     *rw_write_ignore_poison(&WAYLAY_PROP_APPS) = prop_apps.to_vec();
     *rw_write_ignore_poison(&WAYLAY_PROP_UIDS) = build_waylay_uids(prop_apps);
     *rw_write_ignore_poison(&WAYLAY_UIDS) = build_waylay_uids(apps);
@@ -225,30 +204,26 @@ pub fn waylay_sanitize_rules() -> (
     Vec<(String, String)>,
     Vec<(String, String)>,
     Vec<String>,
-    Vec<String>,
 ) {
-    let valid = |f: &str, t: &str| {
+    let valid32 = |f: &str, t: &str| {
         !f.is_empty() && f.len() == t.len() && f.len() <= 32 && f.is_ascii() && t.is_ascii()
+    };
+    let valid92 = |f: &str, t: &str| {
+        !f.is_empty() && f.len() == t.len() && f.len() <= 92 && f.is_ascii() && t.is_ascii()
     };
     let apps = rw_read_ignore_poison(&WAYLAY_APPS).clone();
     let dirty = rw_read_ignore_poison(&WAYLAY_RULES).clone();
     let dprop = rw_read_ignore_poison(&WAYLAY_PROP_RULES).clone();
-    let dtargets = rw_read_ignore_poison(&WAYLAY_PROP_TARGETS).clone();
     let dpropapps = rw_read_ignore_poison(&WAYLAY_PROP_APPS).clone();
     let clean: Vec<(String, String)> = dirty
         .iter()
-        .filter(|(f, t)| valid(f, t))
+        .filter(|(f, t)| valid32(f, t))
         .cloned()
         .collect();
     let clean_prop: Vec<(String, String)> = dprop
         .iter()
-        .filter(|(f, t)| valid(f, t))
+        .filter(|(f, t)| valid92(f, t))
         .cloned()
-        .collect();
-    let clean_targets: Vec<String> = dtargets
-        .iter()
-        .filter(|n| !n.trim().is_empty() && n.len() <= 92 && n.is_ascii())
-        .map(|n| n.trim().to_string())
         .collect();
     let clean_prop_apps: Vec<String> = dpropapps
         .iter()
@@ -257,12 +232,10 @@ pub fn waylay_sanitize_rules() -> (
         .collect();
     if clean.len() != dirty.len()
         || clean_prop.len() != dprop.len()
-        || clean_targets.len() != dtargets.len()
         || clean_prop_apps.len() != dpropapps.len()
     {
         *rw_write_ignore_poison(&WAYLAY_RULES) = clean.clone();
         *rw_write_ignore_poison(&WAYLAY_PROP_RULES) = clean_prop.clone();
-        *rw_write_ignore_poison(&WAYLAY_PROP_TARGETS) = clean_targets.clone();
         *rw_write_ignore_poison(&WAYLAY_PROP_APPS) = clean_prop_apps.clone();
         // 重写 waylay.conf (移除错误行): 不置 CHANGED/不重建 UIDS
         let mut out = String::from("# 注意:手动添加不生效，需要在webui中添加\n");
@@ -276,15 +249,9 @@ pub fn waylay_sanitize_rules() -> (
             out.push_str(&format!("{}\n", a.trim()));
         }
         if !clean_prop.is_empty() {
-            out.push_str("# [prop] property 区伪装 (等长 ASCII)\n[prop]\n");
+            out.push_str("# [prop] 属性名替换对: prop_set <原属性名> <新属性名> (完整名, 等长 ASCII)\n[prop]\n");
             for (f, t) in &clean_prop {
                 out.push_str(&format!("prop_set {} {}\n", f.trim(), t.trim()));
-            }
-            if !clean_targets.is_empty() {
-                out.push_str("# 目标属性替换: 仅以下属性生效 (留空=全部替换)\n");
-                for n in &clean_targets {
-                    out.push_str(&format!("prop_target {}\n", n.trim()));
-                }
             }
             if !clean_prop_apps.is_empty() {
                 out.push_str("# prop 目标应用 (前台时激活 prop 替换), 包名一行一个\n");
@@ -298,16 +265,15 @@ pub fn waylay_sanitize_rules() -> (
             let _ = fs::rename(&tmp, WAYLAY_FILE);
         }
     }
-    (clean, clean_prop, clean_targets, clean_prop_apps)
+    (clean, clean_prop, clean_prop_apps)
 }
 
 /// 启动/重载时把 waylay.conf 加载进静态 (默认 lineage→opluseu 一组 + 空应用表兜底)
 pub fn waylay_load_static() {
-    let (rules, a, prop_rules, prop_targets, prop_apps) = load_waylay();
+    let (rules, a, prop_rules, prop_apps) = load_waylay();
     *rw_write_ignore_poison(&WAYLAY_RULES) = rules;
     *rw_write_ignore_poison(&WAYLAY_APPS) = a.clone();
     *rw_write_ignore_poison(&WAYLAY_PROP_RULES) = prop_rules;
-    *rw_write_ignore_poison(&WAYLAY_PROP_TARGETS) = prop_targets;
     *rw_write_ignore_poison(&WAYLAY_PROP_APPS) = prop_apps.clone();
     *rw_write_ignore_poison(&WAYLAY_PROP_UIDS) = build_waylay_uids(&prop_apps);
     *rw_write_ignore_poison(&WAYLAY_UIDS) = build_waylay_uids(&a);

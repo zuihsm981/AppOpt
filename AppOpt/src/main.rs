@@ -378,8 +378,7 @@ impl AppState {
     /// 错误配置行不会下发; 自动保存路径同样经此兜底)
     fn sync_waylay_rules(&self) {
         if let Some(es) = self.ebpf_state.as_ref() {
-            let (rules, prop_rules, prop_targets, _prop_apps) =
-                crate::config::waylay_sanitize_rules();
+            let (rules, prop_rules, _prop_apps) = crate::config::waylay_sanitize_rules();
             es.bpf.srv_clear();
             for (i, (f, t)) in rules.iter().enumerate() {
                 es.bpf.srv_rule(i, f, t);
@@ -388,10 +387,6 @@ impl AppState {
             es.bpf.prop_clear();
             for (i, (f, t)) in prop_rules.iter().enumerate() {
                 es.bpf.prop_rule(i, f, t);
-            }
-            es.bpf.prop_target_clear();
-            for n in prop_targets.iter() {
-                es.bpf.prop_target(n);
             }
         }
     }

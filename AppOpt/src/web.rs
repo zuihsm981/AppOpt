@@ -829,15 +829,12 @@ fn waylay_json() -> String {
     let apps = crate::rw_read_ignore_poison(&crate::config::WAYLAY_APPS).clone();
     let prop_rules =
         crate::rw_read_ignore_poison(&crate::config::WAYLAY_PROP_RULES).clone();
-    let prop_targets =
-        crate::rw_read_ignore_poison(&crate::config::WAYLAY_PROP_TARGETS).clone();
     let prop_apps = crate::rw_read_ignore_poison(&crate::config::WAYLAY_PROP_APPS).clone();
     json!({
         // 已连接 = KPM 模块已武装 (拦截功能随 start/stop)
         "connected": KPM_ARMED.load(Ordering::Relaxed),
         "rules": rules.iter().map(|(f, t)| json!({"from": f, "to": t})).collect::<Vec<_>>(),
         "propRules": prop_rules.iter().map(|(f, t)| json!({"from": f, "to": t})).collect::<Vec<_>>(),
-        "propTargets": prop_targets,
         "propApps": prop_apps,
         "apps": apps,
     })
@@ -868,7 +865,11 @@ fn waylay_set_api(req: &Request) -> (u16, String) {
             rules.push((f, t));
         }
     }
-    if rules.is_empty() {
+    let has_prop_rules = v["propRules"]
+        .as_array()
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+    if rules.is_empty() && !has_prop_rules {
         return err_json(400, "至少需要一组拦截规则");
     }
     // property 区伪装规则 (同校验: 非空/等长/≤32/ASCII), 可空
@@ -877,24 +878,12 @@ fn waylay_set_api(req: &Request) -> (u16, String) {
         for r in arr {
             let f = r["from"].as_str().unwrap_or("").to_string();
             let t = r["to"].as_str().unwrap_or("").to_string();
-            if f.is_empty() || f.len() != t.len() || f.len() > 32
+            if f.is_empty() || f.len() != t.len() || f.len() > 92
                 || !f.is_ascii() || !t.is_ascii()
             {
-                return err_json(400, "prop 拦截与替换字符数需一致 (ASCII, ≤32)");
+                return err_json(400, "prop 属性名替换对需等长 ASCII (≤92)");
             }
             prop_rules.push((f, t));
-        }
-    }
-    // property 目标属性名列表 (非空=目标属性替换, 空=全部替换)
-    let mut prop_targets: Vec<String> = Vec::new();
-    if let Some(arr) = v["propTargets"].as_array() {
-        for x in arr {
-            if let Some(n) = x.as_str() {
-                let n = n.trim().to_string();
-                if !n.is_empty() && n.len() <= 92 && n.is_ascii() {
-                    prop_targets.push(n);
-                }
-            }
         }
     }
     // property 伪装目标应用 (前台命中时激活 prop 替换; 独立于 srv 目标应用)
@@ -924,7 +913,7 @@ fn waylay_set_api(req: &Request) -> (u16, String) {
         }
     }
     if let Err(e) =
-        crate::config::save_waylay(&rules, &apps, &prop_rules, &prop_targets, &prop_apps)
+        crate::config::save_waylay(&rules, &apps, &prop_rules, &prop_apps)
     {
         return err_json(500, &format!("保存失败: {}", e));
     }

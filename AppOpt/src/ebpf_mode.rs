@@ -197,17 +197,6 @@ impl KpmHandle {
         self.cmd(&s);
     }
 
-    /// 清空内核 property 目标属性名表
-    pub(crate) fn prop_target_clear(&self) {
-        self.cmd("prop_target_clear");
-    }
-
-    /// 追加一个目标属性名 (非空表 = 目标属性替换模式, 仅这些属性生效)
-    pub(crate) fn prop_target(&self, name: &str) {
-        let s = format!("prop_target {}", name);
-        self.cmd(&s);
-    }
-
     /// 内核态 property 区等长替换 (lineage<->hyperos): 解析本进程 maps 中
     /// /dev/__properties__/ 共享 vma 地址, 交内核 access_process_vm 写穿
     /// (共享物理页 → 全部进程生效)。on=true 替换 lineage→hyperos, false 恢复。
