@@ -454,7 +454,7 @@ impl AppState {
         if want_prop != self.prop_active_cur {
             self.prop_active_cur = want_prop;
             if let Some(es) = self.ebpf_state.as_ref() {
-                es.bpf.prop_apply(want_prop);
+                es.bpf.prop_file_apply(want_prop);   // 用户态文件写替换
             }
         }
         let Some(e) = self.uid_map.get(&uid) else { return };

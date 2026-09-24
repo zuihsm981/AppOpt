@@ -190,6 +190,60 @@ impl KpmHandle {
         self.cmd("stop");
     }
 
+    /// property 区用户态文件写替换 (root 读写 /dev/__properties__/<ctx> 文件,
+    /// 等长替换 → tmpfs page cache 更新 → 全进程共享映射见新名)。
+    /// on=true from→to, false 反向恢复。完全用户态, 无内核内存操作。
+    pub(crate) fn prop_file_apply(&self, on: bool) {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let ctxs =
+            crate::rw_read_ignore_poison(&crate::config::WAYLAY_PROP_CTX).clone();
+        let rules =
+            crate::rw_read_ignore_poison(&crate::config::WAYLAY_PROP_RULES).clone();
+        for (_, ctx) in &ctxs {
+            let path = format!("/dev/__properties__/{}", ctx);
+            let Ok(mut f) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+            else {
+                continue;
+            };
+            let mut data = Vec::new();
+            if f.read_to_end(&mut data).is_err() {
+                continue;
+            }
+            let mut changed = false;
+            for (from, to) in &rules {
+                if from.is_empty() || from.len() != to.len() {
+                    continue;
+                }
+                let (pat, rep) = if on {
+                    (from.as_bytes(), to.as_bytes())
+                } else {
+                    (to.as_bytes(), from.as_bytes())
+                };
+                if pat.len() > data.len() {
+                    continue;
+                }
+                let mut i = 0;
+                while i + pat.len() <= data.len() {
+                    if &data[i..i + pat.len()] == pat {
+                        data[i..i + pat.len()].copy_from_slice(rep);
+                        changed = true;
+                        i += pat.len();
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            if changed {
+                let _ = f.seek(SeekFrom::Start(0));
+                let _ = f.write_all(&data);
+                let _ = f.sync_data();
+            }
+        }
+    }
+
     /// 清空内核 property 替换规则表 (waylay.conf [prop] 段重载前调用)
     pub(crate) fn prop_clear(&self) {
         self.cmd("prop_clear");
@@ -201,68 +255,7 @@ impl KpmHandle {
         self.cmd(&s);
     }
 
-    /// 内核态 property 区属性名替换 (精准定位): 使用 config 在初始化/保存时
-    /// 解析缓存的 原属性名→selinux context (WAYLAY_PROP_CTX), 只 mmap/替换
-    /// 主区对应 context 文件 (主区共享页写穿 → 全局生效)。不做每次读
-    /// property_contexts 的重复解析。
-    pub(crate) fn prop_apply(&self, on: bool) {
-        use std::fmt::Write as _;
-        let ctxs = crate::rw_read_ignore_poison(&crate::config::WAYLAY_PROP_CTX).clone();
-        let mut paths: Vec<std::path::PathBuf> = Vec::new();
-        for (_, ctx) in &ctxs {
-            let f = std::path::PathBuf::from(format!("/dev/__properties__/{}", ctx));
-            if f.exists() {
-                paths.push(f);
-            }
-        }
-        // mmap 目标文件 (保持存活到命令执行后), 记录 (basename, vma);
-        // 下次 prop_apply 先 munmap 旧映射, 避免 vma 累积 (areas 不再递增)
-        static KEPT: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
-        let mut want: Vec<String> = Vec::new();
-        {
-            let mut kept = KEPT.lock().unwrap();
-            for &(ptr, plen) in kept.iter() {
-                unsafe { libc::munmap(ptr as *mut libc::c_void, plen); }
-            }
-            kept.clear();
-            for p in paths {
-                use std::os::unix::io::AsRawFd;
-                let Ok(f) = std::fs::File::open(&p) else { continue };
-                let Ok(md) = f.metadata() else { continue };
-                let len = md.len();
-                if len == 0 { continue; }
-                let mlen = (len as usize & !0xFFF) + 4096;
-                let pr = unsafe {
-                    libc::mmap(std::ptr::null_mut(), mlen,
-                               libc::PROT_READ, libc::MAP_SHARED, f.as_raw_fd(), 0)
-                };
-                if pr != libc::MAP_FAILED {
-                    kept.push((pr as usize, mlen));
-                    if let Some(bn) = p.file_name().and_then(|x| x.to_str()) {
-                        if !want.contains(&bn.to_string()) { want.push(bn.to_string()); }
-                    }
-                }
-            }
-        }
-        let mut s = String::from(if on { "prop_apply 1" } else { "prop_apply 0" });
-        if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
-            for line in maps.lines() {
-                if !want.iter().any(|bn| line.contains(bn.as_str())) {
-                    continue;
-                }
-                let mut it = line.split_whitespace();
-                let (Some(rng), Some(_perm)) = (it.next(), it.next()) else { continue };
-                let Some((st, en)) = rng.split_once('-') else { continue };
-                if let (Ok(a), Ok(b)) = (u64::from_str_radix(st, 16),
-                                        u64::from_str_radix(en, 16)) {
-                    if b > a {
-                        let _ = write!(s, " {:x} {:x}", a, b - a);
-                    }
-                }
-            }
-        }
-        self.cmd(&s);
-    }
+
 
 }
 
