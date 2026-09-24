@@ -378,16 +378,12 @@ impl AppState {
     /// 错误配置行不会下发; 自动保存路径同样经此兜底)
     fn sync_waylay_rules(&self) {
         if let Some(es) = self.ebpf_state.as_ref() {
-            let (rules, prop_rules, _prop_apps) = crate::config::waylay_sanitize_rules();
+            let rules = crate::config::waylay_sanitize_rules();
             es.bpf.srv_clear();
             for (i, (f, t)) in rules.iter().enumerate() {
                 es.bpf.srv_rule(i, f, t);
             }
-            // property 区伪装规则 (from→to) + 目标属性 (非空=目标属性替换)
-            es.bpf.prop_clear();
-            for (i, (f, t)) in prop_rules.iter().enumerate() {
-                es.bpf.prop_rule(i, f, t);
-            }
+            // property 区伪装为纯用户态文件写 (prop_file_apply), 无需下发内核
         }
     }
 
@@ -402,6 +398,8 @@ impl AppState {
         // save_waylay 更新静态, 下一次前台回调差量生效)
         if crate::config::take_waylay_changed() {
             self.sync_waylay_rules();
+            // 保存后: 新 prop 规则/应用提前映射
+            crate::ebpf_mode::ensure_prop_maps();
         }
         let cpu_changed = crate::config::take_cpu_rules_changed();
         self.cfg = rw_read_ignore_poison(&CURRENT_CONFIG).clone();
@@ -627,6 +625,8 @@ fn main() {
 
     // waylay (service list 拦截伪装) 独立配置: 启动加载 (字符 + 目标应用 uid 集合)
     crate::config::waylay_load_static();
+    // 配置含 prop 目标应用时提前 mmap 目标 tmpfs 文件 (前台切换零系统调用)
+    crate::ebpf_mode::ensure_prop_maps();
 
     if web_enable {
         web_start();

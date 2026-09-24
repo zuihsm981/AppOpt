@@ -180,9 +180,7 @@ impl KpmHandle {
     /// 武装 KPM (start: affinity 拦截 + 清理探针 + service list 伪装)
     pub(crate) fn arm(&self) {
         self.cmd("start");
-        // 连接即绑定本进程 mm 给内核 (property 写穿依赖), 断开由内核释放
-        let b = format!("prop_bind {}", std::process::id());
-        self.cmd(&b);
+        ensure_prop_maps();   // 连接时提前 mmap 目标 tmpfs 文件并保持
     }
 
     /// 解除武装 (stop: 摘除全部业务探针)
@@ -194,65 +192,43 @@ impl KpmHandle {
     /// 等长替换 → tmpfs page cache 更新 → 全进程共享映射见新名)。
     /// on=true from→to, false 反向恢复。完全用户态, 无内核内存操作。
     pub(crate) fn prop_file_apply(&self, on: bool) {
-        use std::io::{Read, Seek, SeekFrom, Write};
-        let ctxs =
-            crate::rw_read_ignore_poison(&crate::config::WAYLAY_PROP_CTX).clone();
+        ensure_prop_maps();   // 懒补充 (保存后新增 context 时补映射)
         let rules =
             crate::rw_read_ignore_poison(&crate::config::WAYLAY_PROP_RULES).clone();
-        for (_, ctx) in &ctxs {
-            let path = format!("/dev/__properties__/{}", ctx);
-            let Ok(mut f) = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&path)
-            else {
-                continue;
-            };
-            let mut data = Vec::new();
-            if f.read_to_end(&mut data).is_err() {
-                continue;
-            }
+        let maps = PROP_MAPS.lock().unwrap();
+        for (_, ptr, len) in maps.iter() {
+            let len = *len;
             let mut changed = false;
-            for (from, to) in &rules {
-                if from.is_empty() || from.len() != to.len() {
-                    continue;
-                }
-                let (pat, rep) = if on {
-                    (from.as_bytes(), to.as_bytes())
-                } else {
-                    (to.as_bytes(), from.as_bytes())
-                };
-                if pat.len() > data.len() {
-                    continue;
-                }
-                let mut i = 0;
-                while i + pat.len() <= data.len() {
-                    if &data[i..i + pat.len()] == pat {
-                        data[i..i + pat.len()].copy_from_slice(rep);
-                        changed = true;
-                        i += pat.len();
+            unsafe {
+                let base = *ptr as *mut u8;
+                for (from, to) in &rules {
+                    if from.is_empty() || from.len() != to.len() {
+                        continue;
+                    }
+                    let (pat, rep) = if on {
+                        (from.as_bytes(), to.as_bytes())
                     } else {
-                        i += 1;
+                        (to.as_bytes(), from.as_bytes())
+                    };
+                    if pat.len() > len {
+                        continue;
+                    }
+                    let mut i = 0usize;
+                    while i + pat.len() <= len {
+                        if std::slice::from_raw_parts(base.add(i), pat.len()) == pat {
+                            std::ptr::copy_nonoverlapping(rep.as_ptr(), base.add(i), pat.len());
+                            changed = true;
+                            i += pat.len();
+                        } else {
+                            i += 1;
+                        }
                     }
                 }
-            }
-            if changed {
-                let _ = f.seek(SeekFrom::Start(0));
-                let _ = f.write_all(&data);
-                let _ = f.sync_data();
+                if changed {
+                    libc::msync(*ptr as *mut libc::c_void, len, libc::MS_SYNC);
+                }
             }
         }
-    }
-
-    /// 清空内核 property 替换规则表 (waylay.conf [prop] 段重载前调用)
-    pub(crate) fn prop_clear(&self) {
-        self.cmd("prop_clear");
-    }
-
-    /// 设置第 i 组 property 替换规则 (from→to, 等长 ASCII ≤32)
-    pub(crate) fn prop_rule(&self, i: usize, from: &str, to: &str) {
-        let s = format!("prop_rule {} {} {}", i, from, to);
-        self.cmd(&s);
     }
 
 
@@ -456,3 +432,39 @@ pub fn event_dispatch(event: &EbpfProcEvent, _cfg: &AppConfig, _state: &mut Ebpf
 }
 
 
+
+/// 提前 mmap 并保持目标 property tmpfs 文件映射 (连接/首次使用时建立,
+/// 前台切换只做内存替换)。MAP_SHARED 改动即写回 page cache → 全进程共享映射可见。
+static PROP_MAPS: std::sync::Mutex<Vec<(String, usize, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+pub(crate) fn ensure_prop_maps() {
+    let ctxs = crate::rw_read_ignore_poison(&crate::config::WAYLAY_PROP_CTX).clone();
+    let mut maps = PROP_MAPS.lock().unwrap();
+    for (_, ctx) in &ctxs {
+        if maps.iter().any(|(b, _, _)| *b == *ctx) {
+            continue;
+        }
+        use std::os::unix::io::AsRawFd;
+        let path = format!("/dev/__properties__/{}", ctx);
+        let Ok(f) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+        else {
+            continue;
+        };
+        let Ok(md) = f.metadata() else { continue };
+        let len = md.len() as usize;
+        if len == 0 {
+            continue;
+        }
+        let map = unsafe {
+            libc::mmap(std::ptr::null_mut(), len,
+                       libc::PROT_READ | libc::PROT_WRITE,
+                       libc::MAP_SHARED, f.as_raw_fd(), 0)
+        };
+        if map != libc::MAP_FAILED {
+            maps.push((ctx.clone(), map as usize, len));
+        }
+    }
+}

@@ -203,11 +203,9 @@ pub fn take_waylay_changed() -> bool {
 /// 校验并清理规则 (供同步内核前调用): 返回 (srv 合法规则, prop 合法规则)
 /// (非空/字符数一致/≤32/ASCII); 有错误行时从静态移除并重写 waylay.conf
 /// (不置 CHANGED, 避免循环)
-pub fn waylay_sanitize_rules() -> (
-    Vec<(String, String)>,
-    Vec<(String, String)>,
-    Vec<String>,
-) {
+pub fn waylay_sanitize_rules() -> Vec<(String, String)> {
+    // 返回 srv 规则 (sync 下发内核用); prop 规则/prop 应用清理作为副作用
+    // 同步到静态 (WAYLAY_PROP_RULES / WAYLAY_PROP_APPS), prop_file_apply 读取
     let valid32 = |f: &str, t: &str| {
         !f.is_empty() && f.len() == t.len() && f.len() <= 32 && f.is_ascii() && t.is_ascii()
     };
@@ -268,7 +266,8 @@ pub fn waylay_sanitize_rules() -> (
             let _ = fs::rename(&tmp, WAYLAY_FILE);
         }
     }
-    (clean, clean_prop, clean_prop_apps)
+    let _ = (clean_prop, clean_prop_apps);   /* 清理副作用已同步静态 */
+    clean
 }
 
 /// 启动/重载时把 waylay.conf 加载进静态 (默认 lineage→opluseu 一组 + 空应用表兜底)

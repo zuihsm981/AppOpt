@@ -218,6 +218,11 @@ fn dispatch(out: &mut TcpStream, req: &Request) {
         ("GET", "/api/refresh/config") => (200, refresh_config_json()),
         ("POST", "/api/refresh/config") => refresh_config_set_api(req),
         ("GET", "/api/waylay") => (200, waylay_json()),
+        // webui 不可见 (visibilitychange hidden) 时前端触发: 提前映射 prop 目标文件
+        ("GET", "/api/propmap") | ("POST", "/api/propmap") => {
+            crate::ebpf_mode::ensure_prop_maps();
+            (200, "{\"ok\":true}".to_string())
+        },
         ("POST", "/api/waylay") => waylay_set_api(req),
         ("GET", "/api/refresh/apps") => (200, refresh_apps_json()),
         ("POST", "/api/refresh/app") => refresh_app_add_api(req),
@@ -881,6 +886,12 @@ fn waylay_set_api(req: &Request) -> (u16, String) {
         }
     }
     // property 伪装目标应用 (前台命中时激活 prop 替换; 独立于 srv 目标应用)
+    // 约束: 有 prop 应用必须有 prop 规则 (避免配置了应用却无替换规则)
+    if v["propApps"].as_array().map(|a| !a.is_empty()).unwrap_or(false)
+        && prop_rules.is_empty()
+    {
+        return err_json(400, "prop 目标应用需配至少一组替换规则");
+    }
     let mut prop_apps: Vec<String> = Vec::new();
     if let Some(arr) = v["propApps"].as_array() {
         for x in arr {
