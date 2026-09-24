@@ -163,7 +163,7 @@ pub fn spawn_event(touch_sock: c_int, ctrl_sock: c_int, exit_sock: c_int) {
     set_epfd(epfd);
 
     // 触摸设备: 探测并打开 (失败不致命: 仅触摸活动检测退化)
-    let (touch_fd, _ev_idx) = open_touch();
+    let (touch_fd, _) = open_touch();
 
     // 控制 fd 常驻 epoll (触摸启停指令)
     if ctrl_sock >= 0 {

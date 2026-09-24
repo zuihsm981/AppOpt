@@ -59,7 +59,8 @@ static BINDER_NDK: OnceLock<Option<BinderNdk>> = OnceLock::new();
 
 fn ndk() -> Option<&'static BinderNdk> {
     BINDER_NDK.get_or_init(|| unsafe {
-        let lib = dlopen(b"libbinder_ndk.so\0".as_ptr() as *const c_char, RTLD_LAZY | libc::RTLD_GLOBAL);
+        // RTLD_LOCAL: 避免 libbinder_ndk 符号污染进程全局符号空间 (标准做法)
+        let lib = dlopen(b"libbinder_ndk.so\0".as_ptr() as *const c_char, RTLD_LAZY | libc::RTLD_LOCAL);
         if lib.is_null() { return None; }
 
         let sym = |name: &str| -> *mut c_void {
@@ -138,7 +139,8 @@ extern "C" fn on_transact(
 
     match code {
         TX_ON_PROCESS_STARTED => {
-            // oneway 事务，无需读取数据
+            // 本事务不携带有效负载; 即使协议变体带参数, 每次 onTransact 也是独立
+            // parcel (无跨事务位置状态), oneway 无 reply —— 漏读不影响后续
             STATUS_OK
         }
         TX_ON_FG_ACTIVITIES_CHANGED => {

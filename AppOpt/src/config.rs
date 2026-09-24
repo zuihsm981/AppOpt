@@ -490,24 +490,36 @@ pub fn parse_outer(p: &str) -> OuterLine<'_> {
 
 /// 规则 CPU 规格解析 (新格式): 返回 (CPU 规格, util_min, util_max, freeze)
 /// `cpus[-min-max][-freeze]` —— util 段成对 (单侧缺省由输出端补默认 min=0/max=1024);
-/// 仅末尾 freeze 时解析 util, 避免纯数字区间 cpus (如 `0-3`) 被误剥。
+/// 剩余段数 >=3 才尝试剥 util (freeze 可有无), 防纯数字区间 cpus (如 `0-3`/`0-3,6-7`) 误剥。
 pub(crate) fn parse_rule_spec(spec: &str) -> (String, i32, i32, bool) {
     let parts: Vec<&str> = spec.split('-').collect();
-    if parts.last() != Some(&"freeze") {
-        return (spec.to_string(), -1, -1, false);
+    let mut i = parts.len();
+    let mut freeze = false;
+    if i > 0 && parts[i - 1] == "freeze" {
+        freeze = true;
+        i -= 1;
     }
-    let mut i = parts.len() - 1;
+    if i < 3 {
+        return (parts[..i].join("-"), -1, -1, freeze);
+    }
+    let mut got = 0;
     let mut util_max = -1;
-    if i > 0 && let Ok(v) = parts[i - 1].parse::<i32>() && (0..=1024).contains(&v) {
+    if let Ok(v) = parts[i - 1].parse::<i32>() && (0..=1024).contains(&v) {
         util_max = v;
         i -= 1;
+        got += 1;
     }
     let mut util_min = -1;
-    if i > 0 && let Ok(v) = parts[i - 1].parse::<i32>() && (0..=1024).contains(&v) {
+    if let Ok(v) = parts[i - 1].parse::<i32>() && (0..=1024).contains(&v) {
         util_min = v;
         i -= 1;
+        got += 1;
     }
-    (parts[..i].join("-"), util_min, util_max, true)
+    if got < 2 {
+        // 不成对 (如 0-3,6-7 只剩 1 个数字可剥) → 整串当 CPU 规格
+        return (spec.to_string(), -1, -1, false);
+    }
+    (parts[..i].join("-"), util_min, util_max, freeze)
 }
 
 fn add_rule(

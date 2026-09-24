@@ -19,9 +19,9 @@ use std::env;
 use std::ffi::CString;
 use std::fs;
 use std::process;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock, RwLock};
-use std::time::Duration;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use crate::config::{
     init_inotify, load_config, AppConfig,
@@ -29,7 +29,7 @@ use crate::config::{
 };
 use crate::cpuset::{init_cpu_topo, set_base_cpuset};
 use crate::ebpf_mode::{
-    event_dispatch, ebpf_init, EbpfState,
+    ebpf_init, EbpfState,
 };
 use crate::web::{
     settings_load, settings_save, web_start, SETTINGS_FILE,
@@ -323,36 +323,11 @@ fn rebuild_uid_if_needed(
 }
 
 /// 主循环跨事件共享状态 (打包原 6 个局部 mut, 消除长参数传递)
-/// 规则应用切换冻结: 上一前台命中规则表 → 延迟 freeze; 切回前台 → 置 true 取消
-static FREEZE_CANCELS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
-
-fn freeze_cancels() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
-    FREEZE_CANCELS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// 延迟 delay 后对 pkg 执行 `cmd activity freeze <pkg>`。
-/// 取消: 该包在 delay 内重新回到前台 → cancel_freeze_pkg 置取消标记, 到期不冻结。
-fn freeze_pkg_delayed(pkg: String, delay: Duration) {
-    let cancel = Arc::new(AtomicBool::new(false));
-    crate::lock_ignore_poison(freeze_cancels()).insert(pkg.clone(), cancel.clone());
-    std::thread::spawn(move || {
-        std::thread::sleep(delay);
-        if !cancel.load(Ordering::Relaxed) {
-            let _ = std::process::Command::new("cmd")
-                .arg("activity")
-                .arg("freeze")
-                .arg(&pkg)
-                .output();
-        }
-        crate::lock_ignore_poison(freeze_cancels()).remove(&pkg);
-    });
-}
-
-/// 取消 pkg 的待执行冻结 (该包重新成为前台)
-fn cancel_freeze_pkg(pkg: &str) {
-    if let Some(c) = crate::lock_ignore_poison(freeze_cancels()).get(pkg) {
-        c.store(true, Ordering::Relaxed);
-    }
+/// 延迟冻结登记 (主循环驱动, 按 uid 去重): 切换走 30s 后写 cgroup.freeze=1
+struct FreezePending {
+    pid: i32,
+    uid: i32,
+    deadline: Instant,
 }
 
 struct AppState {
@@ -366,12 +341,12 @@ struct AppState {
     srv_active_cur: bool,
     /// 已下发给内核的 property 区伪装开关 (独立目标应用集)
     prop_active_cur: bool,
-    /// 主循环事件通知 fd (EV_KPM): 连接时重新初始化 ebpf 用
-    kpm_wake_fd: libc::c_int,
-    /// 上一前台 uid (fg=true 回调): 规则应用切换时冻结切换前应用用
-    last_fg_uid: Option<i32>,
+    /// 上一前台 (pid, uid): 规则应用切换时冻结切换前应用用
+    last_fg: Option<(i32, i32)>,
     /// 包行 freeze 标志集合 (增量维护对比用)
     freeze_pkgs_set: HashSet<String>,
+    /// 待执行延迟冻结 (主循环到期检查; 每 uid 一个, 切换登记/切回取消)
+    freeze_pending: HashMap<i32, FreezePending>,
 }
 
 impl AppState {
@@ -395,9 +370,9 @@ impl AppState {
             rfr_pkgs_set,
             srv_active_cur: false,
             prop_active_cur: false,
-            kpm_wake_fd: -1,
-            last_fg_uid: None,
+            last_fg: None,
             freeze_pkgs_set,
+            freeze_pending: HashMap::new(),
         }
     }
 
@@ -407,8 +382,8 @@ impl AppState {
     /// 武装后立即同步 waylay 规则 (清理后的合法规则)
     fn set_kpm_arm(&mut self, arm: bool) {
         // 连接且 KPM 未就绪: 模块可能后加载 (AppOpt 先启动) —— 重试初始化
-        if arm && self.ebpf_state.is_none() && self.kpm_wake_fd >= 0 {
-            if let Some(es) = crate::ebpf_mode::ebpf_init(self.kpm_wake_fd, String::new()) {
+        if arm && self.ebpf_state.is_none() {
+            if let Some(es) = crate::ebpf_mode::ebpf_init(String::new()) {
                 self.ebpf_state = Some(es);
             }
         }
@@ -467,6 +442,9 @@ impl AppState {
                 &mut self.rfr_pkgs_set,
                 &mut self.freeze_pkgs_set,
             );
+            // 冻结 pending 失效: 配置移除 freeze 标志 → 丢弃对应 pending
+            self.freeze_pending
+                .retain(|uid, _| self.uid_map.get(uid).is_some_and(|e| e.freeze));
         }
         apply_config(cpu_changed, self.cfg.as_deref(), &self.pkg_uid);
     }
@@ -488,21 +466,32 @@ impl AppState {
     /// binder 前台回调 (pid+uid): 查 uid 表分发 CPU (冷启动 ApplyPkg + pidfd watch)
     /// 与刷新率 (包名) —— 原 EV_FG 分支主体
     fn on_fg(&mut self, pid: i32, uid: i32) {
-        // 规则应用切换冻结: 上一前台 (fg=true) 命中规则表 → 延迟 30s freeze;
-        // 当前包重新前台 → 取消其待执行冻结
-        if let Some(prev) = self.last_fg_uid {
-            if prev != uid {
-                if let Some(pe) = self.uid_map.get(&prev) {
+        // 规则应用切换冻结: 每次切换都登记上一前台 (每 uid 一个 pending, 覆盖同 uid);
+        // 当前包重新前台 → 取消其 pending + 立即解冻
+        if let Some((prev_pid, prev_uid)) = self.last_fg {
+            if prev_uid != uid {
+                if let Some(pe) = self.uid_map.get(&prev_uid) {
                     if pe.freeze {
-                        freeze_pkg_delayed(pe.pkg.clone(), Duration::from_secs(30));
+                        self.freeze_pending.insert(
+                            prev_uid,
+                            FreezePending {
+                                pid: prev_pid,
+                                uid: prev_uid,
+                                deadline: Instant::now() + Duration::from_secs(30),
+                            },
+                        );
                     }
                 }
             }
         }
         if let Some(e) = self.uid_map.get(&uid) {
-            cancel_freeze_pkg(&e.pkg);
+            if e.freeze {
+                self.freeze_pending.remove(&uid);
+                let path = format!("/sys/fs/cgroup/apps/uid_{}/cgroup.freeze", uid);
+                let _ = std::fs::write(&path, "0");
+            }
         }
-        self.last_fg_uid = Some(uid);
+        self.last_fg = Some((pid, uid));
         // service list 伪装: 前台回调驱动开关 —— 前台 uid 命中 waylay 目标应用集
         // (waylay.conf, 默认空 → 不激活), 命中则激活无差别替换, 否则关闭;
         // 差量下发: 仅状态变化才发 supercall (幂等, 避免每次回调冗余往返);
@@ -524,20 +513,14 @@ impl AppState {
             }
         }
         let Some(e) = self.uid_map.get(&uid) else { return };
-        // CPU 规则: 冷热判断 (cpu_known 中 uid+pid 一致=热)
-        if e.cpu {
-            // 冷启动不再清除 pid 列表/cpu_known —— 身份清除改由 pidfd 退出事件驱动
-            // (EV_EXIT_PID → EvictUid); 冷时仅重发 ApplyPkg, CPU 线程枚举后覆盖写回
-            if !crate::cpu_affinity::cpu_known_is_hot(uid, pid) {
-                // 身份记录/枚举/亲和性统一经 ApplyPkg → CPU worker 回写
-                // CPU_KNOWN(uid,(主pid,全部pids))。主 pid 注册 pidfd 监听
-                // (全模式统一; KPM 不再依赖内核 EXIT)。
-                crate::event_probe::watch(pid);
-                if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
-                    let _ = tx.send(crate::cpu_affinity::CpuMsg::ApplyPkg(
-                        pid, uid, e.pkg.clone(),
-                    ));
-                }
+        // CPU 规则: 冷热判断 (cpu_known 中 uid+pid 一致=热);
+        // 冷时注册 pidfd 监听 (退出清理由 EV_EXIT_PID 驱动; freeze 复用, 不单独注册)
+        if e.cpu && !crate::cpu_affinity::cpu_known_is_hot(uid, pid) {
+            crate::event_probe::watch(pid);
+            if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
+                let _ = tx.send(crate::cpu_affinity::CpuMsg::ApplyPkg(
+                    pid, uid, e.pkg.clone(),
+                ));
             }
         }
         // 刷新率: 命中 → 发包名给刷新率线程
@@ -613,7 +596,6 @@ fn main() {
 
     // ================= 初始化并发: 独立无依赖项并行 =================
     // 提前创建 fd (不依赖 settings; 供各独立线程使用)
-    let kpm_wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     let mut fg_sv: [libc::c_int; 2] = [0, 0];
     let socket_ok = unsafe {
         libc::socketpair(
@@ -637,9 +619,8 @@ fn main() {
     }
 
     // T2: ebpf_init (按驱动模式尝试 KPM: userspace 直退 / auto 快速回退 / kpm 等待)
-    let wk = kpm_wake_fd;
     let dm = drive_mode.clone();
-    let ebpf_thread = std::thread::spawn(move || ebpf_init(wk, dm));
+    let ebpf_thread = std::thread::spawn(move || ebpf_init(dm));
 
     // T3: process_observer (binder 回调注册; 完成后线程退出)
     let obs_fd = fg_sv[1];
@@ -706,7 +687,6 @@ fn main() {
     // 主循环共享状态: uid 表 / 规则包集合 / 当前配置 (ebpf_state 稍后 join 填入)
     let mut state = AppState::new();
     // ebpf_init 线程: KPM 加载+激活已并行完成, join 拿 EbpfState
-    state.kpm_wake_fd = kpm_wake_fd;
     state.ebpf_state = ebpf_thread.join().ok().flatten();
     if state.ebpf_state.is_some() {
         crate::web::KPM_ACTIVE.store(true, Ordering::Relaxed);
@@ -715,7 +695,7 @@ fn main() {
     // 用户态事件探测线程 (模块级 spawn_event_probe): 触摸活动 → EV_TOUCH, 主进程退出 → EV_EXIT_PID
     let mut touch_sv: [libc::c_int; 2] = [-1, -1];
     let mut exit_sv: [libc::c_int; 2] = [-1, -1];
-    let (touch_ok, mut exit_ok) = spawn_event_probe(&mut touch_sv, &mut exit_sv);
+    let (touch_ok, exit_ok) = spawn_event_probe(&mut touch_sv, &mut exit_sv);
     // T4: packages.list inotify fd
     let pkg_inotify_fd = pkg_inotify_thread.join().unwrap_or(-1);
     // T3: observer 注册完成
@@ -732,7 +712,6 @@ fn main() {
     // ================= 纯事件驱动主循环 =================
     // 事件源: KPM 事件唤醒 eventfd / inotify / 配置重载 eventfd / binder 前台回调
     //         / packages.list inotify (全模式)
-    const EV_KPM: u64 = 1;
     const EV_INOTIFY: u64 = 2;
     const EV_CONFIG: u64 = 4;
     const EV_FG: u64 = 6; // binder 前台回调 (pid+uid), 主线程分发
@@ -746,8 +725,6 @@ fn main() {
         process::exit(1);
     }
     // KPM 事件唤醒 eventfd: reader 收到事件后写入, 主循环 epoll 唤醒
-    // (kpm_wake_fd 已在初始化并发段创建)
-    epoll_add(epfd, kpm_wake_fd, EV_KPM);
     // 配置重载 eventfd: web 端写配置/规则后由 config_reload_now 写入
     let config_wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     CONFIG_WAKE_FD.store(config_wake_fd, Ordering::Relaxed);
@@ -777,7 +754,14 @@ fn main() {
     let mut events = [unsafe { std::mem::zeroed::<libc::epoll_event>() }; 8];
 
     loop {
-        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 8, -1) };
+        let timeout = state
+            .freeze_pending
+            .values()
+            .map(|p| p.deadline.saturating_duration_since(Instant::now()))
+            .min()
+            .map(|d| d.as_millis().min(i32::MAX as u128) as i32)
+            .unwrap_or(-1);
+        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 8, timeout) };
         if n < 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINTR) {
@@ -785,39 +769,29 @@ fn main() {
             }
             break;
         }
+        // 延迟冻结到期: 写 cgroup.freeze=1 (事件分发前, 保证 deadline 准时)
+        if !state.freeze_pending.is_empty() {
+            let now = Instant::now();
+            let due: Vec<i32> = state
+                .freeze_pending
+                .iter()
+                .filter(|(_, p)| now >= p.deadline)
+                .map(|(u, _)| *u)
+                .collect();
+            for uid in due {
+                if let Some(p) = state.freeze_pending.remove(&uid) {
+                    let path = format!("/sys/fs/cgroup/apps/uid_{}/cgroup.freeze", p.uid);
+                    let _ = std::fs::write(&path, "1");
+                }
+            }
+        }
         if n == 0 {
             continue;
         }
 
-        let mut kpm_died = false;
-
         for i in 0..n as usize {
             let ev = events[i];
             match ev.u64 {
-                EV_KPM => {
-                    read_eventfd(kpm_wake_fd);
-                    if let Some(es) = state.ebpf_state.as_mut() {
-                        // CPU 亲和性已由 binder 触发的 CpuAffinity 模块负责;
-                        // 事件流仅消费 input (刷新率活动检测)。
-                        loop {
-                            match es.event_rx.try_recv() {
-                                Ok(event) => {
-                                    let Some(cfg) =
-                                        rw_read_ignore_poison(&CURRENT_CONFIG).clone()
-                                    else {
-                                        continue;
-                                    };
-                                    event_dispatch(&event, &cfg, es);
-                                }
-                                Err(mpsc::TryRecvError::Empty) => break,
-                                Err(mpsc::TryRecvError::Disconnected) => {
-                                    kpm_died = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
                 EV_PKG => {
                     // packages.list 变化 (安装/卸载/替换) → 重建 uid 表
                     if pkg_inotify_fd > 0 {
@@ -911,14 +885,13 @@ fn main() {
                         if n == 4 {
                             let pid = i32::from_ne_bytes([pb[0], pb[1], pb[2], pb[3]]);
                             // 清身份 + 通知 CPU worker 清该 uid managed → 发布统计
+                            // 冻结状态清理 (按 pid, 不依赖 cpu_known; 覆盖 freeze-only 包)
+                            state.freeze_pending.retain(|_, p| p.pid != pid);
+                            if state.last_fg.is_some_and(|(pp, _)| pp == pid) {
+                                state.last_fg = None;
+                            }
+                            // CPU 身份清理 (原有依赖)
                             if let Some(uid) = crate::cpu_affinity::cpu_known_pid_to_uid(pid) {
-                                // 冻结状态清理: 规则应用退出 → 取消待执行冻结 + 清上一前台身份
-                                if let Some(e) = state.uid_map.get(&uid) {
-                                    cancel_freeze_pkg(&e.pkg);
-                                }
-                                if state.last_fg_uid == Some(uid) {
-                                    state.last_fg_uid = None;
-                                }
                                 if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
                                     let _ = tx.send(crate::cpu_affinity::CpuMsg::EvictUid(uid));
                                 }
@@ -940,34 +913,6 @@ fn main() {
                 _ => {}
             }
         }
-
-        // KPM 通道断开: 标记断开并尝试重新初始化 (仅 KPM 模式, 无 /proc 回退)
-        if kpm_died {
-            state.ebpf_state = None;
-            crate::web::KPM_ACTIVE.store(false, Ordering::Relaxed);
-            if let Some(es) = ebpf_init(kpm_wake_fd, drive_mode.clone()) {
-                crate::web::KPM_ACTIVE.store(true, Ordering::Relaxed);
-                state.ebpf_state = Some(es);
-                state.apply_all();
-            } else if !exit_ok {
-                // 事件探测线程首次建立失败 → 重试补建 (全模式统一)
-                if touch_sv[0] >= 0 {
-                    unsafe { libc::close(touch_sv[0]); libc::close(touch_sv[1]); }
-                }
-                if exit_sv[0] >= 0 {
-                    unsafe { libc::close(exit_sv[0]); libc::close(exit_sv[1]); }
-                }
-                let (t2, e2) = spawn_event_probe(&mut touch_sv, &mut exit_sv);
-                if e2 {
-                    exit_ok = true;
-                    if t2 {
-                        epoll_add(epfd, touch_sv[0], EV_TOUCH);
-                    }
-                    epoll_add(epfd, exit_sv[0], EV_EXIT_PID);
-                }
-            }
-        }
-
     }
 
     unsafe { libc::close(epfd) };

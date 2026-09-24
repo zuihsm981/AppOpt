@@ -557,15 +557,18 @@ pub fn refresh_set_config(timeout: i32, active: &str, idle: &str) {
             _ => {}
         }
     }
-    if !found_timeout {
-        lines.push(format!("refresh_timeout={}", timeout));
-    }
-    if !found_active {
-        lines.push(format!("refresh_active={}", active));
-    }
-    if !found_idle {
-        lines.push(format!("refresh_idle={}", idle));
-    }
+    // 缺失字段插头部 (与 write_global_refresh_defaults 一致), 保持分区整齐
+    let missing: Vec<String> = [
+        (!found_timeout).then(|| format!("refresh_timeout={}", timeout)),
+        (!found_active).then(|| format!("refresh_active={}", active)),
+        (!found_idle).then(|| format!("refresh_idle={}", idle)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let mut new_lines = missing;
+    new_lines.extend(lines);
+    let lines = new_lines;
 
     // 原子写: 先写临时文件再 rename, 避免中途崩溃留下半写配置
     let tmp = format!("{}.tmp", path);

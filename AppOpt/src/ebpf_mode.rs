@@ -22,10 +22,8 @@
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
 // use std::sync::atomic::{AtomicU32, Ordering};  // 事件环停用, 临时注释
-use std::sync::mpsc;
 use std::thread;
 
-use crate::config::AppConfig;
 
 /// 安全构造 CString (输入受控/常量; 无 NUL 时保底空串, 避免 panic)
 /// KPM 模块可用性探测 (状态页 kpm_available 用): KP 就绪 + 握手
@@ -37,18 +35,8 @@ fn cstr(s: &str) -> CString {
     CString::new(s).unwrap_or_default()
 }
 
-/// eBPF 进程事件, 布局需与内核态 appopt_proc_event_t 完全一致 (28B)
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct EbpfProcEvent {
-    pub pid: i32,
-    pub tid: i32,
-    pub comm: [u8; 16],
-    pub event_type: u32,
-}
-
-/* 事件环当前只流动 INPUT (内核事件已停用, 临时注释)
-pub const EBPF_EVENT_INPUT: u32 = 5;*/
+// 事件环当前只流动 INPUT (内核事件已停用, 临时注释)
+// pub const EBPF_EVENT_INPUT: u32 = 5;
 
 /* ================= mmap 共享内存事件环 (临时注释: 内核事件停用) =================
 #[repr(C)]
@@ -198,7 +186,6 @@ impl KpmHandle {
         let maps = crate::lock_ignore_poison(&PROP_MAPS);
         for (_, ptr, len) in maps.iter() {
             let len = *len;
-            let _ = len;
             unsafe {
                 let base = *ptr as *mut u8;
                 for (from, to) in &rules {
@@ -234,7 +221,6 @@ impl KpmHandle {
 
 /// KPM 初始化状态 (由 ebpf_init 创建; 事件环通道已移除)
 pub struct EbpfState {
-    pub event_rx: mpsc::Receiver<EbpfProcEvent>,
     pub reader_thread: Option<thread::JoinHandle<()>>,
     /// KPM 传输句柄 (ctl0 supercall 通道); 字段名 bpf 沿用历史
     pub bpf: KpmHandle,
@@ -269,7 +255,7 @@ impl Drop for EbpfState {
 /// 初始化 KPM: 握手 + 校验; 事件环通道已移除 (内核无事件生产者), 只保留
 /// 空事件接收端 (主循环 EV_KPM try_recv 恒 Empty, 空转); 不自动武装 (start),
 /// 武装由 webui 拦截页「连接」触发。
-pub fn ebpf_init(_kpm_wake_fd: c_int, drive_mode: String) -> Option<EbpfState> {
+pub fn ebpf_init(drive_mode: String) -> Option<EbpfState> {
     // 设置项工作模式 UI 已移除: 只要模块加载 (ping 成功) 即可用 KPM
     let _ = drive_mode;
     let key = kpm_key();
@@ -280,10 +266,7 @@ pub fn ebpf_init(_kpm_wake_fd: c_int, drive_mode: String) -> Option<EbpfState> {
     if !handle.verify_loaded() {
         return None;
     }
-    // 事件环停用: 仅保留空事件接收端
-    let (_tx, rx) = mpsc::channel::<EbpfProcEvent>();
     Some(EbpfState {
-        event_rx: rx,
         reader_thread: None,
         bpf: handle,
         wakeup_fd: -1,
@@ -422,11 +405,6 @@ fn kpm_shm_reader(
 
 /// 事件派发 (input: 刷新率活动检测; 退出清理统一由用户态 pidfd 负责,
 /// 内核 EXIT 事件不再消费; CPU/刷新率主体由 binder 三线程驱动)
-pub fn event_dispatch(event: &EbpfProcEvent, _cfg: &AppConfig, _state: &mut EbpfState)  {
-    /* 临时注释: 事件环已停用, 内核不发事件 (input 用户态, SRV 纯内核) */
-    let _ = event;
-}
-
 
 
 /// 提前 mmap 并保持目标 property tmpfs 文件映射 (连接/首次使用时建立,
