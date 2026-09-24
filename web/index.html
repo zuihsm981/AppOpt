@@ -420,7 +420,7 @@ document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{
   activeTab=t;
   document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x===b));
   ['status','rules','waylay','settings'].forEach(n=>$('tab-'+n).hidden=n!==t);
-  if(t==='status')resumeStatus();else pauseStatus();
+  // 轮询由前端可见性统一控制 (visibilitychange), 不再绑定状态页 tab
   if(t==='rules')loadRules();
   if(t==='waylay')loadWaylay();
   if(t==='settings')loadCfg();
@@ -546,6 +546,7 @@ function wlSaveNow(){
     for(const r of wlPropRules){
       if(!r.from||!r.to||r.from.length!==r.to.length){toast('原/新属性名需等长');return}
     }
+    if(wlPropApps.length&&!wlPropRules.length){toast('prop 目标应用需配至少一组替换规则');return}
     try{await api('/api/waylay',{rules:wlRules,apps:wlApps,propRules:wlPropRules,propApps:wlPropApps})}
     catch(e){toast(e.message)}
   },200);
@@ -565,6 +566,10 @@ $('w-conn-chips').addEventListener('click',async e=>{
   }catch(e){toast(e.message)}
 });
 
+// webui 不可见 (切后台/关闭) 时: 提前映射 prop 目标 tmpfs 文件 (配置已保存则生效)
+document.addEventListener('visibilitychange',()=>{
+  if(document.hidden)api('/api/propmap').catch(()=>{});
+});
 // ===== 状态页: 线程状态 / 刷新率状态 切换 =====
 let statusSeg='thread';
 function switchStatusSeg(st){
@@ -572,8 +577,8 @@ function switchStatusSeg(st){
   document.querySelectorAll('#st-seg button').forEach(x=>x.classList.toggle('on',x.dataset.st===st));
   $('st-thread').hidden=st!=='thread';
   $('st-refresh').hidden=st!=='refresh';
-  if(st==='thread'){stopRf();startStat();loadRefreshOnce();}
-  else{stopStat();loadRefresh();}
+  if(st==='thread'){loadRefreshOnce();}
+  resumeStatus();   // 按当前段启动轮询 (thread→startStat / refresh→loadRefresh)
 }
 document.querySelectorAll('#st-seg button').forEach(b=>b.onclick=()=>switchStatusSeg(b.dataset.st));
 
@@ -601,7 +606,7 @@ async function loadRefreshOnce(){
 }
 // 轮询可见性管理: 仅前端打开/可见时轮询; 隐藏/失焦/关闭页面即停止
 function pausePolling(){pauseStatus()}
-function resumePolling(){if(activeTab==='status')resumeStatus()}
+function resumePolling(){resumeStatus()}
 document.addEventListener('visibilitychange',()=>{if(document.hidden)pausePolling();else resumePolling()});
 window.addEventListener('blur',()=>pausePolling());
 window.addEventListener('focus',()=>resumePolling());
