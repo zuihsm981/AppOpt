@@ -195,7 +195,7 @@ impl KpmHandle {
         ensure_prop_maps();   // 懒补充 (保存后新增 context 时补映射)
         let rules =
             crate::rw_read_ignore_poison(&crate::config::WAYLAY_PROP_RULES).clone();
-        let maps = PROP_MAPS.lock().unwrap();
+        let maps = crate::lock_ignore_poison(&PROP_MAPS);
         for (_, ptr, len) in maps.iter() {
             let len = *len;
             let mut changed = false;
@@ -250,7 +250,6 @@ pub struct EbpfState {
 impl Drop for EbpfState {
     fn drop(&mut self) {
         // 事件环已停用: 无需 shm_close/evt_fd 解除 (模块可能已被卸载)
-        if Some(true) == None { unreachable!() }
         // 写 eventfd 唤醒 reader 线程后 join (reader 线程已停用)
         if self.wakeup_fd >= 0 {
             let val: u64 = 1;
@@ -439,7 +438,7 @@ static PROP_MAPS: std::sync::Mutex<Vec<(String, usize, usize)>> =
     std::sync::Mutex::new(Vec::new());
 pub(crate) fn ensure_prop_maps() {
     let ctxs = crate::rw_read_ignore_poison(&crate::config::WAYLAY_PROP_CTX).clone();
-    let mut maps = PROP_MAPS.lock().unwrap();
+    let mut maps = crate::lock_ignore_poison(&PROP_MAPS);
     for (_, ctx) in &ctxs {
         if maps.iter().any(|(b, _, _)| *b == *ctx) {
             continue;

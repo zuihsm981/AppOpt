@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! IProcessObserver binder 回调实现（dlopen 运行时加载 libbinder_ndk.so）
 //!
 //! 触发分离/数据共享（参考 优化.md）：

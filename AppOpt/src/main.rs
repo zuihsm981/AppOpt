@@ -538,7 +538,7 @@ fn main() {
 
     // 应用设置 (AppOpt.json) 提前读取: 驱动模式需在 L1 ebpf_init spawn 前决定
     let st = settings_load(SETTINGS_FILE);
-    let drive_mode = st.mode.clone();
+    let drive_mode = st.mode;
     crate::web::set_drive_mode(&drive_mode);
     // uclamp 支持探测 (webui 据此隐藏/显示 uclamp 配置)
     crate::web::init_uclamp_support();

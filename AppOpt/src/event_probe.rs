@@ -25,7 +25,7 @@ fn set_epfd(fd: c_int) {
 }
 
 fn reg_lock() -> std::sync::MutexGuard<'static, HashMap<i32, c_int>> {
-    REG.lock().unwrap_or_else(|e| e.into_inner())
+    crate::lock_ignore_poison(&REG)
 }
 
 /// 用户态触摸监听状态: 成功打开触摸屏 event 后置 true (web 状态页展示)
@@ -80,7 +80,7 @@ pub fn watch(pid: i32) {
     let mut ev: libc::epoll_event = unsafe { std::mem::zeroed() };
     ev.events = (libc::EPOLLIN | libc::EPOLLHUP | libc::EPOLLERR) as u32;
     ev.u64 = pid as u64; // pidfd 事件标记 = pid 本身 (与 TAG_CTRL/TAG_TOUCH 不冲突)
-    if unsafe { libc::epoll_ctl(*epfd.lock().unwrap_or_else(|e| e.into_inner()), libc::EPOLL_CTL_ADD, fd, &mut ev) } == 0 {
+    if unsafe { libc::epoll_ctl(*crate::lock_ignore_poison(&epfd), libc::EPOLL_CTL_ADD, fd, &mut ev) } == 0 {
         reg_lock().insert(pid, fd);
     } else {
         unsafe { libc::close(fd); }

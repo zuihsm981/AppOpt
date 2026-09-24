@@ -346,10 +346,11 @@ impl CpuAffinity {
         }
 
         loop {
+            let now = std::time::Instant::now();
             let timeout = self
                 .pending
                 .iter()
-                .map(|t| t.due.saturating_duration_since(std::time::Instant::now()))
+                .map(|t| t.due.saturating_duration_since(now))
                 .min()
                 .unwrap_or(std::time::Duration::from_secs(3600)); // 无 pending: 长阻塞 (消息唤醒)
             match rx.recv_timeout(timeout) {

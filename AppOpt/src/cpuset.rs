@@ -67,7 +67,7 @@ impl CpuSet {
         }
     }
 
-    pub fn to_range_string(self) -> String {
+    pub fn to_range_string(&self) -> String {
         let mut result = String::new();
         let mut start: Option<usize> = None;
         let mut end: Option<usize> = None;

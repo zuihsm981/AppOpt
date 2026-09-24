@@ -51,6 +51,7 @@ pub(crate) fn task_tids(pid: i32) -> Option<Vec<i32>> {
 /// 字段顺序/对齐与内核一致, 直接作为 sched_setattr syscall 参数。注意: 内核
 /// SCHED_ATTR_SIZE_VER0 = 48B 是不含 util 字段的旧版本; 本结构含
 /// sched_util_min/max (5.3+), size 字段运行时取 size_of::<SchedAttr>() = 56。
+#[derive(Default)]
 #[repr(C)]
 struct SchedAttr {
     size: u32,
@@ -77,15 +78,10 @@ pub fn set_uclamp(tid: i32, util_min: i32, util_max: i32) {
     // size = 56 (含 sched_util_min/max 字段; 内核 5.3+ 才支持该字段, 4.19 无)
     let attr = SchedAttr {
         size: std::mem::size_of::<SchedAttr>() as u32,
-        sched_policy: 0,
         sched_flags: SCHED_FLAG_UTIL_CLAMP,
-        sched_nice: 0,
-        sched_priority: 0,
-        sched_runtime: 0,
-        sched_deadline: 0,
-        sched_period: 0,
         sched_util_min: util_min.clamp(0, 1024) as u32,
         sched_util_max: util_max.clamp(0, 1024) as u32,
+        ..Default::default()
     };
-    unsafe { libc::syscall(libc::SYS_sched_setattr, tid, &attr as *const SchedAttr, 0) };
+    let _ = unsafe { libc::syscall(libc::SYS_sched_setattr, tid, &attr as *const SchedAttr, 0) };
 }

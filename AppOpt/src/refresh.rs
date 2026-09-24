@@ -7,9 +7,6 @@ use std::sync::{mpsc, Mutex};
 use std::thread;
 use std::time::Instant;
 
-const MODE_120: i32 = 0;
-const MODE_60: i32 = 1;
-const MODE_90: i32 = 2;
 
 /// 刷新率配置与 CPU 规则共用 CONFIG_FILE 指向的主配置文件。
 fn config_path() -> String {
@@ -201,9 +198,9 @@ fn set_refresh_rate(state: &mut RefreshState, mode: i32) {
     }
     // 内部 mode 码 (MODE_120/60/90) → 设备实际显示模式 id (初始化检测所得)
     let arg = match mode {
-        MODE_120 => state.rate_args[0],
-        MODE_90 => state.rate_args[1],
-        MODE_60 => state.rate_args[2],
+        crate::config::REFRESH_MODE_120 => state.rate_args[0],
+        crate::config::REFRESH_MODE_90 => state.rate_args[1],
+        crate::config::REFRESH_MODE_60 => state.rate_args[2],
         _ => mode,
     };
     // 解析失败/未检测到该档位 (arg<0): 不切换也不改内部状态 (保持原档位,
@@ -349,13 +346,11 @@ fn update_status(state: &RefreshState) {
         timeout: state.effective.timeout,
         active_mode: state.effective.active,
         idle_mode: state.effective.idle,
-        available: {
-            let mut v = Vec::new();
-            if state.available_modes[0] { v.push(120); }
-            if state.available_modes[1] { v.push(90); }
-            if state.available_modes[2] { v.push(60); }
-            v
-        },
+        available: [120, 90, 60]
+            .iter()
+            .zip(state.available_modes)
+            .filter_map(|(r, ok)| ok.then_some(*r))
+            .collect(),
         device_modes: std::sync::Arc::clone(&state.device_modes),
         input_hooked: crate::event_probe::TOUCH_LISTENING.load(Ordering::Relaxed),
         last_input_secs: state
@@ -395,9 +390,17 @@ pub fn refresh_init(display_modes: std::thread::JoinHandle<Vec<(u32, u32, u32, f
     // 初始化一次性解析 dumpsys display 的显示模式: 已在 L1 并发线程完成, join 取结果
     let device_modes_raw = display_modes.join().unwrap_or_default();
     let mut state = RefreshState {
-        global: RateConfig { active: MODE_120, idle: MODE_60, timeout: 30 },
+        global: RateConfig {
+            active: crate::config::REFRESH_MODE_120,
+            idle: crate::config::REFRESH_MODE_60,
+            timeout: 30,
+        },
         app_configs: HashMap::new(),
-        effective: RateConfig { active: MODE_120, idle: MODE_60, timeout: 30 },
+        effective: RateConfig {
+            active: crate::config::REFRESH_MODE_120,
+            idle: crate::config::REFRESH_MODE_60,
+            timeout: 30,
+        },
         current_applied_mode: -1,
         rate_args: detect_rate_args(&device_modes_raw),
         available_modes: detect_available_modes(&device_modes_raw),
@@ -599,12 +602,10 @@ pub fn refresh_get_apps() -> Vec<(String, i32, String, String)> {
 
 /// 判断一行是否属于该包的刷新率配置 (新格式 pkg=refresh-*)
 fn is_refresh_pkg_line(line: &str, pkg: &str) -> bool {
-    let t = line.trim();
-    if let Some((k, v)) = t.split_once('=') {
-        return k.trim() == pkg && v.starts_with("refresh-");
-    }
-    let fields: Vec<&str> = t.split(',').map(str::trim).collect();
-    fields.len() == 4 && fields[0] == pkg
+    let Some((k, v)) = line.trim().split_once('=') else {
+        return false;
+    };
+    k.trim() == pkg && v.starts_with("refresh-")
 }
 
 pub fn refresh_add_app(pkg: &str, timeout: i32, active: &str, idle: &str) {

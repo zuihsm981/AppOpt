@@ -266,7 +266,7 @@ pub fn waylay_sanitize_rules() -> Vec<(String, String)> {
             let _ = fs::rename(&tmp, WAYLAY_FILE);
         }
     }
-    let _ = (clean_prop, clean_prop_apps);   /* 清理副作用已同步静态 */
+    drop((clean_prop, clean_prop_apps));   /* 清理副作用已同步静态 */
     clean
 }
 
@@ -537,7 +537,7 @@ fn add_rule(
             let dir_name = set.to_range_string();
             if topo.cpuset_enabled {
                 let path = format!("{}/{}", base_cpuset(), dir_name);
-                if create_cpuset_dir(&path, &dir_name, &topo.mems_str) { dir_name } else { Default::default() }
+                if create_cpuset_dir(&path, &dir_name, &topo.mems_str) { dir_name } else { String::new() }
             } else {
                 String::new()
             }
@@ -588,7 +588,6 @@ fn parse_refresh_config_line(
     timeout: &mut i32,
     active: &mut i32,
     idle: &mut i32,
-    _apps: &mut HashMap<String, (i32, i32, i32)>,
 ) -> bool {
     let line = strip_comment(line).trim();
     let Some((key, value)) = line.split_once('=') else { return false };
@@ -803,11 +802,7 @@ pub fn load_refresh_config(config_file: &str) -> (i32, i32, i32, HashMap<String,
     if let Ok(content) = fs::read_to_string(config_file) {
         for line in content.lines() {
             if !parse_refresh_config_line(
-                line,
-                &mut timeout,
-                &mut active,
-                &mut idle,
-                &mut apps,
+                line, &mut timeout, &mut active, &mut idle,
             ) {
                 // 新格式 pkg=refresh-<t>-<a>-<i>: parse_refresh_config_line 不识别,
                 // 走 route_pkg_val_line 路由 (与 load_config 主循环一致)
@@ -861,11 +856,7 @@ pub fn load_config(
         // 刷新率配置与 CPU 规则共用主配置文件。识别后跳过 CPU 规则解析，
         // 同时把值写入 AppConfig，避免出现“字段存在但永远是默认值”的问题。
         if parse_refresh_config_line(
-            p,
-            &mut refresh_timeout,
-            &mut refresh_active,
-            &mut refresh_idle,
-            &mut app_refresh_configs,
+            p, &mut refresh_timeout, &mut refresh_active, &mut refresh_idle,
         ) {
             continue;
         }
@@ -987,6 +978,11 @@ pub fn load_config(
 /// 读取独立文件，避免共享配置与磁盘配置分裂。
 
 /// 解析刷新率模式字符串 → 内部模式码 (0=120, 1=60, 2=90)
+/// 刷新率模式码 (与 parse_refresh_mode / refresh_mode_str 一致): 120=0, 90=2, 60=1
+pub const REFRESH_MODE_120: i32 = 0;
+pub const REFRESH_MODE_90: i32 = 2;
+pub const REFRESH_MODE_60: i32 = 1;
+
 pub fn parse_refresh_mode(s: &str) -> i32 {
     match s.trim() {
         "120" => 0,
@@ -1012,9 +1008,7 @@ pub fn inotify_drain() -> bool {
     }
     let inotify_fd = INOTIFY_FD.load(Ordering::Acquire);
 
-    #[repr(align(8))]
-    struct InotifyBuf([u8; 4096]);
-    let mut buf = InotifyBuf([0u8; 4096]);
+    let mut buf = [0u64; 512];   /* 8 字节天然对齐, 4096B */
     let mut reload_needed = false;
     let mut needs_rewatch = false;
     let hdr = std::mem::size_of::<libc::inotify_event>();
@@ -1023,8 +1017,8 @@ pub fn inotify_drain() -> bool {
         let len = unsafe {
             libc::read(
                 inotify_fd,
-                buf.0.as_mut_ptr() as *mut libc::c_void,
-                buf.0.len(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                std::mem::size_of_val(&buf),
             )
         };
         if len <= 0 {
@@ -1042,7 +1036,7 @@ pub fn inotify_drain() -> bool {
 
         let mut offset = 0;
         while offset + hdr <= len as usize {
-            let event = unsafe { &*(buf.0.as_ptr().add(offset) as *const libc::inotify_event) };
+            let event = unsafe { &*(buf.as_ptr().add(offset) as *const libc::inotify_event) };
             if event.mask & (libc::IN_CLOSE_WRITE | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0
             {
                 reload_needed = true;
@@ -1162,8 +1156,10 @@ fn config_reload(last_mtime: &mut i64) -> bool {
     };
     let cpu_changed = cpu_config_changed(&old_cfg, &new_cfg);
     CPU_RULES_CHANGED.store(cpu_changed, Ordering::Relaxed);
-    let mut guard = rw_write_ignore_poison(&CURRENT_CONFIG);
-    *guard = Some(Arc::new(new_cfg));
+    {
+        let mut guard = rw_write_ignore_poison(&CURRENT_CONFIG);
+        *guard = Some(Arc::new(new_cfg));
+    }
     cpu_changed
 }
 
