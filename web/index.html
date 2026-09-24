@@ -110,6 +110,9 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 #mr-rf-box{margin-top:12px} /* 与线程区同距, 无分隔横线 */
 #mr-rows .core-chips{margin-bottom:6px}
 #mr-rows .rr-custom{margin-bottom:0}
+#mr-rows .tr-freeze{margin-left:auto;font-size:12px;color:#999;display:flex;align-items:center;gap:4px;white-space:nowrap;user-select:none;cursor:pointer}
+#mr-rows .tr-freeze input{transform:scale(0.85);vertical-align:middle;margin-right:2px}
+#mr-rows .tr-freeze span{line-height:1;transform:translateY(0.5px)}
 #mr-addrow{width:100%;margin:0 0 4px}
 #toast{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,.75);color:#fff;padding:10px 20px;border-radius:12px;font-size:14px;z-index:200;opacity:0;transition:opacity .15s;pointer-events:none;max-width:80vw;word-break:break-all}
 #toast.show{opacity:1}
@@ -770,27 +773,37 @@ function semanticVisible(){
   return CORE_KEYS.filter(k=>multi&&(k!=='p-core'||(t.p&&t.p!==t.e&&t.p!==t.hp)));
 }
 function parseSpec(spec){
-  // 提取 uclamp token (util_min=/util_max=, 可为空=不设)
+  // 新格式: cpus[-min[-max]][-freeze] (util 段 -1=未设; 仅 freeze 结尾才解析 util)
   const u={uclampMin:null,uclampMax:null};
-  const um=spec.match(/util_min=(\d+)/);if(um)u.uclampMin=+um[1];
-  const ux=spec.match(/util_max=(\d+)/);if(ux)u.uclampMax=+ux[1];
-  const s=(um||ux)?spec.replace(/\s*util_(min|max)=\d+/g,'').trim():spec;
+  const s0=spec.trim();
+  let fr=false,cpu=s0;
+  if(s0.split('-').pop()==='freeze'){
+    fr=true;
+    const p=s0.split('-').slice(0,-1);
+    let idx=p.length;
+    if(idx>0){const v=Number(p[idx-1]);if(Number.isInteger(v)&&v>=0&&v<=1024){u.uclampMax=v;idx--;}}
+    if(idx>0){const v=Number(p[idx-1]);if(Number.isInteger(v)&&v>=0&&v<=1024){u.uclampMin=v;idx--;}}
+    cpu=p.slice(0,idx).join('-');
+  }
   const vis=semanticVisible();
-  const parts=s.split(',').map(x=>x.trim()).filter(Boolean);
+  const parts=cpu.split(',').map(x=>x.trim()).filter(Boolean);
   const sem=parts.filter(p=>CORE_KEYS.includes(p)&&vis.includes(p));
-  if(s==='all-core')return{...u,sem:vis,all:true};
-  if(parts.length&&sem.length===parts.length)return{...u,sem};
-  return{...u,custom:true,customVal:s};
+  if(cpu==='all-core')return{...u,freeze:fr,sem:vis,all:true};
+  if(parts.length&&sem.length===parts.length)return{...u,freeze:fr,sem};
+  return{...u,freeze:fr,custom:true,customVal:cpu};
 }
-const mkRow=o=>({thread:'',sem:[],all:false,custom:false,customVal:'',uclampMin:null,uclampMax:null,...o});
+const mkRow=o=>({thread:'',sem:[],all:false,custom:false,customVal:'',uclampMin:null,uclampMax:null,freeze:false,...o});
 function specOf(r){
   let s=r.custom?r.customVal.trim():r.all?'all-core':r.sem.join(',');
-  const u=[];
-  // 仅数字才拼 util token (undefined/空串/null 一律不拼, 防 "util_max=undefined")
-  if(typeof r.uclampMin==='number')u.push('util_min='+r.uclampMin);
-  if(typeof r.uclampMax==='number')u.push('util_max='+r.uclampMax);
-  if(!u.length)return s;
-  return s? s+' '+u.join(' ') : u.join(' '); // 只有 util 时无前导空格
+  const hasMin=typeof r.uclampMin==='number',hasMax=typeof r.uclampMax==='number';
+  // 连字符格式: cpus[-min[-max]][-freeze], 未设侧补 -1
+  // util 段成对: 单侧缺省补默认 (min=0 / max=1024, 语义等价未设)
+  if(hasMin||hasMax){
+    const mn=hasMin?r.uclampMin:0, mx=hasMax?r.uclampMax:1024;
+    s=s?`${s}-${mn}-${mx}`:`${mn}-${mx}`;
+  }
+  if(r.freeze)s+='-freeze';
+  return s;
 }
 const CHIP_HTML=[['e-core','e-core 小核'],['p-core','p-core 中核'],['hp-core','hp-core 大核'],['all-core','all-core 全部'],['自定义','自定义']]
   .map(([c,t])=>`<button data-core="${c}" title="${t}">${c}</button>`).join('');
@@ -837,7 +850,7 @@ function renderRows(){
   box.innerHTML=mrRows.map((r,i)=>`
 <div class="tree-row${r.pkgRow?'':' branch'}" data-ri="${i}">
 ${r.pkgRow
-  ?'<div class="tr-head"><span class="tr-tag">全部线程·可选</span></div>'
+  ?`<div class="tr-head"><span class="tr-tag">全部线程·可选</span><label class="tr-freeze" title="切换后台 30 秒后执行 cmd activity freeze"><input type="checkbox" data-fz="1" ${r.freeze?'checked':''}><span>应用切换后台30秒后冻结</span></label></div>`
   :`<div class="tr-head sg-wrap"><input class="rr-thread" placeholder="输入线程名" value="${esc(r.thread)}"><div class="sg-box" hidden></div>${tree?`<button class="icon-btn danger rr-del" title="删除该行">${ICO_TRASH}</button>`:''}</div>`}
 <div class="core-chips">${CHIP_HTML}</div>
 <input class="rr-custom" placeholder="CPU 范围，如 0-3,6" value="${esc(r.customVal||'')}" hidden>
@@ -867,6 +880,8 @@ ${uclampSupported?`<div class="rr-uclamp-fold">
 $('mr-rows').addEventListener('click',e=>{
   const del=e.target.closest('.rr-del');
   if(del){mrRows.splice(+del.closest('[data-ri]').dataset.ri,1);renderRows();return}
+  const fz=e.target.closest('[data-fz]');
+  if(fz){const el=fz.closest('[data-ri]'),r=mrRows[+el.dataset.ri];r.freeze=fz.checked;return}
   const add=e.target.closest('.uclamp-add-btn');
   if(add){
     const el=add.closest('[data-ri]'),r=mrRows[+el.dataset.ri];
