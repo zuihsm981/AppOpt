@@ -442,18 +442,9 @@ impl AppState {
                 &mut self.rfr_pkgs_set,
                 &mut self.freeze_pkgs_set,
             );
-            // 冻结 pending 失效: 配置移除 freeze 标志 → 丢弃对应 pending 并解冻 (写 0 幂等)
-            let removed: Vec<i32> = self
-                .freeze_pending
-                .iter()
-                .filter(|(uid, _)| !self.uid_map.get(uid).is_some_and(|e| e.freeze))
-                .map(|(u, _)| *u)
-                .collect();
-            for uid in removed {
-                self.freeze_pending.remove(&uid);
-                let path = format!("/sys/fs/cgroup/apps/uid_{}/cgroup.freeze", uid);
-                let _ = std::fs::write(&path, "0");
-            }
+            // 冻结 pending 失效: 配置移除 freeze 标志 → 丢弃对应 pending
+            self.freeze_pending
+                .retain(|uid, _| self.uid_map.get(uid).is_some_and(|e| e.freeze));
         }
         apply_config(cpu_changed, self.cfg.as_deref(), &self.pkg_uid);
     }
@@ -496,10 +487,10 @@ impl AppState {
         if let Some(e) = self.uid_map.get(&uid) {
             if e.freeze {
                 self.freeze_pending.remove(&uid);
+                // freeze 包切回前台: 解冻 (写 0 幂等)
+                let path = format!("/sys/fs/cgroup/apps/uid_{}/cgroup.freeze", uid);
+                let _ = std::fs::write(&path, "0");
             }
-            // 规则包前台: 无条件解冻 (写 0 幂等; 覆盖配置移除 freeze 后的残留冻结)
-            let path = format!("/sys/fs/cgroup/apps/uid_{}/cgroup.freeze", uid);
-            let _ = std::fs::write(&path, "0");
         }
         self.last_fg = Some((pid, uid));
         // service list 伪装: 前台回调驱动开关 —— 前台 uid 命中 waylay 目标应用集
