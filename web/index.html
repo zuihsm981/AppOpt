@@ -773,17 +773,20 @@ function semanticVisible(){
   return CORE_KEYS.filter(k=>multi&&(k!=='p-core'||(t.p&&t.p!==t.e&&t.p!==t.hp)));
 }
 function parseSpec(spec){
-  // 新格式: cpus[-min[-max]][-freeze] (util 段 -1=未设; 仅 freeze 结尾才解析 util)
+  // 新格式: cpus[-min-max][-freeze] (freeze 可有无; 剩余段数>=3 才剥 util, 防数字区间误剥)
   const u={uclampMin:null,uclampMax:null};
   const s0=spec.trim();
   let fr=false,cpu=s0;
-  if(s0.split('-').pop()==='freeze'){
-    fr=true;
-    const p=s0.split('-').slice(0,-1);
-    let idx=p.length;
-    if(idx>0){const v=Number(p[idx-1]);if(Number.isInteger(v)&&v>=0&&v<=1024){u.uclampMax=v;idx--;}}
-    if(idx>0){const v=Number(p[idx-1]);if(Number.isInteger(v)&&v>=0&&v<=1024){u.uclampMin=v;idx--;}}
-    cpu=p.slice(0,idx).join('-');
+  const p0=s0.split('-');
+  let idx=p0.length;
+  if(idx>0&&p0[idx-1]==='freeze'){fr=true;idx--;}
+  cpu=p0.slice(0,idx).join('-');
+  if(idx>=3){
+    let got=0;
+    if(idx>0){const v=Number(p0[idx-1]);if(Number.isInteger(v)&&v>=0&&v<=1024){u.uclampMax=v;idx--;got++;}}
+    if(idx>0){const v=Number(p0[idx-1]);if(Number.isInteger(v)&&v>=0&&v<=1024){u.uclampMin=v;idx--;got++;}}
+    if(got>=2) cpu=p0.slice(0,idx).join('-');
+    else{u.uclampMin=null;u.uclampMax=null;}
   }
   const vis=semanticVisible();
   const parts=cpu.split(',').map(x=>x.trim()).filter(Boolean);
@@ -850,7 +853,7 @@ function renderRows(){
   box.innerHTML=mrRows.map((r,i)=>`
 <div class="tree-row${r.pkgRow?'':' branch'}" data-ri="${i}">
 ${r.pkgRow
-  ?`<div class="tr-head"><span class="tr-tag">全部线程·可选</span><label class="tr-freeze" title="切换后台 30 秒后执行 cmd activity freeze"><input type="checkbox" data-fz="1" ${r.freeze?'checked':''}><span>应用切换后台30秒后冻结</span></label></div>`
+  ?`<div class="tr-head"><span class="tr-tag">全部线程·可选</span><label class="tr-freeze" title="切换后台 30 秒后冻结 (写 cgroup.freeze)"><input type="checkbox" data-fz="1" ${r.freeze?'checked':''}><span>应用切换后台30秒后冻结</span></label></div>`
   :`<div class="tr-head sg-wrap"><input class="rr-thread" placeholder="输入线程名" value="${esc(r.thread)}"><div class="sg-box" hidden></div>${tree?`<button class="icon-btn danger rr-del" title="删除该行">${ICO_TRASH}</button>`:''}</div>`}
 <div class="core-chips">${CHIP_HTML}</div>
 <input class="rr-custom" placeholder="CPU 范围，如 0-3,6" value="${esc(r.customVal||'')}" hidden>
