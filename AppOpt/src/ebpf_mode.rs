@@ -198,7 +198,7 @@ impl KpmHandle {
         let maps = crate::lock_ignore_poison(&PROP_MAPS);
         for (_, ptr, len) in maps.iter() {
             let len = *len;
-            let mut changed = false;
+            let _ = len;
             unsafe {
                 let base = *ptr as *mut u8;
                 for (from, to) in &rules {
@@ -217,16 +217,13 @@ impl KpmHandle {
                     while i + pat.len() <= len {
                         if std::slice::from_raw_parts(base.add(i), pat.len()) == pat {
                             std::ptr::copy_nonoverlapping(rep.as_ptr(), base.add(i), pat.len());
-                            changed = true;
                             i += pat.len();
                         } else {
                             i += 1;
                         }
                     }
                 }
-                if changed {
-                    libc::msync(*ptr as *mut libc::c_void, len, libc::MS_SYNC);
-                }
+                // tmpfs: MAP_SHARED 写入即进 page cache, 其他进程映射同页立即可见
             }
         }
     }
