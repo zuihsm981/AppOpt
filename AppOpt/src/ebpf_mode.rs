@@ -180,6 +180,9 @@ impl KpmHandle {
     /// 武装 KPM (start: affinity 拦截 + 清理探针 + service list 伪装)
     pub(crate) fn arm(&self) {
         self.cmd("start");
+        // 连接即绑定本进程 mm 给内核 (property 写穿依赖), 断开由内核释放
+        let b = format!("prop_bind {}", std::process::id());
+        self.cmd(&b);
     }
 
     /// 解除武装 (stop: 摘除全部业务探针)
@@ -212,11 +215,15 @@ impl KpmHandle {
                 paths.push(f);
             }
         }
-        // mmap 目标文件 (保持存活防回收), 记录 (basename, vma)
-        static KEPT: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+        // mmap 目标文件 (保持存活到命令执行后), 记录 (basename, vma);
+        // 下次 prop_apply 先 munmap 旧映射, 避免 vma 累积 (areas 不再递增)
+        static KEPT: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
         let mut want: Vec<String> = Vec::new();
         {
             let mut kept = KEPT.lock().unwrap();
+            for &(ptr, plen) in kept.iter() {
+                unsafe { libc::munmap(ptr as *mut libc::c_void, plen); }
+            }
             kept.clear();
             for p in paths {
                 use std::os::unix::io::AsRawFd;
@@ -224,13 +231,13 @@ impl KpmHandle {
                 let Ok(md) = f.metadata() else { continue };
                 let len = md.len();
                 if len == 0 { continue; }
+                let mlen = (len as usize & !0xFFF) + 4096;
                 let pr = unsafe {
-                    libc::mmap(std::ptr::null_mut(),
-                               (len as usize & !0xFFF) + 4096,
+                    libc::mmap(std::ptr::null_mut(), mlen,
                                libc::PROT_READ, libc::MAP_SHARED, f.as_raw_fd(), 0)
                 };
                 if pr != libc::MAP_FAILED {
-                    kept.push(pr as usize);
+                    kept.push((pr as usize, mlen));
                     if let Some(bn) = p.file_name().and_then(|x| x.to_str()) {
                         if !want.contains(&bn.to_string()) { want.push(bn.to_string()); }
                     }
