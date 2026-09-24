@@ -19,8 +19,9 @@ use std::env;
 use std::ffi::CString;
 use std::fs;
 use std::process;
-use std::sync::atomic::Ordering;
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock, RwLock};
+use std::time::Duration;
 
 use crate::config::{
     init_inotify, load_config, AppConfig,
@@ -56,6 +57,8 @@ struct UidEntry {
     pkg: String,
     cpu: bool,
     rfr: bool,
+    /// 包行 freeze 标志: 切换后台延迟 30s freeze
+    freeze: bool,
 }
 
 /// 从 packages.list 构建 uid→条目 静态表 (主线程持有):
@@ -63,8 +66,12 @@ struct UidEntry {
 /// 一个应用可同时 CPU + 刷新率 (合表后用标志位表达)。前台回调只查本表。
 fn build_uid_tables(cfg: &AppConfig) -> (HashMap<i32, UidEntry>, HashMap<String, i32>) {
     let mut cpu_pkgs: HashSet<&str> = HashSet::new();
+    let mut freeze_pkgs: HashSet<&str> = HashSet::new();
     for r in &cfg.rules {
         cpu_pkgs.insert(r.pkg.as_str());
+        if r.freeze {
+            freeze_pkgs.insert(r.pkg.as_str());
+        }
     }
     let mut fwd: HashMap<i32, UidEntry> = HashMap::new();
     let mut rev: HashMap<String, i32> = HashMap::new();
@@ -78,10 +85,11 @@ fn build_uid_tables(cfg: &AppConfig) -> (HashMap<i32, UidEntry>, HashMap<String,
                 continue;
             }
             let cpu = cpu_pkgs.contains(pkg);
+            let freeze = freeze_pkgs.contains(pkg);
             let rfr = pkg == crate::config::DEFAULT_REFRESH_PACKAGE
                 || cfg.app_refresh_configs.contains_key(pkg);
             if cpu || rfr {
-                fwd.entry(uid).or_insert_with(|| UidEntry { pkg: pkg.to_string(), cpu, rfr });
+                fwd.entry(uid).or_insert_with(|| UidEntry { pkg: pkg.to_string(), cpu, rfr, freeze });
                 rev.entry(pkg.to_string()).or_insert(uid);
             }
         }
@@ -124,11 +132,12 @@ fn lookup_uid_in_packages_list(pkg: &str) -> Option<i32> {
 }
 
 /// 规则应用集合 (cpu/rfr): 主线程检测“新增/删除规则应用”, 集合未变则跳过重建
-fn cfg_pkg_sets(cfg: &AppConfig) -> (HashSet<String>, HashSet<String>) {
+fn cfg_pkg_sets(cfg: &AppConfig) -> (HashSet<String>, HashSet<String>, HashSet<String>) {
     let cpu: HashSet<String> = cfg.rules.iter().map(|r| r.pkg.clone()).collect();
     let mut rfr: HashSet<String> = cfg.app_refresh_configs.keys().cloned().collect();
     rfr.insert(crate::config::DEFAULT_REFRESH_PACKAGE.to_string());
-    (cpu, rfr)
+    let freeze: HashSet<String> = cfg.rules.iter().filter(|r| r.freeze).map(|r| r.pkg.clone()).collect();
+    (cpu, rfr, freeze)
 }
 
 
@@ -270,11 +279,13 @@ fn rebuild_uid_if_needed(
     pkg_uid: &mut HashMap<String, i32>,
     cpu_pkgs_set: &mut HashSet<String>,
     rfr_pkgs_set: &mut HashSet<String>,
+    freeze_pkgs_set: &mut HashSet<String>,
 ) {
-    let (nc, nr) = cfg_pkg_sets(cfg);
+    let (nc, nr, nf) = cfg_pkg_sets(cfg);
     let cpu_set_changed = cpu_changed && nc != *cpu_pkgs_set;
     let rfr_set_changed = nr != *rfr_pkgs_set;
-    if !cpu_set_changed && !rfr_set_changed {
+    let freeze_set_changed = nf != *freeze_pkgs_set;
+    if !cpu_set_changed && !rfr_set_changed && !freeze_set_changed {
         return;
     }
     // 合表增量维护 (不再整表重扫 packages.list):
@@ -284,6 +295,7 @@ fn rebuild_uid_if_needed(
     uid_map.retain(|_, e| {
         e.cpu = nc.contains(&e.pkg);
         e.rfr = nr.contains(&e.pkg);
+        e.freeze = nf.contains(&e.pkg);
         e.cpu || e.rfr
     });
     let known: HashSet<String> = uid_map.values().map(|e| e.pkg.clone()).collect();
@@ -296,6 +308,7 @@ fn rebuild_uid_if_needed(
                 pkg: pkg.clone(),
                 cpu: nc.contains(pkg),
                 rfr: nr.contains(pkg),
+                freeze: nf.contains(pkg),
             });
         }
     }
@@ -306,9 +319,42 @@ fn rebuild_uid_if_needed(
     }
     *cpu_pkgs_set = nc;
     *rfr_pkgs_set = nr;
+    *freeze_pkgs_set = nf;
 }
 
 /// 主循环跨事件共享状态 (打包原 6 个局部 mut, 消除长参数传递)
+/// 规则应用切换冻结: 上一前台命中规则表 → 延迟 freeze; 切回前台 → 置 true 取消
+static FREEZE_CANCELS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
+
+fn freeze_cancels() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
+    FREEZE_CANCELS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 延迟 delay 后对 pkg 执行 `cmd activity freeze <pkg>`。
+/// 取消: 该包在 delay 内重新回到前台 → cancel_freeze_pkg 置取消标记, 到期不冻结。
+fn freeze_pkg_delayed(pkg: String, delay: Duration) {
+    let cancel = Arc::new(AtomicBool::new(false));
+    crate::lock_ignore_poison(freeze_cancels()).insert(pkg.clone(), cancel.clone());
+    std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        if !cancel.load(Ordering::Relaxed) {
+            let _ = std::process::Command::new("cmd")
+                .arg("activity")
+                .arg("freeze")
+                .arg(&pkg)
+                .output();
+        }
+        crate::lock_ignore_poison(freeze_cancels()).remove(&pkg);
+    });
+}
+
+/// 取消 pkg 的待执行冻结 (该包重新成为前台)
+fn cancel_freeze_pkg(pkg: &str) {
+    if let Some(c) = crate::lock_ignore_poison(freeze_cancels()).get(pkg) {
+        c.store(true, Ordering::Relaxed);
+    }
+}
+
 struct AppState {
     ebpf_state: Option<EbpfState>,
     cfg: Option<Arc<AppConfig>>,
@@ -322,6 +368,10 @@ struct AppState {
     prop_active_cur: bool,
     /// 主循环事件通知 fd (EV_KPM): 连接时重新初始化 ebpf 用
     kpm_wake_fd: libc::c_int,
+    /// 上一前台 uid (fg=true 回调): 规则应用切换时冻结切换前应用用
+    last_fg_uid: Option<i32>,
+    /// 包行 freeze 标志集合 (增量维护对比用)
+    freeze_pkgs_set: HashSet<String>,
 }
 
 impl AppState {
@@ -332,7 +382,7 @@ impl AppState {
             .as_ref()
             .map(|c| build_uid_tables(c))
             .unwrap_or_default();
-        let (cpu_pkgs_set, rfr_pkgs_set) = cfg
+        let (cpu_pkgs_set, rfr_pkgs_set, freeze_pkgs_set) = cfg
             .as_ref()
             .map(|c| cfg_pkg_sets(c))
             .unwrap_or_default();
@@ -346,6 +396,8 @@ impl AppState {
             srv_active_cur: false,
             prop_active_cur: false,
             kpm_wake_fd: -1,
+            last_fg_uid: None,
+            freeze_pkgs_set,
         }
     }
 
@@ -413,6 +465,7 @@ impl AppState {
                 &mut self.pkg_uid,
                 &mut self.cpu_pkgs_set,
                 &mut self.rfr_pkgs_set,
+                &mut self.freeze_pkgs_set,
             );
         }
         apply_config(cpu_changed, self.cfg.as_deref(), &self.pkg_uid);
@@ -435,6 +488,21 @@ impl AppState {
     /// binder 前台回调 (pid+uid): 查 uid 表分发 CPU (冷启动 ApplyPkg + pidfd watch)
     /// 与刷新率 (包名) —— 原 EV_FG 分支主体
     fn on_fg(&mut self, pid: i32, uid: i32) {
+        // 规则应用切换冻结: 上一前台 (fg=true) 命中规则表 → 延迟 30s freeze;
+        // 当前包重新前台 → 取消其待执行冻结
+        if let Some(prev) = self.last_fg_uid {
+            if prev != uid {
+                if let Some(pe) = self.uid_map.get(&prev) {
+                    if pe.freeze {
+                        freeze_pkg_delayed(pe.pkg.clone(), Duration::from_secs(30));
+                    }
+                }
+            }
+        }
+        if let Some(e) = self.uid_map.get(&uid) {
+            cancel_freeze_pkg(&e.pkg);
+        }
+        self.last_fg_uid = Some(uid);
         // service list 伪装: 前台回调驱动开关 —— 前台 uid 命中 waylay 目标应用集
         // (waylay.conf, 默认空 → 不激活), 命中则激活无差别替换, 否则关闭;
         // 差量下发: 仅状态变化才发 supercall (幂等, 避免每次回调冗余往返);
@@ -844,6 +912,13 @@ fn main() {
                             let pid = i32::from_ne_bytes([pb[0], pb[1], pb[2], pb[3]]);
                             // 清身份 + 通知 CPU worker 清该 uid managed → 发布统计
                             if let Some(uid) = crate::cpu_affinity::cpu_known_pid_to_uid(pid) {
+                                // 冻结状态清理: 规则应用退出 → 取消待执行冻结 + 清上一前台身份
+                                if let Some(e) = state.uid_map.get(&uid) {
+                                    cancel_freeze_pkg(&e.pkg);
+                                }
+                                if state.last_fg_uid == Some(uid) {
+                                    state.last_fg_uid = None;
+                                }
                                 if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
                                     let _ = tx.send(crate::cpu_affinity::CpuMsg::EvictUid(uid));
                                 }

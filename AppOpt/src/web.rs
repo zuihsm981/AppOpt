@@ -369,11 +369,14 @@ fn rules_json() -> String {
         // spec 携带 util token (util_min=/util_max=): 前端 parseSpec 提取回填 chips;
         // 前端显示时再剥离 util 只显示 CPU 名。
         let mut spec = spec_name(&r.cpus, &cfg.topo);
-        if r.util_min >= 0 {
-            spec.push_str(&format!(" util_min={}", r.util_min));
+        if r.util_min >= 0 || r.util_max >= 0 {
+            // util 段成对: 单侧缺省补默认 (min=0 / max=1024, 语义等价未设)
+            let mn = if r.util_min >= 0 { r.util_min } else { 0 };
+            let mx = if r.util_max >= 0 { r.util_max } else { 1024 };
+            spec.push_str(&format!("-{}-{}", mn, mx));
         }
-        if r.util_max >= 0 {
-            spec.push_str(&format!(" util_max={}", r.util_max));
+        if r.freeze {
+            spec.push_str("-freeze");
         }
         groups[gi]["items"]
             .as_array_mut()
@@ -422,11 +425,11 @@ fn rule_api(req: &Request) -> (u16, String) {
     }
     // 剥离 uclamp token (util_min=/util_max=) 后再校验 CPU 规格; 原始 cpus 原样写文件。
     // CPU 集合可空 (只有 uclamp): 允许; 空且无 util 才算无效。
-    let (cpu_spec, umin, umax) = crate::config::split_uclamp(cpus);
+    let (cpu_spec, umin, umax, _freeze) = crate::config::parse_rule_spec(cpus);
     let has_util = umin >= 0 || umax >= 0;
     if cpu_spec.len() >= 64 || (cpu_spec.is_empty() && !has_util)
         || (!cpu_spec.is_empty()
-            && (!spec_like(cpu_spec) || parse_cpu_spec(cpu_spec, &cfg.topo).count() == 0))
+            && (!spec_like(&cpu_spec) || parse_cpu_spec(&cpu_spec, &cfg.topo).count() == 0))
     {
         return err_json(400, "无效的 CPU 规格");
     }

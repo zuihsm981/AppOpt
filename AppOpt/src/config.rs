@@ -338,6 +338,8 @@ pub struct AffinityRule {
     pub util_min: i32,
     /// uclamp 上限 (0..=1024, -1 = 未设)
     pub util_max: i32,
+    /// 应用切换后台冻结 (包行 spec 含 freeze 标志: 切换后台延迟 30s freeze)
+    pub freeze: bool,
 }
 
 #[derive(Clone)]
@@ -486,22 +488,26 @@ pub fn parse_outer(p: &str) -> OuterLine<'_> {
     }
 }
 
-/// 从规则 CPU 规格中提取 uclamp token (util_min=/util_max=), 返回 (纯 CPU 规格, min, max)
-/// 规则行格式: `0-3 util_min=256 util_max=1024` (util token 空格分隔, 可只给其一)
-pub(crate) fn split_uclamp(spec: &str) -> (&str, i32, i32) {
-    let mut util_min = -1;
-    let mut util_max = -1;
-    let mut cpus = ""; // 仅 uclamp 时保持空 (无 CPU 集合)
-    for t in spec.split_whitespace() {
-        if let Some(v) = t.strip_prefix("util_min=") {
-            util_min = v.parse::<i32>().unwrap_or(-1);
-        } else if let Some(v) = t.strip_prefix("util_max=") {
-            util_max = v.parse::<i32>().unwrap_or(-1);
-        } else if cpus.is_empty() {
-            cpus = t; // 第一个非 util token 为 CPU 集合规格
-        }
+/// 规则 CPU 规格解析 (新格式): 返回 (CPU 规格, util_min, util_max, freeze)
+/// `cpus[-min-max][-freeze]` —— util 段成对 (单侧缺省由输出端补默认 min=0/max=1024);
+/// 仅末尾 freeze 时解析 util, 避免纯数字区间 cpus (如 `0-3`) 被误剥。
+pub(crate) fn parse_rule_spec(spec: &str) -> (String, i32, i32, bool) {
+    let parts: Vec<&str> = spec.split('-').collect();
+    if parts.last() != Some(&"freeze") {
+        return (spec.to_string(), -1, -1, false);
     }
-    (cpus, util_min, util_max)
+    let mut i = parts.len() - 1;
+    let mut util_max = -1;
+    if i > 0 && let Ok(v) = parts[i - 1].parse::<i32>() && (0..=1024).contains(&v) {
+        util_max = v;
+        i -= 1;
+    }
+    let mut util_min = -1;
+    if i > 0 && let Ok(v) = parts[i - 1].parse::<i32>() && (0..=1024).contains(&v) {
+        util_min = v;
+        i -= 1;
+    }
+    (parts[..i].join("-"), util_min, util_max, true)
 }
 
 fn add_rule(
@@ -517,8 +523,8 @@ fn add_rule(
     if pkg.bytes().chain(thread.bytes()).any(|b| b < 0x20 || b == 0x7f) {
         return false;
     }
-    // 先提 uclamp token; CPU 集合可空 (只有 uclamp 时不设亲和)
-    let (cpus_spec, util_min, util_max) = split_uclamp(cpus_spec);
+    // 解析 CPU 规格 + uclamp + freeze (连字符 `cpus-min-max-freeze` / 旧 token 两格式)
+    let (cpus_spec, util_min, util_max, freeze) = crate::config::parse_rule_spec(cpus_spec);
     let has_util = util_min >= 0 || util_max >= 0;
     if cpus_spec.is_empty() && !has_util {
         return false; // 无 CPU 也无 uclamp: 无意义
@@ -526,10 +532,10 @@ fn add_rule(
     let mut set = CpuSet::new();
     let mut cpuset_dir = String::new();
     if !cpus_spec.is_empty() {
-        if !spec_like(cpus_spec) {
+        if !spec_like(&cpus_spec) {
             return false;
         }
-        set = parse_cpu_spec(cpus_spec, topo);
+        set = parse_cpu_spec(&cpus_spec, topo);
         if set.count() == 0 {
             return false;
         }
@@ -553,6 +559,7 @@ fn add_rule(
         cpus: set,
         util_min,
         util_max,
+        freeze,
     });
     true
 }
