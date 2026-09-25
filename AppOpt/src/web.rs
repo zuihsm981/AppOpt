@@ -375,9 +375,6 @@ fn rules_json() -> String {
             let mx = if r.util_max >= 0 { r.util_max } else { 1024 };
             spec.push_str(&format!("-{}-{}", mn, mx));
         }
-        if r.freeze {
-            spec.push_str("-freeze");
-        }
         groups[gi]["items"]
             .as_array_mut()
             .unwrap()
@@ -425,7 +422,7 @@ fn rule_api(req: &Request) -> (u16, String) {
     }
     // 剥离 uclamp token (util_min=/util_max=) 后再校验 CPU 规格; 原始 cpus 原样写文件。
     // CPU 集合可空 (只有 uclamp): 允许; 空且无 util 才算无效。
-    let (cpu_spec, umin, umax, _freeze) = crate::config::parse_rule_spec(cpus);
+    let (cpu_spec, umin, umax) = crate::config::parse_rule_spec(cpus);
     let has_util = umin >= 0 || umax >= 0;
     if cpu_spec.len() >= 64 || (cpu_spec.is_empty() && !has_util)
         || (!cpu_spec.is_empty()

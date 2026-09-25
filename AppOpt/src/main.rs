@@ -56,8 +56,6 @@ struct UidEntry {
     pkg: String,
     cpu: bool,
     rfr: bool,
-    /// 包行 freeze 标志: 切走后跟随系统冻结主进程再冻整个 uid
-    freeze: bool,
 }
 
 /// 从 packages.list 构建 uid→条目 静态表 (主线程持有):
@@ -65,12 +63,8 @@ struct UidEntry {
 /// 一个应用可同时 CPU + 刷新率 (合表后用标志位表达)。前台回调只查本表。
 fn build_uid_tables(cfg: &AppConfig) -> (HashMap<i32, UidEntry>, HashMap<String, i32>) {
     let mut cpu_pkgs: HashSet<&str> = HashSet::new();
-    let mut freeze_pkgs: HashSet<&str> = HashSet::new();
     for r in &cfg.rules {
         cpu_pkgs.insert(r.pkg.as_str());
-        if r.freeze {
-            freeze_pkgs.insert(r.pkg.as_str());
-        }
     }
     let mut fwd: HashMap<i32, UidEntry> = HashMap::new();
     let mut rev: HashMap<String, i32> = HashMap::new();
@@ -84,11 +78,10 @@ fn build_uid_tables(cfg: &AppConfig) -> (HashMap<i32, UidEntry>, HashMap<String,
                 continue;
             }
             let cpu = cpu_pkgs.contains(pkg);
-            let freeze = freeze_pkgs.contains(pkg);
             let rfr = pkg == crate::config::DEFAULT_REFRESH_PACKAGE
                 || cfg.app_refresh_configs.contains_key(pkg);
             if cpu || rfr {
-                fwd.entry(uid).or_insert_with(|| UidEntry { pkg: pkg.to_string(), cpu, rfr, freeze });
+                fwd.entry(uid).or_insert_with(|| UidEntry { pkg: pkg.to_string(), cpu, rfr });
                 rev.entry(pkg.to_string()).or_insert(uid);
             }
         }
@@ -131,12 +124,11 @@ fn lookup_uid_in_packages_list(pkg: &str) -> Option<i32> {
 }
 
 /// 规则应用集合 (cpu/rfr): 主线程检测“新增/删除规则应用”, 集合未变则跳过重建
-fn cfg_pkg_sets(cfg: &AppConfig) -> (HashSet<String>, HashSet<String>, HashSet<String>) {
+fn cfg_pkg_sets(cfg: &AppConfig) -> (HashSet<String>, HashSet<String>) {
     let cpu: HashSet<String> = cfg.rules.iter().map(|r| r.pkg.clone()).collect();
     let mut rfr: HashSet<String> = cfg.app_refresh_configs.keys().cloned().collect();
     rfr.insert(crate::config::DEFAULT_REFRESH_PACKAGE.to_string());
-    let freeze: HashSet<String> = cfg.rules.iter().filter(|r| r.freeze).map(|r| r.pkg.clone()).collect();
-    (cpu, rfr, freeze)
+    (cpu, rfr)
 }
 
 
@@ -278,13 +270,11 @@ fn rebuild_uid_if_needed(
     pkg_uid: &mut HashMap<String, i32>,
     cpu_pkgs_set: &mut HashSet<String>,
     rfr_pkgs_set: &mut HashSet<String>,
-    freeze_pkgs_set: &mut HashSet<String>,
 ) {
-    let (nc, nr, nf) = cfg_pkg_sets(cfg);
+    let (nc, nr) = cfg_pkg_sets(cfg);
     let cpu_set_changed = cpu_changed && nc != *cpu_pkgs_set;
     let rfr_set_changed = nr != *rfr_pkgs_set;
-    let freeze_set_changed = nf != *freeze_pkgs_set;
-    if !cpu_set_changed && !rfr_set_changed && !freeze_set_changed {
+    if !cpu_set_changed && !rfr_set_changed {
         return;
     }
     // 合表增量维护 (不再整表重扫 packages.list):
@@ -294,7 +284,6 @@ fn rebuild_uid_if_needed(
     uid_map.retain(|_, e| {
         e.cpu = nc.contains(&e.pkg);
         e.rfr = nr.contains(&e.pkg);
-        e.freeze = nf.contains(&e.pkg);
         e.cpu || e.rfr
     });
     let known: HashSet<String> = uid_map.values().map(|e| e.pkg.clone()).collect();
@@ -307,7 +296,6 @@ fn rebuild_uid_if_needed(
                 pkg: pkg.clone(),
                 cpu: nc.contains(pkg),
                 rfr: nr.contains(pkg),
-                freeze: nf.contains(pkg),
             });
         }
     }
@@ -318,7 +306,6 @@ fn rebuild_uid_if_needed(
     }
     *cpu_pkgs_set = nc;
     *rfr_pkgs_set = nr;
-    *freeze_pkgs_set = nf;
 }
 
 /// 主循环跨事件共享状态 (打包原 6 个局部 mut, 消除长参数传递)
@@ -333,13 +320,6 @@ struct AppState {
     srv_active_cur: bool,
     /// 已下发给内核的 property 区伪装开关 (独立目标应用集)
     prop_active_cur: bool,
-    /// 上一前台 (pid, uid): 规则应用切换时冻结切换前应用用
-    last_fg: Option<(i32, i32)>,
-    /// 包行 freeze 标志集合 (增量维护对比用)
-    freeze_pkgs_set: HashSet<String>,
-    /// 冻结轮询名单: uid → (主 pid, 已冻结) —— onProcessStateChanged(CACHED) 登记,
-    /// 前台回调解冻并停止轮询
-    freeze_watch: HashMap<i32, (i32, bool)>,
 }
 
 impl AppState {
@@ -350,7 +330,7 @@ impl AppState {
             .as_ref()
             .map(|c| build_uid_tables(c))
             .unwrap_or_default();
-        let (cpu_pkgs_set, rfr_pkgs_set, freeze_pkgs_set) = cfg
+        let (cpu_pkgs_set, rfr_pkgs_set) = cfg
             .as_ref()
             .map(|c| cfg_pkg_sets(c))
             .unwrap_or_default();
@@ -363,9 +343,6 @@ impl AppState {
             rfr_pkgs_set,
             srv_active_cur: false,
             prop_active_cur: false,
-            last_fg: None,
-            freeze_pkgs_set,
-            freeze_watch: HashMap::new(),
         }
     }
 
@@ -433,31 +410,9 @@ impl AppState {
                 &mut self.pkg_uid,
                 &mut self.cpu_pkgs_set,
                 &mut self.rfr_pkgs_set,
-                &mut self.freeze_pkgs_set,
             );
-            // 冻结轮询清理: 配置移除 freeze → 解冻 (写 0 幂等) + 停止轮询
-            let removed: Vec<i32> = self
-                .freeze_watch
-                .iter()
-                .filter(|(uid, _)| !self.uid_map.get(uid).is_some_and(|e| e.freeze))
-                .map(|(u, _)| *u)
-                .collect();
-            for uid in removed {
-                self.freeze_watch.remove(&uid);
-                let path = format!("/sys/fs/cgroup/apps/uid_{}/cgroup.freeze", uid);
-                let _ = std::fs::write(&path, "0");
-            }
         }
         apply_config(cpu_changed, self.cfg.as_deref(), &self.pkg_uid);
-    }
-
-    /// onForegroundActivitiesChanged(false): 应用离开前台 → 配置 freeze 应用登记轮询
-    /// (设备 IProcessObserver 无 onProcessStateChanged; 轮询主 pid cgroup.freeze,
-    /// 系统冻结主进程后再冻结整个 uid; 前台回调 (fg=true) 解冻并停止轮询)
-    fn on_pid_left(&mut self, pid: i32, uid: i32) {
-        if self.uid_map.get(&uid).is_some_and(|e| e.freeze) {
-            self.freeze_watch.insert(uid, (pid, false));
-        }
     }
 
     /// packages.list 变化 (安装/卸载/替换) → 整表重建 uid 表
@@ -477,12 +432,6 @@ impl AppState {
     /// binder 前台回调 (pid+uid): 查 uid 表分发 CPU (冷启动 ApplyPkg + pidfd watch)
     /// 与刷新率 (包名) —— 原 EV_FG 分支主体
     fn on_fg(&mut self, pid: i32, uid: i32) {
-        // 前台回调: 该 uid 已登记冻结轮询 → 解冻 (写 0 幂等) + 停止轮询 (移除)
-        if self.freeze_watch.remove(&uid).is_some() {
-            let path = format!("/sys/fs/cgroup/apps/uid_{}/cgroup.freeze", uid);
-            let _ = std::fs::write(&path, "0");
-        }
-        self.last_fg = Some((pid, uid));
         // service list 伪装: 前台回调驱动开关 —— 前台 uid 命中 waylay 目标应用集
         // (waylay.conf, 默认空 → 不激活), 命中则激活无差别替换, 否则关闭;
         // 差量下发: 仅状态变化才发 supercall (幂等, 避免每次回调冗余往返);
@@ -505,7 +454,7 @@ impl AppState {
         }
         let Some(e) = self.uid_map.get(&uid) else { return };
         // CPU 规则: 冷热判断 (cpu_known 中 uid+pid 一致=热);
-        // 冷时注册 pidfd 监听 (退出清理由 EV_EXIT_PID 驱动; freeze 复用, 不单独注册)
+        // 冷时注册 pidfd 监听 (退出清理由 EV_EXIT_PID 驱动)
         if e.cpu && !crate::cpu_affinity::cpu_known_is_hot(uid, pid) {
             crate::event_probe::watch(pid);
             if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
@@ -692,7 +641,7 @@ fn main() {
     // T3: observer 注册完成
     let _ = observer_thread.join();
     let fg_recv_fd = fg_sv[0];
-    let mut fg_buf = [0u8; 12];
+    let mut fg_buf = [0u8; 8];
 
     crate::cpu_affinity::start();
 
@@ -745,35 +694,13 @@ fn main() {
     let mut events = [unsafe { std::mem::zeroed::<libc::epoll_event>() }; 8];
 
     loop {
-        // 冻结轮询名单 (freeze_watch 未冻结的): 有则周期轮询, 否则永久阻塞
-        let timeout = if state.freeze_watch.is_empty() { -1 } else { 1000 };
-        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 8, timeout) };
+        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 8, -1) };
         if n < 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
             break;
-        }
-        // 轮询: 主 pid 被系统冻结(cgroup.freeze=1) → 冻结整个 uid (标已冻结, 等前台回调解冻)
-        let watch: Vec<(i32, i32)> = state
-            .freeze_watch
-            .iter()
-            .filter(|(_, (_, frozen))| !frozen)
-            .map(|(u, (p, _))| (*u, *p))
-            .collect();
-        for (uid, mp) in watch {
-            let p = format!("/sys/fs/cgroup/apps/uid_{}/pid_{}/cgroup.freeze", uid, mp);
-            let frozen = std::fs::read_to_string(&p)
-                .map(|v| v.trim() == "1")
-                .unwrap_or(false);
-            if frozen {
-                let p2 = format!("/sys/fs/cgroup/apps/uid_{}/cgroup.freeze", uid);
-                let _ = std::fs::write(&p2, "1");
-                if let Some(e) = state.freeze_watch.get_mut(&uid) {
-                    e.1 = true;
-                }
-            }
         }
         if n == 0 {
             continue;
@@ -840,17 +767,10 @@ fn main() {
                                 0,
                             )
                         };
-                        if nrecv == 12 {
+                        if nrecv == 8 {
                             let pid = i32::from_ne_bytes([fg_buf[0], fg_buf[1], fg_buf[2], fg_buf[3]]);
                             let uid = i32::from_ne_bytes([fg_buf[4], fg_buf[5], fg_buf[6], fg_buf[7]]);
-                            let tag = i32::from_ne_bytes([fg_buf[8], fg_buf[9], fg_buf[10], fg_buf[11]]);
-                            if tag == -1 {
-                                // 前台事件 (fg=true): 分发 (含解冻)
-                                state.on_fg(pid, uid);
-                            } else if tag == 0 {
-                                // 离开前台 (fg=false): 配置 freeze 应用登记冻结轮询
-                                state.on_pid_left(pid, uid);
-                            }
+                            state.on_fg(pid, uid);
                         }
                     }
                 }
@@ -880,12 +800,7 @@ fn main() {
                         if n == 4 {
                             let pid = i32::from_ne_bytes([pb[0], pb[1], pb[2], pb[3]]);
                             // 清身份 + 通知 CPU worker 清该 uid managed → 发布统计
-                            // 冻结轮询清理 (主 pid 退出 → 停止轮询; last_fg 清身份)
-                            state.freeze_watch.retain(|_, (p, _)| *p != pid);
-                            if state.last_fg.is_some_and(|(pp, _)| pp == pid) {
-                                state.last_fg = None;
-                            }
-                            // CPU 身份清理 (原有依赖; EvictUid → evict_uid 移除条目, 冻结状态随之清除)
+                            // CPU 身份清理 (EvictUid → evict_uid 移除条目)
                             if let Some(uid) = crate::cpu_affinity::cpu_known_pid_to_uid(pid) {
                                 if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
                                     let _ = tx.send(crate::cpu_affinity::CpuMsg::EvictUid(uid));

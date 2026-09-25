@@ -338,8 +338,6 @@ pub struct AffinityRule {
     pub util_min: i32,
     /// uclamp 上限 (0..=1024, -1 = 未设)
     pub util_max: i32,
-    /// 应用切换后台冻结 (包行 spec 含 freeze 标志: 切换后台延迟 30s freeze)
-    pub freeze: bool,
 }
 
 #[derive(Clone)]
@@ -488,20 +486,15 @@ pub fn parse_outer(p: &str) -> OuterLine<'_> {
     }
 }
 
-/// 规则 CPU 规格解析 (新格式): 返回 (CPU 规格, util_min, util_max, freeze)
-/// `cpus[-min-max][-freeze]` —— util 段成对 (单侧缺省由输出端补默认 min=0/max=1024);
-/// 剩余段数 >=3 才尝试剥 util (freeze 可有无), 防纯数字区间 cpus (如 `0-3`/`0-3,6-7`) 误剥。
-pub(crate) fn parse_rule_spec(spec: &str) -> (String, i32, i32, bool) {
+/// 规则 CPU 规格解析 (新格式): 返回 (CPU 规格, util_min, util_max)
+/// `cpus[-min-max]` —— util 段成对 (单侧缺省由输出端补默认 min=0/max=1024);
+/// 剩余段数 >=3 才尝试剥 util, 防纯数字区间 cpus (如 `0-3`/`0-3,6-7`) 误剥。
+pub(crate) fn parse_rule_spec(spec: &str) -> (String, i32, i32) {
     let parts: Vec<&str> = spec.split('-').collect();
+    if parts.len() < 3 {
+        return (spec.to_string(), -1, -1);
+    }
     let mut i = parts.len();
-    let mut freeze = false;
-    if i > 0 && parts[i - 1] == "freeze" {
-        freeze = true;
-        i -= 1;
-    }
-    if i < 3 {
-        return (parts[..i].join("-"), -1, -1, freeze);
-    }
     let mut got = 0;
     let mut util_max = -1;
     if let Ok(v) = parts[i - 1].parse::<i32>() && (0..=1024).contains(&v) {
@@ -517,9 +510,9 @@ pub(crate) fn parse_rule_spec(spec: &str) -> (String, i32, i32, bool) {
     }
     if got < 2 {
         // 不成对 (如 0-3,6-7 只剩 1 个数字可剥) → 整串当 CPU 规格
-        return (spec.to_string(), -1, -1, false);
+        return (spec.to_string(), -1, -1);
     }
-    (parts[..i].join("-"), util_min, util_max, freeze)
+    (parts[..i].join("-"), util_min, util_max)
 }
 
 fn add_rule(
@@ -535,8 +528,8 @@ fn add_rule(
     if pkg.bytes().chain(thread.bytes()).any(|b| b < 0x20 || b == 0x7f) {
         return false;
     }
-    // 解析 CPU 规格 + uclamp + freeze (连字符 `cpus-min-max-freeze` / 旧 token 两格式)
-    let (cpus_spec, util_min, util_max, freeze) = crate::config::parse_rule_spec(cpus_spec);
+    // 解析 CPU 规格 + uclamp (连字符 `cpus-min-max`)
+    let (cpus_spec, util_min, util_max) = crate::config::parse_rule_spec(cpus_spec);
     let has_util = util_min >= 0 || util_max >= 0;
     if cpus_spec.is_empty() && !has_util {
         return false; // 无 CPU 也无 uclamp: 无意义
@@ -571,7 +564,6 @@ fn add_rule(
         cpus: set,
         util_min,
         util_max,
-        freeze,
     });
     true
 }

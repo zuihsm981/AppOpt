@@ -14,8 +14,6 @@ const TX_REGISTER_PROCESS_OBSERVER: u32 = 0x0d;
 const TX_ON_PROCESS_STARTED: u32 = 0x01;
 const TX_ON_FG_ACTIVITIES_CHANGED: u32 = 0x02;
 const TX_ON_FG_SERVICES_CHANGED: u32 = 0x03;
-// 设备 IProcessObserver 无 onProcessStateChanged (0x04=onProcessDied), 冻结轮询
-// 由 onForegroundActivitiesChanged(false) 触发 (见下)
 
 // ── FFI 函数指针类型 ──
 type FnGetService = unsafe extern "C" fn(*const c_char) -> *mut c_void;
@@ -156,15 +154,14 @@ extern "C" fn on_transact(
 
             let fg = fg_val != 0;
 
-            if pid > 0 {
-                // 触发分离：12 字节 (pid, uid, tag)。
-                // tag = -1: 前台(fg=true, 分发含解冻); tag = 0: 离开前台(fg=false,
-                // 触发冻结轮询登记)。刷新率按 pid 解析包名; CPU 亲和性按 uid 取全部进程
+            if fg && pid > 0 {
+                // 触发分离：Binder 回调携带 pid + uid（8 字节）。
+                // 刷新率按 pid 解析包名; CPU 亲和性按 uid 取该应用全部进程
                 let fd = FG_SEND_FD.load(Ordering::Acquire);
                 if fd >= 0 {
-                    let pkt = [pid, uid, if fg { -1 } else { 0 }];
+                    let pkt = [pid, uid];
                     let _ = unsafe {
-                        libc::send(fd, pkt.as_ptr() as *const libc::c_void, 12, 0)
+                        libc::send(fd, pkt.as_ptr() as *const libc::c_void, 8, 0)
                     };
                 }
             }
