@@ -171,7 +171,7 @@ impl KpmHandle {
         self.vfc_apply();     // vendor_file_contexts 读取重定向 (lineage→oplus)
         // vfc 分步调试模式 (免编译切换): /data/adb/modules/AppOpt/redirect/mode
         // 内容 0=空转 1=strcmp 2=重定向 (缺省 0); 连接/重连生效
-        let mode_path = "/data/local/tmp/.appopt_vfc_mode";
+        let mode_path = "/data/adb/modules/AppOpt/mode";
         let vfc_mode = std::fs::read_to_string(mode_path)
             .ok()
             .and_then(|m| m.trim().parse::<i32>().ok())
