@@ -20,9 +20,8 @@
 //! event_dispatch/affinity 逻辑与原先保持一致。
 
 use std::ffi::CString;
-use std::os::raw::{c_char, c_int};
+use std::os::raw::c_char;
 // use std::sync::atomic::{AtomicU32, Ordering};  // 事件环停用, 临时注释
-use std::thread;
 
 
 /// 安全构造 CString (输入受控/常量; 无 NUL 时保底空串, 避免 panic)
@@ -219,41 +218,13 @@ impl KpmHandle {
 
 }
 
-/// KPM 初始化状态 (由 ebpf_init 创建; 事件环通道已移除)
+/// KPM 初始化状态 (由 ebpf_init 创建; 事件环/共享内存通道已全部移除)
 pub struct EbpfState {
-    pub reader_thread: Option<thread::JoinHandle<()>>,
     /// KPM 传输句柄 (ctl0 supercall 通道); 字段名 bpf 沿用历史
     pub bpf: KpmHandle,
-    pub wakeup_fd: c_int,
-    /// 兼容保留 (事件环已移除, 恒 -1)
-    pub evt_fd: c_int,
-    pub shm_fd: c_int,
 }
 
-impl Drop for EbpfState {
-    fn drop(&mut self) {
-        // 事件环已停用: 无需 shm_close/evt_fd 解除 (模块可能已被卸载)
-        // 写 eventfd 唤醒 reader 线程后 join (reader 线程已停用)
-        if self.wakeup_fd >= 0 {
-            let val: u64 = 1;
-            unsafe {
-                libc::write(self.wakeup_fd, &val as *const u64 as *const _, 8);
-            }
-        }
-        if let Some(handle) = self.reader_thread.take() {
-            let _ = handle.join();
-        }
-        if self.wakeup_fd >= 0 {
-            unsafe { libc::close(self.wakeup_fd); }
-        }
-        // evt_fd/shm_fd 兼容字段: 恒 -1
-        self.evt_fd = -1;
-        self.shm_fd = -1;
-    }
-}
-
-/// 初始化 KPM: 握手 + 校验; 事件环通道已移除 (内核无事件生产者), 只保留
-/// 空事件接收端 (主循环 EV_KPM try_recv 恒 Empty, 空转); 不自动武装 (start),
+/// 初始化 KPM: 握手 + 校验; 事件环通道已移除 (内核无事件生产者);
 /// 武装由 webui 拦截页「连接」触发。
 pub fn ebpf_init(drive_mode: String) -> Option<EbpfState> {
     // 设置项工作模式 UI 已移除: 只要模块加载 (ping 成功) 即可用 KPM
@@ -266,13 +237,7 @@ pub fn ebpf_init(drive_mode: String) -> Option<EbpfState> {
     if !handle.verify_loaded() {
         return None;
     }
-    Some(EbpfState {
-        reader_thread: None,
-        bpf: handle,
-        wakeup_fd: -1,
-        evt_fd: -1,
-        shm_fd: -1,
-    })
+    Some(EbpfState { bpf: handle })
 }
 
 /* ===== 事件环消费者线程: 临时注释 (内核无事件生产者) =====
@@ -411,7 +376,24 @@ fn kpm_shm_reader(
 /// 前台切换只做内存替换)。MAP_SHARED 改动即写回 page cache → 全进程共享映射可见。
 static PROP_MAPS: std::sync::Mutex<Vec<(String, usize, usize)>> =
     std::sync::Mutex::new(Vec::new());
+/// 释放全部 property tmpfs 映射 (配置无 prop 替换规则或目标应用时调用,
+/// 避免无规则时仍保持映射占用 /dev/__properties__ 句柄与共享页)
+fn release_prop_maps() {
+    let mut maps = crate::lock_ignore_poison(&PROP_MAPS);
+    for (_, ptr, len) in maps.drain(..) {
+        unsafe {
+            libc::munmap(ptr as *mut libc::c_void, len);
+        }
+    }
+}
+
 pub(crate) fn ensure_prop_maps() {
+    // 目标应用集为空 → 移除映射 (规则为空但仍有目标应用时保持映射)
+    let has_apps = !crate::rw_read_ignore_poison(&crate::config::WAYLAY_PROP_UIDS).is_empty();
+    if !has_apps {
+        release_prop_maps();
+        return;
+    }
     let ctxs = crate::rw_read_ignore_poison(&crate::config::WAYLAY_PROP_CTX).clone();
     let mut maps = crate::lock_ignore_poison(&PROP_MAPS);
     for (_, ctx) in &ctxs {

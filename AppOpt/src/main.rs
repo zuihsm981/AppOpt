@@ -326,7 +326,6 @@ fn rebuild_uid_if_needed(
 /// 延迟冻结登记 (主循环驱动, 按 uid 去重): 切换走 30s 后写 cgroup.freeze=1
 struct FreezePending {
     pid: i32,
-    uid: i32,
     deadline: Instant,
 }
 
@@ -345,7 +344,7 @@ struct AppState {
     last_fg: Option<(i32, i32)>,
     /// 包行 freeze 标志集合 (增量维护对比用)
     freeze_pkgs_set: HashSet<String>,
-    /// 待执行延迟冻结 (主循环到期检查; 每 uid 一个, 切换登记/切回取消)
+    /// 待执行延迟冻结 (主循环到期检查; 每 uid 一个, 切换登记/不重复登记)
     freeze_pending: HashMap<i32, FreezePending>,
 }
 
@@ -442,11 +441,41 @@ impl AppState {
                 &mut self.rfr_pkgs_set,
                 &mut self.freeze_pkgs_set,
             );
-            // 冻结 pending 失效: 配置移除 freeze 标志 → 丢弃对应 pending
-            self.freeze_pending
-                .retain(|uid, _| self.uid_map.get(uid).is_some_and(|e| e.freeze));
+            // 冻结状态重放: 以新配置为准同步 CPU_KNOWN 冻结状态 + pending
+            self.sync_freeze_states();
         }
         apply_config(cpu_changed, self.cfg.as_deref(), &self.pkg_uid);
+    }
+
+    /// 冻结状态重放 (配置变更后调用): 以新配置为准同步 CPU_KNOWN 冻结状态与 pending
+    ///  - freeze 移除/包删除 → 清状态 + 解冻 (写 0 幂等, 含不在 pending 的 FROZEN 残留)
+    ///  - 新增 freeze → 补未冻结标记 (无需等下次冷启动 ApplyPkg)
+    ///  - freeze 保持 → 状态不变 (调整 CPU 规则不影响已冻结/准备冻结)
+    fn sync_freeze_states(&mut self) {
+        let fz: HashMap<i32, bool> = self.uid_map.iter().map(|(u, e)| (*u, e.freeze)).collect();
+        let mut to_unfrozen: Vec<i32> = Vec::new();
+        let mut to_clear: Vec<i32> = Vec::new();
+        {
+            let g = crate::rw_read_ignore_poison(&crate::cpu_affinity::CPU_KNOWN);
+            for (&uid, e) in g.iter() {
+                let want = fz.get(&uid).copied().unwrap_or(false);
+                match e.2 {
+                    st if st == crate::cpu_affinity::FS_NONE && want => to_unfrozen.push(uid),
+                    st if st != crate::cpu_affinity::FS_NONE && !want => to_clear.push(uid),
+                    _ => {}
+                }
+            }
+        }
+        for uid in to_unfrozen {
+            crate::cpu_affinity::freeze_set_state(uid, crate::cpu_affinity::FS_UNFROZEN);
+        }
+        for uid in to_clear {
+            crate::cpu_affinity::freeze_set_state(uid, crate::cpu_affinity::FS_NONE);
+            let path = format!("/sys/fs/cgroup/apps/uid_{}/cgroup.freeze", uid);
+            let _ = std::fs::write(&path, "0");
+        }
+        self.freeze_pending
+            .retain(|uid, _| fz.get(uid).copied().unwrap_or(false));
     }
 
     /// packages.list 变化 (安装/卸载/替换) → 整表重建 uid 表
@@ -466,17 +495,24 @@ impl AppState {
     /// binder 前台回调 (pid+uid): 查 uid 表分发 CPU (冷启动 ApplyPkg + pidfd watch)
     /// 与刷新率 (包名) —— 原 EV_FG 分支主体
     fn on_fg(&mut self, pid: i32, uid: i32) {
-        // 规则应用切换冻结: 每次切换都登记上一前台 (每 uid 一个 pending, 覆盖同 uid);
-        // 当前包重新前台 → 取消其 pending + 立即解冻
+        // ===== 延迟冻结状态机 (状态挂 CPU_KNOWN 条目, 主线程驱动 deadline) =====
+        // 切换: 上一前台"未冻结"(FS_UNFROZEN) → 登记一次 30s 延迟 + 标记"准备冻结";
+        // "准备冻结"/"已冻结"都是门控 —— 该 uid 切回再切走不会重新登记/反复执行
         if let Some((prev_pid, prev_uid)) = self.last_fg {
             if prev_uid != uid {
                 if let Some(pe) = self.uid_map.get(&prev_uid) {
-                    if pe.freeze {
+                    if pe.freeze
+                        && crate::cpu_affinity::freeze_state(prev_uid)
+                            == crate::cpu_affinity::FS_UNFROZEN
+                    {
+                        crate::cpu_affinity::freeze_set_state(
+                            prev_uid,
+                            crate::cpu_affinity::FS_PENDING,
+                        );
                         self.freeze_pending.insert(
                             prev_uid,
                             FreezePending {
                                 pid: prev_pid,
-                                uid: prev_uid,
                                 deadline: Instant::now() + Duration::from_secs(30),
                             },
                         );
@@ -484,13 +520,19 @@ impl AppState {
                 }
             }
         }
-        if let Some(e) = self.uid_map.get(&uid) {
-            if e.freeze {
+        // 当前前台: 准备冻结切回 → 重置 (清 pending + 回未冻结, 下次切走重新计 30s);
+        // 已冻结 → 解冻 (写 0) + 回未冻结
+        match crate::cpu_affinity::freeze_state(uid) {
+            crate::cpu_affinity::FS_PENDING => {
                 self.freeze_pending.remove(&uid);
-                // freeze 包切回前台: 解冻 (写 0 幂等)
+                crate::cpu_affinity::freeze_set_state(uid, crate::cpu_affinity::FS_UNFROZEN);
+            }
+            crate::cpu_affinity::FS_FROZEN => {
                 let path = format!("/sys/fs/cgroup/apps/uid_{}/cgroup.freeze", uid);
                 let _ = std::fs::write(&path, "0");
+                crate::cpu_affinity::freeze_set_state(uid, crate::cpu_affinity::FS_UNFROZEN);
             }
+            _ => {}
         }
         self.last_fg = Some((pid, uid));
         // service list 伪装: 前台回调驱动开关 —— 前台 uid 命中 waylay 目标应用集
@@ -520,7 +562,7 @@ impl AppState {
             crate::event_probe::watch(pid);
             if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
                 let _ = tx.send(crate::cpu_affinity::CpuMsg::ApplyPkg(
-                    pid, uid, e.pkg.clone(),
+                    pid, uid, e.pkg.clone(), e.freeze,
                 ));
             }
         }
@@ -770,7 +812,8 @@ fn main() {
             }
             break;
         }
-        // 延迟冻结到期: 写 cgroup.freeze=1 (事件分发前, 保证 deadline 准时)
+        // 延迟冻结到期 (事件分发前, 保证 deadline 准时):
+        // 仅"准备冻结"继续; 执行前二次检查当前前台 uid, 相同则停止冻结
         if !state.freeze_pending.is_empty() {
             let now = Instant::now();
             let due: Vec<i32> = state
@@ -780,9 +823,17 @@ fn main() {
                 .map(|(u, _)| *u)
                 .collect();
             for uid in due {
-                if let Some(p) = state.freeze_pending.remove(&uid) {
-                    let path = format!("/sys/fs/cgroup/apps/uid_{}/cgroup.freeze", p.uid);
+                state.freeze_pending.remove(&uid);
+                if crate::cpu_affinity::freeze_state(uid) != crate::cpu_affinity::FS_PENDING {
+                    continue; // 非准备中 (切回已取消/已冻结): 不动作
+                }
+                if state.last_fg.is_some_and(|(_, u)| u == uid) {
+                    // 二次检查: 当前前台就是这个 uid → 停止冻结
+                    crate::cpu_affinity::freeze_set_state(uid, crate::cpu_affinity::FS_UNFROZEN);
+                } else {
+                    let path = format!("/sys/fs/cgroup/apps/uid_{}/cgroup.freeze", uid);
                     let _ = std::fs::write(&path, "1");
+                    crate::cpu_affinity::freeze_set_state(uid, crate::cpu_affinity::FS_FROZEN);
                 }
             }
         }
@@ -886,12 +937,12 @@ fn main() {
                         if n == 4 {
                             let pid = i32::from_ne_bytes([pb[0], pb[1], pb[2], pb[3]]);
                             // 清身份 + 通知 CPU worker 清该 uid managed → 发布统计
-                            // 冻结状态清理 (按 pid, 不依赖 cpu_known; 覆盖 freeze-only 包)
+                            // 冻结状态清理 (按 pid 清 pending + last_fg; 状态表由 evict_uid 清)
                             state.freeze_pending.retain(|_, p| p.pid != pid);
                             if state.last_fg.is_some_and(|(pp, _)| pp == pid) {
                                 state.last_fg = None;
                             }
-                            // CPU 身份清理 (原有依赖)
+                            // CPU 身份清理 (原有依赖; EvictUid → evict_uid 移除条目, 冻结状态随之清除)
                             if let Some(uid) = crate::cpu_affinity::cpu_known_pid_to_uid(pid) {
                                 if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
                                     let _ = tx.send(crate::cpu_affinity::CpuMsg::EvictUid(uid));
