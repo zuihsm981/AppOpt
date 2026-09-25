@@ -497,9 +497,15 @@ impl AppState {
     fn on_fg(&mut self, pid: i32, uid: i32) {
         // ===== 延迟冻结状态机 (状态挂 CPU_KNOWN 条目, 主线程驱动 deadline) =====
         // 切换: 上一前台"未冻结"(FS_UNFROZEN) → 登记一次 30s 延迟 + 标记"准备冻结";
-        // "准备冻结"/"已冻结"都是门控 —— 该 uid 切回再切走不会重新登记/反复执行
+        // "准备冻结"/"已冻结"都是门控 —— 该 uid 切回再切走不会重新登记/反复执行;
+        // 仅"切到 CPU 规则应用"才单点登记上一前台 —— 切到非 CPU 规则前台
+        // (输入法/系统 UI/刷新率-only 应用/桌面 launcher 等) 不单点登记:
+        // 输入法/系统 UI 是短暂接管不冻结; 桌面由下方批量逻辑处理;
+        // 避免"只启动一个规则应用、被系统 UI 短暂打断"就自动冻结
         if let Some((prev_pid, prev_uid)) = self.last_fg {
-            if prev_uid != uid {
+            if prev_uid != uid
+                && self.uid_map.get(&uid).is_some_and(|e| e.cpu)
+            {
                 if let Some(pe) = self.uid_map.get(&prev_uid) {
                     if pe.freeze
                         && crate::cpu_affinity::freeze_state(prev_uid)
@@ -518,6 +524,33 @@ impl AppState {
                         );
                     }
                 }
+            }
+        }
+        // 切到桌面 (com.android.launcher3): 一次性冻结 CPU_KNOWN 里所有"未冻结"标记的 uid
+        // (所有 freeze 规则应用都不在前台, 批量进入准备冻结;
+        // 已 PENDING/FROZEN 的不重复登记, 由状态门控保证;
+        // 输入法/系统 UI 等非规则前台不触发批量)
+        if self
+            .uid_map
+            .get(&uid)
+            .is_some_and(|e| e.pkg == crate::config::DEFAULT_REFRESH_PACKAGE)
+        {
+            let un: Vec<(i32, i32)> = {
+                let g = crate::rw_read_ignore_poison(&crate::cpu_affinity::CPU_KNOWN);
+                g.iter()
+                    .filter(|(_, e)| e.2 == crate::cpu_affinity::FS_UNFROZEN)
+                    .map(|(u, e)| (*u, e.0))
+                    .collect()
+            };
+            for (u, p) in un {
+                crate::cpu_affinity::freeze_set_state(u, crate::cpu_affinity::FS_PENDING);
+                self.freeze_pending.insert(
+                    u,
+                    FreezePending {
+                        pid: p,
+                        deadline: Instant::now() + Duration::from_secs(30),
+                    },
+                );
             }
         }
         // 当前前台: 准备冻结切回 → 重置 (清 pending + 回未冻结, 下次切走重新计 30s);
