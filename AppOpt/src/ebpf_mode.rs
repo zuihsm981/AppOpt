@@ -189,13 +189,48 @@ impl KpmHandle {
 
     /// vendor_file_contexts 读取重定向 (方案 B): 内核 filp_open hook 将对该路径的 open
     /// 精确重定向到伪装文件。伪装文件由用户自行准备 (内容自行修改, AppOpt 不做替换),
-    /// 放在 /storage/emulated/0 (FUSE, 所有应用可读) —— 读取者与目标文件权限对齐:
-    /// 能读 /vendor/... 的进程同样能读 /storage/emulated/0 下文件。
+    /// 放在 /storage/emulated/0 (FUSE, 所有应用可读)。
+    /// 同时下发原文件元数据 + security.selinux 标签, 内核 vfs_getattr/vfs_getxattr
+    /// 覆盖 fd 层查询 (fstat/fgetxattr(fd)) —— 元数据与原文件一致, 大小/标签不暴露伪装。
     pub(crate) fn vfc_apply(&self) {
+        use std::os::unix::fs::MetadataExt;
+        const VFC_ORIG: &str = "/vendor/etc/selinux/vendor_file_contexts";
         const VFC_FAKE: &str = "/storage/emulated/0/vendor_file_contexts";
         if std::fs::metadata(VFC_FAKE).is_ok() {
             let cmd = format!("vfc {}", VFC_FAKE);
             self.cmd(&cmd);
+        }
+        // 原文件元数据: size ino mode mtime(sec nsec) ctime(sec nsec)
+        if let Ok(md) = std::fs::metadata(VFC_ORIG) {
+            let sec_ns = |t: std::io::Result<std::time::SystemTime>| {
+                t.ok()
+                    .and_then(|x| x.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| (d.as_secs(), d.subsec_nanos()))
+                    .unwrap_or((0, 0))
+            };
+            let mt = sec_ns(md.modified());
+            let ct = sec_ns(md.created());
+            let stat = format!(
+                "vfc_stat {} {} {} {} {} {} {}",
+                md.len(), md.ino(), md.mode() & 0o7777, mt.0, mt.1, ct.0, ct.1
+            );
+            self.cmd(&stat);
+        }
+        // 原文件 security.selinux 标签
+        let cpath = std::ffi::CString::new(VFC_ORIG).unwrap_or_default();
+        let cname = std::ffi::CString::new("security.selinux").unwrap_or_default();
+        let mut buf = [0u8; 256];
+        let n = unsafe {
+            libc::getxattr(
+                cpath.as_ptr(),
+                cname.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+            )
+        };
+        if n > 0 {
+            let label = String::from_utf8_lossy(&buf[..n as usize]).to_string();
+            self.cmd(&format!("vfc_label {}", label));
         }
     }
 
