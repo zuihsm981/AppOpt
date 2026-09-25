@@ -195,7 +195,7 @@ impl KpmHandle {
     pub(crate) fn vfc_apply(&self) {
         use std::os::unix::fs::MetadataExt;
         const VFC_ORIG: &str = "/vendor/etc/selinux/vendor_file_contexts";
-        const VFC_FAKE: &str = "/storage/emulated/0/vendor_file_contexts";
+        const VFC_FAKE: &str = "/system/etc/redirect";
         if std::fs::metadata(VFC_FAKE).is_ok() {
             let cmd = format!("vfc {}", VFC_FAKE);
             self.cmd(&cmd);
