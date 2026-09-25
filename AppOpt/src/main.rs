@@ -447,21 +447,48 @@ impl AppState {
         apply_config(cpu_changed, self.cfg.as_deref(), &self.pkg_uid);
     }
 
-    /// 冻结状态重放 (配置变更后调用): 以新配置为准同步 CPU_KNOWN 冻结状态与 pending
-    ///  - freeze 移除/包删除 → 清状态 + 解冻 (写 0 幂等, 含不在 pending 的 FROZEN 残留)
-    ///  - 新增 freeze → 补未冻结标记 (无需等下次冷启动 ApplyPkg)
-    ///  - freeze 保持 → 状态不变 (调整 CPU 规则不影响已冻结/准备冻结)
+    /// 冻结状态重放 (配置变更后调用): 以最新配置为准同步 CPU_KNOWN 冻结状态与 pending
+    /// 关闭 freeze 开关时, 按 CPU_KNOWN 中该应用的状态分类处理:
+    ///  - FROZEN(已冻结) 或 CPU_KNOWN 无条目 → 直接重放 (写 0 解冻 + 状态更新为未冻结)
+    ///  - PENDING(准备冻结) → 先停止执行冻结 (清 pending, 不再写 1) 再重放 (写 0)
+    ///  - UNFROZEN(未冻结) → 不用重放 (未冻结无需写 0, 状态保持)
+    /// 重放完成后应用仍在 CPU_KNOWN → 按写入 0 更新状态为未冻结;
+    /// 新增 freeze 且状态 NONE → 补未冻结标记 (无需等下次冷启动)
     fn sync_freeze_states(&mut self) {
-        let fz: HashMap<i32, bool> = self.uid_map.iter().map(|(u, e)| (*u, e.freeze)).collect();
+        // 最新配置 freeze 包 → uid (基于 pkg_uid, 不依赖 rebuild 门控后的 uid_map)
+        let fz: HashMap<i32, bool> = crate::config::current_cfg()
+            .as_ref()
+            .map(|cfg| {
+                let fset: HashSet<&str> = cfg
+                    .rules
+                    .iter()
+                    .filter(|r| r.freeze)
+                    .map(|r| r.pkg.as_str())
+                    .collect();
+                self.pkg_uid
+                    .iter()
+                    .filter_map(|(pkg, uid)| fset.contains(pkg.as_str()).then_some((*uid, true)))
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut to_unfrozen: Vec<i32> = Vec::new();
-        let mut to_clear: Vec<i32> = Vec::new();
+        let mut to_settle: Vec<i32> = Vec::new();
         {
             let g = crate::rw_read_ignore_poison(&crate::cpu_affinity::CPU_KNOWN);
             for (&uid, e) in g.iter() {
                 let want = fz.get(&uid).copied().unwrap_or(false);
                 match e.2 {
+                    // 新增 freeze: 补未冻结标记
                     st if st == crate::cpu_affinity::FS_NONE && want => to_unfrozen.push(uid),
-                    st if st != crate::cpu_affinity::FS_NONE && !want => to_clear.push(uid),
+                    // 关闭 freeze:
+                    //  FROZEN → 直接重放 (写 0 解冻)
+                    //  PENDING → 停止执行冻结 (清 pending) + 写 0 重放
+                    //  UNFROZEN → 不用重放 (保持)
+                    crate::cpu_affinity::FS_FROZEN if !want => to_settle.push(uid),
+                    crate::cpu_affinity::FS_PENDING if !want => {
+                        self.freeze_pending.remove(&uid);
+                        to_settle.push(uid);
+                    }
                     _ => {}
                 }
             }
@@ -469,10 +496,11 @@ impl AppState {
         for uid in to_unfrozen {
             crate::cpu_affinity::freeze_set_state(uid, crate::cpu_affinity::FS_UNFROZEN);
         }
-        for uid in to_clear {
-            crate::cpu_affinity::freeze_set_state(uid, crate::cpu_affinity::FS_NONE);
+        for uid in to_settle {
+            // 写 0 解冻/确保未冻 → 应用在 CPU_KNOWN: 状态更新为未冻结
             let path = format!("/sys/fs/cgroup/apps/uid_{}/cgroup.freeze", uid);
             let _ = std::fs::write(&path, "0");
+            crate::cpu_affinity::freeze_set_state(uid, crate::cpu_affinity::FS_UNFROZEN);
         }
         self.freeze_pending
             .retain(|uid, _| fz.get(uid).copied().unwrap_or(false));
