@@ -168,11 +168,36 @@ impl KpmHandle {
     pub(crate) fn arm(&self) {
         self.cmd("start");
         ensure_prop_maps();   // 连接时提前 mmap 目标 tmpfs 文件并保持
+        self.vfc_apply();     // vendor_file_contexts 读取重定向 (lineage→oplus)
     }
 
-    /// 解除武装 (stop: 摘除全部业务探针)
+    /// 解除武装 (stop: 摘除全部业务探针 + 恢复 vendor_file_contexts 读取)
     pub(crate) fn disarm(&self) {
         self.cmd("stop");
+        self.vfc_disable();
+    }
+
+    /// vendor_file_contexts 读取重定向 (方案 B): 生成伪装副本 (lineage→oplus) 并下发内核。
+    /// 内核 filp_open hook 将对该路径的 open 精确重定向到伪装副本 (普通应用读取看不到 lineage)。
+    pub(crate) fn vfc_apply(&self) {
+        const VFC_FAKE: &str = "/data/adb/modules/AppOpt/redirect/vendor_file_contexts";
+        let ok = (|| {
+            std::fs::create_dir_all("/data/adb/modules/AppOpt/redirect").ok()?;
+            let orig = std::fs::read("/vendor/etc/selinux/vendor_file_contexts").ok()?;
+            let txt = String::from_utf8_lossy(&orig).replace("lineage", "oplus");
+            std::fs::write(VFC_FAKE, txt.as_bytes()).ok()?;
+            Some(())
+        })()
+        .is_some();
+        if ok {
+            let cmd = format!("vfc {}", VFC_FAKE);
+            self.cmd(&cmd);
+        }
+    }
+
+    /// 禁用 vendor_file_contexts 重定向 (摘除内核 hook, 恢复原文件读取)
+    pub(crate) fn vfc_disable(&self) {
+        self.cmd("vfc off");
     }
 
     /// property 区用户态文件写替换 (root 读写 /dev/__properties__/<ctx> 文件,
