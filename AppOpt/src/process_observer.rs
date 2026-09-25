@@ -14,7 +14,8 @@ const TX_REGISTER_PROCESS_OBSERVER: u32 = 0x0d;
 const TX_ON_PROCESS_STARTED: u32 = 0x01;
 const TX_ON_FG_ACTIVITIES_CHANGED: u32 = 0x02;
 const TX_ON_FG_SERVICES_CHANGED: u32 = 0x03;
-const TX_ON_PROCESS_STATE_CHANGED: u32 = 0x04;
+// 设备 IProcessObserver 无 onProcessStateChanged (0x04=onProcessDied), 冻结轮询
+// 由 onForegroundActivitiesChanged(false) 触发 (见下)
 
 // ── FFI 函数指针类型 ──
 type FnGetService = unsafe extern "C" fn(*const c_char) -> *mut c_void;
@@ -155,35 +156,13 @@ extern "C" fn on_transact(
 
             let fg = fg_val != 0;
 
-            if fg && pid > 0 {
-                // 触发分离：Binder 回调携带 pid + uid（12 字节, 末位哨兵 -1 = 前台事件）。
-                // 刷新率模块按 pid 解析包名; CPU 亲和性按 uid 取该应用全部进程
-                // (cgroup apps; 主进程 + pkg: 子进程共享 uid, 规避 pid 归因盲区)。
+            if pid > 0 {
+                // 触发分离：12 字节 (pid, uid, tag)。
+                // tag = -1: 前台(fg=true, 分发含解冻); tag = 0: 离开前台(fg=false,
+                // 触发冻结轮询登记)。刷新率按 pid 解析包名; CPU 亲和性按 uid 取全部进程
                 let fd = FG_SEND_FD.load(Ordering::Acquire);
                 if fd >= 0 {
-                    let pkt = [pid, uid, -1];
-                    let _ = unsafe {
-                        libc::send(fd, pkt.as_ptr() as *const libc::c_void, 12, 0)
-                    };
-                }
-            }
-            STATUS_OK
-        }
-        TX_ON_PROCESS_STATE_CHANGED => {
-            // 进程状态变化: procState >= 0xf (LAST_ACTIVITY, cached 判定起点;
-            // HOME=0xe 是 launcher/系统 UI 保护态不参与) → 发送 (pid, uid, procState)
-            // 12 字节, 主线程据此登记冻结轮询
-            let mut pid = 0i32;
-            let mut uid = 0i32;
-            let mut st = 0i32;
-            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut pid) };
-            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut uid) };
-            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut st) };
-            if pid > 0 && st >= 0xf {
-                // 阈值已在发送端过滤: 主线程只需区分 前台(-1) / cached(1), 无需原始 procState
-                let fd = FG_SEND_FD.load(Ordering::Acquire);
-                if fd >= 0 {
-                    let pkt = [pid, uid, 1];
+                    let pkt = [pid, uid, if fg { -1 } else { 0 }];
                     let _ = unsafe {
                         libc::send(fd, pkt.as_ptr() as *const libc::c_void, 12, 0)
                     };

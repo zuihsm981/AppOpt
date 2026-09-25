@@ -451,9 +451,10 @@ impl AppState {
         apply_config(cpu_changed, self.cfg.as_deref(), &self.pkg_uid);
     }
 
-    /// onProcessStateChanged: 主进程降为 CACHED (可冻结) → 配置 freeze 应用登记轮询
-    /// (重复 CACHED 事件更新主 pid; 前台回调解冻并停止轮询)
-    fn on_pid_cached(&mut self, pid: i32, uid: i32) {
+    /// onForegroundActivitiesChanged(false): 应用离开前台 → 配置 freeze 应用登记轮询
+    /// (设备 IProcessObserver 无 onProcessStateChanged; 轮询主 pid cgroup.freeze,
+    /// 系统冻结主进程后再冻结整个 uid; 前台回调 (fg=true) 解冻并停止轮询)
+    fn on_pid_left(&mut self, pid: i32, uid: i32) {
         if self.uid_map.get(&uid).is_some_and(|e| e.freeze) {
             self.freeze_watch.insert(uid, (pid, false));
         }
@@ -844,12 +845,11 @@ fn main() {
                             let uid = i32::from_ne_bytes([fg_buf[4], fg_buf[5], fg_buf[6], fg_buf[7]]);
                             let tag = i32::from_ne_bytes([fg_buf[8], fg_buf[9], fg_buf[10], fg_buf[11]]);
                             if tag == -1 {
-                                // 前台事件: 分发 (含解冻)
+                                // 前台事件 (fg=true): 分发 (含解冻)
                                 state.on_fg(pid, uid);
-                            } else {
-                                // onProcessStateChanged(cached): 发送端已按 procState >= 0xf 过滤
-                                // → 直接登记冻结轮询
-                                state.on_pid_cached(pid, uid);
+                            } else if tag == 0 {
+                                // 离开前台 (fg=false): 配置 freeze 应用登记冻结轮询
+                                state.on_pid_left(pid, uid);
                             }
                         }
                     }
