@@ -195,9 +195,16 @@ impl KpmHandle {
     pub(crate) fn vfc_apply(&self) {
         use std::os::unix::fs::MetadataExt;
         const VFC_ORIG: &str = "/vendor/etc/selinux/vendor_file_contexts";
-        // 内容替换版: 不重定向文件位置 (普通应用无可读全局目录) —— 内核 vfs_read
-        // 读真实 vendor 文件时替换 lineage→oplus; 文件位置重定向后续再实现。
-        self.cmd("vfc on");
+        // 恢复"伪装文件 + 重定向"方案 (之前验证生效):
+        // 读原 → lineage→oplus 替换 → 写伪装文件 → 内核 do_filp_open 重定向到它。
+        const VFC_FAKE: &str = "/storage/emulated/0/vendor_file_contexts";
+        if let Ok(orig) = std::fs::read(VFC_ORIG) {
+            let txt = String::from_utf8_lossy(&orig).replace("lineage", "oplus");
+            if std::fs::write(VFC_FAKE, txt.as_bytes()).is_ok() {
+                let cmd = format!("vfc {}", VFC_FAKE);
+                self.cmd(&cmd);
+            }
+        }
         self.vfc_status_debug();
         // 原文件元数据: size ino mode mtime(sec nsec) ctime(sec nsec)
         if let Ok(md) = std::fs::metadata(VFC_ORIG) {
