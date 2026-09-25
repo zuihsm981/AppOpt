@@ -691,7 +691,7 @@ fn main() {
     // T3: observer 注册完成
     let _ = observer_thread.join();
     let fg_recv_fd = fg_sv[0];
-    let mut fg_buf = [0u8; 8];
+    let mut fg_buf = [0u8; 12];
 
     crate::cpu_affinity::start();
 
