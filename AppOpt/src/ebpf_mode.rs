@@ -171,7 +171,7 @@ impl KpmHandle {
         self.vfc_apply();     // vendor_file_contexts 读取重定向 (lineage→oplus)
         // vfc 分步调试模式 (免编译切换): /data/adb/modules/AppOpt/redirect/mode
         // 内容 0=空转 1=strcmp 2=重定向 (缺省 0); 连接/重连生效
-        let mode_path = "/data/adb/modules/AppOpt/redirect/mode";
+        let mode_path = "/data/local/tmp/.appopt_vfc_mode";
         let vfc_mode = std::fs::read_to_string(mode_path)
             .ok()
             .and_then(|m| m.trim().parse::<i32>().ok())
@@ -187,19 +187,13 @@ impl KpmHandle {
         self.vfc_disable();
     }
 
-    /// vendor_file_contexts 读取重定向 (方案 B): 生成伪装副本 (lineage→oplus) 并下发内核。
-    /// 内核 filp_open hook 将对该路径的 open 精确重定向到伪装副本 (普通应用读取看不到 lineage)。
+    /// vendor_file_contexts 读取重定向 (方案 B): 内核 filp_open hook 将对该路径的 open
+    /// 精确重定向到伪装文件。伪装文件由用户自行准备 (内容自行修改, AppOpt 不做替换),
+    /// 放在 /storage/emulated/0 (FUSE, 所有应用可读) —— 读取者与目标文件权限对齐:
+    /// 能读 /vendor/... 的进程同样能读 /storage/emulated/0 下文件。
     pub(crate) fn vfc_apply(&self) {
-        const VFC_FAKE: &str = "/data/adb/modules/AppOpt/redirect/vendor_file_contexts";
-        let ok = (|| {
-            std::fs::create_dir_all("/data/adb/modules/AppOpt/redirect").ok()?;
-            let orig = std::fs::read("/vendor/etc/selinux/vendor_file_contexts").ok()?;
-            let txt = String::from_utf8_lossy(&orig).replace("lineage", "oplus");
-            std::fs::write(VFC_FAKE, txt.as_bytes()).ok()?;
-            Some(())
-        })()
-        .is_some();
-        if ok {
+        const VFC_FAKE: &str = "/storage/emulated/0/vendor_file_contexts";
+        if std::fs::metadata(VFC_FAKE).is_ok() {
             let cmd = format!("vfc {}", VFC_FAKE);
             self.cmd(&cmd);
         }
