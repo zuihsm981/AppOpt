@@ -169,6 +169,16 @@ impl KpmHandle {
         self.cmd("start");
         ensure_prop_maps();   // 连接时提前 mmap 目标 tmpfs 文件并保持
         self.vfc_apply();     // vendor_file_contexts 读取重定向 (lineage→oplus)
+        // vfc 分步调试模式 (免编译切换): /data/adb/modules/AppOpt/redirect/mode
+        // 内容 0=空转 1=strcmp 2=重定向 (缺省 0); 连接/重连生效
+        let mode_path = "/data/adb/modules/AppOpt/redirect/mode";
+        let vfc_mode = std::fs::read_to_string(mode_path)
+            .ok()
+            .and_then(|m| m.trim().parse::<i32>().ok())
+            .unwrap_or(0);
+        if (0..=2).contains(&vfc_mode) {
+            self.cmd(&format!("vfc_mode {}", vfc_mode));
+        }
     }
 
     /// 解除武装 (stop: 摘除全部业务探针 + 恢复 vendor_file_contexts 读取)
