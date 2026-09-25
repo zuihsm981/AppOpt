@@ -846,9 +846,9 @@ fn main() {
                             if tag == -1 {
                                 // 前台事件: 分发 (含解冻)
                                 state.on_fg(pid, uid);
-                            } else if tag >= 0xf {
-                                // onProcessStateChanged: procState >= LAST_ACTIVITY (cached)
-                                // → 登记冻结轮询 (HOME=0xe 排除)
+                            } else {
+                                // onProcessStateChanged(cached): 发送端已按 procState >= 0xf 过滤
+                                // → 直接登记冻结轮询
                                 state.on_pid_cached(pid, uid);
                             }
                         }

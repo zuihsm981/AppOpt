@@ -180,9 +180,10 @@ extern "C" fn on_transact(
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut uid) };
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut st) };
             if pid > 0 && st >= 0xf {
+                // 阈值已在发送端过滤: 主线程只需区分 前台(-1) / cached(1), 无需原始 procState
                 let fd = FG_SEND_FD.load(Ordering::Acquire);
                 if fd >= 0 {
-                    let pkt = [pid, uid, st];
+                    let pkt = [pid, uid, 1];
                     let _ = unsafe {
                         libc::send(fd, pkt.as_ptr() as *const libc::c_void, 12, 0)
                     };
