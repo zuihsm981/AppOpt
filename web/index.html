@@ -853,7 +853,7 @@ function renderRows(){
   box.innerHTML=mrRows.map((r,i)=>`
 <div class="tree-row${r.pkgRow?'':' branch'}" data-ri="${i}">
 ${r.pkgRow
-  ?`<div class="tr-head"><span class="tr-tag">全部线程·可选</span><label class="tr-freeze" title="切换后台 30 秒后冻结 (写 cgroup.freeze)"><input type="checkbox" data-fz="1" ${r.freeze?'checked':''}><span>应用切换后台30秒后冻结</span></label></div>`
+  ?`<div class="tr-head"><span class="tr-tag">全部线程·可选</span><label class="tr-freeze" title="冻结: 系统冻结主进程时写 cgroup.freeze"><input type="checkbox" data-fz="1" ${r.freeze?'checked':''}><span>墓碑模式</span></label></div>`
   :`<div class="tr-head sg-wrap"><input class="rr-thread" placeholder="输入线程名" value="${esc(r.thread)}"><div class="sg-box" hidden></div>${tree?`<button class="icon-btn danger rr-del" title="删除该行">${ICO_TRASH}</button>`:''}</div>`}
 <div class="core-chips">${CHIP_HTML}</div>
 <input class="rr-custom" placeholder="CPU 范围，如 0-3,6" value="${esc(r.customVal||'')}" hidden>
