@@ -190,9 +190,9 @@ impl KpmHandle {
         self.cmd("vfc off");
     }
 
-    /// 前台 uid (前台回调下发; <0=无前台通知 → 仅全局规则)
-    pub(crate) fn vfc_fg(&self, uid: i32) {
-        self.cmd(&format!("vfc_fg {}", uid));
+    /// 前台包名 (前台回调下发; 空=无前台通知 → 仅全局规则)
+    pub(crate) fn vfc_fg(&self, pkg: &str) {
+        self.cmd(&format!("vfc_fg {}", pkg));
     }
 
     /// 清空全部 vfc 规则 (配置重下发前)
@@ -205,9 +205,9 @@ impl KpmHandle {
         self.cmd(&format!("vfc_glob_count {}", n));
     }
 
-    /// 统一 vfc 规则: uid(应用; -1=全局) + kind "c"=内容替换(需 target) / "p"=文件重定向
-    pub(crate) fn vfc_rule(&self, idx: usize, uid: i32, kind: &str, target: &str, from: &str, to: &str) {
-        let args = format!("vfc_rule {} {} {} {} {} {}", idx, uid, kind, target, from, to);
+    /// 统一 vfc 规则: pkg(应用; "*"=全局) + kind "c"=内容替换(需 target) / "p"=文件重定向
+    pub(crate) fn vfc_rule(&self, idx: usize, pkg: &str, kind: &str, target: &str, from: &str, to: &str) {
+        let args = format!("vfc_rule {} {} {} {} {} {}", idx, pkg, kind, target, from, to);
         self.cmd(&args);
     }
 

@@ -96,32 +96,32 @@ pub struct WaylayRule {
 
 pub static WAYLAY_RULES_NEW: LazyLock<RwLock<Vec<WaylayRule>>> =
     LazyLock::new(|| RwLock::new(Vec::new()));
-/// uid → 该 uid 所属包的全部规则 (新格式按包激活; save 时重建)
-pub static WAYLAY_BY_UID: LazyLock<RwLock<HashMap<i32, Vec<WaylayRule>>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+/// uid → 包名 (waylay 规则应用缓存; 与 cpu 表共用 packages.list 构建时机, on_fg 查缓存不读文件)
+pub static WAYLAY_PKG_BY_UID: LazyLock<RwLock<std::collections::HashMap<i32, String>>> =
+    LazyLock::new(|| RwLock::new(std::collections::HashMap::new()));
 
-/// 重建 uid→规则 映射 (packages.list: uid→包名; 规则按包名匹配)
-pub fn build_waylay_by_uid(rules: &[WaylayRule]) -> HashMap<i32, Vec<WaylayRule>> {
-    let mut m: HashMap<String, Vec<WaylayRule>> = HashMap::new();
-    for r in rules {
-        m.entry(r.pkg.clone()).or_default().push(r.clone());
+/// 重建 uid→包名 缓存 (读 packages.list + WAYLAY_RULES_NEW 规则包过滤; 触发: 配置保存/加载/EV_PKG)
+pub fn rebuild_pkg_by_uid() {
+    let rules = rw_read_ignore_poison(&WAYLAY_RULES_NEW);
+    let mut pkgs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for r in rules.iter() {
+        if r.pkg != "*" {
+            pkgs.insert(r.pkg.clone());
+        }
     }
-    let mut out: HashMap<i32, Vec<WaylayRule>> = HashMap::new();
+    let mut m: std::collections::HashMap<i32, String> = std::collections::HashMap::new();
     if let Ok(content) = std::fs::read_to_string("/data/system/packages.list") {
         for line in content.lines() {
             let mut it = line.split_whitespace();
             let (Some(pkg), Some(uid_s)) = (it.next(), it.next()) else { continue };
             let Ok(uid) = uid_s.parse::<i32>() else { continue };
-            if uid < 100000 {
-                if let Some(r) = m.get(pkg) {
-                    out.insert(uid, r.clone());
-                }
+            if uid >= 100000 && pkgs.contains(pkg) {
+                m.insert(uid, pkg.to_string());
             }
         }
     }
-    out
+    *rw_write_ignore_poison(&WAYLAY_PKG_BY_UID) = m;
 }
-
 /// 解析 waylay.conf 新格式: <pkg>=<kind>-<from>-<to> (旧 srv_set/包名行/[prop]/[redirect] 废弃)
 pub fn load_waylay_rules() -> Vec<WaylayRule> {
     let mut out: Vec<WaylayRule> = Vec::new();
@@ -198,7 +198,6 @@ pub fn load_waylay_rules() -> Vec<WaylayRule> {
         .iter()
         .any(|r| r.kind == WaylayKind::Red || r.kind == WaylayKind::RedPath);
     *rw_write_ignore_poison(&WAYLAY_RULES_NEW) = out.clone();
-    *rw_write_ignore_poison(&WAYLAY_BY_UID) = build_waylay_by_uid(&out);
     WAYLAY_VFC_CHANGED.store(old_has_vfc || out.iter().any(|r| r.kind == WaylayKind::Red || r.kind == WaylayKind::RedPath), Ordering::Release);
     WAYLAY_CHANGED.store(true, Ordering::Release);
     out
@@ -247,7 +246,6 @@ pub fn save_waylay_rules(rules: &[WaylayRule]) -> io::Result<()> {
     fs::write(&tmp, out.as_bytes())?;
     fs::rename(&tmp, WAYLAY_FILE)?;
     *rw_write_ignore_poison(&WAYLAY_RULES_NEW) = rules.to_vec();
-    *rw_write_ignore_poison(&WAYLAY_BY_UID) = build_waylay_by_uid(rules);
     WAYLAY_VFC_CHANGED.store(old_has_vfc || new_has_vfc, Ordering::Release);
     WAYLAY_CHANGED.store(true, Ordering::Release);
     Ok(())
