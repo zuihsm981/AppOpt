@@ -288,6 +288,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div id="w-red-pane" hidden>
 <div class="card" style="padding:13px 14px;display:flex;align-items:center;justify-content:space-between"><span class="label" style="color:#000;font-weight:600">全局生效</span><label class="switch"><input type="checkbox" id="rd-global"><span></span></label></div>
 <div class="card">
+<div class="field"><span class="label" style="white-space:nowrap;color:#000;font-weight:600">目标文件</span><input id="rd-ctarget" placeholder="/vendor/etc/selinux/vendor_file_contexts"></div>
 <div class="field"><span class="label" style="white-space:nowrap;color:#000;font-weight:600">原内容</span><input id="rd-cfrom" maxlength="32"></div>
 <div class="field"><span class="label" style="white-space:nowrap;color:#000;font-weight:600">新内容</span><input id="rd-cto" maxlength="32"></div>
 <button class="btn" id="rd-cadd" style="width:100%;margin-top:8px">＋ 添加内容替换规则</button>
@@ -486,7 +487,20 @@ function renderWaylayRules(){$('w-rules').innerHTML=wlRules.length?wlRules.map((
 function renderWaylayApps(){$('w-apps').innerHTML=wlApps.length?wlApps.map((a,i)=>grow(a,i)).join(''):'<div class="hint">未添加目标应用</div>';}
 function renderWpRules(){$('wp-rules').innerHTML=wlPropRules.length?wlPropRules.map((r,i)=>growRule(r.from,r.to,i)).join(''):'<div class="hint">未添加替换对</div>';}
 function renderWpApps(){$('wp-apps').innerHTML=wlPropApps.length?wlPropApps.map((a,i)=>grow(a,i)).join(''):'<div class="hint">未添加目标应用</div>';}
-function renderRdCrules(){if(!rdCrules.length){$('rd-crules').innerHTML='<div class="hint">未添加内容替换规则</div>';return}$('rd-crules').innerHTML=rdCrules.map((r,i)=>growRule(r.from,r.to,i)).join('');}
+// 内容替换规则: 与其他 tab 完全同款 (标准图标/from-to 布局), 路径单独圆角框
+function renderRdCrules(){
+  if(!rdCrules.length){$('rd-crules').innerHTML='<div class="hint">未添加内容替换规则</div>';return}
+  $('rd-crules').innerHTML=rdCrules.map((r,i)=>
+`<div class="grp"><div class="grp-head" style="cursor:default;gap:0">
+<svg viewBox="0 0 24 36" style="width:22px;height:33px;overflow:visible;margin-top:37px;stroke:var(--sub);fill:none;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0"><path d="M4 1v28"/><path d="M4 1h14"/><path d="M4 29h16"/><path d="M20 29l-5-5"/><path d="M20 29l-5 5"/></svg>
+<span class="grp-name" style="display:flex;flex-direction:column;gap:1px;padding-left:6px;margin-top:5px">
+<span style="margin-top:-9px;background:var(--bg);border-radius:8px;padding:4px 10px;font-size:11px;color:var(--sub);word-break:break-all;border:1px solid var(--border)">${esc(r.target||'/vendor/etc/selinux/vendor_file_contexts')}</span>
+<span style="margin-top:11px">${esc(r.from)}</span>
+<span style="margin-top:12px">${esc(r.to)}</span>
+</span>
+<button class="icon-btn danger" style="margin-left:auto" data-i="${i}" title="删除">${ICO_TRASH}</button>
+</div></div>`).join('');
+}
 function renderRdFrules(){if(!rdFrules.length){$('rd-frules').innerHTML='<div class="hint">未添加文件重定向规则</div>';return}$('rd-frules').innerHTML=rdFrules.map((r,i)=>growRule(r.from,r.to,i)).join('');}
 function renderRdApps(){$('rd-apps').innerHTML=rdApps.length?rdApps.map((a,i)=>grow(a,i)).join(''):'<div class="hint">未添加目标应用</div>';}
 function renderRdpApps(){$('rdp-apps').innerHTML=rdpApps.length?rdpApps.map((a,i)=>grow(a,i)).join(''):'<div class="hint">未添加目标应用</div>';}
@@ -511,7 +525,8 @@ $('wp-add').onclick=()=>{
 $('rd-cadd').onclick=()=>{
   const f=$('rd-cfrom').value.trim(),t=$('rd-cto').value.trim();
   if(!f.length||f.length!==t.length||f.length>64){toast('内容替换原/新字符数需一致 (≤64)');return}
-  rdCrules.push({from:f,to:t});$('rd-cfrom').value='';$('rd-cto').value='';renderRdCrules();wlSaveNow();
+  const tg=($('rd-ctarget')&&$('rd-ctarget').value.trim())||'/vendor/etc/selinux/vendor_file_contexts';
+  rdCrules.push({target:tg,from:f,to:t});$('rd-cfrom').value='';$('rd-cto').value='';renderRdCrules();wlSaveNow();
 };
 $('rd-fadd').onclick=()=>{
   const f=$('rd-ffrom').value.trim(),t=$('rd-fto').value.trim();
@@ -542,10 +557,10 @@ function buildRules(){
   wlApps.forEach(p=>wlRules.forEach(r=>out.push({pkg:p,kind:'src',from:r.from,to:r.to})));
   wlPropApps.forEach(p=>wlPropRules.forEach(r=>out.push({pkg:p,kind:'prop',from:r.from,to:r.to})));
   (($('rd-global')&&$('rd-global').checked)?['*']:rdApps).forEach(p=>{
-    rdCrules.forEach(r=>out.push({pkg:p,kind:'red',from:r.from,to:r.to}));
+    rdCrules.forEach(r=>out.push({pkg:p,kind:'red-path',target:r.target||'/vendor/etc/selinux/vendor_file_contexts',from:r.from,to:r.to}));  /* 内容替换 */
   });
   (($('rdp-global')&&$('rdp-global').checked)?['*']:rdpApps).forEach(p=>{
-    rdFrules.forEach(r=>out.push({pkg:p,kind:'red-path',from:r.from,to:r.to}));
+    rdFrules.forEach(r=>out.push({pkg:p,kind:'red-path',from:r.from,to:r.to}));  /* 文件重定向: from 有 '/' */
   });
   return out;
 }
@@ -561,6 +576,8 @@ function wlSaveNow(){
       const max=r.kind==='prop'?92:(r.kind==='src'||r.kind==='red')?64:255;
       if(!r.from||!r.to){toast('规则不能为空');return}
       if(isPath){if(r.from.length>127||r.to.length>255){toast('路径超限 (≤127/255)');return}continue}
+      /* 内容替换: 目标文件必须是路径 (防 vfc_rtarget 空 → 无差别替换崩溃) */
+      if(!r.target||!r.target.startsWith('/')){toast('内容替换需目标文件路径');return}
       if(r.from.length!==r.to.length){toast('需等长 (ASCII)');return}
       if(r.from.length>max){toast('超出长度限制 (≤'+max+')');return}
       if(r.from.split('').some(c=>c.charCodeAt(0)>127)||r.to.split('').some(c=>c.charCodeAt(0)>127)){toast('\u4ec5\u652f\u6301 ASCII \u5b57\u7b26');return}
@@ -577,12 +594,13 @@ async function loadWaylay(){
     wlApps=uniq(rs.filter(r=>r.kind==='src').map(r=>r.pkg));
     wlPropRules=uniq(rs.filter(r=>r.kind==='prop').map(r=>r.from+'\u0000'+r.to)).map(k=>{const [f,t]=k.split('\u0000');return {from:f,to:t}});
     wlPropApps=uniq(rs.filter(r=>r.kind==='prop').map(r=>r.pkg));
-    rdCrules=uniq(rs.filter(r=>r.kind==='red'&&r.pkg!=='*').map(r=>r.from+'\u0000'+r.to)).map(k=>{const [f,t]=k.split('\u0000');return {from:f,to:t}});
-    rdFrules=uniq(rs.filter(r=>r.kind==='red-path'&&r.pkg!=='*').map(r=>r.from+'\u0000'+r.to)).map(k=>{const [f,t]=k.split('\u0000');return {from:f,to:t}});
-    rdApps=uniq(rs.filter(r=>r.kind==='red'&&r.pkg!=='*').map(r=>r.pkg));
-    rdpApps=uniq(rs.filter(r=>r.kind==='red-path'&&r.pkg!=='*').map(r=>r.pkg));
-    if($('rd-global'))$('rd-global').checked=rs.some(r=>r.kind==='red'&&r.pkg==='*');
-    if($('rdp-global'))$('rdp-global').checked=rs.some(r=>r.kind==='red-path'&&r.pkg==='*');
+    rdCrules=uniq(rs.filter(r=>r.kind==='red-path'&&!r.from.startsWith('/')&&r.pkg!=='*').map(r=>r.from+'\u0000'+r.to+'\u0000'+(r.target||'/vendor/etc/selinux/vendor_file_contexts'))).map(k=>{const [f,t,tg]=k.split('\u0000');return {target:tg,from:f,to:t}});
+    if(rdCrules.length&&$('rd-ctarget'))$('rd-ctarget').value=rdCrules[0].target;
+    rdFrules=uniq(rs.filter(r=>r.kind==='red-path'&&r.from.startsWith('/')&&r.pkg!=='*').map(r=>r.from+'\u0000'+r.to)).map(k=>{const [f,t]=k.split('\u0000');return {from:f,to:t}});
+    rdApps=uniq(rs.filter(r=>r.kind==='red-path'&&!r.from.startsWith('/')&&r.pkg!=='*').map(r=>r.pkg));
+    rdpApps=uniq(rs.filter(r=>r.kind==='red-path'&&r.from.startsWith('/')&&r.pkg!=='*').map(r=>r.pkg));
+    if($('rd-global'))$('rd-global').checked=rs.some(r=>r.kind==='red-path'&&!r.from.startsWith('/')&&r.pkg==='*');
+    if($('rdp-global'))$('rdp-global').checked=rs.some(r=>r.kind==='red-path'&&r.from.startsWith('/')&&r.pkg==='*');
     renderWaylayConn(!!d.connected);
     renderWaylayRules();renderWaylayApps();renderWpRules();renderWpApps();renderRdCrules();renderRdFrules();renderRdApps();renderRdpApps();
     return !!d.connected;
