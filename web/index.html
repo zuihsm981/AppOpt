@@ -257,64 +257,27 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 </div>
 <div id="w-srv-pane">
 <div class="card">
-<div class="field"><span class="label" style="white-space:nowrap;color:#000;font-weight:600">原服务名</span><input id="w-from" maxlength="32"></div>
-<div class="field"><span class="label" style="white-space:nowrap;color:#000;font-weight:600">新服务名</span><input id="w-to" maxlength="32"></div>
-<button class="btn" id="w-rule-add" style="width:100%;margin-top:8px">＋ 添加规则</button>
-<div class="hint">原服务名/新服务名字符数需一致 (ASCII ≤64), 无需输入完整服务名，可以只输入关键词</div>
+<button class="btn" id="sv-fshow" style="width:100%;margin-bottom:8px">＋ 添加服务伪装规则</button>
 <div id="w-rules" style="margin-top:8px"></div>
-</div>
-<div class="card">
-<div class="card-title">目标应用 <span class="hint" style="font-weight:400">(应用在前台时自动伪装)</span></div>
-<div class="sg-wrap"><input id="w-app" placeholder="输入包名添加目标应用"><div class="sg-box" id="w-sg" hidden></div></div>
-<button class="btn" id="w-add" style="width:100%;margin-top:8px">＋ 添加应用</button>
-<div id="w-apps" style="margin-top:8px"></div>
 </div>
 </div>
 <div id="w-prop-pane" hidden>
 <div class="card">
-<div class="field"><span class="label" style="white-space:nowrap;color:#000;font-weight:600">原属性名</span><input id="wp-from" maxlength="92" placeholder="ro.boottime.vendor.lineage_health"></div>
-<div class="field"><span class="label" style="white-space:nowrap;color:#000;font-weight:600">新属性名</span><input id="wp-to" maxlength="92" placeholder="ro.boottime.vendor.opluscn_health"></div>
-<button class="btn" id="wp-add" style="width:100%;margin-top:8px">＋ 添加替换对</button>
-<div class="hint">原属性名/新属性名字符数需一致 (ASCII ≤92)</div>
+<button class="btn" id="wp-fshow" style="width:100%;margin-bottom:8px">＋ 添加伪装规则</button>
 <div id="wp-rules" style="margin-top:8px"></div>
-</div>
-<div class="card">
-<div class="card-title">目标应用 <span class="hint" style="font-weight:400">(应用在前台时自动伪装)</span></div>
-<div class="sg-wrap"><input id="wp-app" placeholder="输入包名添加目标应用"><div class="sg-box" id="wp-sg" hidden></div></div>
-<button class="btn" id="wp-add-app" style="width:100%;margin-top:8px">＋ 添加应用</button>
-<div id="wp-apps" style="margin-top:8px"></div>
 </div>
 </div>
 <div id="w-red-pane" hidden>
 <div class="card">
 <button class="btn" id="rd-cimport" style="width:100%;margin-bottom:8px">⤓ 批量导入</button>
-<div class="field"><span class="label" style="white-space:nowrap;color:#000;font-weight:600">目标文件</span><input id="rd-ctarget" placeholder="/vendor/etc/selinux/vendor_file_contexts"></div>
-<div class="field"><span class="label" style="white-space:nowrap;color:#000;font-weight:600">原内容</span><input id="rd-cfrom" maxlength="32"></div>
-<div class="field"><span class="label" style="white-space:nowrap;color:#000;font-weight:600">新内容</span><input id="rd-cto" maxlength="32"></div>
-<button class="btn" id="rd-cadd" style="width:100%;margin-top:8px">＋ 添加内容替换规则</button>
-<div class="hint">内容替换 原/新字符数需一致 (ASCII ≤64)</div>
+<button class="btn" id="rd-cshow" style="width:100%;margin-bottom:8px">＋ 添加内容替换规则</button>
 <div id="rd-crules" style="margin-top:8px"></div>
-</div>
-<div class="card">
-<div class="card-title">目标应用 </div>
-<div class="sg-wrap"><input id="rd-app" placeholder="输入包名添加目标应用"><div class="sg-box" id="rd-sg" hidden></div></div>
-<button class="btn" id="rd-add-app" style="width:100%;margin-top:8px">＋ 添加应用</button>
-<div id="rd-apps" style="margin-top:8px"></div>
 </div>
 </div>
 <div id="w-redpath-pane" hidden>
 <div class="card">
-<div class="field" style="flex-direction:column;align-items:stretch"><span class="label" style="margin-bottom:4px;color:#000;font-weight:600">原路径</span><input id="rd-ffrom" placeholder="/vendor/etc/selinux/vendor_file_contexts"></div>
-<div class="field" style="margin-top:8px;flex-direction:column;align-items:stretch"><span class="label" style="margin-bottom:4px;color:#000;font-weight:600">新路径</span><input id="rd-fto" placeholder="/storage/emulated/0/vendor_file_contexts"></div>
-<button class="btn" id="rd-fadd" style="width:100%;margin-top:8px">＋ 添加文件重定向规则</button>
-<div class="hint">文件重定向: 打开原路径 → 重定向到目标路径 (目标需读取者可访问)</div>
+<button class="btn" id="rd-fshow" style="width:100%;margin-bottom:8px">＋ 添加文件重定向规则</button>
 <div id="rd-frules" style="margin-top:8px"></div>
-</div>
-<div class="card">
-<div class="card-title">目标应用 </div>
-<div class="sg-wrap"><input id="rdp-app" placeholder="输入包名添加目标应用"><div class="sg-box" id="rdp-sg" hidden></div></div>
-<button class="btn" id="rdp-add-app" style="width:100%;margin-top:8px">＋ 添加应用</button>
-<div id="rdp-apps" style="margin-top:8px"></div>
 </div>
 </div>
 </section>
@@ -437,30 +400,189 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 </div>
 
 <div id="toast"></div>
+<div id="sv-apps-modal" hidden style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:999">
+<div class="card" style="width:min(420px,90vw);padding:16px;margin:0">
+<div style="font-weight:600;color:#000;margin-bottom:10px">生效应用</div>
+<div id="sv-apps-modal-list" style="max-height:40vh;overflow:auto;display:flex;flex-direction:column;gap:6px"></div>
+<div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
+<div class="sg-wrap"><input id="sv-apps-input" placeholder="输入包名添加目标应用" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:9px 12px;font-size:14px;color:#000;outline:none"><div class="sg-box" id="sv-apps-sg" hidden></div></div>
+<button class="btn" id="sv-apps-add" style="width:100%;margin-top:8px">＋ 添加应用</button>
+</div>
+<button class="btn" id="sv-apps-modal-close" style="width:100%;margin-top:14px">关闭</button>
+</div>
+</div>
+<div id="wp-apps-modal" hidden style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:999">
+<div class="card" style="width:min(420px,90vw);padding:16px;margin:0">
+<div style="font-weight:600;color:#000;margin-bottom:10px">生效应用</div>
+<div id="wp-apps-modal-list" style="max-height:40vh;overflow:auto;display:flex;flex-direction:column;gap:6px"></div>
+<div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
+<div class="sg-wrap"><input id="wp-apps-input" placeholder="输入包名添加目标应用" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:9px 12px;font-size:14px;color:#000;outline:none"><div class="sg-box" id="wp-apps-sg" hidden></div></div>
+<button class="btn" id="wp-apps-add" style="width:100%;margin-top:8px">＋ 添加应用</button>
+</div>
+<button class="btn" id="wp-apps-modal-close" style="width:100%;margin-top:14px">关闭</button>
+</div>
+</div>
+<div id="sv-add-modal" hidden style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:999">
+<div class="card" style="width:min(440px,92vw);padding:16px;margin:0">
+<div style="font-weight:600;color:#000;margin-bottom:10px">添加系统服务伪装规则</div>
+<div style="font-size:12px;color:var(--sub);margin-bottom:4px">原服务名</div>
+<input id="w-from" maxlength="32" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000">
+<div style="font-size:12px;color:var(--sub);margin-bottom:4px;margin-top:10px">新服务名</div>
+<input id="w-to" maxlength="32" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000">
+<div style="font-size:11px;color:var(--sub);margin-top:6px">原/新服务名字符数需一致 (ASCII ≤64), 可只输入关键词</div>
+<div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
+<div style="font-size:12px;color:var(--sub);margin-bottom:6px">目标应用</div>
+<div class="sg-wrap"><input id="sv-add-app-input" placeholder="输入包名添加目标应用" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:9px 12px;font-size:14px;color:#000;outline:none"><div class="sg-box" id="sv-add-sg" hidden></div></div>
+<button class="btn" id="sv-add-app-btn" style="width:100%;margin-top:8px">＋ 添加应用</button>
+<div id="sv-add-apps" style="margin-top:8px"></div>
+</div>
+<div id="sv-add-err" hidden style="color:#e5484d;font-size:12px;margin-top:10px"></div>
+<div style="display:flex;gap:8px;margin-top:14px">
+<button class="btn" id="sv-add-ok" style="flex:1">添加</button>
+<button class="btn" id="sv-add-close" style="flex:1;background:var(--bg);color:var(--sub)">取消</button>
+</div>
+</div>
+</div>
+<div id="wp-add-modal" hidden style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:999">
+<div class="card" style="width:min(440px,92vw);padding:16px;margin:0">
+<div style="font-weight:600;color:#000;margin-bottom:10px">添加系统属性伪装规则</div>
+<div style="font-size:12px;color:var(--sub);margin-bottom:4px">原属性名</div>
+<input id="wp-from" maxlength="92" placeholder="ro.boottime.vendor.lineage_health" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000">
+<div style="font-size:12px;color:var(--sub);margin-bottom:4px;margin-top:10px">新属性名</div>
+<input id="wp-to" maxlength="92" placeholder="ro.boottime.vendor.opluscn_health" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000">
+<div style="font-size:11px;color:var(--sub);margin-top:6px">原/新属性名字符数需一致 (ASCII ≤92)</div>
+<div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
+<div style="font-size:12px;color:var(--sub);margin-bottom:6px">目标应用</div>
+<div class="sg-wrap"><input id="wp-add-app-input" placeholder="输入包名添加目标应用" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:9px 12px;font-size:14px;color:#000;outline:none"><div class="sg-box" id="wp-add-sg" hidden></div></div>
+<button class="btn" id="wp-add-app-btn" style="width:100%;margin-top:8px">＋ 添加应用</button>
+<div id="wp-add-apps" style="margin-top:8px"></div>
+</div>
+<div id="wp-add-err" hidden style="color:#e5484d;font-size:12px;margin-top:10px"></div>
+<div style="display:flex;gap:8px;margin-top:14px">
+<button class="btn" id="wp-add-ok" style="flex:1">添加</button>
+<button class="btn" id="wp-add-close" style="flex:1;background:var(--bg);color:var(--sub)">取消</button>
+</div>
+</div>
+</div>
+<div id="rd-field-modal" hidden style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:999">
+<div class="card" style="width:min(440px,92vw);padding:16px;margin:0">
+<div style="font-weight:600;color:#000;margin-bottom:10px">添加文件重定向规则</div>
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+<span style="color:#000;font-weight:600">全局生效</span>
+<label class="switch"><input type="checkbox" id="rd-field-global"><span></span></label>
+</div>
+<div style="font-size:12px;color:var(--sub);margin-bottom:4px">原路径</div>
+<input id="rd-ffrom" placeholder="/vendor/etc/selinux/vendor_file_contexts" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000">
+<div style="font-size:12px;color:var(--sub);margin-bottom:4px;margin-top:10px">新路径</div>
+<input id="rd-fto" placeholder="/storage/emulated/0/vendor_file_contexts" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000">
+<div style="font-size:11px;color:var(--sub);margin-top:6px">目标需读取者可访问</div>
+<div id="rd-field-apps-section">
+<div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
+<div style="font-size:12px;color:var(--sub);margin-bottom:6px">目标应用</div>
+<div class="sg-wrap"><input id="rd-field-app-input" placeholder="输入包名添加目标应用" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:9px 12px;font-size:14px;color:#000;outline:none"><div class="sg-box" id="rd-field-sg" hidden></div></div>
+<button class="btn" id="rd-field-app-btn" style="width:100%;margin-top:8px">＋ 添加应用</button>
+<div id="rd-field-apps" style="margin-top:8px"></div>
+</div>
+</div>
+<div id="rd-field-err" hidden style="color:#e5484d;font-size:12px;margin-top:10px"></div>
+<div style="display:flex;gap:8px;margin-top:14px">
+<button class="btn" id="rd-field-ok" style="flex:1">添加</button>
+<button class="btn" id="rd-field-close" style="flex:1;background:var(--bg);color:var(--sub)">取消</button>
+</div>
+</div>
+</div>
+<div id="rd-fgroup-modal" hidden style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:999">
+<div class="card" style="width:min(440px,92vw);padding:16px;margin:0">
+<div id="rd-fgroup-title" style="font-weight:700;color:#000;margin-bottom:10px"></div>
+<div id="rd-fgroup-body" style="max-height:60vh;overflow:auto;display:flex;flex-direction:column;gap:6px"></div>
+<button class="btn" id="rd-fgroup-close" style="width:100%;margin-top:14px">关闭</button>
+</div>
+</div>
+<div id="rd-add-modal" hidden style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:999">
+<div class="card" style="width:min(420px,90vw);padding:16px;margin:0">
+<div style="font-weight:600;color:#000;margin-bottom:10px">添加内容替换规则</div>
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+<span style="color:#000;font-weight:600">全局生效</span>
+<label class="switch"><input type="checkbox" id="rd-add-global"><span></span></label>
+</div>
+<div style="font-size:12px;color:var(--sub);margin-bottom:4px">目标文件</div>
+<input id="rd-ctarget" placeholder="/vendor/etc/selinux/vendor_file_contexts" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000">
+<div style="display:flex;gap:8px;margin-top:10px">
+<div style="flex:1"><div style="font-size:12px;color:var(--sub);margin-bottom:4px">原内容</div><input id="rd-cfrom" maxlength="32" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000"></div>
+<div style="flex:1"><div style="font-size:12px;color:var(--sub);margin-bottom:4px">新内容</div><input id="rd-cto" maxlength="32" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000"></div>
+</div>
+<div style="font-size:11px;color:var(--sub);margin-top:6px">原/新字符数需一致 (ASCII ≤64)</div>
+<div id="rd-add-apps-section">
+<div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
+<div style="font-size:12px;color:var(--sub);margin-bottom:4px">目标应用</div>
+<div class="sg-wrap"><input id="rd-add-app-input" placeholder="输入包名添加目标应用" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:9px 12px;font-size:14px;color:#000;outline:none"><div class="sg-box" id="rd-add-sg" hidden></div></div>
+<button class="btn" id="rd-add-app-btn" style="width:100%;margin-top:8px">＋ 添加应用</button>
+<div id="rd-add-apps" style="margin-top:8px"></div>
+</div>
+</div>
+<div id="rd-add-err" hidden style="color:#e5484d;font-size:12px;margin-top:10px"></div>
+<div style="display:flex;gap:8px;margin-top:14px">
+<button class="btn" id="rd-cadd" style="flex:1">添加</button>
+<button class="btn" id="rd-add-close" style="flex:1;background:var(--bg);color:var(--sub)">取消</button>
+</div>
+</div>
+</div>
 <div id="rd-batch-modal" hidden style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:999">
 <div class="card" style="width:min(460px,92vw);padding:16px;margin:0">
 <div style="font-weight:600;color:#000;margin-bottom:10px">批量导入内容替换</div>
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+<span style="color:#000;font-weight:600">全局生效</span>
+<label class="switch"><input type="checkbox" id="rd-batch-global"><span></span></label>
+</div>
 <div style="font-size:12px;color:var(--sub);margin-bottom:6px">目标文件（每行一个路径）</div>
 <textarea id="rd-batch-targets" rows="5" placeholder="/vendor/etc/selinux/vendor_hwservice_contexts&#10;/vendor/etc/selinux/vendor_file_contexts&#10;/vendor/etc/selinux/vendor_file" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000;resize:vertical"></textarea>
 <div style="display:flex;gap:8px;margin-top:10px">
 <div style="flex:1"><div style="font-size:12px;color:var(--sub);margin-bottom:4px">原内容</div><input id="rd-batch-from" placeholder="lineage" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000"></div>
 <div style="flex:1"><div style="font-size:12px;color:var(--sub);margin-bottom:4px">新内容</div><input id="rd-batch-to" placeholder="hyperos" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000"></div>
 </div>
+<div id="rd-batch-apps-section">
+<div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
+<div style="font-size:12px;color:var(--sub);margin-bottom:6px">目标应用</div>
+<div class="sg-wrap"><input id="rd-batch-app-input" placeholder="输入包名添加目标应用" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:9px 12px;font-size:14px;color:#000;outline:none"><div class="sg-box" id="rd-batch-sg" hidden></div></div>
+<button class="btn" id="rd-batch-app-btn" style="width:100%;margin-top:8px">＋ 添加应用</button>
+<div id="rd-batch-apps" style="margin-top:8px"></div>
+</div>
+</div>
+<div id="rd-batch-err" hidden style="color:#e5484d;font-size:12px;margin-top:10px"></div>
 <div style="display:flex;gap:8px;margin-top:14px">
 <button class="btn" id="rd-batch-ok" style="flex:1">导入</button>
 <button class="btn" id="rd-batch-cancel" style="flex:1;background:var(--bg);color:var(--sub)">取消</button>
 </div>
 </div>
 </div>
+<div id="rd-group-modal" hidden style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:999">
+<div class="card" style="width:min(440px,92vw);padding:16px;margin:0">
+<div id="rd-group-title" style="font-weight:700;color:#000;margin-bottom:10px"></div>
+<div id="rd-group-body" style="max-height:45vh;overflow:auto;display:flex;flex-direction:column;gap:6px"></div>
+<div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
+<div style="font-size:12px;color:var(--sub);margin-bottom:6px">目标应用</div>
+<div id="rd-group-apps" style="max-height:25vh;overflow:auto;display:flex;flex-direction:column;gap:6px"></div>
+</div>
+<button class="btn" id="rd-group-close" style="width:100%;margin-top:14px">关闭</button>
+</div>
+</div>
 <div id="rd-edit-modal" hidden style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:999">
 <div class="card" style="width:min(420px,90vw);padding:16px;margin:0">
-<div id="rd-edit-title" style="font-weight:600;color:#000;margin-bottom:8px"></div>
-<div id="rd-edit-body" style="color:var(--sub);font-size:12px;word-break:break-all;margin-bottom:14px;white-space:pre-line"></div>
-<div style="display:flex;align-items:center;justify-content:space-between">
+<div id="rd-edit-title" style="font-weight:600;color:#000;margin-bottom:10px"></div>
+<div style="font-size:12px;color:var(--sub);margin-bottom:4px">目标文件</div>
+<input id="rd-edit-target" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000">
+<div style="display:flex;gap:8px;margin-top:10px">
+<div style="flex:1"><div style="font-size:12px;color:var(--sub);margin-bottom:4px">原路径</div><input id="rd-edit-from-input" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000"></div>
+<div style="flex:1"><div style="font-size:12px;color:var(--sub);margin-bottom:4px">新路径</div><input id="rd-edit-to-input" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000"></div>
+</div>
+<div style="display:flex;align-items:center;justify-content:space-between;margin-top:12px">
 <span style="color:#000;font-weight:600">全局生效</span>
 <label class="switch"><input type="checkbox" id="rd-edit-global"><span></span></label>
 </div>
-<button class="btn" id="rd-edit-close" style="width:100%;margin-top:14px">完成</button>
+<div style="display:flex;gap:8px;margin-top:14px">
+<button class="btn" id="rd-edit-save" style="flex:1">保存</button>
+<button class="btn" id="rd-edit-close" style="flex:1;background:var(--bg);color:var(--sub)">取消</button>
+</div>
 </div>
 </div>
 <script>
@@ -509,77 +631,174 @@ const growRule=(f,t,i)=>`
 <button class="icon-btn danger" style="margin-left:auto" data-i="${i}" title="删除">${ICO_TRASH}</button>
 </div></div>`;
 function renderWaylayRules(){$('w-rules').innerHTML=wlRules.length?wlRules.map((r,i)=>growRule(r.from,r.to,i)).join(''):'<div class="hint">未添加规则</div>';}
-function renderWaylayApps(){$('w-apps').innerHTML=wlApps.length?wlApps.map((a,i)=>grow(a,i)).join(''):'<div class="hint">未添加目标应用</div>';}
+function renderWaylayApps(){$('sv-add-apps').innerHTML=wlApps.length?wlApps.map((a,i)=>grow(a,i)).join(''):'<div class="hint">未添加目标应用</div>';}
 function renderWpRules(){$('wp-rules').innerHTML=wlPropRules.length?wlPropRules.map((r,i)=>growRule(r.from,r.to,i)).join(''):'<div class="hint">未添加替换对</div>';}
-function renderWpApps(){$('wp-apps').innerHTML=wlPropApps.length?wlPropApps.map((a,i)=>grow(a,i)).join(''):'<div class="hint">未添加目标应用</div>';}
+function renderWpApps(){$('wp-add-apps').innerHTML=wlPropApps.length?wlPropApps.map((a,i)=>grow(a,i)).join(''):'<div class="hint">未添加目标应用</div>';}
 // 内容替换规则: 与其他 tab 完全同款 (标准图标/from-to 布局), 路径单独圆角框
+const grpItem=(root,rs)=>`<div class="grp"><div class="grp-head" style="cursor:pointer;gap:0;align-items:center" data-root="${esc(root)}">
+<span style="font-weight:700;font-size:14px;color:#000;padding-left:8px;min-width:64px;flex-shrink:0">${esc(root)}</span>
+<svg viewBox="0 0 24 36" style="width:22px;height:33px;overflow:visible;stroke:var(--sub);fill:none;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0"><path d="M4 1v28"/><path d="M4 1h14"/><path d="M4 29h16"/><path d="M20 29l-5-5"/><path d="M20 29l-5 5"/></svg>
+<span class="grp-name" style="display:flex;flex-direction:column;gap:2px;padding-left:6px">${rs.map(r=>`<span style="margin-top:-5px">${esc(r.from)}</span><span style="margin-top:10px">${esc(r.to)}</span>`).join('')}</span>
+<span style="color:var(--sub);font-size:11px;margin-left:auto;padding-right:8px;flex-shrink:0">${rs.length} 条</span>
+</div></div>`;
 function renderRdCrules(){
   if(!rdCrules.length){$('rd-crules').innerHTML='<div class="hint">未添加内容替换规则</div>';return}
-  $('rd-crules').innerHTML=rdCrules.map((r,i)=>
-`<div class="grp"><div class="grp-head" style="cursor:default;gap:0">
-<svg viewBox="0 0 24 36" style="width:22px;height:33px;overflow:visible;margin-top:37px;stroke:var(--sub);fill:none;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0"><path d="M4 1v28"/><path d="M4 1h14"/><path d="M4 29h16"/><path d="M20 29l-5-5"/><path d="M20 29l-5 5"/></svg>
-<span class="grp-name" style="display:flex;flex-direction:column;gap:1px;padding-left:6px;margin-top:5px">
-<span style="margin-top:-9px;background:var(--bg);border-radius:8px;padding:4px 10px;font-size:11px;color:var(--sub);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;border:1px solid var(--border)">${esc(r.target||'/vendor/etc/selinux/vendor_file_contexts')}</span>
-<span style="margin-top:11px">${esc(r.from)}</span>
-<span style="margin-top:12px">${esc(r.to)}</span>
-</span>
-<button class="icon-btn" style="flex-shrink:0;margin-left:auto${r.global?';color:var(--accent,#4c8dff)':''}" data-edit="${i}" title="编辑${r.global?' (全局生效已开启)':''}">${ICO_EDIT}</button>
-<button class="icon-btn danger" style="margin-left:8px" data-i="${i}" title="删除">${ICO_TRASH}</button>
-</div></div>`).join('');
+  /* 分类式: 全局(global)固定第一行, 其余按目标文件主目录分组 */
+  const glob=rdCrules.filter(r=>r.global);
+  const groups={};
+  rdCrules.filter(r=>!r.global).forEach(r=>{const root=((r.target||'/').split('/')[1]||'?');(groups[root]=groups[root]||[]).push(r)});
+  const globHtml=glob.length?grpItem('全局',glob):'';
+  $('rd-crules').innerHTML=globHtml+Object.keys(groups).map(root=>grpItem(root,groups[root])).join('');
 }
 function renderRdFrules(){
   if(!rdFrules.length){$('rd-frules').innerHTML='<div class="hint">未添加文件重定向规则</div>';return}
-  $('rd-frules').innerHTML=rdFrules.map((r,i)=>
-`<div class="grp"><div class="grp-head" style="cursor:default;gap:0">
-<svg viewBox="0 0 24 36" style="width:22px;height:33px;overflow:visible;margin-top:5px;stroke:var(--sub);fill:none;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0"><path d="M4 1v28"/><path d="M4 1h14"/><path d="M4 29h16"/><path d="M20 29l-5-5"/><path d="M20 29l-5 5"/></svg>
-<span class="grp-name" style="display:flex;flex-direction:column;gap:2px;padding-left:6px;margin-top:5px"><span>${esc(r.from)}</span><span>${esc(r.to)}</span></span>
-<button class="icon-btn" style="flex-shrink:0;margin-left:auto${r.global?';color:var(--accent,#4c8dff)':''}" data-edit="${i}" title="编辑${r.global?' (全局生效已开启)':''}">${ICO_EDIT}</button>
-<button class="icon-btn danger" style="margin-left:8px" data-i="${i}" title="删除">${ICO_TRASH}</button>
+  /* 分类: 按 from 主目录; 组项只显示主目录名 + 条数 (无图标/规则名) */
+  const groups={};
+  rdFrules.forEach(r=>{const root=((r.from||'/').split('/')[1]||'?');(groups[root]=groups[root]||[]).push(r)});
+  $('rd-frules').innerHTML=Object.keys(groups).map(root=>
+`<div class="grp"><div class="grp-head" style="cursor:pointer;gap:0;align-items:center" data-froot="${esc(root)}">
+<span style="font-weight:700;font-size:14px;color:#000;padding-left:8px;flex:1">${esc(root)}</span>
+<span style="color:var(--sub);font-size:11px;padding-right:8px">${groups[root].length} 条</span>
 </div></div>`).join('');
 }
-function renderRdApps(){$('rd-apps').innerHTML=rdApps.length?rdApps.map((a,i)=>grow(a,i)).join(''):'<div class="hint">未添加目标应用</div>';}
-function renderRdpApps(){$('rdp-apps').innerHTML=rdpApps.length?rdpApps.map((a,i)=>grow(a,i)).join(''):'<div class="hint">未添加目标应用</div>';}
-$('w-rules').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(!b)return;wlRules.splice(+b.dataset.i,1);renderWaylayRules();wlSaveNow();});
-$('w-apps').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(b){wlApps.splice(+b.dataset.i,1);renderWaylayApps();wlSaveNow();return}const h=e.target.closest('.grp-head');if(h)h.parentElement.classList.toggle('open');});
-$('wp-rules').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(!b)return;wlPropRules.splice(+b.dataset.i,1);renderWpRules();wlSaveNow();});
-$('wp-apps').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(b){wlPropApps.splice(+b.dataset.i,1);renderWpApps();wlSaveNow();return}const h=e.target.closest('.grp-head');if(h)h.parentElement.classList.toggle('open');});
-$('rd-crules').addEventListener('click',e=>{const ed=e.target.closest('button[data-edit]');if(ed){openRdEdit('c',+ed.dataset.edit);return}const b=e.target.closest('button[data-i]');if(!b)return;rdCrules.splice(+b.dataset.i,1);renderRdCrules();wlSaveNow();});
-$('rd-frules').addEventListener('click',e=>{const ed=e.target.closest('button[data-edit]');if(ed){openRdEdit('f',+ed.dataset.edit);return}const b=e.target.closest('button[data-i]');if(!b)return;rdFrules.splice(+b.dataset.i,1);renderRdFrules();wlSaveNow();});
-$('rd-apps').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(b){rdApps.splice(+b.dataset.i,1);renderRdApps();wlSaveNow();return}const h=e.target.closest('.grp-head');if(h)h.parentElement.classList.toggle('open');});
-$('rdp-apps').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(b){rdpApps.splice(+b.dataset.i,1);renderRdpApps();wlSaveNow();return}const h=e.target.closest('.grp-head');if(h)h.parentElement.classList.toggle('open');});
-$('w-rule-add').onclick=()=>{
-  const f=$('w-from').value.trim(),t=$('w-to').value.trim();
-  if(!f.length||f.length!==t.length||f.length>64){toast('原/新服务名字符数需一致 (≤64)');return}
-  wlRules.push({from:f,to:t});$('w-from').value='';$('w-to').value='';renderWaylayRules();wlSaveNow();
+/* 组弹层: 该组规则 (图标 + from/to + 编辑/删除) */
+let rdFGroupRoot='';
+function openFGroup(root){
+  rdFGroupRoot=root;
+  $('rd-fgroup-title').textContent='/' + root + ' 下的重定向';
+  const rs=rdFrules.filter(r=>(r.from||'/').split('/')[1]===root);
+  $('rd-fgroup-body').innerHTML=rs.map((r,i)=>{
+    const gidx=rdFrules.indexOf(r);
+    return `<div class="grp"><div class="grp-head" style="cursor:default;gap:0;align-items:center">
+<svg viewBox="0 0 24 36" style="width:22px;height:33px;overflow:visible;stroke:var(--sub);fill:none;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0"><path d="M4 1v28"/><path d="M4 1h14"/><path d="M4 29h16"/><path d="M20 29l-5-5"/><path d="M20 29l-5 5"/></svg>
+<span class="grp-name" style="display:flex;flex-direction:column;gap:2px;padding-left:6px"><span style="margin-top:-5px">${esc(r.from)}</span><span style="margin-top:10px">${esc(r.to)}</span></span>
+<button class="icon-btn" style="margin-left:auto;flex-shrink:0" data-fedit="${gidx}" title="编辑">${ICO_EDIT}</button><button class="icon-btn danger" style="margin-left:8px;flex-shrink:0" data-fdel="${gidx}" title="删除">${ICO_TRASH}</button>
+</div></div>`;
+  }).join('');
+  $('rd-fgroup-modal').hidden=false;
+}
+closeFGroup=()=>{$('rd-fgroup-modal').hidden=true;rdFGroupRoot='';};
+$('rd-fgroup-close').onclick=closeFGroup;
+$('rd-fgroup-modal').addEventListener('click',e=>{if(e.target.id==='rd-fgroup-modal')closeFGroup();});
+$('rd-fgroup-body').addEventListener('click',e=>{
+  const ed=e.target.closest('button[data-fedit]');
+  if(ed){openRdEdit('f',+ed.dataset.fedit);return}
+  const b=e.target.closest('button[data-fdel]');
+  if(!b)return;
+  rdFrules.splice(+b.dataset.fdel,1);
+  renderRdFrules(); wlSaveNow();
+  const left=rdFrules.some(r=>(r.from||'/').split('/')[1]===rdFGroupRoot);
+  if(left)openFGroup(rdFGroupRoot); else closeFGroup();
+});
+function renderRdApps(){
+  const html=rdApps.length?rdApps.map((a,i)=>grow(a,i)).join(''):'<div class="hint">未添加目标应用</div>';
+  if($('rd-add-apps'))$('rd-add-apps').innerHTML=html;
+  if($('rd-batch-apps'))$('rd-batch-apps').innerHTML=html;
+}
+function renderRdpApps(){$('rd-field-apps').innerHTML=rdpApps.length?rdpApps.map((a,i)=>grow(a,i)).join(''):'<div class="hint">未添加目标应用</div>';}
+$('w-rules').addEventListener('click',e=>{
+  const b=e.target.closest('[data-i]');
+  if(b){wlRules.splice(+b.dataset.i,1);renderWaylayRules();wlSaveNow();return}
+  const h=e.target.closest('.grp-head');
+  if(h){svAppsRender();$('sv-apps-modal').hidden=false;}
+});
+$('sv-add-apps').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(b){wlApps.splice(+b.dataset.i,1);renderWaylayApps();wlSaveNow();return}const h=e.target.closest('.grp-head');if(h)h.parentElement.classList.toggle('open');});
+$('wp-rules').addEventListener('click',e=>{
+  const b=e.target.closest('[data-i]');
+  if(b){wlPropRules.splice(+b.dataset.i,1);renderWpRules();wlSaveNow();return}
+  const h=e.target.closest('.grp-head');
+  if(h){wpAppsRender();$('wp-apps-modal').hidden=false;}
+});
+wpAppsRender=()=>{$('wp-apps-modal-list').innerHTML=wlPropApps.length?wlPropApps.map((a,i)=>grow(a,i)).join(''):'<div class="hint" style="margin:0">未添加目标应用</div>';};
+$('wp-apps-add').onclick=()=>{
+  const v=$('wp-apps-input').value.trim();
+  if(v&&!wlPropApps.includes(v))wlPropApps.push(v);
+  $('wp-apps-input').value='';$('wp-apps-sg').hidden=true;
+  renderWpApps();wlSaveNow();wpAppsRender();
 };
-$('wp-add').onclick=()=>{
+suggest_bind($('wp-apps-input'),$('wp-apps-sg'),{onpick:v=>{if(v&&!wlPropApps.includes(v))wlPropApps.push(v);$('wp-apps-input').value='';$('wp-apps-sg').hidden=true;renderWpApps();wlSaveNow();wpAppsRender();}});
+$('wp-apps-modal-close').onclick=()=>{$('wp-apps-modal').hidden=true;};
+$('wp-apps-modal').addEventListener('click',e=>{if(e.target.id==='wp-apps-modal')$('wp-apps-modal').hidden=true;});
+$('wp-apps-modal-list').addEventListener('click',e=>{
+  const b=e.target.closest('[data-i]');
+  if(!b)return;
+  wlPropApps.splice(+b.dataset.i,1);renderWpApps();wlSaveNow();
+  if(!wlPropApps.length){
+    wlPropRules=[];renderWpRules();
+    $('wp-apps-modal').hidden=true;return;
+  }
+  wpAppsRender();
+});
+$('wp-add-apps').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(b){wlPropApps.splice(+b.dataset.i,1);renderWpApps();wlSaveNow();return}const h=e.target.closest('.grp-head');if(h)h.parentElement.classList.toggle('open');});
+$('rd-crules').addEventListener('click',e=>{const h=e.target.closest('[data-root]');if(h){openRdGroup(h.dataset.root);return}});
+$('rd-frules').addEventListener('click',e=>{const h=e.target.closest('[data-froot]');if(h){openFGroup(h.dataset.froot);return}});
+$('rd-add-apps').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(b){rdApps.splice(+b.dataset.i,1);renderRdApps();wlSaveNow();return}const h=e.target.closest('.grp-head');if(h)h.parentElement.classList.toggle('open');});
+$('rd-field-apps').addEventListener('click',e=>{
+  const b=e.target.closest('[data-i]');
+  if(b){
+    rdpApps.splice(+b.dataset.i,1);renderRdpApps();wlSaveNow();
+    if(!rdpApps.length){
+      rdFrules=rdFrules.filter(r=>r.global);
+      renderRdFrules();
+      if(rdFGroupRoot)closeFGroup();
+      return;
+    }
+    return;
+  }
+  const h=e.target.closest('.grp-head');if(h)h.parentElement.classList.toggle('open');
+});
+$('wp-fshow').onclick=()=>{$('wp-add-modal').hidden=false;renderWpApps();};
+$('wp-add-close').onclick=()=>{$('wp-add-modal').hidden=true;};
+$('wp-add-modal').addEventListener('click',e=>{if(e.target.id==='wp-add-modal')$('wp-add-modal').hidden=true;});
+$('wp-add-ok').onclick=()=>{
   const f=$('wp-from').value.trim(),t=$('wp-to').value.trim();
-  if(!f.length||f.length!==t.length||f.length>92){toast('原/新属性名需等长 (≤92)');return}
-  wlPropRules.push({from:f,to:t});$('wp-from').value='';$('wp-to').value='';renderWpRules();wlSaveNow();
+  if(!f.length||!t.length){$('wp-add-err').textContent='原/新属性名不能为空';$('wp-add-err').hidden=false;return}else{$('wp-add-err').hidden=true}
+  if(f.length!==t.length||f.length>92){$('wp-add-err').textContent='原/新属性名字符数需一致 (ASCII ≤92)';$('wp-add-err').hidden=false;return}else{$('wp-add-err').hidden=true}
+  if(!wlPropApps.length){$('wp-add-err').textContent='无法保存: 需要添加目标应用';$('wp-add-err').hidden=false;return}else{$('wp-add-err').hidden=true}
+  wlPropRules.push({from:f,to:t});
+  $('wp-from').value='';$('wp-to').value='';
+  renderWpRules();wlSaveNow();
+  $('wp-add-modal').hidden=true;
 };
 $('rd-cadd').onclick=()=>{
   const f=$('rd-cfrom').value.trim(),t=$('rd-cto').value.trim();
-  if(!f.length||f.length!==t.length||f.length>64){toast('内容替换原/新字符数需一致 (≤64)');return}
+  if(!f.length||f.length!==t.length||f.length>64){$('rd-add-err').textContent='原/新字符数需一致 (≤64)';$('rd-add-err').hidden=false;return}else{$('rd-add-err').hidden=true}
+  if(!$('rd-add-global').checked&&!rdApps.length){$('rd-add-err').textContent='无法保存: 需要添加目标应用或者开启全局';$('rd-add-err').hidden=false;return}else{$('rd-add-err').hidden=true}
   const tg=($('rd-ctarget')&&$('rd-ctarget').value.trim())||'/vendor/etc/selinux/vendor_file_contexts';
-  rdCrules.push({target:tg,from:f,to:t,global:false});$('rd-cfrom').value='';$('rd-cto').value='';renderRdCrules();wlSaveNow();
+  rdCrules.push({target:tg,from:f,to:t,global:$('rd-add-global').checked});$('rd-cfrom').value='';$('rd-cto').value='';renderRdCrules();wlSaveNow();$('rd-add-modal').hidden=true;if(rdGroupRoot)openRdGroup(rdGroupRoot);
 };
-$('rd-fadd').onclick=()=>{
+$('rd-fshow').onclick=()=>{$('rd-field-modal').hidden=false;$('rd-field-global').checked=false;$('rd-field-apps-section').hidden=false;renderRdpApps();};
+$('rd-field-close').onclick=()=>{$('rd-field-modal').hidden=true;};
+$('rd-field-modal').addEventListener('click',e=>{if(e.target.id==='rd-field-modal')$('rd-field-modal').hidden=true;});
+$('rd-field-global').addEventListener('change',e=>{$('rd-field-apps-section').hidden=e.target.checked;});
+$('rd-field-ok').onclick=()=>{
   const f=$('rd-ffrom').value.trim(),t=$('rd-fto').value.trim();
-  if(!f.length||!t.length){toast('文件重定向路径不能为空');return}
-  rdFrules.push({from:f,to:t,global:false});$('rd-ffrom').value='';$('rd-fto').value='';renderRdFrules();wlSaveNow();
+  if(!f.length||!t.length){$('rd-field-err').textContent='原/新路径不能为空';$('rd-field-err').hidden=false;return}else{$('rd-field-err').hidden=true}
+  if(!$('rd-field-global').checked&&!rdpApps.length){$('rd-field-err').textContent='无法保存: 需要添加目标应用或者开启全局';$('rd-field-err').hidden=false;return}else{$('rd-field-err').hidden=true}
+  rdFrules.push({from:f,to:t,global:$('rd-field-global').checked});
+  $('rd-ffrom').value='';$('rd-fto').value='';
+  renderRdFrules();wlSaveNow();
+  $('rd-field-modal').hidden=true;
 };
-function wlAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!wlApps.includes(pkg))wlApps.push(pkg);$('w-app').value='';$('w-sg').hidden=true;renderWaylayApps();wlSaveNow();}
-function wpAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!wlPropApps.includes(pkg))wlPropApps.push(pkg);$('wp-app').value='';$('wp-sg').hidden=true;renderWpApps();wlSaveNow();}
-function rdAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!rdApps.includes(pkg))rdApps.push(pkg);$('rd-app').value='';$('rd-sg').hidden=true;renderRdApps();wlSaveNow();}
-function rdpAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!rdpApps.includes(pkg))rdpApps.push(pkg);$('rdp-app').value='';$('rdp-sg').hidden=true;renderRdpApps();wlSaveNow();}
-$('w-add').onclick=()=>wlAddApp($('w-app').value);
-$('wp-add-app').onclick=()=>wpAddApp($('wp-app').value);
-$('rd-add-app').onclick=()=>rdAddApp($('rd-app').value);
-$('rdp-add-app').onclick=()=>rdpAddApp($('rdp-app').value);
-suggest_bind($('w-app'),$('w-sg'),{onpick:wlAddApp});
-suggest_bind($('wp-app'),$('wp-sg'),{onpick:wpAddApp});
-suggest_bind($('rd-app'),$('rd-sg'),{onpick:rdAddApp});
-suggest_bind($('rdp-app'),$('rdp-sg'),{onpick:rdpAddApp});
+function wlAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!wlApps.includes(pkg))wlApps.push(pkg);$('sv-add-app-input').value='';$('sv-add-sg').hidden=true;renderWaylayApps();wlSaveNow();}
+function wpAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!wlPropApps.includes(pkg))wlPropApps.push(pkg);$('wp-add-app-input').value='';$('wp-add-sg').hidden=true;renderWpApps();wlSaveNow();}
+function rdAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!rdApps.includes(pkg))rdApps.push(pkg);$('rd-add-app-input').value='';$('rd-add-sg').hidden=true;renderRdApps();wlSaveNow();}
+function rdpAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!rdpApps.includes(pkg))rdpApps.push(pkg);$('rd-field-app-input').value='';$('rd-field-sg').hidden=true;renderRdpApps();wlSaveNow();}
+$('sv-add-app-btn').onclick=()=>wlAddApp($('sv-add-app-input').value);
+$('wp-add-app-btn').onclick=()=>wpAddApp($('wp-add-app-input').value);
+$('rd-add-app-btn').onclick=()=>rdAddApp($('rd-add-app-input').value);
+$('rd-batch-app-btn').onclick=()=>rdAddApp($('rd-batch-app-input').value);
+suggest_bind($('rd-batch-app-input'),$('rd-batch-sg'),{onpick:rdAddApp});
+$('rd-batch-apps').addEventListener('click',e=>{
+  const b=e.target.closest('[data-i]');
+  if(!b)return;
+  rdApps.splice(+b.dataset.i,1);renderRdApps();wlSaveNow();
+});
+$('rd-field-app-btn').onclick=()=>rdpAddApp($('rd-field-app-input').value);
+suggest_bind($('sv-add-app-input'),$('sv-add-sg'),{onpick:wlAddApp});
+suggest_bind($('wp-add-app-input'),$('wp-add-sg'),{onpick:wpAddApp});
+suggest_bind($('rd-add-app-input'),$('rd-add-sg'),{onpick:rdAddApp});
+suggest_bind($('rd-field-app-input'),$('rd-field-sg'),{onpick:rdpAddApp});
 $('w-seg').addEventListener('click',e=>{
   const b=e.target.closest('button');if(!b)return;
   const v=b.dataset.v;
@@ -595,6 +814,36 @@ function buildRules(){
   rdFrules.forEach(r=>{((r.global)?['*']:rdpApps).forEach(p=>out.push({pkg:p,kind:'red-path',from:r.from,to:r.to}))});  /* 文件重定向 */
   return out;
 }
+svAppsRender=()=>{$('sv-apps-modal-list').innerHTML=wlApps.length?wlApps.map((a,i)=>grow(a,i)).join(''):'<div class="hint" style="margin:0">未添加目标应用</div>';};
+$('sv-apps-add').onclick=()=>{
+  const v=$('sv-apps-input').value.trim();
+  if(v&&!wlApps.includes(v))wlApps.push(v);
+  $('sv-apps-input').value='';$('sv-apps-sg').hidden=true;
+  renderWaylayApps();wlSaveNow();svAppsRender();
+};
+suggest_bind($('sv-apps-input'),$('sv-apps-sg'),{onpick:v=>{if(v&&!wlApps.includes(v))wlApps.push(v);$('sv-apps-input').value='';$('sv-apps-sg').hidden=true;renderWaylayApps();wlSaveNow();svAppsRender();}});
+$('sv-apps-modal-close').onclick=()=>{$('sv-apps-modal').hidden=true;};
+$('sv-apps-modal').addEventListener('click',e=>{if(e.target.id==='sv-apps-modal')$('sv-apps-modal').hidden=true;});
+$('sv-apps-modal-list').addEventListener('click',e=>{
+  const b=e.target.closest('[data-i]');
+  if(!b)return;
+  wlApps.splice(+b.dataset.i,1);renderWaylayApps();wlSaveNow();
+  if(!wlApps.length){wlRules=[];renderWaylayRules();$('sv-apps-modal').hidden=true;return;}
+  svAppsRender();
+});
+$('sv-fshow').onclick=()=>{$('sv-add-modal').hidden=false;renderWaylayApps();};
+$('sv-add-close').onclick=()=>{$('sv-add-modal').hidden=true;};
+$('sv-add-modal').addEventListener('click',e=>{if(e.target.id==='sv-add-modal')$('sv-add-modal').hidden=true;});
+$('sv-add-ok').onclick=()=>{
+  const f=$('w-from').value.trim(),t=$('w-to').value.trim();
+  if(!f.length||!t.length){$('sv-add-err').textContent='原/新服务名不能为空';$('sv-add-err').hidden=false;return}else{$('sv-add-err').hidden=true}
+  if(f.length!==t.length||f.length>64){$('sv-add-err').textContent='原/新服务名字符数需一致 (ASCII ≤64)';$('sv-add-err').hidden=false;return}else{$('sv-add-err').hidden=true}
+  if(!wlApps.length){$('sv-add-err').textContent='无法保存: 需要添加目标应用';$('sv-add-err').hidden=false;return}else{$('sv-add-err').hidden=true}
+  wlRules.push({from:f,to:t});
+  $('w-from').value='';$('w-to').value='';
+  renderWaylayRules();wlSaveNow();
+  $('sv-add-modal').hidden=true;
+};
 function renderWaylayConn(c){$('w-conn').textContent=c?'已连接':'未连接';$('w-conn').className='badge '+(c?'kpm':'proc');$('w-conn-chips').querySelectorAll('button').forEach(b=>b.classList.toggle('on',(b.dataset.v==='1')===c));}
 let wlSaveTimer=null;
 /* 保存串行化: 一次只发一个请求, 期间新触发排队 (防并发写文件乱序覆盖 → 规则被清成一条) */
@@ -606,7 +855,7 @@ async function wlDoSave(){
     /* 保存前: 存在非全局规则但无目标应用 → 阻止 (否则展开无条目 → 规则静默丢失) */
     if(wlRules.length&&!wlApps.length){toast('服务伪装: 未添加目标应用, 规则不会保存');return}
     if(wlPropRules.length&&!wlPropApps.length){toast('属性伪装: 未添加目标应用, 规则不会保存');return}
-    if(rdCrules.some(r=>!r.global)&&!rdApps.length){toast('内容替换: 有非全局规则但未添加目标应用, 规则不会保存');return}
+    if(rdCrules.some(r=>!r.global)&&!rdApps.length){toast('内容替换: 无法保存, 需要添加目标应用或者开启全局');return}
     if(rdFrules.some(r=>!r.global)&&!rdpApps.length){toast('文件重定向: 有非全局规则但未添加目标应用, 规则不会保存');return}
     const rules=buildRules();
     // 保存前检查: 非空 / 等长 / 长度 / ASCII
@@ -777,34 +1026,114 @@ $('modal-hit').addEventListener('click',e=>{if(e.target===$('modal-hit'))$('moda
 let rulesData=[];
 function chipCls(s){return s==='e-core'?'e':s==='p-core'?'p':s==='hp-core'?'h':'c'}
 function chipHtml(s){return `<span class="chip ${chipCls(s)}">${esc(s)}</span>`}
-const ICO_TRASH='<svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3m-8 0l1 13h8l1-13"/></svg>';
+const ICO_TRASH='<svg viewBox="0 0 24 24" style="width:17px;height:17px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round"><path d="M4 7h16M9 7V4h6v3m-8 0l1 13h8l1-13"/></svg>';
 const ICO_EDIT=`<svg viewBox="0 0 24 24" style="width:17px;height:17px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>`;
 /* 规则编辑面板 (全局生效开关不放在规则行内) */
 let rdEditIdx=-1,rdEditKind='';
-$('rd-cimport').onclick=()=>{$('rd-batch-modal').hidden=false;};
+$('rd-cshow').onclick=()=>{$('rd-add-modal').hidden=false;$('rd-add-global').checked=false;$('rd-add-apps-section').hidden=false;renderRdApps();};
+$('rd-add-global').addEventListener('change',e=>{$('rd-add-apps-section').hidden=e.target.checked;});
+$('rd-add-close').onclick=()=>{$('rd-add-modal').hidden=true;};
+$('rd-add-modal').addEventListener('click',e=>{if(e.target.id==='rd-add-modal')$('rd-add-modal').hidden=true;});
+$('rd-cimport').onclick=()=>{$('rd-batch-modal').hidden=false;$('rd-batch-global').checked=false;$('rd-batch-apps-section').hidden=false;};
 $('rd-batch-cancel').onclick=()=>{$('rd-batch-modal').hidden=true;};
 $('rd-batch-modal').addEventListener('click',e=>{if(e.target.id==='rd-batch-modal')$('rd-batch-modal').hidden=true;});
+$('rd-batch-global').addEventListener('change',e=>{$('rd-batch-apps-section').hidden=e.target.checked;});
 $('rd-batch-ok').onclick=()=>{
   const f=$('rd-batch-from').value.trim(),t=$('rd-batch-to').value.trim();
-  if(!f.length||f.length!==t.length||f.length>64){toast('原/新字符数需一致 (ASCII ≤64)');return}
-  if(f.split('').some(c=>c.charCodeAt(0)>127)||t.split('').some(c=>c.charCodeAt(0)>127)){toast('仅支持 ASCII 字符');return}
+  if(!f.length||f.length!==t.length||f.length>64){$('rd-batch-err').textContent='原/新字符数需一致 (ASCII ≤64)';$('rd-batch-err').hidden=false;return}else{$('rd-batch-err').hidden=true}
+  if(!$('rd-batch-global').checked&&!rdApps.length){$('rd-batch-err').textContent='无法保存: 需要添加目标应用或者开启全局';$('rd-batch-err').hidden=false;return}else{$('rd-batch-err').hidden=true}
+  if(f.split('').some(c=>c.charCodeAt(0)>127)||t.split('').some(c=>c.charCodeAt(0)>127)){$('rd-batch-err').textContent='仅支持 ASCII 字符';$('rd-batch-err').hidden=false;return}else{$('rd-batch-err').hidden=true}
   const paths=$('rd-batch-targets').value.split('\n').map(x=>x.trim()).filter(Boolean);
   const seen=new Set();let added=0;
   for(const p of paths){
     if(!p.startsWith('/')||p.length>127){toast('目标文件需以 / 开头 (≤127): '+p);return}
     if(seen.has(p))continue;seen.add(p);
-    rdCrules.push({target:p,from:f,to:t,global:false});added++;
+    rdCrules.push({target:p,from:f,to:t,global:$('rd-batch-global').checked});added++;
   }
   if(!added){toast('未添加任何目标文件');return}
   $('rd-batch-modal').hidden=true;
   $('rd-batch-targets').value='';$('rd-batch-from').value='';$('rd-batch-to').value='';
   renderRdCrules();wlSaveNow();toast('已导入 '+added+' 条');
 };
+let rdGroupRoot='';
+function openRdGroup(root){
+  rdGroupRoot=root;
+  $('rd-group-title').textContent=(root==='全局'?'全局生效规则':'/'+root+' 下的路径');
+  const rs=root==='全局'?rdCrules.filter(r=>r.global):rdCrules.filter(r=>!r.global&&(r.target||'/').split('/')[1]===root);
+  $('rd-group-body').innerHTML=rs.map((r,i)=>
+`<div style="display:flex;align-items:center;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font-size:12px;color:#000;word-break:break-all">${esc(r.target)}<button class="icon-btn" style="margin-left:auto;flex-shrink:0" data-gedit="${i}" title="编辑">${ICO_EDIT}</button><button class="icon-btn danger" style="margin-left:8px;flex-shrink:0" data-gdel="${i}" title="删除">${ICO_TRASH}</button></div>`).join('');
+  $('rd-group-apps').innerHTML=(root==='全局')?'<div class="hint" style="margin:0">全局生效，不依赖目标应用</div>':(rdApps.length?rdApps.map((a,i)=>grow(a,i)).join(''):'<div class="hint" style="margin:0">未添加目标应用</div>');
+  $('rd-group-modal').hidden=false;
+}
+$('rd-group-close').onclick=()=>{$('rd-group-modal').hidden=true;};
+$('rd-group-apps').addEventListener('click',e=>{
+  const b=e.target.closest('[data-i]');
+  if(!b)return;
+  rdApps.splice(+b.dataset.i,1);
+  wlSaveNow();
+  if(!rdApps.length){
+    rdCrules=rdCrules.filter(r=>r.global);
+    renderRdCrules();renderRdApps();
+    if(rdGroupRoot!=='全局')$('rd-group-modal').hidden=true;
+    return;
+  }
+  if(rdGroupRoot)openRdGroup(rdGroupRoot);
+});
+$('rd-group-modal').addEventListener('click',e=>{if(e.target.id==='rd-group-modal')$('rd-group-modal').hidden=true;});
+$('rd-group-body').addEventListener('click',e=>{
+  const ed=e.target.closest('button[data-gedit]');
+  if(ed){openRdGroupEdit(+ed.dataset.gedit);return}
+  const b=e.target.closest('button[data-gdel]');
+  if(!b)return;
+  const rs=rdGroupRoot==='全局'?rdCrules.filter(r=>r.global):rdCrules.filter(r=>!r.global&&(r.target||'/').split('/')[1]===rdGroupRoot);
+  const t=rs[+b.dataset.gdel];
+  if(!t)return;
+  rdCrules=rdCrules.filter(r=>!(r.target===t.target&&r.from===t.from&&r.to===t.to));
+  renderRdCrules(); wlSaveNow();
+  const left=rdGroupRoot==='全局'?rdCrules.some(r=>r.global):rdCrules.some(r=>!r.global&&(r.target||'/').split('/')[1]===rdGroupRoot);
+  if(left)openRdGroup(rdGroupRoot); else $('rd-group-modal').hidden=true;
+});
+function openRdGroupEdit(i){
+  const rs=rdGroupRoot==='全局'?rdCrules.filter(r=>r.global):rdCrules.filter(r=>!r.global&&(r.target||'/').split('/')[1]===rdGroupRoot);
+  const t=rs[i]; if(!t)return;
+  const gidx=rdCrules.indexOf(t);
+  rdEditIdx=gidx;
+  $('rd-edit-title').textContent='编辑内容替换';
+  $('rd-edit-target').value=t.target||'/vendor/etc/selinux/vendor_file_contexts';
+  $('rd-edit-from-input').value=t.from;$('rd-edit-from-input').readOnly=true;
+  $('rd-edit-to-input').value=t.to;$('rd-edit-to-input').readOnly=true;
+  $('rd-edit-global').checked=!!t.global;
+  $('rd-edit-modal').hidden=false;
+}
+$('rd-edit-save').onclick=()=>{
+  if(rdEditIdx<0)return;
+  if(rdEditKind==='c'){
+    const tg=$('rd-edit-target').value.trim()||'/vendor/etc/selinux/vendor_file_contexts';
+    if(!tg.startsWith('/')||tg.length>127){toast('目标文件需以 / 开头 (≤127)');return}
+    rdCrules[rdEditIdx].target=tg;
+    renderRdCrules();
+    if(rdGroupRoot)openRdGroup(rdGroupRoot);
+  }else{
+    const nf=$('rd-edit-from-input').value.trim(),nt=$('rd-edit-to-input').value.trim();
+    if(!nf.length||!nt.length){toast('原/新路径不能为空');return}
+    rdFrules[rdEditIdx].from=nf;
+    rdFrules[rdEditIdx].to=nt;
+    renderRdFrules();
+    if(rdFGroupRoot)openFGroup(rdFGroupRoot);
+  }
+  rdEditIdx=-1;
+  $('rd-edit-modal').hidden=true;
+  wlSaveNow();
+};
 function openRdEdit(kind,i){
   const list=kind==='c'?rdCrules:rdFrules;const r=list[i];if(!r)return;
   rdEditIdx=i;rdEditKind=kind;
-  $('rd-edit-title').textContent=(kind==='c'?'内容替换规则':'文件重定向规则');
-  $('rd-edit-body').textContent=(kind==='c'?('目标文件: '+(r.target||'/vendor/etc/selinux/vendor_file_contexts')+'\n'):'')+r.from+' → '+r.to;
+  $('rd-edit-title').textContent=(kind==='c'?'编辑内容替换':'编辑文件重定向');
+  const isC=kind==='c';
+  $('rd-edit-target').style.display=isC?'':'none';
+  if(isC)$('rd-edit-target').value=r.target||'/vendor/etc/selinux/vendor_file_contexts';
+  $('rd-edit-from-input').value=r.from;$('rd-edit-from-input').readOnly=isC;
+  $('rd-edit-to-input').value=r.to;$('rd-edit-to-input').readOnly=isC;
   $('rd-edit-global').checked=!!r.global;
   $('rd-edit-modal').hidden=false;
 }
