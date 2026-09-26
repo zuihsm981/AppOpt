@@ -144,30 +144,17 @@ pub fn load_waylay_rules() -> Vec<WaylayRule> {
             } else {
                 rest.split_once('-').unwrap_or((rest, ""))
             };
-            let Some(mut kind) = WaylayKind::parse(kind_t) else { continue };
+            let Some(kind) = WaylayKind::parse(kind_t) else { continue };
             let mut target = String::new();
             let from: String;
             let to: String;
             if kind == WaylayKind::RedPath {
-                /* red-path 统一判定 (内容/文件/内容带目标):
-                 *   parts[0] 非 '/'            → 内容 (默认目标)
-                 *   parts[0] '/' 且 parts[1] 非 '/' → 内容带目标: <目标>-<from>-<to>
-                 *   parts[0] '/' 且 parts[1] 也 '/' → 文件重定向: <路径from>-<路径to> */
-                let parts: Vec<&str> = rr.split('-').collect();
-                let p0 = parts.first().unwrap_or(&"");
-                if !p0.starts_with('/') {
-                    kind = WaylayKind::Red;
-                    from = parts[0].to_string();
-                    to = parts[1..].join("-");
-                } else if parts.len() >= 3 && !parts[1].starts_with('/') {
-                    kind = WaylayKind::Red;
-                    target = parts[0].to_string();
-                    from = parts[1].to_string();
-                    to = parts[2..].join("-");
-                } else {
-                    kind = WaylayKind::RedPath;
-                    from = parts[0].to_string();
-                    to = parts[1..].join("-");
+                /* red-path 仅文件重定向: red-path-<from路径>-<to路径> (split_once 取首个 '-') */
+                let (f, t) = rr.split_once('-').unwrap_or(("", ""));
+                from = f.trim().to_string();
+                to = t.trim().to_string();
+                if !from.starts_with('/') || !to.starts_with('/') {
+                    continue;   /* 非路径 → 整条丢弃 */
                 }
             } else if kind == WaylayKind::Red {
                 /* red 内容替换: red-<目标文件路径>-<from>-<to> (目标必为 '/' 路径, 防无差别替换) */

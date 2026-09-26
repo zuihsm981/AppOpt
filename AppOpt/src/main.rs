@@ -318,7 +318,7 @@ struct AppState {
     rfr_pkgs_set: HashSet<String>,
     /// 已下发给内核的 service list 伪装开关 (差量下发, 仅应用切换时调整)
     srv_active_cur: bool,
-    red_active_cur: bool,
+    fg_pkg_cur: String,
     /// 已下发给内核的 property 区伪装开关 (独立目标应用集)
     prop_active_cur: bool,
 }
@@ -343,7 +343,7 @@ impl AppState {
             cpu_pkgs_set,
             rfr_pkgs_set,
             srv_active_cur: false,
-            red_active_cur: false,
+            fg_pkg_cur: String::new(),
             prop_active_cur: false,
         }
     }
@@ -361,11 +361,14 @@ impl AppState {
         }
         if let Some(es) = self.ebpf_state.as_ref() {
             if arm {
-                es.bpf.arm();   // vfc 已由 arm 关闭; 规则由前台回调 on_fg 按包激活
+                es.bpf.arm();
                 // red-path 副本权限/上下文同步 (连接时校准)
                 crate::config::sync_redpath_perm(&crate::rw_read_ignore_poison(
                     &crate::config::WAYLAY_RULES_NEW,
                 ));
+                // 用户态配置驱动: 连接即全量下发规则 + 激活 (hook 常驻)
+                self.sync_vfc_rules();
+                es.bpf.vfc_apply();
             } else {
                 es.bpf.disarm();
                 // 断开把探针摘除 (srv_remove); 重置激活记录 → 下次前台回调重新下发
@@ -373,6 +376,32 @@ impl AppState {
                 self.srv_active_cur = false;
             }
             crate::web::KPM_ARMED.store(arm, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// 用户态配置驱动: 全量下发 vfc 规则到内核 (clear + 重发, 带 pkg)。
+    /// 初始化 / 保存 / 删除配置时调用 (删除的规则因不在表中而被移除)。
+    fn sync_vfc_rules(&self) {
+        if let Some(es) = self.ebpf_state.as_ref() {
+            es.bpf.vfc_rule_clear();
+            let all = crate::rw_read_ignore_poison(&crate::config::WAYLAY_RULES_NEW);
+            let mut i = 0usize;
+            for r in all.iter() {
+                if i >= 32 {
+                    break;
+                }
+                match r.kind {
+                    crate::config::WaylayKind::Red => {
+                        es.bpf.vfc_rule(i, "c", &r.pkg, &r.target, &r.from, &r.to);
+                        i += 1;
+                    }
+                    crate::config::WaylayKind::RedPath => {
+                        es.bpf.vfc_rule(i, "p", &r.pkg, "-", &r.from, &r.to);
+                        i += 1;
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -388,7 +417,8 @@ impl AppState {
         // waylay 配置保存 (web /api/waylay): 同步替换字符到内核 (目标 uid 集合已由
         // save_waylay 更新静态, 下一次前台回调差量生效)
         if crate::config::take_waylay_changed() {
-            // 新格式保存: uid→规则 映射已由 save_waylay_rules 重建; 前台回调驱动激活
+            // 配置(初始化/保存/删除) → 全量重下发内核规则 (clear + 重发; 删除即移除)
+            self.sync_vfc_rules();
             crate::config::sync_redpath_perm(&crate::rw_read_ignore_poison(
                 &crate::config::WAYLAY_RULES_NEW,
             ));
@@ -434,6 +464,14 @@ impl AppState {
             .cloned()
             .unwrap_or_default();
         let active = !my.is_empty();
+        // ---- 前台包名通知内核 (vfc 规则按 pkg 匹配执行; 未通知→仅全局) ----
+        if let Some(es) = self.ebpf_state.as_ref() {
+            let fg_pkg = my.first().map(|r| r.pkg.clone()).unwrap_or_default();
+            if fg_pkg != self.fg_pkg_cur {
+                self.fg_pkg_cur = fg_pkg.clone();
+                es.bpf.vfc_fg(&fg_pkg);
+            }
+        }
         // ---- src (系统服务伪装): 该包 src 规则 + 开关 ----
         if active != self.srv_active_cur {
             self.srv_active_cur = active;
@@ -445,53 +483,6 @@ impl AppState {
                     }
                 }
                 es.bpf.srv_active(active);
-            }
-        }
-        // ---- red (重定向/内容替换): 该包 red 规则 或 全局 red(pkg="*" 任何前台) ----
-        let global_red = crate::config::WAYLAY_GLOBAL_RED.load(std::sync::atomic::Ordering::Acquire);
-        let red_active = active || global_red;   // 全局规则 → 任何前台都启用, 不随切换摘除
-        if red_active != self.red_active_cur {
-            self.red_active_cur = red_active;
-            if let Some(es) = self.ebpf_state.as_ref() {
-                if red_active {
-                    es.bpf.vfc_crule_clear();
-                    es.bpf.vfc_frule_clear();
-                    // 全局规则 (pkg="*") + 该包规则 合并下发
-                    let all = crate::rw_read_ignore_poison(&crate::config::WAYLAY_RULES_NEW);
-                    let mut ci = 0usize;
-                    for r in all
-                        .iter()
-                        .filter(|r| r.pkg == "*" && r.kind == crate::config::WaylayKind::Red)
-                    {
-                        es.bpf.vfc_crule(ci, &r.target, &r.from, &r.to);
-                        ci += 1;
-                    }
-                    for r in my
-                        .iter()
-                        .filter(|r| r.kind == crate::config::WaylayKind::Red)
-                    {
-                        es.bpf.vfc_crule(ci, &r.target, &r.from, &r.to);
-                        ci += 1;
-                    }
-                    let mut fi = 0usize;
-                    for r in all
-                        .iter()
-                        .filter(|r| r.pkg == "*" && r.kind == crate::config::WaylayKind::RedPath)
-                    {
-                        es.bpf.vfc_frule(fi, &r.from, &r.to);
-                        fi += 1;
-                    }
-                    for r in my
-                        .iter()
-                        .filter(|r| r.kind == crate::config::WaylayKind::RedPath)
-                    {
-                        es.bpf.vfc_frule(fi, &r.from, &r.to);
-                        fi += 1;
-                    }
-                    es.bpf.vfc_apply();    // vfc off→on (挂 hook)
-                } else {
-                    es.bpf.vfc_disable();  // vfc off (摘 hook, 非全局时刻零回调)
-                }
             }
         }
         // prop (系统属性伪装): 该包 prop 规则前台激活, 切走恢复 (用户态 tmpfs 写替换)

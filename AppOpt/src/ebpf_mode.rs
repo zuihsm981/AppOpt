@@ -168,8 +168,7 @@ impl KpmHandle {
     pub(crate) fn arm(&self) {
         self.cmd("start");
         ensure_prop_maps();   // 连接时提前 mmap 目标 tmpfs 文件并保持
-        // vfc 伪装有前台回调驱动 (on_fg 按包 vfc_on/off), 连接仅确保关闭
-        self.vfc_disable();
+        // vfc: 规则由用户态配置事件下发 (vfc_sync), 连接后激活; 这里不触碰
     }
 
     /// 解除武装 (stop: 摘除全部业务探针 + 恢复 vendor_file_contexts 读取)
@@ -178,10 +177,9 @@ impl KpmHandle {
         self.vfc_disable();
     }
 
-    /// vendor_file_contexts 内容替换 (vfs_read 读真实文件时按 crule 规则替换内容):
-    /// 先 vfc off 清状态, 再 vfc on 启用 (普通应用读真实文件, 内容被替换)。
+    /// 激活 vfc (enabled=1 + 首次常驻挂载); 规则已由 vfc_sync 下发
     pub(crate) fn vfc_apply(&self) {
-        self.cmd("vfc off");
+        self.cmd("vfc off");   // 清 file* 表与应用侧残留
         self.cmd("vfc on");
         self.vfc_status_debug();
     }
@@ -191,25 +189,24 @@ impl KpmHandle {
         self.cmd("vfc off");
     }
 
-    /// 内容替换规则: 清空
-    pub(crate) fn vfc_crule_clear(&self) {
-        self.cmd("vfc_crule_clear");
-    }
-
-    /// 内容替换规则: 第 idx 组 from→to (等长 ASCII, ≤32)
-    pub(crate) fn vfc_crule(&self, idx: usize, target: &str, from: &str, to: &str) {
-        let args = format!("vfc_crule {} {} {} {}", idx, target, from, to);
+    /// 前台包名 (前台回调下发; 空串=无前台通知 → 仅全局规则)
+    pub(crate) fn vfc_fg(&self, pkg: &str) {
+        let args = if pkg.is_empty() {
+            "vfc_fg ".to_string()
+        } else {
+            format!("vfc_fg {}", pkg)
+        };
         self.cmd(&args);
     }
 
-    /// 文件重定向规则: 清空
-    pub(crate) fn vfc_frule_clear(&self) {
-        self.cmd("vfc_frule_clear");
+    /// 清空全部 vfc 规则 (配置重下发前)
+    pub(crate) fn vfc_rule_clear(&self) {
+        self.cmd("vfc_rule_clear");
     }
 
-    /// 文件重定向规则: 第 idx 组 from 路径 → to 路径
-    pub(crate) fn vfc_frule(&self, idx: usize, from: &str, to: &str) {
-        let args = format!("vfc_frule {} {} {}", idx, from, to);
+    /// 统一 vfc 规则: kind "c"=内容替换(需 target, 等长) / "p"=文件重定向
+    pub(crate) fn vfc_rule(&self, idx: usize, kind: &str, pkg: &str, target: &str, from: &str, to: &str) {
+        let args = format!("vfc_rule {} {} {} {} {} {}", idx, kind, pkg, target, from, to);
         self.cmd(&args);
     }
 
