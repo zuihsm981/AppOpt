@@ -438,22 +438,50 @@ impl AppState {
                 es.bpf.srv_active(active);
             }
         }
-        // ---- red (重定向/内容替换): 该包 red 规则 + vfc on/off (off 摘 hook, 零回调) ----
-        if active != self.red_active_cur {
-            self.red_active_cur = active;
+        // ---- red (重定向/内容替换): 该包 red 规则 或 全局 red(pkg="*" 任何前台) ----
+        let global_red = crate::config::WAYLAY_GLOBAL_RED.load(std::sync::atomic::Ordering::Acquire);
+        let red_active = active || global_red;   // 全局规则 → 任何前台都启用, 不随切换摘除
+        if red_active != self.red_active_cur {
+            self.red_active_cur = red_active;
             if let Some(es) = self.ebpf_state.as_ref() {
-                if active {
+                if red_active {
                     es.bpf.vfc_crule_clear();
                     es.bpf.vfc_frule_clear();
-                    for (i, r) in my.iter().filter(|r| r.kind == crate::config::WaylayKind::Red).enumerate() {
-                        es.bpf.vfc_crule(i, &r.from, &r.to);
+                    // 全局规则 (pkg="*") + 该包规则 合并下发
+                    let all = crate::rw_read_ignore_poison(&crate::config::WAYLAY_RULES_NEW);
+                    let mut ci = 0usize;
+                    for r in all
+                        .iter()
+                        .filter(|r| r.pkg == "*" && r.kind == crate::config::WaylayKind::Red)
+                    {
+                        es.bpf.vfc_crule(ci, &r.from, &r.to);
+                        ci += 1;
                     }
-                    for (i, r) in my.iter().filter(|r| r.kind == crate::config::WaylayKind::RedPath).enumerate() {
-                        es.bpf.vfc_frule(i, &r.from, &r.to);
+                    for r in my
+                        .iter()
+                        .filter(|r| r.kind == crate::config::WaylayKind::Red)
+                    {
+                        es.bpf.vfc_crule(ci, &r.from, &r.to);
+                        ci += 1;
+                    }
+                    let mut fi = 0usize;
+                    for r in all
+                        .iter()
+                        .filter(|r| r.pkg == "*" && r.kind == crate::config::WaylayKind::RedPath)
+                    {
+                        es.bpf.vfc_frule(fi, &r.from, &r.to);
+                        fi += 1;
+                    }
+                    for r in my
+                        .iter()
+                        .filter(|r| r.kind == crate::config::WaylayKind::RedPath)
+                    {
+                        es.bpf.vfc_frule(fi, &r.from, &r.to);
+                        fi += 1;
                     }
                     es.bpf.vfc_apply();    // vfc off→on (挂 hook)
                 } else {
-                    es.bpf.vfc_disable();  // vfc off (摘 hook, 非前台零回调)
+                    es.bpf.vfc_disable();  // vfc off (摘 hook, 非全局时刻零回调)
                 }
             }
         }

@@ -98,6 +98,8 @@ pub static WAYLAY_RULES_NEW: LazyLock<RwLock<Vec<WaylayRule>>> =
 /// uid → 该 uid 所属包的全部规则 (新格式按包激活; save 时重建)
 pub static WAYLAY_BY_UID: LazyLock<RwLock<HashMap<i32, Vec<WaylayRule>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
+/// 是否存在全局重定向规则 (pkg="*" 的 red/red-path): 有则任何前台都启用 vfc
+pub static WAYLAY_GLOBAL_RED: AtomicBool = AtomicBool::new(false);
 
 /// 重建 uid→规则 映射 (packages.list: uid→包名; 规则按包名匹配)
 pub fn build_waylay_by_uid(rules: &[WaylayRule]) -> HashMap<i32, Vec<WaylayRule>> {
@@ -135,6 +137,7 @@ pub fn load_waylay_rules() -> Vec<WaylayRule> {
             if pkg.is_empty() {
                 continue;
             }
+            let rest = rest.trim();   /* 容忍 '= ' 后空格 */
             let (kind_t, rr) = if let Some(r) = rest.strip_prefix("red-path-") {
                 ("red-path", r)
             } else {
@@ -164,7 +167,7 @@ pub fn save_waylay_rules(rules: &[WaylayRule]) -> io::Result<()> {
     out.push_str("# kind: src=服务伪装 prop=属性伪装 red=重定向(内容替换); from/to 等长且不含 '-'\n");
     for r in rules {
         out.push_str(&format!(
-            "{}= {}-{}-{}\n",
+            "{}={}-{}-{}\n",
             r.pkg.trim(),
             r.kind.tag(),
             r.from.trim(),
@@ -176,6 +179,10 @@ pub fn save_waylay_rules(rules: &[WaylayRule]) -> io::Result<()> {
     fs::rename(&tmp, WAYLAY_FILE)?;
     *rw_write_ignore_poison(&WAYLAY_RULES_NEW) = rules.to_vec();
     *rw_write_ignore_poison(&WAYLAY_BY_UID) = build_waylay_by_uid(rules);
+    WAYLAY_GLOBAL_RED.store(
+        rules.iter().any(|r| r.pkg == "*" && (r.kind == WaylayKind::Red || r.kind == WaylayKind::RedPath)),
+        Ordering::Release,
+    );
     WAYLAY_CHANGED.store(true, Ordering::Release);
     Ok(())
 }
