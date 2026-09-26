@@ -253,7 +253,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 </div>
 </div>
 <div class="uclamp-chips" id="w-seg" style="margin-bottom:8px">
-<button data-v="srv" class="on">系统服务伪装</button><button data-v="prop">系统属性伪装</button><button data-v="red">内容替换</button><button data-v="redpath">重定向文件</button>
+<button data-v="srv" class="on">系统服务伪装</button><button data-v="prop">系统属性伪装</button><button data-v="red">文件内容替换</button><button data-v="redpath">重定向文件</button>
 </div>
 <div id="w-srv-pane">
 <div class="card">
@@ -473,12 +473,21 @@ let rdCrules=[];let rdFrules=[];let rdApps=[];let rdpApps=[];
 function rowHtml(txt,i){return `<div class="rule-row"><span class="rule-name">${esc(txt)}</span><button class="icon-btn danger" data-i="${i}" title="删除">${ICO_TRASH}</button></div>`}
 // 目标应用: 每应用一个 grp 圆角框 (规则页同款; 默认折叠)
 const grow=(a,i)=>`<div class="grp"><div class="grp-head"><svg class="chev" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg><span class="grp-name">${esc(a)}</span><span class="grp-count">0</span><button class="icon-btn danger" data-i="${i}" title="移除">${ICO_TRASH}</button></div><div class="grp-body"><div class="grp-inner"><div class="hint" style="padding:8px 14px">规则在上方「规则配置」区添加</div></div></div></div>`;
-function renderWaylayRules(){$('w-rules').innerHTML=wlRules.length?wlRules.map((r,i)=>rowHtml(`${r.from} → ${r.to}`,i)).join(''):'<div class="hint">未添加规则</div>';}
+// 规则项: 每条一个 grp 圆角框 (与目标应用列表同款)
+// 规则项: 每条一个 grp 圆角框; 规则对竖排 (from ▼ to)
+// 规则项: grp 圆角框; 一体式连线图标 (顶横线+竖线+底部箭头) + from/to 两行
+const growRule=(f,t,i)=>`
+<div class="grp"><div class="grp-head" style="cursor:default;gap:0">
+<svg viewBox="0 0 24 36" style="width:22px;height:33px;overflow:visible;margin-top:5px;stroke:var(--sub);fill:none;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0"><path d="M4 1v28"/><path d="M4 1h14"/><path d="M4 29h16"/><path d="M20 29l-5-5"/><path d="M20 29l-5 5"/></svg>
+<span class="grp-name" style="display:flex;flex-direction:column;gap:2px;padding-left:6px;margin-top:5px"><span style="margin-top:-5px">${esc(f)}</span><span style="margin-top:10px">${esc(t)}</span></span>
+<button class="icon-btn danger" style="margin-left:auto" data-i="${i}" title="删除">${ICO_TRASH}</button>
+</div></div>`;
+function renderWaylayRules(){$('w-rules').innerHTML=wlRules.length?wlRules.map((r,i)=>growRule(r.from,r.to,i)).join(''):'<div class="hint">未添加规则</div>';}
 function renderWaylayApps(){$('w-apps').innerHTML=wlApps.length?wlApps.map((a,i)=>grow(a,i)).join(''):'<div class="hint">未添加目标应用</div>';}
-function renderWpRules(){$('wp-rules').innerHTML=wlPropRules.length?wlPropRules.map((r,i)=>rowHtml(`${r.from} → ${r.to}`,i)).join(''):'<div class="hint">未添加替换对</div>';}
+function renderWpRules(){$('wp-rules').innerHTML=wlPropRules.length?wlPropRules.map((r,i)=>growRule(r.from,r.to,i)).join(''):'<div class="hint">未添加替换对</div>';}
 function renderWpApps(){$('wp-apps').innerHTML=wlPropApps.length?wlPropApps.map((a,i)=>grow(a,i)).join(''):'<div class="hint">未添加目标应用</div>';}
-function renderRdCrules(){if(!rdCrules.length){$('rd-crules').innerHTML='<div class="hint">未添加内容替换规则</div>';return}$('rd-crules').innerHTML=rdCrules.map((r,i)=>rowHtml(`${r.from} → ${r.to}`,i)).join('');}
-function renderRdFrules(){if(!rdFrules.length){$('rd-frules').innerHTML='<div class="hint">未添加文件重定向规则</div>';return}$('rd-frules').innerHTML=rdFrules.map((r,i)=>rowHtml(`${r.from} → ${r.to}`,i)).join('');}
+function renderRdCrules(){if(!rdCrules.length){$('rd-crules').innerHTML='<div class="hint">未添加内容替换规则</div>';return}$('rd-crules').innerHTML=rdCrules.map((r,i)=>growRule(r.from,r.to,i)).join('');}
+function renderRdFrules(){if(!rdFrules.length){$('rd-frules').innerHTML='<div class="hint">未添加文件重定向规则</div>';return}$('rd-frules').innerHTML=rdFrules.map((r,i)=>growRule(r.from,r.to,i)).join('');}
 function renderRdApps(){$('rd-apps').innerHTML=rdApps.length?rdApps.map((a,i)=>grow(a,i)).join(''):'<div class="hint">未添加目标应用</div>';}
 function renderRdpApps(){$('rdp-apps').innerHTML=rdpApps.length?rdpApps.map((a,i)=>grow(a,i)).join(''):'<div class="hint">未添加目标应用</div>';}
 $('w-rules').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(!b)return;wlRules.splice(+b.dataset.i,1);renderWaylayRules();wlSaveNow();});
@@ -554,7 +563,7 @@ function wlSaveNow(){
       if(isPath){if(r.from.length>127||r.to.length>255){toast('路径超限 (≤127/255)');return}continue}
       if(r.from.length!==r.to.length){toast('需等长 (ASCII)');return}
       if(r.from.length>max){toast('超出长度限制 (≤'+max+')');return}
-      if(!/^[ -]*$/.test(r.from)||!/^[ -]*$/.test(r.to)){toast('仅支持 ASCII 字符');return}
+      if(r.from.split('').some(c=>c.charCodeAt(0)>127)||r.to.split('').some(c=>c.charCodeAt(0)>127)){toast('\u4ec5\u652f\u6301 ASCII \u5b57\u7b26');return}
     }
     try{await api('/api/waylay',{rules})}catch(e){toast(e.message)}
   },200);
