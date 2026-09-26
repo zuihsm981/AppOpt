@@ -603,11 +603,11 @@ async function wlDoSave(){
   if(wlSaving){wlSaveQueued=true;return}
   wlSaving=true;
   try{
-    /* 保存前: 非全局规则必须有目标应用 (否则展开后无条目 → 规则丢失/不生效) */
+    /* 保存前: 存在非全局规则但无目标应用 → 阻止 (否则展开无条目 → 规则静默丢失) */
     if(wlRules.length&&!wlApps.length){toast('服务伪装: 未添加目标应用, 规则不会保存');return}
     if(wlPropRules.length&&!wlPropApps.length){toast('属性伪装: 未添加目标应用, 规则不会保存');return}
-    if(rdCrules.length&&!rdCrules.some(r=>r.global)&&!rdApps.length){toast('内容替换: 未开启全局且未添加目标应用, 规则不会保存');return}
-    if(rdFrules.length&&!rdFrules.some(r=>r.global)&&!rdpApps.length){toast('文件重定向: 未开启全局且未添加目标应用, 规则不会保存');return}
+    if(rdCrules.some(r=>!r.global)&&!rdApps.length){toast('内容替换: 有非全局规则但未添加目标应用, 规则不会保存');return}
+    if(rdFrules.some(r=>!r.global)&&!rdpApps.length){toast('文件重定向: 有非全局规则但未添加目标应用, 规则不会保存');return}
     const rules=buildRules();
     // 保存前检查: 非空 / 等长 / 长度 / ASCII
     for(const r of rules){
@@ -638,7 +638,7 @@ async function loadWaylay(){
     wlApps=uniq(rs.filter(r=>r.kind==='src').map(r=>r.pkg));
     wlPropRules=uniq(rs.filter(r=>r.kind==='prop').map(r=>r.from+'\u0000'+r.to)).map(k=>{const [f,t]=k.split('\u0000');return {from:f,to:t}});
     wlPropApps=uniq(rs.filter(r=>r.kind==='prop').map(r=>r.pkg));
-    rdCrules=uniq(rs.filter(r=>r.kind==='red').map(r=>r.from+'\u0000'+r.to+'\u0000'+(r.target||'/vendor/etc/selinux/vendor_file_contexts'))).map(k=>{const [f,t,tg]=k.split('\u0000');return {target:tg,from:f,to:t,global:rs.some(x=>x.kind==='red'&&x.pkg==='*'&&x.from===f&&x.to===t)}});
+    rdCrules=uniq(rs.filter(r=>r.kind==='red').map(r=>r.from+'\u0000'+r.to+'\u0000'+(r.target||'/vendor/etc/selinux/vendor_file_contexts'))).map(k=>{const [f,t,tg]=k.split('\u0000');return {target:tg,from:f,to:t,global:rs.some(x=>x.kind==='red'&&x.pkg==='*'&&x.from===f&&x.to===t&&(x.target||'/vendor/etc/selinux/vendor_file_contexts')===tg)}});
     if(rdCrules.length&&$('rd-ctarget'))$('rd-ctarget').value=rdCrules[0].target;
     rdFrules=uniq(rs.filter(r=>r.kind==='red-path'&&r.from.startsWith('/')).map(r=>r.from+'\u0000'+r.to)).map(k=>{const [f,t]=k.split('\u0000');return {from:f,to:t,global:rs.some(x=>x.kind==='red-path'&&x.pkg==='*'&&x.from===f&&x.to===t)}});
     rdApps=uniq(rs.filter(r=>r.kind==='red'&&r.pkg!=='*').map(r=>r.pkg));
