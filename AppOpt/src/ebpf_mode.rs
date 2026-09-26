@@ -436,8 +436,7 @@ fn release_prop_maps() {
 }
 
 pub(crate) fn ensure_prop_maps() {
-    // 门控改用新格式 prop 规则 (旧 WAYLAY_PROP_UIDS 经重构后不再维护恒空):
-    // 存在 prop 规则才映射属性区文件; 规则清空时释放
+    // 门控: 新格式 prop 规则 (WAYLAY_PROP_RULES, on_fg 按包维护) 存在才映射属性区; 清空时释放
     let has_rules = !crate::rw_read_ignore_poison(&crate::config::WAYLAY_PROP_RULES).is_empty();
     if !has_rules {
         release_prop_maps();

@@ -249,27 +249,13 @@ pub fn save_waylay_rules(rules: &[WaylayRule]) -> io::Result<()> {
     Ok(())
 }
 
-/// 拦截规则列表 (from→to 多组, from/to 等长)
-pub static WAYLAY_RULES: LazyLock<RwLock<Vec<(String, String)>>> =
-    LazyLock::new(|| RwLock::new(vec![("lineage".to_string(), "opluseu".to_string())]));
-/// 目标应用列表 (waylay.conf)
-pub static WAYLAY_APPS: LazyLock<RwLock<Vec<String>>> = LazyLock::new(|| RwLock::new(Vec::new()));
-/// property 区伪装规则列表 (waylay.conf [prop] 段: from→to 等长 ASCII)
+/// property 区伪装规则列表 (新格式 prop 规则; on_fg 按包 set_prop_rules 维护)
 pub static WAYLAY_PROP_RULES: LazyLock<RwLock<Vec<(String, String)>>> =
-    LazyLock::new(|| RwLock::new(Vec::new()));
-/// property 伪装目标应用列表 (waylay.conf [prop] 段 prop_app): 前台命中时
-/// 激活 property 区替换 (独立于 service list 目标应用, 见 WAYLAY_* 同名)
-pub static WAYLAY_PROP_APPS: LazyLock<RwLock<Vec<String>>> =
     LazyLock::new(|| RwLock::new(Vec::new()));
 /// prop 规则 → selinux context 缓存 (原属性名 → context): 初始化/保存时由
 /// property_contexts 解析一次, prop_apply 直接使用 (不再每次读上下文文件)
 pub static WAYLAY_PROP_CTX: LazyLock<RwLock<Vec<(String, String)>>> =
     LazyLock::new(|| RwLock::new(Vec::new()));
-/// property 目标应用 uid 集合 (前台回调据此激活 property 替换)
-pub static WAYLAY_PROP_UIDS: LazyLock<RwLock<HashSet<i32>>> =
-    LazyLock::new(|| RwLock::new(HashSet::new()));
-/// 目标应用 uid 集合 (查 packages.list; 前台回调据此激活拦截)
-pub static WAYLAY_UIDS: LazyLock<RwLock<HashSet<i32>>> = LazyLock::new(|| RwLock::new(HashSet::new()));
 /// waylay 配置已变更 (web 保存后置位; 主循环 EV_CONFIG 分支消费并同步内核)
 pub static WAYLAY_CHANGED: AtomicBool = AtomicBool::new(false);
 /// KPM 武装请求 (拦截页连接/断开): 1=武装(start), -1=解除(stop), 0=无
@@ -284,104 +270,18 @@ pub fn take_kpm_arm_req() -> i8 {
     KPM_ARM_REQ.swap(0, Ordering::AcqRel)
 }
 
-/// 解析 waylay.conf: srv_set <f> <t> 多组; 非 srv_ 行为目标应用包名;
-/// [prop] 段后 prop_set <f> <t> 为属性名替换对 (原属性名→新属性名, 等长)
-pub fn load_waylay() -> (
-    Vec<(String, String)>,
-    Vec<String>,
-    Vec<(String, String)>,
-    Vec<String>,
-) {
-    let mut rules: Vec<(String, String)> = Vec::new();
-    let mut apps: Vec<String> = Vec::new();
-    let mut prop_rules: Vec<(String, String)> = Vec::new();
-    let mut prop_apps: Vec<String> = Vec::new();
-    let mut in_prop = false;
-    if let Ok(content) = std::fs::read_to_string(WAYLAY_FILE) {
-        for line in content.lines() {
-            let t = line.trim();
-            if t.is_empty() || t.starts_with('#') || t.starts_with("//") {
-                continue;
-            }
-            if t == "[prop]" {
-                in_prop = true;
-                continue;
-            }
-            if let Some(rest) = t.strip_prefix("srv_set ") {
-                let mut it = rest.split_whitespace();
-                if let (Some(f), Some(to)) = (it.next(), it.next()) {
-                    rules.push((f.to_string(), to.to_string()));
-                }
-            } else if let Some(rest) = t.strip_prefix("prop_set ") {
-                let mut it = rest.split_whitespace();
-                if let (Some(f), Some(to)) = (it.next(), it.next()) {
-                    prop_rules.push((f.to_string(), to.to_string()));
-                }
-            } else if let Some(rest) = t.strip_prefix("prop_app ") {
-                let pkg = rest.trim().to_string();
-                if !pkg.is_empty() {
-                    prop_apps.push(pkg);
-                }
-            } else if in_prop {
-                // [prop] 段内未知行忽略 (段边界)
-            } else if !t.starts_with("srv_") {
-                apps.push(t.to_string());
-            }
-        }
-    }
-    // 允许全空: 不做默认补全 (空配置 = 不启用拦截)
-    (rules, apps, prop_rules, prop_apps)
-}
 
 /// 目标应用 → uid 集合 (查 packages.list; 未安装跳过)
-pub fn build_waylay_uids(apps: &[String]) -> HashSet<i32> {
-    let mut uids = HashSet::new();
-    if let Ok(content) = std::fs::read_to_string("/data/system/packages.list") {
-        for line in content.lines() {
-            let mut it = line.split_whitespace();
-            let (Some(pkg), Some(uid_s)) = (it.next(), it.next()) else { continue };
-            let Ok(uid) = uid_s.parse::<i32>() else { continue };
-            if uid >= 100000 {
-                continue;
-            }
-            if apps.iter().any(|a| a == pkg) {
-                uids.insert(uid);
-            }
-        }
-    }
-    uids
-}
 
 /// 取出并复位 waylay 变更标志
 pub fn take_waylay_changed() -> bool {
     WAYLAY_CHANGED.swap(false, Ordering::AcqRel)
 }
 
-/* ================= redirect (vendor_file_contexts 伪装) 配置 =================
- * 独立配置文件 redirect.conf (与 applist.conf 同目录):
- *   enabled=1                       内容替换总开关
- *   content_rule <from> <to>        内容替换规则 (等长 ASCII, ≤32)
- *   file_rule <from> <to>           文件重定向规则 (打开 from 路径→重定向到 to 路径)
- */
-// redirect 配置与 waylay 共用 waylay.conf 的 [redirect] 段
-
-/// 解析 redirect.conf: enabled= / content_rule / file_rule
-/// 解析 waylay.conf 的 [redirect] 段: enabled= / content_rule / file_rule.
-/// 无默认保底: 未配置 [redirect] 段 → 禁用 + 空规则。
-/// 校验并清理规则 (供同步内核前调用): 返回 (srv 合法规则, prop 合法规则)
-/// (非空/字符数一致/≤32/ASCII); 有错误行时从静态移除并重写 waylay.conf
-/// (不置 CHANGED, 避免循环)
-/// 启动/重载时把 waylay.conf 加载进静态 (默认 lineage→opluseu 一组 + 空应用表兜底)
-pub fn waylay_load_static() {
-    let (rules, a, prop_rules, prop_apps) = load_waylay();
-    *rw_write_ignore_poison(&WAYLAY_RULES) = rules;
-    *rw_write_ignore_poison(&WAYLAY_APPS) = a.clone();
-    *rw_write_ignore_poison(&WAYLAY_PROP_RULES) = prop_rules;
-    *rw_write_ignore_poison(&WAYLAY_PROP_APPS) = prop_apps.clone();
-    *rw_write_ignore_poison(&WAYLAY_PROP_UIDS) = build_waylay_uids(&prop_apps);
-    *rw_write_ignore_poison(&WAYLAY_UIDS) = build_waylay_uids(&a);
-    rebuild_prop_ctx_cache();
-}
+/* ===== waylay 规则 (新格式 <pkg>=<kind>-<from>-<to>) =====
+ * 加载/保存统一走 load_waylay_rules / save_waylay_rules (WAYLAY_RULES_NEW);
+ * 内容替换 red-<目标>-<from>-<to>, 文件重定向 red-path-<from路径>-<to路径>,
+ * 服务伪装 src-, 属性伪装 prop-; 规则带 pkg (全局为 "*")。 */
 /// 属性名 → selinux context: 读各 property_contexts 取最长匹配前缀的 context
 fn prop_context_for(name: &str) -> Option<String> {
     const FILES: &[&str] = &[

@@ -387,7 +387,7 @@ impl AppState {
             let all = crate::rw_read_ignore_poison(&crate::config::WAYLAY_RULES_NEW);
             let mut i = 0usize;
             for r in all.iter() {
-                if i >= 32 {
+                if i >= 256 {
                     break;
                 }
                 match r.kind {
@@ -661,9 +661,7 @@ fn main() {
 
     init_inotify(&config_file);
 
-    // waylay (service list 拦截伪装) 独立配置: 启动加载 (字符 + 目标应用 uid 集合)
-    crate::config::waylay_load_static();
-    // 配置含 prop 目标应用时提前 mmap 目标 tmpfs 文件 (前台切换零系统调用)
+    // waylay 规则: 启动/重载由 reload() 的 load_waylay_rules 加载 (WAYLAY_RULES_NEW)
     crate::ebpf_mode::ensure_prop_maps();
 
     if web_enable {
