@@ -144,16 +144,29 @@ pub fn load_waylay_rules() -> Vec<WaylayRule> {
             } else {
                 rest.split_once('-').unwrap_or((rest, ""))
             };
-            let Some(kind) = WaylayKind::parse(kind_t) else { continue };
+            let Some(mut kind) = WaylayKind::parse(kind_t) else { continue };
             let mut target = String::new();
             let from: String;
             let to: String;
             if kind == WaylayKind::RedPath {
                 /* red-path 仅文件重定向: red-path-<from路径>-<to路径> (split_once 取首个 '-') */
                 let (f, t) = rr.split_once('-').unwrap_or(("", ""));
-                from = f.trim().to_string();
-                to = t.trim().to_string();
-                if !from.starts_with('/') || !to.starts_with('/') {
+                let f = f.trim();
+                let t = t.trim();
+                if f.starts_with('/') && t.starts_with('/') {
+                    from = f.to_string();
+                    to = t.to_string();
+                } else if f.starts_with('/') && !t.starts_with('/') && t.len() > 2 {
+                    /* 兼容旧错误格式: red-path-<target>-<from>-<to> (内容带目标, 救回) */
+                    if let Some((from1, to1)) = t.split_once('-') {
+                        kind = WaylayKind::Red;
+                        target = f.to_string();
+                        from = from1.to_string();
+                        to = to1.to_string();
+                    } else {
+                        continue;
+                    }
+                } else {
                     continue;   /* 非路径 → 整条丢弃 */
                 }
             } else if kind == WaylayKind::Red {
@@ -198,10 +211,10 @@ pub fn save_waylay_rules(rules: &[WaylayRule]) -> io::Result<()> {
     let mut out = String::from("# waylay 新格式: <包名>=<kind>-<from>-<to>\n");
     out.push_str("# kind: src=服务伪装 prop=属性伪装 red=重定向(内容替换); from/to 等长且不含 '-'\n");
     for r in rules {
-        let prefix = if r.kind == WaylayKind::Red || r.kind == WaylayKind::RedPath {
-            "red-path"
-        } else {
-            r.kind.tag()
+        let prefix = match r.kind {
+            WaylayKind::Red => "red",
+            WaylayKind::RedPath => "red-path",
+            _ => r.kind.tag(),
         };
         if r.kind == WaylayKind::Red {
             /* 内容替换带目标文件: <目标>-<from>-<to> */
