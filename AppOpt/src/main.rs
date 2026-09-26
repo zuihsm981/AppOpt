@@ -362,6 +362,10 @@ impl AppState {
         if let Some(es) = self.ebpf_state.as_ref() {
             if arm {
                 es.bpf.arm();   // vfc 已由 arm 关闭; 规则由前台回调 on_fg 按包激活
+                // red-path 副本权限/上下文同步 (连接时校准)
+                crate::config::sync_redpath_perm(&crate::rw_read_ignore_poison(
+                    &crate::config::WAYLAY_RULES_NEW,
+                ));
             } else {
                 es.bpf.disarm();
                 // 断开把探针摘除 (srv_remove); 重置激活记录 → 下次前台回调重新下发
@@ -383,6 +387,9 @@ impl AppState {
         // save_waylay 更新静态, 下一次前台回调差量生效)
         if crate::config::take_waylay_changed() {
             // 新格式保存: uid→规则 映射已由 save_waylay_rules 重建; 前台回调驱动激活
+            crate::config::sync_redpath_perm(&crate::rw_read_ignore_poison(
+                &crate::config::WAYLAY_RULES_NEW,
+            ));
             crate::ebpf_mode::ensure_prop_maps();
         }
         let cpu_changed = crate::config::take_cpu_rules_changed();

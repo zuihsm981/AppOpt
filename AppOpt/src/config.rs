@@ -351,6 +351,44 @@ fn prop_context_for(name: &str) -> Option<String> {
     best.map(|(_, c)| c)
 }
 
+/// red-path 规则 to 文件: 同步 from 的权限 (DAC mode) 与 SELinux 上下文。
+/// 目的: 重定向后读取者按"读 from 的预期"访问 to —— to 的权限/上下文应与
+/// from 对齐 (同目录场景 base.apk 副本继承 apk 上下文, 读取者即可读)。
+pub fn sync_redpath_perm(rules: &[WaylayRule]) {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    for r in rules.iter().filter(|r| r.kind == WaylayKind::RedPath) {
+        if !std::path::Path::new(&r.to).exists() {
+            continue;
+        }
+        if let Ok(md) = std::fs::metadata(&r.from) {
+            let _ = std::fs::set_permissions(&r.to, std::fs::Permissions::from_mode(md.mode() & 0o7777));
+        }
+        let cf = std::ffi::CString::new(r.from.as_str()).unwrap_or_default();
+        let ct = std::ffi::CString::new(r.to.as_str()).unwrap_or_default();
+        let cn = std::ffi::CString::new("security.selinux").unwrap_or_default();
+        let mut buf = [0u8; 256];
+        let n = unsafe {
+            libc::getxattr(
+                cf.as_ptr(),
+                cn.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+            )
+        };
+        if n > 0 {
+            unsafe {
+                libc::lsetxattr(
+                    ct.as_ptr(),
+                    cn.as_ptr(),
+                    buf.as_ptr() as *const libc::c_void,
+                    n as usize,
+                    0,
+                );
+            }
+        }
+    }
+}
+
 /// 按包临时设置 prop 替换规则 (前台驱动): 更新 WAYLAY_PROP_RULES + 重建 ctx 缓存
 pub fn set_prop_rules(rules: &[(String, String)]) {
     *rw_write_ignore_poison(&WAYLAY_PROP_RULES) = rules.to_vec();
