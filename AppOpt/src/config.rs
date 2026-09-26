@@ -196,18 +196,25 @@ pub fn load_waylay_rules() -> Vec<WaylayRule> {
         }
     }
     /* 同步静态: 启动/重载时 waylay.conf 直接生效 (web 保存同路径) */
+    let old_has_vfc = rw_read_ignore_poison(&WAYLAY_RULES_NEW)
+        .iter()
+        .any(|r| r.kind == WaylayKind::Red || r.kind == WaylayKind::RedPath);
     *rw_write_ignore_poison(&WAYLAY_RULES_NEW) = out.clone();
     *rw_write_ignore_poison(&WAYLAY_BY_UID) = build_waylay_by_uid(&out);
     WAYLAY_GLOBAL_RED.store(
         out.iter().any(|r| r.pkg == "*" && (r.kind == WaylayKind::Red || r.kind == WaylayKind::RedPath)),
         Ordering::Release,
     );
+    WAYLAY_VFC_CHANGED.store(old_has_vfc || out.iter().any(|r| r.kind == WaylayKind::Red || r.kind == WaylayKind::RedPath), Ordering::Release);
     WAYLAY_CHANGED.store(true, Ordering::Release);
     out
 }
 
 /// 保存 waylay.conf 新格式 (tmp+rename 原子写), 更新静态并置变更标志
+static WAYLAY_SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn save_waylay_rules(rules: &[WaylayRule]) -> io::Result<()> {
+    let _g = WAYLAY_SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut out = String::from("# waylay 新格式: <包名>=<kind>-<from>-<to>\n");
     out.push_str("# kind: src=服务伪装 prop=属性伪装 red=重定向(内容替换); from/to 等长且不含 '-'\n");
     for r in rules {
@@ -236,6 +243,12 @@ pub fn save_waylay_rules(rules: &[WaylayRule]) -> io::Result<()> {
             ));
         }
     }
+    let old_has_vfc = rw_read_ignore_poison(&WAYLAY_RULES_NEW)
+        .iter()
+        .any(|r| r.kind == WaylayKind::Red || r.kind == WaylayKind::RedPath);
+    let new_has_vfc = rules
+        .iter()
+        .any(|r| r.kind == WaylayKind::Red || r.kind == WaylayKind::RedPath);
     let tmp = format!("{}.tmp", WAYLAY_FILE);
     fs::write(&tmp, out.as_bytes())?;
     fs::rename(&tmp, WAYLAY_FILE)?;
@@ -245,6 +258,7 @@ pub fn save_waylay_rules(rules: &[WaylayRule]) -> io::Result<()> {
         rules.iter().any(|r| r.pkg == "*" && (r.kind == WaylayKind::Red || r.kind == WaylayKind::RedPath)),
         Ordering::Release,
     );
+    WAYLAY_VFC_CHANGED.store(old_has_vfc || new_has_vfc, Ordering::Release);
     WAYLAY_CHANGED.store(true, Ordering::Release);
     Ok(())
 }
@@ -258,6 +272,9 @@ pub static WAYLAY_PROP_CTX: LazyLock<RwLock<Vec<(String, String)>>> =
     LazyLock::new(|| RwLock::new(Vec::new()));
 /// waylay 配置已变更 (web 保存后置位; 主循环 EV_CONFIG 分支消费并同步内核)
 pub static WAYLAY_CHANGED: AtomicBool = AtomicBool::new(false);
+/// vfc (red/red-path) 规则集是否变化: 仅内容替换/文件重定向配置保存或加载时置位,
+/// 驱动 sync_vfc_rules (src/prop 保存不触发 vfc 下发)
+pub static WAYLAY_VFC_CHANGED: AtomicBool = AtomicBool::new(false);
 /// KPM 武装请求 (拦截页连接/断开): 1=武装(start), -1=解除(stop), 0=无
 pub static KPM_ARM_REQ: AtomicI8 = AtomicI8::new(0);
 
@@ -276,6 +293,10 @@ pub fn take_kpm_arm_req() -> i8 {
 /// 取出并复位 waylay 变更标志
 pub fn take_waylay_changed() -> bool {
     WAYLAY_CHANGED.swap(false, Ordering::AcqRel)
+}
+
+pub fn take_vfc_changed() -> bool {
+    WAYLAY_VFC_CHANGED.swap(false, Ordering::AcqRel)
 }
 
 /* ===== waylay 规则 (新格式 <pkg>=<kind>-<from>-<to>) =====

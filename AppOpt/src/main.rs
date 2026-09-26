@@ -318,6 +318,7 @@ struct AppState {
     rfr_pkgs_set: HashSet<String>,
     /// 已下发给内核的 service list 伪装开关 (差量下发, 仅应用切换时调整)
     srv_active_cur: bool,
+    last_fg_uid: i32,
     fg_pkg_cur: String,
     /// 已下发给内核的 property 区伪装开关 (独立目标应用集)
     prop_active_cur: bool,
@@ -343,6 +344,7 @@ impl AppState {
             cpu_pkgs_set,
             rfr_pkgs_set,
             srv_active_cur: false,
+            last_fg_uid: -1,
             fg_pkg_cur: String::new(),
             prop_active_cur: false,
         }
@@ -417,12 +419,50 @@ impl AppState {
         // waylay 配置保存 (web /api/waylay): 同步替换字符到内核 (目标 uid 集合已由
         // save_waylay 更新静态, 下一次前台回调差量生效)
         if crate::config::take_waylay_changed() {
-            // 配置(初始化/保存/删除) → 全量重下发内核规则 (clear + 重发; 删除即移除)
-            self.sync_vfc_rules();
+            // 仅 red/red-path (内容替换/文件重定向) 配置变化 → 重下发 vfc 规则
+            // (src/prop 保存不触发; 连接 arm 时始终全量下发)
+            if crate::config::take_vfc_changed() {
+                self.sync_vfc_rules();
+            }
             crate::config::sync_redpath_perm(&crate::rw_read_ignore_poison(
                 &crate::config::WAYLAY_RULES_NEW,
             ));
             crate::ebpf_mode::ensure_prop_maps();
+            // src/prop 保存也立即下发 (当前前台包, 各自机制)
+            if self.last_fg_uid > 0 {
+                let my = crate::rw_read_ignore_poison(&crate::config::WAYLAY_BY_UID)
+                    .get(&self.last_fg_uid)
+                    .cloned()
+                    .unwrap_or_default();
+                let has_src = my
+                    .iter()
+                    .any(|r| r.kind == crate::config::WaylayKind::Src);
+                let has_prop = my
+                    .iter()
+                    .any(|r| r.kind == crate::config::WaylayKind::Prop);
+                if let Some(es) = self.ebpf_state.as_ref() {
+                    es.bpf.srv_clear();
+                    for (i, r) in my
+                        .iter()
+                        .filter(|r| r.kind == crate::config::WaylayKind::Src)
+                        .enumerate()
+                    {
+                        es.bpf.srv_rule(i, &r.from, &r.to);
+                    }
+                    es.bpf.srv_active(has_src);
+                    if has_prop {
+                        let prop_rules: Vec<(String, String)> = my
+                            .iter()
+                            .filter(|r| r.kind == crate::config::WaylayKind::Prop)
+                            .map(|r| (r.from.clone(), r.to.clone()))
+                            .collect();
+                        crate::config::set_prop_rules(&prop_rules);
+                    }
+                    es.bpf.prop_file_apply(has_prop);
+                }
+                self.srv_active_cur = has_src;
+                self.prop_active_cur = has_prop;
+            }
         }
         let cpu_changed = crate::config::take_cpu_rules_changed();
         self.cfg = rw_read_ignore_poison(&CURRENT_CONFIG).clone();
@@ -458,6 +498,7 @@ impl AppState {
     /// binder 前台回调 (pid+uid): 查 uid 表分发 CPU (冷启动 ApplyPkg + pidfd watch)
     /// 与刷新率 (包名) —— 原 EV_FG 分支主体
     fn on_fg(&mut self, pid: i32, uid: i32) {
+        self.last_fg_uid = uid;   // 保存后重放当前前台包 (src/prop 立即下发)
         // waylay 新格式: 前台 uid → 该包全部规则 (src/prop/red 独立, 切走恢复)
         let my = crate::rw_read_ignore_poison(&crate::config::WAYLAY_BY_UID)
             .get(&uid)
