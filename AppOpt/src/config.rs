@@ -49,6 +49,137 @@ pub fn request_config_reload() {
  *                          ASCII ≤92, 每 pair 一行)
  */
 pub const WAYLAY_FILE: &str = "waylay.conf";
+
+/* ================= waylay.conf 新格式 (目标应用独立) =================
+ * 每行: <包名>=<kind>-<from>-<to>
+ *   kind = src       系统服务伪装 (from 服务名 → to 服务名, 等长)
+ *        | prop      系统属性伪装 (from 完整属性名 → to 属性名, 等长)
+ *        | red       重定向/内容替换 (from → to, 等长)
+ *        | red-path  重定向/文件重定向 (from 原路径 → to 新路径, 不限长度)
+ * 前台回调节省: 仅该包名应用在前台时激活其规则; 切走恢复 (vfc off 摘 hook)。
+ */
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum WaylayKind {
+    Src,
+    Prop,
+    Red,
+    RedPath,
+}
+impl WaylayKind {
+    pub fn tag(&self) -> &'static str {
+        match self {
+            WaylayKind::Src => "src",
+            WaylayKind::Prop => "prop",
+            WaylayKind::Red => "red",
+            WaylayKind::RedPath => "red-path",
+        }
+    }
+    pub fn parse(t: &str) -> Option<WaylayKind> {
+        match t {
+            "src" => Some(WaylayKind::Src),
+            "prop" => Some(WaylayKind::Prop),
+            "red" => Some(WaylayKind::Red),
+            "red-path" => Some(WaylayKind::RedPath),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct WaylayRule {
+    pub pkg: String,
+    pub kind: WaylayKind,
+    pub from: String,
+    pub to: String,
+}
+
+pub static WAYLAY_RULES_NEW: LazyLock<RwLock<Vec<WaylayRule>>> =
+    LazyLock::new(|| RwLock::new(Vec::new()));
+/// uid → 该 uid 所属包的全部规则 (新格式按包激活; save 时重建)
+pub static WAYLAY_BY_UID: LazyLock<RwLock<HashMap<i32, Vec<WaylayRule>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// 重建 uid→规则 映射 (packages.list: uid→包名; 规则按包名匹配)
+pub fn build_waylay_by_uid(rules: &[WaylayRule]) -> HashMap<i32, Vec<WaylayRule>> {
+    let mut m: HashMap<String, Vec<WaylayRule>> = HashMap::new();
+    for r in rules {
+        m.entry(r.pkg.clone()).or_default().push(r.clone());
+    }
+    let mut out: HashMap<i32, Vec<WaylayRule>> = HashMap::new();
+    if let Ok(content) = std::fs::read_to_string("/data/system/packages.list") {
+        for line in content.lines() {
+            let mut it = line.split_whitespace();
+            let (Some(pkg), Some(uid_s)) = (it.next(), it.next()) else { continue };
+            let Ok(uid) = uid_s.parse::<i32>() else { continue };
+            if uid < 100000 {
+                if let Some(r) = m.get(pkg) {
+                    out.insert(uid, r.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 解析 waylay.conf 新格式: <pkg>=<kind>-<from>-<to> (旧 srv_set/包名行/[prop]/[redirect] 废弃)
+pub fn load_waylay_rules() -> Vec<WaylayRule> {
+    let mut out: Vec<WaylayRule> = Vec::new();
+    if let Ok(content) = std::fs::read_to_string(WAYLAY_FILE) {
+        for line in content.lines() {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') || t.starts_with("//") {
+                continue;
+            }
+            let Some((pkg, rest)) = t.split_once('=') else { continue };
+            let pkg = pkg.trim().to_string();
+            if pkg.is_empty() {
+                continue;
+            }
+            let (kind_t, rr) = if let Some(r) = rest.strip_prefix("red-path-") {
+                ("red-path", r)
+            } else {
+                rest.split_once('-').unwrap_or((rest, ""))
+            };
+            let Some(kind) = WaylayKind::parse(kind_t) else { continue };
+            let (from, to) = rr.split_once('-').unwrap_or(("", ""));
+            let from = from.trim();
+            let to = to.trim();
+            if from.is_empty() || to.is_empty() {
+                continue;
+            }
+            out.push(WaylayRule {
+                pkg: pkg.clone(),
+                kind,
+                from: from.to_string(),
+                to: to.to_string(),
+            });
+        }
+    }
+    out
+}
+
+/// 保存 waylay.conf 新格式 (tmp+rename 原子写), 更新静态并置变更标志
+pub fn save_waylay_rules(rules: &[WaylayRule]) -> io::Result<()> {
+    let mut out = String::from("# waylay 新格式: <包名>=<kind>-<from>-<to>\n");
+    out.push_str("# kind: src=服务伪装 prop=属性伪装 red=重定向(内容替换); from/to 等长且不含 '-'\n");
+    for r in rules {
+        out.push_str(&format!(
+            "{}= {}-{}-{}\n",
+            r.pkg.trim(),
+            r.kind.tag(),
+            r.from.trim(),
+            r.to.trim()
+        ));
+    }
+    let tmp = format!("{}.tmp", WAYLAY_FILE);
+    fs::write(&tmp, out.as_bytes())?;
+    fs::rename(&tmp, WAYLAY_FILE)?;
+    *rw_write_ignore_poison(&WAYLAY_RULES_NEW) = rules.to_vec();
+    *rw_write_ignore_poison(&WAYLAY_BY_UID) = build_waylay_by_uid(rules);
+    WAYLAY_CHANGED.store(true, Ordering::Release);
+    Ok(())
+}
+
 /// 拦截规则列表 (from→to 多组, from/to 等长)
 pub static WAYLAY_RULES: LazyLock<RwLock<Vec<(String, String)>>> =
     LazyLock::new(|| RwLock::new(vec![("lineage".to_string(), "opluseu".to_string())]));
@@ -152,74 +283,6 @@ pub fn build_waylay_uids(apps: &[String]) -> HashSet<i32> {
     uids
 }
 
-/// 保存 waylay.conf (tmp+rename 原子写), 更新静态并置变更标志
-pub fn save_waylay(
-    rules: &[(String, String)],
-    apps: &[String],
-    prop_rules: &[(String, String)],
-    prop_apps: &[String],
-) -> io::Result<()> {
-    let mut out = String::from("# 注意:手动添加不生效，需要在webui中添加\n");
-    out.push_str("# waylay: service list / prop 伪装配置\n");
-    out.push_str("# srv_set <拦截> <替换> 每组一行 (字符数一致)\n");
-    for (f, t) in rules {
-        out.push_str(&format!("srv_set {} {}\n", f.trim(), t.trim()));
-    }
-    out.push_str("# 目标应用 (前台时激活拦截), 包名一行一个\n");
-    for a in apps {
-        out.push_str(&format!("{}\n", a.trim()));
-    }
-    if !prop_rules.is_empty() {
-        out.push_str("# [prop] 属性名替换对: prop_set <原属性名> <新属性名> (完整名, 等长 ASCII)\n[prop]\n");
-        for (f, t) in prop_rules {
-            out.push_str(&format!("prop_set {} {}\n", f.trim(), t.trim()));
-        }
-        if !prop_apps.is_empty() {
-            out.push_str("# prop 目标应用 (前台时激活 prop 替换), 包名一行一个\n");
-            for a in prop_apps {
-                out.push_str(&format!("prop_app {}\n", a.trim()));
-            }
-        }
-    }
-    // 保留 redirect 配置段 (共用 waylay.conf): 原 [redirect] 段整体保留
-    if let Ok(content) = std::fs::read_to_string(WAYLAY_FILE) {
-        let mut keep_red = String::new();
-        let mut in_red = false;
-        for line in content.lines() {
-            let t = line.trim();
-            if t == "[redirect]" {
-                in_red = true;
-                keep_red.push_str(line);
-                keep_red.push('\n');
-                continue;
-            }
-            if in_red && t.starts_with('[') {
-                in_red = false;
-            }
-            if in_red {
-                keep_red.push_str(line);
-                keep_red.push('\n');
-            }
-        }
-        if !keep_red.is_empty() {
-            out.push('\n');
-            out.push_str(&keep_red);
-        }
-    }
-    let tmp = format!("{}.tmp", WAYLAY_FILE);
-    fs::write(&tmp, out.as_bytes())?;
-    fs::rename(&tmp, WAYLAY_FILE)?;
-    *rw_write_ignore_poison(&WAYLAY_RULES) = rules.to_vec();
-    *rw_write_ignore_poison(&WAYLAY_APPS) = apps.to_vec();
-    *rw_write_ignore_poison(&WAYLAY_PROP_RULES) = prop_rules.to_vec();
-    *rw_write_ignore_poison(&WAYLAY_PROP_APPS) = prop_apps.to_vec();
-    *rw_write_ignore_poison(&WAYLAY_PROP_UIDS) = build_waylay_uids(prop_apps);
-    *rw_write_ignore_poison(&WAYLAY_UIDS) = build_waylay_uids(apps);
-    rebuild_prop_ctx_cache();
-    WAYLAY_CHANGED.store(true, Ordering::Release);
-    Ok(())
-}
-
 /// 取出并复位 waylay 变更标志
 pub fn take_waylay_changed() -> bool {
     WAYLAY_CHANGED.swap(false, Ordering::AcqRel)
@@ -232,176 +295,13 @@ pub fn take_waylay_changed() -> bool {
  *   file_rule <from> <to>           文件重定向规则 (打开 from 路径→重定向到 to 路径)
  */
 // redirect 配置与 waylay 共用 waylay.conf 的 [redirect] 段
-pub static REDIRECT_CRULES: LazyLock<RwLock<Vec<(String, String)>>> =
-    LazyLock::new(|| RwLock::new(Vec::new()));
-pub static REDIRECT_FRULES: LazyLock<RwLock<Vec<(String, String)>>> =
-    LazyLock::new(|| RwLock::new(Vec::new()));
-pub static REDIRECT_ENABLED: AtomicBool = AtomicBool::new(false);
-pub static REDIRECT_CHANGED: AtomicBool = AtomicBool::new(false);
 
 /// 解析 redirect.conf: enabled= / content_rule / file_rule
 /// 解析 waylay.conf 的 [redirect] 段: enabled= / content_rule / file_rule.
 /// 无默认保底: 未配置 [redirect] 段 → 禁用 + 空规则。
-pub fn load_redirect() -> (bool, Vec<(String, String)>, Vec<(String, String)>) {
-    let mut enabled = false;
-    let mut crules: Vec<(String, String)> = Vec::new();
-    let mut frules: Vec<(String, String)> = Vec::new();
-    let mut in_red = false;
-    if let Ok(content) = std::fs::read_to_string(WAYLAY_FILE) {
-        for line in content.lines() {
-            let t = line.trim();
-            if t.is_empty() || t.starts_with('#') || t.starts_with("//") {
-                continue;
-            }
-            if t == "[redirect]" {
-                in_red = true;
-                continue;
-            }
-            if t.starts_with('[') {
-                in_red = false;
-                continue;
-            }
-            if !in_red {
-                continue;
-            }
-            if let Some(rest) = t.strip_prefix("enabled=") {
-                enabled = rest.trim() == "1";
-            } else if let Some(rest) = t.strip_prefix("content_rule ") {
-                let mut it = rest.split_whitespace();
-                if let (Some(f), Some(to)) = (it.next(), it.next()) {
-                    crules.push((f.to_string(), to.to_string()));
-                }
-            } else if let Some(rest) = t.strip_prefix("file_rule ") {
-                let mut it = rest.split_whitespace();
-                if let (Some(f), Some(to)) = (it.next(), it.next()) {
-                    frules.push((f.to_string(), to.to_string()));
-                }
-            }
-        }
-    }
-    (enabled, crules, frules)
-}
-
-/// 保存 redirect 段到 waylay.conf (保留原 waylay 非 [redirect] 内容, tmp+rename 原子写),
-/// 更新静态并置变更标志
-pub fn save_redirect(
-    enabled: bool,
-    crules: &[(String, String)],
-    frules: &[(String, String)],
-) -> io::Result<()> {
-    let mut out = String::new();
-    if let Ok(content) = std::fs::read_to_string(WAYLAY_FILE) {
-        let mut drop = false;
-        for line in content.lines() {
-            let t = line.trim();
-            if t == "[redirect]" {
-                drop = true;
-                continue;
-            }
-            if drop && t.starts_with('[') {
-                drop = false;
-            }
-            if !drop {
-                out.push_str(line);
-                out.push('\n');
-            }
-        }
-    }
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push_str("[redirect]\n");
-    out.push_str(&format!("enabled={}\n", if enabled { 1 } else { 0 }));
-    for (f, t) in crules {
-        out.push_str(&format!("content_rule {} {}\n", f.trim(), t.trim()));
-    }
-    for (f, t) in frules {
-        out.push_str(&format!("file_rule {} {}\n", f.trim(), t.trim()));
-    }
-    let tmp = format!("{}.tmp", WAYLAY_FILE);
-    fs::write(&tmp, out.as_bytes())?;
-    fs::rename(&tmp, WAYLAY_FILE)?;
-    *rw_write_ignore_poison(&REDIRECT_CRULES) = crules.to_vec();
-    *rw_write_ignore_poison(&REDIRECT_FRULES) = frules.to_vec();
-    REDIRECT_ENABLED.store(enabled, Ordering::Release);
-    REDIRECT_CHANGED.store(true, Ordering::Release);
-    Ok(())
-}
-
-pub fn take_redirect_changed() -> bool {
-    REDIRECT_CHANGED.swap(false, Ordering::AcqRel)
-}
-
 /// 校验并清理规则 (供同步内核前调用): 返回 (srv 合法规则, prop 合法规则)
 /// (非空/字符数一致/≤32/ASCII); 有错误行时从静态移除并重写 waylay.conf
 /// (不置 CHANGED, 避免循环)
-pub fn waylay_sanitize_rules() -> Vec<(String, String)> {
-    // 返回 srv 规则 (sync 下发内核用); prop 规则/prop 应用清理作为副作用
-    // 同步到静态 (WAYLAY_PROP_RULES / WAYLAY_PROP_APPS), prop_file_apply 读取
-    let valid32 = |f: &str, t: &str| {
-        !f.is_empty() && f.len() == t.len() && f.len() <= 32 && f.is_ascii() && t.is_ascii()
-    };
-    let valid92 = |f: &str, t: &str| {
-        !f.is_empty() && f.len() == t.len() && f.len() <= 92 && f.is_ascii() && t.is_ascii()
-    };
-    let apps = rw_read_ignore_poison(&WAYLAY_APPS).clone();
-    let dirty = rw_read_ignore_poison(&WAYLAY_RULES).clone();
-    let dprop = rw_read_ignore_poison(&WAYLAY_PROP_RULES).clone();
-    let dpropapps = rw_read_ignore_poison(&WAYLAY_PROP_APPS).clone();
-    let clean: Vec<(String, String)> = dirty
-        .iter()
-        .filter(|(f, t)| valid32(f, t))
-        .cloned()
-        .collect();
-    let clean_prop: Vec<(String, String)> = dprop
-        .iter()
-        .filter(|(f, t)| valid92(f, t))
-        .cloned()
-        .collect();
-    let clean_prop_apps: Vec<String> = dpropapps
-        .iter()
-        .filter(|p| !p.trim().is_empty() && p.len() <= 256)
-        .map(|p| p.trim().to_string())
-        .collect();
-    if clean.len() != dirty.len()
-        || clean_prop.len() != dprop.len()
-        || clean_prop_apps.len() != dpropapps.len()
-    {
-        *rw_write_ignore_poison(&WAYLAY_RULES) = clean.clone();
-        *rw_write_ignore_poison(&WAYLAY_PROP_RULES) = clean_prop.clone();
-        *rw_write_ignore_poison(&WAYLAY_PROP_APPS) = clean_prop_apps.clone();
-        // 重写 waylay.conf (移除错误行): 不置 CHANGED/不重建 UIDS
-        let mut out = String::from("# 注意:手动添加不生效，需要在webui中添加\n");
-        out.push_str("# waylay: service list / prop 伪装配置\n");
-        out.push_str("# srv_set <拦截> <替换> 每组一行 (字符数一致)\n");
-        for (f, t) in &clean {
-            out.push_str(&format!("srv_set {} {}\n", f.trim(), t.trim()));
-        }
-        out.push_str("# 目标应用 (前台时激活拦截), 包名一行一个\n");
-        for a in &apps {
-            out.push_str(&format!("{}\n", a.trim()));
-        }
-        if !clean_prop.is_empty() {
-            out.push_str("# [prop] 属性名替换对: prop_set <原属性名> <新属性名> (完整名, 等长 ASCII)\n[prop]\n");
-            for (f, t) in &clean_prop {
-                out.push_str(&format!("prop_set {} {}\n", f.trim(), t.trim()));
-            }
-            if !clean_prop_apps.is_empty() {
-                out.push_str("# prop 目标应用 (前台时激活 prop 替换), 包名一行一个\n");
-                for a in &clean_prop_apps {
-                    out.push_str(&format!("prop_app {}\n", a.trim()));
-                }
-            }
-        }
-        let tmp = format!("{}.tmp", WAYLAY_FILE);
-        if fs::write(&tmp, out.as_bytes()).is_ok() {
-            let _ = fs::rename(&tmp, WAYLAY_FILE);
-        }
-    }
-    drop((clean_prop, clean_prop_apps));   /* 清理副作用已同步静态 */
-    clean
-}
-
 /// 启动/重载时把 waylay.conf 加载进静态 (默认 lineage→opluseu 一组 + 空应用表兜底)
 pub fn waylay_load_static() {
     let (rules, a, prop_rules, prop_apps) = load_waylay();
@@ -442,6 +342,12 @@ fn prop_context_for(name: &str) -> Option<String> {
         }
     }
     best.map(|(_, c)| c)
+}
+
+/// 按包临时设置 prop 替换规则 (前台驱动): 更新 WAYLAY_PROP_RULES + 重建 ctx 缓存
+pub fn set_prop_rules(rules: &[(String, String)]) {
+    *rw_write_ignore_poison(&WAYLAY_PROP_RULES) = rules.to_vec();
+    rebuild_prop_ctx_cache();
 }
 
 /// 解析并缓存 prop 规则 → context 映射 (WAYLAY_PROP_CTX): 初始化/保存配置后

@@ -168,7 +168,8 @@ impl KpmHandle {
     pub(crate) fn arm(&self) {
         self.cmd("start");
         ensure_prop_maps();   // 连接时提前 mmap 目标 tmpfs 文件并保持
-        self.vfc_apply();     // vendor_file_contexts 伪装 (内容替换)
+        // vfc 伪装有前台回调驱动 (on_fg 按包 vfc_on/off), 连接仅确保关闭
+        self.vfc_disable();
     }
 
     /// 解除武装 (stop: 摘除全部业务探针 + 恢复 vendor_file_contexts 读取)

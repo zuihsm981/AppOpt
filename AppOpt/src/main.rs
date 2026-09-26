@@ -318,6 +318,7 @@ struct AppState {
     rfr_pkgs_set: HashSet<String>,
     /// 已下发给内核的 service list 伪装开关 (差量下发, 仅应用切换时调整)
     srv_active_cur: bool,
+    red_active_cur: bool,
     /// 已下发给内核的 property 区伪装开关 (独立目标应用集)
     prop_active_cur: bool,
 }
@@ -342,6 +343,7 @@ impl AppState {
             cpu_pkgs_set,
             rfr_pkgs_set,
             srv_active_cur: false,
+            red_active_cur: false,
             prop_active_cur: false,
         }
     }
@@ -359,9 +361,7 @@ impl AppState {
         }
         if let Some(es) = self.ebpf_state.as_ref() {
             if arm {
-                es.bpf.arm();
-                self.sync_waylay_rules();
-                self.sync_vfc_rules();
+                es.bpf.arm();   // vfc 已由 arm 关闭; 规则由前台回调 on_fg 按包激活
             } else {
                 es.bpf.disarm();
                 // 断开把探针摘除 (srv_remove); 重置激活记录 → 下次前台回调重新下发
@@ -369,40 +369,6 @@ impl AppState {
                 self.srv_active_cur = false;
             }
             crate::web::KPM_ARMED.store(arm, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-
-    /// 同步 redirect (vendor_file_contexts 伪装) 规则到内核: 内容替换规则
-    /// (vfc_crule) + 文件重定向规则 (vfc_frule); enabled 决定 vfc on/off
-    fn sync_vfc_rules(&self) {
-        if let Some(es) = self.ebpf_state.as_ref() {
-            let (enabled, crules, frules) = crate::config::load_redirect();
-            es.bpf.vfc_crule_clear();
-            for (i, (f, t)) in crules.iter().enumerate() {
-                es.bpf.vfc_crule(i, f, t);
-            }
-            es.bpf.vfc_frule_clear();
-            for (i, (f, t)) in frules.iter().enumerate() {
-                es.bpf.vfc_frule(i, f, t);
-            }
-            if enabled {
-                es.bpf.vfc_apply();
-            } else {
-                es.bpf.vfc_disable();
-            }
-        }
-    }
-
-    /// 同步 waylay 规则到内核: 同步前校验并移除错误行 (手动编辑 waylay.conf 的
-    /// 错误配置行不会下发; 自动保存路径同样经此兜底)
-    fn sync_waylay_rules(&self) {
-        if let Some(es) = self.ebpf_state.as_ref() {
-            let rules = crate::config::waylay_sanitize_rules();
-            es.bpf.srv_clear();
-            for (i, (f, t)) in rules.iter().enumerate() {
-                es.bpf.srv_rule(i, f, t);
-            }
-            // property 区伪装为纯用户态文件写 (prop_file_apply), 无需下发内核
         }
     }
 
@@ -416,13 +382,8 @@ impl AppState {
         // waylay 配置保存 (web /api/waylay): 同步替换字符到内核 (目标 uid 集合已由
         // save_waylay 更新静态, 下一次前台回调差量生效)
         if crate::config::take_waylay_changed() {
-            self.sync_waylay_rules();
-            // 保存后: 新 prop 规则/应用提前映射
+            // 新格式保存: uid→规则 映射已由 save_waylay_rules 重建; 前台回调驱动激活
             crate::ebpf_mode::ensure_prop_maps();
-        }
-        // redirect (vendor_file_contexts 伪装) 配置保存: 重新下发规则 + 启停
-        if crate::config::take_redirect_changed() {
-            self.sync_vfc_rules();
         }
         let cpu_changed = crate::config::take_cpu_rules_changed();
         self.cfg = rw_read_ignore_poison(&CURRENT_CONFIG).clone();
@@ -458,24 +419,58 @@ impl AppState {
     /// binder 前台回调 (pid+uid): 查 uid 表分发 CPU (冷启动 ApplyPkg + pidfd watch)
     /// 与刷新率 (包名) —— 原 EV_FG 分支主体
     fn on_fg(&mut self, pid: i32, uid: i32) {
-        // service list 伪装: 前台回调驱动开关 —— 前台 uid 命中 waylay 目标应用集
-        // (waylay.conf, 默认空 → 不激活), 命中则激活无差别替换, 否则关闭;
-        // 差量下发: 仅状态变化才发 supercall (幂等, 避免每次回调冗余往返);
-        // 时机先于应用的业务查询, 不晚
-        let want = crate::rw_read_ignore_poison(&crate::config::WAYLAY_UIDS).contains(&uid);
-        if want != self.srv_active_cur {
-            self.srv_active_cur = want;
+        // waylay 新格式: 前台 uid → 该包全部规则 (src/prop/red 独立, 切走恢复)
+        let my = crate::rw_read_ignore_poison(&crate::config::WAYLAY_BY_UID)
+            .get(&uid)
+            .cloned()
+            .unwrap_or_default();
+        let active = !my.is_empty();
+        // ---- src (系统服务伪装): 该包 src 规则 + 开关 ----
+        if active != self.srv_active_cur {
+            self.srv_active_cur = active;
             if let Some(es) = self.ebpf_state.as_ref() {
-                es.bpf.srv_active(want);
+                if active {
+                    es.bpf.srv_clear();
+                    for (i, r) in my.iter().filter(|r| r.kind == crate::config::WaylayKind::Src).enumerate() {
+                        es.bpf.srv_rule(i, &r.from, &r.to);
+                    }
+                }
+                es.bpf.srv_active(active);
             }
         }
-        // property 区伪装: 独立目标应用集 (prop 目标应用前台替换, 切走恢复)
-        let want_prop =
-            crate::rw_read_ignore_poison(&crate::config::WAYLAY_PROP_UIDS).contains(&uid);
+        // ---- red (重定向/内容替换): 该包 red 规则 + vfc on/off (off 摘 hook, 零回调) ----
+        if active != self.red_active_cur {
+            self.red_active_cur = active;
+            if let Some(es) = self.ebpf_state.as_ref() {
+                if active {
+                    es.bpf.vfc_crule_clear();
+                    es.bpf.vfc_frule_clear();
+                    for (i, r) in my.iter().filter(|r| r.kind == crate::config::WaylayKind::Red).enumerate() {
+                        es.bpf.vfc_crule(i, &r.from, &r.to);
+                    }
+                    for (i, r) in my.iter().filter(|r| r.kind == crate::config::WaylayKind::RedPath).enumerate() {
+                        es.bpf.vfc_frule(i, &r.from, &r.to);
+                    }
+                    es.bpf.vfc_apply();    // vfc off→on (挂 hook)
+                } else {
+                    es.bpf.vfc_disable();  // vfc off (摘 hook, 非前台零回调)
+                }
+            }
+        }
+        // prop (系统属性伪装): 该包 prop 规则前台激活, 切走恢复 (用户态 tmpfs 写替换)
+        let prop_rules: Vec<(String, String)> = my
+            .iter()
+            .filter(|r| r.kind == crate::config::WaylayKind::Prop)
+            .map(|r| (r.from.clone(), r.to.clone()))
+            .collect();
+        let want_prop = !prop_rules.is_empty();
         if want_prop != self.prop_active_cur {
             self.prop_active_cur = want_prop;
             if let Some(es) = self.ebpf_state.as_ref() {
-                es.bpf.prop_file_apply(want_prop);   // 用户态文件写替换
+                if want_prop {
+                    crate::config::set_prop_rules(&prop_rules);
+                }
+                es.bpf.prop_file_apply(want_prop);
             }
         }
         let Some(e) = self.uid_map.get(&uid) else { return };

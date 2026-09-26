@@ -217,8 +217,6 @@ fn dispatch(out: &mut TcpStream, req: &Request) {
         ("GET", "/api/refresh/status") => (200, refresh_status_json()),
         ("GET", "/api/refresh/config") => (200, refresh_config_json()),
         ("POST", "/api/refresh/config") => refresh_config_set_api(req),
-        ("GET", "/api/redirect") => (200, redirect_json()),
-        ("POST", "/api/redirect") => redirect_set_api(req),
         ("GET", "/api/waylay") => (200, waylay_json()),
         // webui 不可见 (visibilitychange hidden) 时前端触发: 提前映射 prop 目标文件
         ("GET", "/api/propmap") | ("POST", "/api/propmap") => {
@@ -831,74 +829,28 @@ pub fn settings_save() {
 // ===== waylay (service list 拦截伪装) Web API =====
 
 /// GET /api/waylay: 当前配置 (多组规则) + KPM 连接状态
-fn redirect_json() -> String {
-    let (enabled, crules, frules) = crate::config::load_redirect();
-    let c: Vec<serde_json::Value> = crules
-        .iter()
-        .map(|(f, t)| serde_json::json!({"from": f, "to": t}))
-        .collect();
-    let f: Vec<serde_json::Value> = frules
-        .iter()
-        .map(|(f, t)| serde_json::json!({"from": f, "to": t}))
-        .collect();
-    serde_json::json!({"enabled": enabled, "content_rules": c, "file_rules": f}).to_string()
-}
-
-fn redirect_set_api(req: &Request) -> (u16, String) {
-    let v: serde_json::Value = match serde_json::from_slice(&req.body) {
-        Ok(v) => v,
-        Err(_) => return err_json(400, "invalid json"),
-    };
-    let mut crules: Vec<(String, String)> = Vec::new();
-    if let Some(arr) = v["content_rules"].as_array() {
-        for r in arr {
-            let f = r["from"].as_str().unwrap_or("").to_string();
-            let t = r["to"].as_str().unwrap_or("").to_string();
-            if f.is_empty() || f.len() != t.len() || f.len() > 64
-                || !f.is_ascii() || !t.is_ascii()
-            {
-                return err_json(400, "内容替换: 原与替换字符数需一致 (ASCII, ≤64)");
-            }
-            crules.push((f, t));
-        }
-    }
-    let mut frules: Vec<(String, String)> = Vec::new();
-    if let Some(arr) = v["file_rules"].as_array() {
-        for r in arr {
-            let f = r["from"].as_str().unwrap_or("").to_string();
-            let t = r["to"].as_str().unwrap_or("").to_string();
-            if f.is_empty() || t.is_empty() || f.len() > 127 || t.len() > 255 {
-                return err_json(400, "文件重定向: 路径不能为空且长度受限");
-            }
-            frules.push((f, t));
-        }
-    }
-    // 有规则即自动启用 (无手动开关)
-    let enabled = !crules.is_empty() || !frules.is_empty();
-    match crate::config::save_redirect(enabled, &crules, &frules) {
-        Ok(_) => (200, json!({"ok": true}).to_string()),
-        Err(e) => err_json(500, &format!("save failed: {}", e)),
-    }
-}
-
 fn waylay_json() -> String {
-    let rules = crate::rw_read_ignore_poison(&crate::config::WAYLAY_RULES).clone();
-    let apps = crate::rw_read_ignore_poison(&crate::config::WAYLAY_APPS).clone();
-    let prop_rules =
-        crate::rw_read_ignore_poison(&crate::config::WAYLAY_PROP_RULES).clone();
-    let prop_apps = crate::rw_read_ignore_poison(&crate::config::WAYLAY_PROP_APPS).clone();
+    let rules = crate::config::load_waylay_rules();
     json!({
         // 已连接 = KPM 模块已武装 (拦截功能随 start/stop)
         "connected": KPM_ARMED.load(Ordering::Relaxed),
-        "rules": rules.iter().map(|(f, t)| json!({"from": f, "to": t})).collect::<Vec<_>>(),
-        "propRules": prop_rules.iter().map(|(f, t)| json!({"from": f, "to": t})).collect::<Vec<_>>(),
-        "propApps": prop_apps,
-        "apps": apps,
+        "rules": rules
+            .iter()
+            .map(|r| {
+                json!({
+                    "pkg": r.pkg,
+                    "kind": r.kind.tag(),
+                    "from": r.from,
+                    "to": r.to
+                })
+            })
+            .collect::<Vec<_>>(),
     })
     .to_string()
 }
 
 /// POST /api/waylay: 保存配置 (拦截字符/替换字符各 7 ASCII + 目标应用列表)
+/// POST /api/waylay: 保存新格式配置 [{pkg, kind, from, to}] (kind: src/prop/red)
 fn waylay_set_api(req: &Request) -> (u16, String) {
     let v: serde_json::Value = match serde_json::from_slice(&req.body) {
         Ok(v) => v,
@@ -908,73 +860,53 @@ fn waylay_set_api(req: &Request) -> (u16, String) {
     if v.get("arm").is_some() && v["arm"].is_boolean() {
         crate::config::set_kpm_arm_req(v["arm"].as_bool().unwrap_or(false));
     }
-    // 多组规则: [{from, to}] 每组字符数一致 (非空, ≤32, ASCII)
-    let mut rules: Vec<(String, String)> = Vec::new();
+    let kind_max: std::collections::HashMap<&str, usize> = [
+        ("src", 64usize),
+        ("prop", 92usize),
+        ("red", 64usize),
+    ]
+    .iter()
+    .cloned()
+    .collect();
+    let mut rules: Vec<crate::config::WaylayRule> = Vec::new();
     if let Some(arr) = v["rules"].as_array() {
         for r in arr {
+            let pkg = r["pkg"].as_str().unwrap_or("").trim().to_string();
+            let kind_t = r["kind"].as_str().unwrap_or("").to_string();
             let f = r["from"].as_str().unwrap_or("").to_string();
             let t = r["to"].as_str().unwrap_or("").to_string();
-            if f.is_empty() || f.len() != t.len() || f.len() > 64
-                || !f.is_ascii() || !t.is_ascii()
+            let Some(kind) = crate::config::WaylayKind::parse(&kind_t) else {
+                return err_json(400, "未知类型 (src/prop/red)");
+            };
+            if pkg.is_empty() || pkg.len() > 256 {
+                return err_json(400, "包名非法");
+            }
+            let max = *kind_max.get(kind_t.as_str()).unwrap_or(&64);
+            if f.is_empty() {
+                return err_json(400, "规则 from 不能为空");
+            }
+            let is_path = kind_t == "red-path";
+            if !is_path && (f.len() != t.len() || f.len() > max || !f.is_ascii() || !t.is_ascii())
             {
-                return err_json(400, "拦截与替换字符数需一致 (ASCII, ≤64, 支持长服务名)");
+                return err_json(
+                    400,
+                    &format!("{} 规则需等长 ASCII (≤{}), 且不含 '-'", kind_t, max),
+                );
             }
-            rules.push((f, t));
-        }
-    }
-    // 允许全空保存: 两个 tab 都可清空 (内核空规则短路不替换)
-    // property 区伪装规则 (同校验: 非空/等长/≤32/ASCII), 可空
-    let mut prop_rules: Vec<(String, String)> = Vec::new();
-    if let Some(arr) = v["propRules"].as_array() {
-        for r in arr {
-            let f = r["from"].as_str().unwrap_or("").to_string();
-            let t = r["to"].as_str().unwrap_or("").to_string();
-            if f.is_empty() || f.len() != t.len() || f.len() > 92
-                || !f.is_ascii() || !t.is_ascii()
-            {
-                return err_json(400, "prop 属性名替换对需等长 ASCII (≤92)");
+            if is_path && (t.is_empty() || f.len() > 127 || t.len() > 255) {
+                return err_json(400, "red-path 路径超限 (≤127/255)");
             }
-            prop_rules.push((f, t));
+            rules.push(crate::config::WaylayRule {
+                pkg,
+                kind,
+                from: f,
+                to: t,
+            });
         }
     }
-    // property 伪装目标应用 (前台命中时激活 prop 替换; 独立于 srv 目标应用)
-    // 约束: 有 prop 应用必须有 prop 规则 (避免配置了应用却无替换规则)
-    if v["propApps"].as_array().map(|a| !a.is_empty()).unwrap_or(false)
-        && prop_rules.is_empty()
-    {
-        return err_json(400, "prop 目标应用需配至少一组替换规则");
-    }
-    let mut prop_apps: Vec<String> = Vec::new();
-    if let Some(arr) = v["propApps"].as_array() {
-        for x in arr {
-            if let Some(p) = x.as_str() {
-                let p = p.trim().to_string();
-                if !p.is_empty() && p.len() <= 256 && !p.starts_with(&['#', '/']) {
-                    prop_apps.push(p);
-                }
-            }
-        }
-    }
-    let apps: Vec<String> = v["apps"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
-                .filter(|s| !s.is_empty() && !s.starts_with(&['#', '/']))
-                .collect()
-        })
-        .unwrap_or_default();
-    for a in &apps {
-        if a.len() > MAX_PKG_LEN {
-            return err_json(400, &format!("包名过长: {}", a));
-        }
-    }
-    if let Err(e) =
-        crate::config::save_waylay(&rules, &apps, &prop_rules, &prop_apps)
-    {
+    if let Err(e) = crate::config::save_waylay_rules(&rules) {
         return err_json(500, &format!("保存失败: {}", e));
     }
-    // 唤醒主循环: reload 消费 WAYLAY_CHANGED → 同步内核规则 (srv_clear + 逐组 srv_rule)
     crate::config::request_config_reload();
     (200, json!({"ok": true}).to_string())
 }
