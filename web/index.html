@@ -519,7 +519,7 @@ function renderRdCrules(){
 `<div class="grp"><div class="grp-head" style="cursor:default;gap:0">
 <svg viewBox="0 0 24 36" style="width:22px;height:33px;overflow:visible;margin-top:37px;stroke:var(--sub);fill:none;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0"><path d="M4 1v28"/><path d="M4 1h14"/><path d="M4 29h16"/><path d="M20 29l-5-5"/><path d="M20 29l-5 5"/></svg>
 <span class="grp-name" style="display:flex;flex-direction:column;gap:1px;padding-left:6px;margin-top:5px">
-<span style="margin-top:-9px;background:var(--bg);border-radius:8px;padding:4px 10px;font-size:11px;color:var(--sub);word-break:break-all;border:1px solid var(--border)">${esc(r.target||'/vendor/etc/selinux/vendor_file_contexts')}</span>
+<span style="margin-top:-9px;background:var(--bg);border-radius:8px;padding:4px 10px;font-size:11px;color:var(--sub);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;border:1px solid var(--border)">${esc(r.target||'/vendor/etc/selinux/vendor_file_contexts')}</span>
 <span style="margin-top:11px">${esc(r.from)}</span>
 <span style="margin-top:12px">${esc(r.to)}</span>
 </span>
