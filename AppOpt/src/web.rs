@@ -840,6 +840,7 @@ fn waylay_json() -> String {
                 json!({
                     "pkg": r.pkg,
                     "kind": r.kind.tag(),
+                    "target": r.target,
                     "from": r.from,
                     "to": r.to
                 })
