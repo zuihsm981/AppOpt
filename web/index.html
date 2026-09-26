@@ -576,8 +576,9 @@ function wlSaveNow(){
       const max=r.kind==='prop'?92:(r.kind==='src'||r.kind==='red')?64:255;
       if(!r.from||!r.to){toast('规则不能为空');return}
       if(isPath){if(r.from.length>127||r.to.length>255){toast('路径超限 (≤127/255)');return}continue}
-      /* 内容替换: 目标文件必须是路径 (防 vfc_rtarget 空 → 无差别替换崩溃) */
-      if(!r.target||!r.target.startsWith('/')){toast('内容替换需目标文件路径');return}
+      /* 内容替换(red-path 且 from 非路径)必须指定目标文件路径; src/prop/文件重定向不校验 */
+      const isContent = r.kind==='red-path' && !r.from.startsWith('/');
+      if(isContent && (!r.target||!r.target.startsWith('/'))){toast('内容替换需目标文件路径');return}
       if(r.from.length!==r.to.length){toast('需等长 (ASCII)');return}
       if(r.from.length>max){toast('超出长度限制 (≤'+max+')');return}
       if(r.from.split('').some(c=>c.charCodeAt(0)>127)||r.to.split('').some(c=>c.charCodeAt(0)>127)){toast('\u4ec5\u652f\u6301 ASCII \u5b57\u7b26');return}
