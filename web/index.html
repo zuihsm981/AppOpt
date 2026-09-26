@@ -287,6 +287,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 </div>
 <div id="w-red-pane" hidden>
 <div class="card">
+<button class="btn" id="rd-cimport" style="width:100%;margin-bottom:8px">⤓ 批量导入</button>
 <div class="field"><span class="label" style="white-space:nowrap;color:#000;font-weight:600">目标文件</span><input id="rd-ctarget" placeholder="/vendor/etc/selinux/vendor_file_contexts"></div>
 <div class="field"><span class="label" style="white-space:nowrap;color:#000;font-weight:600">原内容</span><input id="rd-cfrom" maxlength="32"></div>
 <div class="field"><span class="label" style="white-space:nowrap;color:#000;font-weight:600">新内容</span><input id="rd-cto" maxlength="32"></div>
@@ -436,6 +437,21 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 </div>
 
 <div id="toast"></div>
+<div id="rd-batch-modal" hidden style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:999">
+<div class="card" style="width:min(460px,92vw);padding:16px;margin:0">
+<div style="font-weight:600;color:#000;margin-bottom:10px">批量导入内容替换</div>
+<div style="font-size:12px;color:var(--sub);margin-bottom:6px">目标文件（每行一个路径）</div>
+<textarea id="rd-batch-targets" rows="5" placeholder="/vendor/etc/selinux/vendor_hwservice_contexts&#10;/vendor/etc/selinux/vendor_file_contexts&#10;/vendor/etc/selinux/vendor_file" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000;resize:vertical"></textarea>
+<div style="display:flex;gap:8px;margin-top:10px">
+<div style="flex:1"><div style="font-size:12px;color:var(--sub);margin-bottom:4px">原内容</div><input id="rd-batch-from" placeholder="lineage" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000"></div>
+<div style="flex:1"><div style="font-size:12px;color:var(--sub);margin-bottom:4px">新内容</div><input id="rd-batch-to" placeholder="hyperos" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000"></div>
+</div>
+<div style="display:flex;gap:8px;margin-top:14px">
+<button class="btn" id="rd-batch-ok" style="flex:1">导入</button>
+<button class="btn" id="rd-batch-cancel" style="flex:1;background:var(--bg);color:var(--sub)">取消</button>
+</div>
+</div>
+</div>
 <div id="rd-edit-modal" hidden style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:999">
 <div class="card" style="width:min(420px,90vw);padding:16px;margin:0">
 <div id="rd-edit-title" style="font-weight:600;color:#000;margin-bottom:8px"></div>
@@ -761,6 +777,25 @@ const ICO_TRASH='<svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3m-8 0l1 13h8
 const ICO_EDIT=`<svg viewBox="0 0 24 24" style="width:17px;height:17px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>`;
 /* 规则编辑面板 (全局生效开关不放在规则行内) */
 let rdEditIdx=-1,rdEditKind='';
+$('rd-cimport').onclick=()=>{$('rd-batch-modal').hidden=false;};
+$('rd-batch-cancel').onclick=()=>{$('rd-batch-modal').hidden=true;};
+$('rd-batch-modal').addEventListener('click',e=>{if(e.target.id==='rd-batch-modal')$('rd-batch-modal').hidden=true;});
+$('rd-batch-ok').onclick=()=>{
+  const f=$('rd-batch-from').value.trim(),t=$('rd-batch-to').value.trim();
+  if(!f.length||f.length!==t.length||f.length>64){toast('原/新字符数需一致 (ASCII ≤64)');return}
+  if(f.split('').some(c=>c.charCodeAt(0)>127)||t.split('').some(c=>c.charCodeAt(0)>127)){toast('仅支持 ASCII 字符');return}
+  const paths=$('rd-batch-targets').value.split('\n').map(x=>x.trim()).filter(Boolean);
+  const seen=new Set();let added=0;
+  for(const p of paths){
+    if(!p.startsWith('/')||p.length>127){toast('目标文件需以 / 开头 (≤127): '+p);return}
+    if(seen.has(p))continue;seen.add(p);
+    rdCrules.push({target:p,from:f,to:t,global:false});added++;
+  }
+  if(!added){toast('未添加任何目标文件');return}
+  $('rd-batch-modal').hidden=true;
+  $('rd-batch-targets').value='';$('rd-batch-from').value='';$('rd-batch-to').value='';
+  renderRdCrules();wlSaveNow();toast('已导入 '+added+' 条');
+};
 function openRdEdit(kind,i){
   const list=kind==='c'?rdCrules:rdFrules;const r=list[i];if(!r)return;
   rdEditIdx=i;rdEditKind=kind;
