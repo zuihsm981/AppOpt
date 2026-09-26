@@ -286,7 +286,6 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 </div>
 </div>
 <div id="w-red-pane" hidden>
-<div class="card" style="padding:13px 14px;display:flex;align-items:center;justify-content:space-between"><span class="label" style="color:#000;font-weight:600">全局生效</span><label class="switch"><input type="checkbox" id="rd-global"><span></span></label></div>
 <div class="card">
 <div class="field"><span class="label" style="white-space:nowrap;color:#000;font-weight:600">目标文件</span><input id="rd-ctarget" placeholder="/vendor/etc/selinux/vendor_file_contexts"></div>
 <div class="field"><span class="label" style="white-space:nowrap;color:#000;font-weight:600">原内容</span><input id="rd-cfrom" maxlength="32"></div>
@@ -303,7 +302,6 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 </div>
 </div>
 <div id="w-redpath-pane" hidden>
-<div class="card" style="padding:13px 14px;display:flex;align-items:center;justify-content:space-between"><span class="label" style="color:#000;font-weight:600">全局生效</span><label class="switch"><input type="checkbox" id="rdp-global"><span></span></label></div>
 <div class="card">
 <div class="field" style="flex-direction:column;align-items:stretch"><span class="label" style="margin-bottom:4px;color:#000;font-weight:600">原路径</span><input id="rd-ffrom" placeholder="/vendor/etc/selinux/vendor_file_contexts"></div>
 <div class="field" style="margin-top:8px;flex-direction:column;align-items:stretch"><span class="label" style="margin-bottom:4px;color:#000;font-weight:600">新路径</span><input id="rd-fto" placeholder="/storage/emulated/0/vendor_file_contexts"></div>
@@ -438,6 +436,17 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 </div>
 
 <div id="toast"></div>
+<div id="rd-edit-modal" hidden style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:999">
+<div class="card" style="width:min(420px,90vw);padding:16px;margin:0">
+<div id="rd-edit-title" style="font-weight:600;color:#000;margin-bottom:8px"></div>
+<div id="rd-edit-body" style="color:var(--sub);font-size:12px;word-break:break-all;margin-bottom:14px;white-space:pre-line"></div>
+<div style="display:flex;align-items:center;justify-content:space-between">
+<span style="color:#000;font-weight:600">全局生效</span>
+<label class="switch"><input type="checkbox" id="rd-edit-global"><span></span></label>
+</div>
+<button class="btn" id="rd-edit-close" style="width:100%;margin-top:14px">完成</button>
+</div>
+</div>
 <script>
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -498,18 +507,29 @@ function renderRdCrules(){
 <span style="margin-top:11px">${esc(r.from)}</span>
 <span style="margin-top:12px">${esc(r.to)}</span>
 </span>
-<button class="icon-btn danger" style="margin-left:auto" data-i="${i}" title="删除">${ICO_TRASH}</button>
+<button class="icon-btn" style="flex-shrink:0;margin-left:auto${r.global?';color:var(--accent,#4c8dff)':''}" data-edit="${i}" title="编辑${r.global?' (全局生效已开启)':''}">${ICO_EDIT}</button>
+<button class="icon-btn danger" style="margin-left:8px" data-i="${i}" title="删除">${ICO_TRASH}</button>
 </div></div>`).join('');
 }
-function renderRdFrules(){if(!rdFrules.length){$('rd-frules').innerHTML='<div class="hint">未添加文件重定向规则</div>';return}$('rd-frules').innerHTML=rdFrules.map((r,i)=>growRule(r.from,r.to,i)).join('');}
+function renderRdFrules(){
+  if(!rdFrules.length){$('rd-frules').innerHTML='<div class="hint">未添加文件重定向规则</div>';return}
+  $('rd-frules').innerHTML=rdFrules.map((r,i)=>
+`<div class="grp"><div class="grp-head" style="cursor:default;gap:0">
+<svg viewBox="0 0 24 36" style="width:22px;height:33px;overflow:visible;margin-top:5px;stroke:var(--sub);fill:none;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0"><path d="M4 1v28"/><path d="M4 1h14"/><path d="M4 29h16"/><path d="M20 29l-5-5"/><path d="M20 29l-5 5"/></svg>
+<span class="grp-name" style="display:flex;flex-direction:column;gap:2px;padding-left:6px;margin-top:5px"><span>${esc(r.from)}</span><span>${esc(r.to)}</span></span>
+<button class="icon-btn" style="flex-shrink:0;margin-left:auto${r.global?';color:var(--accent,#4c8dff)':''}" data-edit="${i}" title="编辑${r.global?' (全局生效已开启)':''}">${ICO_EDIT}</button>
+<button class="icon-btn danger" style="margin-left:8px" data-i="${i}" title="删除">${ICO_TRASH}</button>
+</div></div>`).join('');
+}
 function renderRdApps(){$('rd-apps').innerHTML=rdApps.length?rdApps.map((a,i)=>grow(a,i)).join(''):'<div class="hint">未添加目标应用</div>';}
 function renderRdpApps(){$('rdp-apps').innerHTML=rdpApps.length?rdpApps.map((a,i)=>grow(a,i)).join(''):'<div class="hint">未添加目标应用</div>';}
 $('w-rules').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(!b)return;wlRules.splice(+b.dataset.i,1);renderWaylayRules();wlSaveNow();});
 $('w-apps').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(b){wlApps.splice(+b.dataset.i,1);renderWaylayApps();wlSaveNow();return}const h=e.target.closest('.grp-head');if(h)h.parentElement.classList.toggle('open');});
 $('wp-rules').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(!b)return;wlPropRules.splice(+b.dataset.i,1);renderWpRules();wlSaveNow();});
 $('wp-apps').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(b){wlPropApps.splice(+b.dataset.i,1);renderWpApps();wlSaveNow();return}const h=e.target.closest('.grp-head');if(h)h.parentElement.classList.toggle('open');});
-$('rd-crules').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(!b)return;rdCrules.splice(+b.dataset.i,1);renderRdCrules();wlSaveNow();});
-$('rd-frules').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(!b)return;rdFrules.splice(+b.dataset.i,1);renderRdFrules();wlSaveNow();});
+$('rd-crules').addEventListener('click',e=>{const ed=e.target.closest('button[data-edit]');if(ed){openRdEdit('c',+ed.dataset.edit);return}const b=e.target.closest('button[data-i]');if(!b)return;rdCrules.splice(+b.dataset.i,1);renderRdCrules();wlSaveNow();});
+$('rd-frules').addEventListener('click',e=>{const ed=e.target.closest('button[data-edit]');if(ed){openRdEdit('f',+ed.dataset.edit);return}const b=e.target.closest('button[data-i]');if(!b)return;rdFrules.splice(+b.dataset.i,1);renderRdFrules();wlSaveNow();});
+$('rd-frules').addEventListener('click',e=>{const b=e.target.closest('button[data-i]');if(!b)return;rdFrules.splice(+b.dataset.i,1);renderRdFrules();wlSaveNow();});
 $('rd-apps').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(b){rdApps.splice(+b.dataset.i,1);renderRdApps();wlSaveNow();return}const h=e.target.closest('.grp-head');if(h)h.parentElement.classList.toggle('open');});
 $('rdp-apps').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(b){rdpApps.splice(+b.dataset.i,1);renderRdpApps();wlSaveNow();return}const h=e.target.closest('.grp-head');if(h)h.parentElement.classList.toggle('open');});
 $('w-rule-add').onclick=()=>{
@@ -526,12 +546,12 @@ $('rd-cadd').onclick=()=>{
   const f=$('rd-cfrom').value.trim(),t=$('rd-cto').value.trim();
   if(!f.length||f.length!==t.length||f.length>64){toast('内容替换原/新字符数需一致 (≤64)');return}
   const tg=($('rd-ctarget')&&$('rd-ctarget').value.trim())||'/vendor/etc/selinux/vendor_file_contexts';
-  rdCrules.push({target:tg,from:f,to:t});$('rd-cfrom').value='';$('rd-cto').value='';renderRdCrules();wlSaveNow();
+  rdCrules.push({target:tg,from:f,to:t,global:true});$('rd-cfrom').value='';$('rd-cto').value='';renderRdCrules();wlSaveNow();
 };
 $('rd-fadd').onclick=()=>{
   const f=$('rd-ffrom').value.trim(),t=$('rd-fto').value.trim();
   if(!f.length||!t.length){toast('文件重定向路径不能为空');return}
-  rdFrules.push({from:f,to:t});$('rd-ffrom').value='';$('rd-fto').value='';renderRdFrules();wlSaveNow();
+  rdFrules.push({from:f,to:t,global:true});$('rd-ffrom').value='';$('rd-fto').value='';renderRdFrules();wlSaveNow();
 };
 function wlAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!wlApps.includes(pkg))wlApps.push(pkg);$('w-app').value='';$('w-sg').hidden=true;renderWaylayApps();wlSaveNow();}
 function wpAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!wlPropApps.includes(pkg))wlPropApps.push(pkg);$('wp-app').value='';$('wp-sg').hidden=true;renderWpApps();wlSaveNow();}
@@ -556,12 +576,8 @@ function buildRules(){
   const out=[];
   wlApps.forEach(p=>wlRules.forEach(r=>out.push({pkg:p,kind:'src',from:r.from,to:r.to})));
   wlPropApps.forEach(p=>wlPropRules.forEach(r=>out.push({pkg:p,kind:'prop',from:r.from,to:r.to})));
-  (($('rd-global')&&$('rd-global').checked)?['*']:rdApps).forEach(p=>{
-    rdCrules.forEach(r=>out.push({pkg:p,kind:'red',target:r.target||'/vendor/etc/selinux/vendor_file_contexts',from:r.from,to:r.to}));  /* 内容替换: red-<目标>-<from>-<to> */
-  });
-  (($('rdp-global')&&$('rdp-global').checked)?['*']:rdpApps).forEach(p=>{
-    rdFrules.forEach(r=>out.push({pkg:p,kind:'red-path',from:r.from,to:r.to}));  /* 文件重定向: from 有 '/' */
-  });
+  rdCrules.forEach(r=>{((r.global)?['*']:rdApps).forEach(p=>out.push({pkg:p,kind:'red',target:r.target||'/vendor/etc/selinux/vendor_file_contexts',from:r.from,to:r.to}))});  /* 内容替换 */
+  rdFrules.forEach(r=>{((r.global)?['*']:rdpApps).forEach(p=>out.push({pkg:p,kind:'red-path',from:r.from,to:r.to}))});  /* 文件重定向 */
   return out;
 }
 function renderWaylayConn(c){$('w-conn').textContent=c?'已连接':'未连接';$('w-conn').className='badge '+(c?'kpm':'proc');$('w-conn-chips').querySelectorAll('button').forEach(b=>b.classList.toggle('on',(b.dataset.v==='1')===c));}
@@ -595,13 +611,11 @@ async function loadWaylay(){
     wlApps=uniq(rs.filter(r=>r.kind==='src').map(r=>r.pkg));
     wlPropRules=uniq(rs.filter(r=>r.kind==='prop').map(r=>r.from+'\u0000'+r.to)).map(k=>{const [f,t]=k.split('\u0000');return {from:f,to:t}});
     wlPropApps=uniq(rs.filter(r=>r.kind==='prop').map(r=>r.pkg));
-    rdCrules=uniq(rs.filter(r=>r.kind==='red'&&r.pkg!=='*').map(r=>r.from+'\u0000'+r.to+'\u0000'+(r.target||'/vendor/etc/selinux/vendor_file_contexts'))).map(k=>{const [f,t,tg]=k.split('\u0000');return {target:tg,from:f,to:t}});
+    rdCrules=uniq(rs.filter(r=>r.kind==='red').map(r=>r.from+'\u0000'+r.to+'\u0000'+(r.target||'/vendor/etc/selinux/vendor_file_contexts'))).map(k=>{const [f,t,tg]=k.split('\u0000');return {target:tg,from:f,to:t,global:rs.some(x=>x.kind==='red'&&x.pkg==='*'&&x.from===f&&x.to===t)}});
     if(rdCrules.length&&$('rd-ctarget'))$('rd-ctarget').value=rdCrules[0].target;
-    rdFrules=uniq(rs.filter(r=>r.kind==='red-path'&&r.from.startsWith('/')&&r.pkg!=='*').map(r=>r.from+'\u0000'+r.to)).map(k=>{const [f,t]=k.split('\u0000');return {from:f,to:t}});
-    rdApps=uniq(rs.filter(r=>r.kind==='red-path'&&!r.from.startsWith('/')&&r.pkg!=='*').map(r=>r.pkg));
+    rdFrules=uniq(rs.filter(r=>r.kind==='red-path'&&r.from.startsWith('/')).map(r=>r.from+'\u0000'+r.to)).map(k=>{const [f,t]=k.split('\u0000');return {from:f,to:t,global:rs.some(x=>x.kind==='red-path'&&x.pkg==='*'&&x.from===f&&x.to===t)}});
+    rdApps=uniq(rs.filter(r=>r.kind==='red'&&r.pkg!=='*').map(r=>r.pkg));
     rdpApps=uniq(rs.filter(r=>r.kind==='red-path'&&r.from.startsWith('/')&&r.pkg!=='*').map(r=>r.pkg));
-    if($('rd-global'))$('rd-global').checked=rs.some(r=>r.kind==='red-path'&&!r.from.startsWith('/')&&r.pkg==='*');
-    if($('rdp-global'))$('rdp-global').checked=rs.some(r=>r.kind==='red-path'&&r.from.startsWith('/')&&r.pkg==='*');
     renderWaylayConn(!!d.connected);
     renderWaylayRules();renderWaylayApps();renderWpRules();renderWpApps();renderRdCrules();renderRdFrules();renderRdApps();renderRdpApps();
     return !!d.connected;
@@ -736,8 +750,27 @@ $('modal-hit').addEventListener('click',e=>{if(e.target===$('modal-hit'))$('moda
 let rulesData=[];
 function chipCls(s){return s==='e-core'?'e':s==='p-core'?'p':s==='hp-core'?'h':'c'}
 function chipHtml(s){return `<span class="chip ${chipCls(s)}">${esc(s)}</span>`}
-const ICO_EDIT='<svg viewBox="0 0 24 24"><path d="M17 3l4 4L8 20l-5 1 1-5z"/></svg>';
 const ICO_TRASH='<svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3m-8 0l1 13h8l1-13"/></svg>';
+const ICO_EDIT=`<svg viewBox="0 0 24 24" style="width:17px;height:17px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>`;
+/* 规则编辑面板 (全局生效开关不放在规则行内) */
+let rdEditIdx=-1,rdEditKind='';
+function openRdEdit(kind,i){
+  const list=kind==='c'?rdCrules:rdFrules;const r=list[i];if(!r)return;
+  rdEditIdx=i;rdEditKind=kind;
+  $('rd-edit-title').textContent=(kind==='c'?'内容替换规则':'文件重定向规则');
+  $('rd-edit-body').textContent=(kind==='c'?('目标文件: '+(r.target||'/vendor/etc/selinux/vendor_file_contexts')+'\n'):'')+r.from+' → '+r.to;
+  $('rd-edit-global').checked=!!r.global;
+  $('rd-edit-modal').hidden=false;
+}
+function closeRdEdit(){$('rd-edit-modal').hidden=true;rdEditIdx=-1;rdEditKind='';}
+$('rd-edit-close').onclick=closeRdEdit;
+$('rd-edit-modal').addEventListener('click',e=>{if(e.target.id==='rd-edit-modal')closeRdEdit();});
+$('rd-edit-global').addEventListener('change',e=>{
+  if(rdEditIdx<0)return;
+  const list=rdEditKind==='c'?rdCrules:rdFrules;
+  if(list[rdEditIdx])list[rdEditIdx].global=e.target.checked;
+  wlSaveNow();
+});
 async function loadRules(){
   fetchTopo();
   try{
