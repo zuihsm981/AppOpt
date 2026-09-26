@@ -96,32 +96,6 @@ pub struct WaylayRule {
 
 pub static WAYLAY_RULES_NEW: LazyLock<RwLock<Vec<WaylayRule>>> =
     LazyLock::new(|| RwLock::new(Vec::new()));
-/// uid → 包名 (waylay 规则应用缓存; 与 cpu 表共用 packages.list 构建时机, on_fg 查缓存不读文件)
-pub static WAYLAY_PKG_BY_UID: LazyLock<RwLock<std::collections::HashMap<i32, String>>> =
-    LazyLock::new(|| RwLock::new(std::collections::HashMap::new()));
-
-/// 重建 uid→包名 缓存 (读 packages.list + WAYLAY_RULES_NEW 规则包过滤; 触发: 配置保存/加载/EV_PKG)
-pub fn rebuild_pkg_by_uid() {
-    let rules = rw_read_ignore_poison(&WAYLAY_RULES_NEW);
-    let mut pkgs: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for r in rules.iter() {
-        if r.pkg != "*" {
-            pkgs.insert(r.pkg.clone());
-        }
-    }
-    let mut m: std::collections::HashMap<i32, String> = std::collections::HashMap::new();
-    if let Ok(content) = std::fs::read_to_string("/data/system/packages.list") {
-        for line in content.lines() {
-            let mut it = line.split_whitespace();
-            let (Some(pkg), Some(uid_s)) = (it.next(), it.next()) else { continue };
-            let Ok(uid) = uid_s.parse::<i32>() else { continue };
-            if uid > 0 && pkgs.contains(pkg) {   /* 含系统应用(uid<100000); uid 0=root 排除 */
-                m.insert(uid, pkg.to_string());
-            }
-        }
-    }
-    *rw_write_ignore_poison(&WAYLAY_PKG_BY_UID) = m;
-}
 /// 解析 waylay.conf 新格式: <pkg>=<kind>-<from>-<to> (旧 srv_set/包名行/[prop]/[redirect] 废弃)
 pub fn load_waylay_rules() -> Vec<WaylayRule> {
     let mut out: Vec<WaylayRule> = Vec::new();

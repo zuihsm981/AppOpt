@@ -68,22 +68,14 @@ fn build_uid_tables(cfg: &AppConfig) -> (HashMap<i32, UidEntry>, HashMap<String,
     }
     let mut fwd: HashMap<i32, UidEntry> = HashMap::new();
     let mut rev: HashMap<String, i32> = HashMap::new();
-    if let Ok(content) = std::fs::read_to_string("/data/system/packages.list") {
-        for line in content.lines() {
-            let mut it = line.split_whitespace();
-            let (Some(pkg), Some(uid_s)) = (it.next(), it.next()) else { continue };
-            let Ok(uid) = uid_s.parse::<i32>() else { continue };
-            // 只收当前用户 (Android 多用户 uid 偏移; 同一包多行时不污染)
-            if uid >= 100000 {
-                continue;
-            }
-            let cpu = cpu_pkgs.contains(pkg);
-            let rfr = pkg == crate::config::DEFAULT_REFRESH_PACKAGE
-                || cfg.app_refresh_configs.contains_key(pkg);
-            if cpu || rfr {
-                fwd.entry(uid).or_insert_with(|| UidEntry { pkg: pkg.to_string(), cpu, rfr });
-                rev.entry(pkg.to_string()).or_insert(uid);
-            }
+    /* 与 pkg_to_uid_map 共用 packages.list 读取 (当前用户 uid<100000) */
+    for (pkg, uid) in pkg_to_uid_map() {
+        let cpu = cpu_pkgs.contains(pkg.as_str());
+        let rfr = pkg == crate::config::DEFAULT_REFRESH_PACKAGE
+            || cfg.app_refresh_configs.contains_key(&pkg);
+        if cpu || rfr {
+            fwd.entry(uid).or_insert_with(|| UidEntry { pkg: pkg.clone(), cpu, rfr });
+            rev.entry(pkg.clone()).or_insert(uid);
         }
     }
     (fwd, rev)
@@ -100,6 +92,23 @@ pub(crate) fn for_each_proc_pid(mut f: impl FnMut(i32)) {
             }
         }
     }
+}
+
+/// vfc 规则表构建: 读 packages.list 建 包名→uid (应用 uid)
+fn pkg_to_uid_map() -> HashMap<String, i32> {
+    let mut m: HashMap<String, i32> = HashMap::new();
+    if let Ok(content) = std::fs::read_to_string("/data/system/packages.list") {
+        for line in content.lines() {
+            let mut it = line.split_whitespace();
+            let (Some(pkg), Some(uid_s)) = (it.next(), it.next()) else { continue };
+            if let Ok(uid) = uid_s.parse::<i32>() {
+                if uid > 0 && uid < 100000 {   /* 当前用户 (Android 多用户 uid 偏移, 与 cpu 一致) */
+                    m.insert(pkg.to_string(), uid);
+                }
+            }
+        }
+    }
+    m
 }
 
 /// CPU 规则包 → uid: 从 main 维护的反向表过滤 (不直接读 packages.list)
@@ -318,9 +327,12 @@ struct AppState {
     rfr_pkgs_set: HashSet<String>,
     /// 已下发给内核的 service list 伪装开关 (差量下发, 仅应用切换时调整)
     srv_active_cur: bool,
-    last_fg_pkg: String,
-    /* vfc 规则下发指纹缓存: (pkg, kind, target, from, to) — 对比判断新增/删除, 无变化不重发 */
-    rule_cache: Vec<(String, String, String, String, String)>,
+    last_fg_uid: i32,
+    /* vfc 规则下发指纹缓存: (uid, kind, target, from, to) — 无变化不重发; vfc_uid_set=表内 uid */
+    rule_cache: Vec<(i32, String, String, String, String)>,
+    vfc_uid_set: std::collections::HashSet<i32>,
+    /* 四功能统一 uid 规则表 (sync_vfc_rules 构建; on_fg/reload 按前台 uid 取 src/prop/red) */
+    uid_rules: std::collections::HashMap<i32, Vec<crate::config::WaylayRule>>,
     /// 已下发给内核的 property 区伪装开关 (独立目标应用集)
     prop_active_cur: bool,
 }
@@ -345,8 +357,10 @@ impl AppState {
             cpu_pkgs_set,
             rfr_pkgs_set,
             srv_active_cur: false,
-            last_fg_pkg: String::new(),
+            last_fg_uid: -1,
             rule_cache: Vec::new(),
+            vfc_uid_set: std::collections::HashSet::new(),
+            uid_rules: std::collections::HashMap::new(),
             prop_active_cur: false,
         }
     }
@@ -386,44 +400,94 @@ impl AppState {
     /// 用户态配置驱动: uid 规则表下发。构建指纹 (uid, kind, target, from, to) 对比缓存,
     /// 有新增/删除才 clear + 重发 (无变化零动作); 全局(pkg="*")→uid=-1 段在前。
     fn sync_vfc_rules(&mut self) {
+        /* 四功能统一 uid 规则表: 规则 pkg → 读 packages.list 转 uid (全局 "*"→-1; 未安装包跳过) */
         let all = crate::rw_read_ignore_poison(&crate::config::WAYLAY_RULES_NEW);
-        /* 包名规则表 (四功能统一包名, 无需转 uid): 指纹 (pkg, kind, target, from, to) 对比缓存 */
-        let mut rows: Vec<(String, String, String, String, String)> = Vec::new();
+        let pkguid = pkg_to_uid_map();
+        let mut tbl: std::collections::HashMap<i32, Vec<crate::config::WaylayRule>> =
+            std::collections::HashMap::new();
         for r in all.iter() {
-            if r.kind == crate::config::WaylayKind::Red
-                || r.kind == crate::config::WaylayKind::RedPath
-            {
+            let u = if r.pkg == "*" {
+                -1
+            } else if let Some(u) = pkguid.get(&r.pkg) {
+                *u
+            } else {
+                continue;   /* 未安装包 → 跳过 */
+            };
+            tbl.entry(u).or_default().push(r.clone());
+        }
+        /* vfc 指纹 (red/redpath) — 对比缓存, 无变化不重发 */
+        let mut rows: Vec<(i32, String, String, String, String)> = Vec::new();
+        for (uid, rules) in tbl.iter() {
+            for r in rules.iter() {
+                if r.kind != crate::config::WaylayKind::Red
+                    && r.kind != crate::config::WaylayKind::RedPath
+                {
+                    continue;
+                }
                 let (k, tg) = if r.kind == crate::config::WaylayKind::Red {
                     ("c", r.target.clone())
                 } else {
                     ("p", "-".to_string())   /* 占位: 内核 sscanf 需 target 段非空 */
                 };
-                rows.push((r.pkg.clone(), k.to_string(), tg, r.from.clone(), r.to.clone()));
+                rows.push((*uid, k.to_string(), tg, r.from.clone(), r.to.clone()));
             }
         }
-        rows.sort_by(|a, b| a.0.cmp(&b.0));   /* "*" 全局段在前, 同包规则连续 */
-        if rows == self.rule_cache {
-            return;   /* 无新增/删除 → 不重发 */
-        }
+        rows.sort_by(|a, b| a.0.cmp(&b.0));   /* uid=-1 全局段在前, 同 uid 规则连续 */
+        self.uid_rules = tbl;
+        self.vfc_uid_set = rows.iter().filter(|x| x.0 >= 0).map(|x| x.0).collect();
+        let changed = rows != self.rule_cache;
         if let Some(es) = self.ebpf_state.as_ref() {
-            let glob_n = rows.iter().filter(|x| x.0 == "*").count().min(512);
-            es.bpf.vfc_rule_clear();
-            let mut i = 0usize;
-            for (pkg, kind, tg, from, to) in rows.iter() {
-                if i >= 512 {
-                    break;
+            if changed {
+                let glob_n = rows.iter().filter(|x| x.0 == -1).count().min(512);
+                es.bpf.vfc_rule_clear();
+                let mut i = 0usize;
+                for (uid, kind, tg, from, to) in rows.iter() {
+                    if i >= 512 {
+                        break;
+                    }
+                    es.bpf.vfc_rule(i, *uid, kind, tg, from, to);
+                    i += 1;
                 }
-                es.bpf.vfc_rule(i, pkg, kind, tg, from, to);
-                i += 1;
+                es.bpf.vfc_glob_count(glob_n);
+                es.bpf.vfc_fg(self.last_fg_uid);   /* 表重建后定位当前前台 uid 段 */
+                self.rule_cache = rows;   /* 仅成功下发后更新缓存 (未连接时不更新 → 连接后必重发) */
             }
-            es.bpf.vfc_glob_count(glob_n);
-            es.bpf.vfc_fg(&self.last_fg_pkg);   /* 表重建后定位当前前台包段 */
-            self.rule_cache = rows;   /* 仅成功下发后更新缓存 (未连接时不更新 → 连接后必重发) */
+            /* src/prop: 当前前台 uid 规则 — 配置任何变化都重发 (prop/src 修改立即生效) */
+            if self.last_fg_uid > 0 {
+                if let Some(my) = self.uid_rules.get(&self.last_fg_uid) {
+                    let has_src = my
+                        .iter()
+                        .any(|r| r.kind == crate::config::WaylayKind::Src);
+                    let has_prop = my
+                        .iter()
+                        .any(|r| r.kind == crate::config::WaylayKind::Prop);
+                    es.bpf.srv_clear();
+                    for (i, r) in my
+                        .iter()
+                        .filter(|r| r.kind == crate::config::WaylayKind::Src)
+                        .enumerate()
+                    {
+                        es.bpf.srv_rule(i, &r.from, &r.to);
+                    }
+                    es.bpf.srv_active(has_src);
+                    if has_prop {
+                        let prop_rules: Vec<(String, String)> = my
+                            .iter()
+                            .filter(|r| r.kind == crate::config::WaylayKind::Prop)
+                            .map(|r| (r.from.clone(), r.to.clone()))
+                            .collect();
+                        crate::config::set_prop_rules(&prop_rules);
+                    }
+                    es.bpf.prop_file_apply(has_prop);
+                    self.srv_active_cur = has_src;
+                    self.prop_active_cur = has_prop;
+                }
+            }
         }
     }
 
     fn reload(&mut self) {
-        // waylay.conf 启动/重载直接加载 (更新 WAYLAY_RULES_NEW/BY_UID/GLOBAL_RED; web 保存已走 save)
+        // waylay.conf 启动/重载直接加载 (WAYLAY_RULES_NEW)
         crate::config::load_waylay_rules();
         // 拦截页连接/断开: 武装请求 (在模块加载/激活前提下执行)
         match crate::config::take_kpm_arm_req() {
@@ -443,45 +507,7 @@ impl AppState {
                 &crate::config::WAYLAY_RULES_NEW,
             ));
             crate::ebpf_mode::ensure_prop_maps();
-            crate::config::rebuild_pkg_by_uid();   /* 规则应用变化 → 重建 uid→包名缓存 */
-            // src/prop 保存也立即下发 (当前前台包, 各自机制)
-            if !self.last_fg_pkg.is_empty() {
-                let my: Vec<crate::config::WaylayRule> = crate::rw_read_ignore_poison(
-                    &crate::config::WAYLAY_RULES_NEW,
-                )
-                .iter()
-                .filter(|r| r.pkg == self.last_fg_pkg)
-                .cloned()
-                .collect();
-                let has_src = my
-                    .iter()
-                    .any(|r| r.kind == crate::config::WaylayKind::Src);
-                let has_prop = my
-                    .iter()
-                    .any(|r| r.kind == crate::config::WaylayKind::Prop);
-                if let Some(es) = self.ebpf_state.as_ref() {
-                    es.bpf.srv_clear();
-                    for (i, r) in my
-                        .iter()
-                        .filter(|r| r.kind == crate::config::WaylayKind::Src)
-                        .enumerate()
-                    {
-                        es.bpf.srv_rule(i, &r.from, &r.to);
-                    }
-                    es.bpf.srv_active(has_src);
-                    if has_prop {
-                        let prop_rules: Vec<(String, String)> = my
-                            .iter()
-                            .filter(|r| r.kind == crate::config::WaylayKind::Prop)
-                            .map(|r| (r.from.clone(), r.to.clone()))
-                            .collect();
-                        crate::config::set_prop_rules(&prop_rules);
-                    }
-                    es.bpf.prop_file_apply(has_prop);
-                }
-                self.srv_active_cur = has_src;
-                self.prop_active_cur = has_prop;
-            }
+            /* 四功能下发统一入口: sync_vfc_rules (vfc 内核 + 当前前台 src/prop) */
         }
         let cpu_changed = crate::config::take_cpu_rules_changed();
         self.cfg = rw_read_ignore_poison(&CURRENT_CONFIG).clone();
@@ -506,8 +532,8 @@ impl AppState {
         if let Some(cfg) = self.cfg.as_ref() {
             (self.uid_map, self.pkg_uid) = build_uid_tables(cfg);
         }
-        /* 与 cpu 共用 packages.list 构建时机: waylay 规则应用 uid→包名缓存 (on_fg 查缓存) */
-        crate::config::rebuild_pkg_by_uid();
+        /* 与 cpu 共用 packages.list 构建时机: uid→包名缓存 + vfc 规则表 (自建 uid) 重建 */
+        self.sync_vfc_rules();
     }
 
     /// 全量重放 (初始 / KPM 重连后): 对当前规则应用整表 apply_all_now
@@ -520,30 +546,25 @@ impl AppState {
     /// binder 前台回调 (pid+uid): 查 uid 表分发 CPU (冷启动 ApplyPkg + pidfd watch)
     /// 与刷新率 (包名) —— 原 EV_FG 分支主体
     fn on_fg(&mut self, pid: i32, uid: i32) {
-        // 前台包名 (查缓存 — 初始化 reload 已构建 uid→包名映射)
-        let fg_pkg = crate::rw_read_ignore_poison(&crate::config::WAYLAY_PKG_BY_UID)
+        /* 四功能统一 uid: 直接查 uid 规则表 (uid 在该表 = 有规则) */
+        self.last_fg_uid = uid;
+        let my: Vec<crate::config::WaylayRule> = self
+            .uid_rules
             .get(&uid)
             .cloned()
             .unwrap_or_default();
-        self.last_fg_pkg = fg_pkg.clone();
-        /* 诊断: on_fg 执行信息 (定位全失效: 是否触发/fg_pkg/规则条数/缓存条数) */
+        /* 诊断: on_fg 执行信息 (定位失效: 是否触发/uid/规则条数/表条数) */
         let wl_len = crate::rw_read_ignore_poison(&crate::config::WAYLAY_RULES_NEW).len();
-        let cache_len = crate::rw_read_ignore_poison(&crate::config::WAYLAY_PKG_BY_UID).len();
+        let cache_len = self.uid_rules.len();
         let _ = std::fs::write(
             "/data/local/tmp/.appopt_fg_diag",
-            format!("pid={} uid={} fg_pkg={} cache={} waylay_rules={}\n", pid, uid, fg_pkg, cache_len, wl_len),
+            format!("pid={} uid={} uid_rules={} uid_tbl={} waylay_rules={}\n", pid, uid, my.len(), cache_len, wl_len),
         );
-        let my: Vec<crate::config::WaylayRule> = crate::rw_read_ignore_poison(
-            &crate::config::WAYLAY_RULES_NEW,
-        )
-        .iter()
-        .filter(|r| r.pkg == fg_pkg || r.pkg == "*")   /* 含全局规则: 任何前台生效 */
-        .cloned()
-        .collect();
         let active = !my.is_empty();
-        // ---- 前台包名通知内核 (vfc 规则按包段执行; 空=仅全局) ----
+        // ---- 前台 uid 通知内核: uid 在 vfc 规则表 → 执行该 uid 全部规则; 否则仅全局 ----
         if let Some(es) = self.ebpf_state.as_ref() {
-            es.bpf.vfc_fg(&fg_pkg);
+            let in_vfc = self.vfc_uid_set.contains(&uid);
+            es.bpf.vfc_fg(if in_vfc { uid } else { -1i32 });
         }
         // ---- src (系统服务伪装): 该包 src 规则 + 开关 ----
         if active != self.srv_active_cur {
