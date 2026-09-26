@@ -498,11 +498,9 @@ impl AppState {
         // waylay 配置保存 (web /api/waylay): 同步替换字符到内核 (目标 uid 集合已由
         // save_waylay 更新静态, 下一次前台回调差量生效)
         if crate::config::take_waylay_changed() {
-            // 仅 red/red-path (内容替换/文件重定向) 配置变化 → 重下发 vfc 规则
-            // (src/prop 保存不触发; 连接 arm 时始终全量下发)
-            if crate::config::take_vfc_changed() {
-                self.sync_vfc_rules();
-            }
+            // 任何配置变化 → sync_vfc_rules 统一处理:
+            // 内部 vfc 指纹对比 (red/redpath 无变化则零动作) + src/prop 当前前台无条件重发
+            self.sync_vfc_rules();
             crate::config::sync_redpath_perm(&crate::rw_read_ignore_poison(
                 &crate::config::WAYLAY_RULES_NEW,
             ));
