@@ -511,10 +511,46 @@ impl AppState {
         apply_config(cpu_changed, self.cfg.as_deref(), &self.pkg_uid);
     }
 
-    /// packages.list 变化 (安装/卸载/替换) → 整表重建 uid 表
+    /// packages.list 变化 (安装/卸载/替换) → 整表重建 uid 表 (cpu + waylay 规则)
     fn rebuild_uid_tables(&mut self) {
         if let Some(cfg) = self.cfg.as_ref() {
             (self.uid_map, self.pkg_uid) = build_uid_tables(cfg);
+        }
+        /* waylay: 重建 uid→规则 (新安装应用转 uid 后规则才能命中) */
+        let all = crate::rw_read_ignore_poison(&crate::config::WAYLAY_RULES_NEW).clone();
+        let new_by_uid = crate::config::build_waylay_by_uid(&all);
+        *crate::rw_write_ignore_poison(&crate::config::WAYLAY_BY_UID) = new_by_uid;
+        self.sync_vfc_rules();   /* vfc 表重建: 新 uid 规则进内核 (缓存对比驱动) */
+        /* src/prop: 当前前台包重发 (新装应用已在前台时立即生效) */
+        if self.last_fg_uid > 0 {
+            let my = crate::rw_read_ignore_poison(&crate::config::WAYLAY_BY_UID)
+                .get(&self.last_fg_uid)
+                .cloned()
+                .unwrap_or_default();
+            let has_src = my.iter().any(|r| r.kind == crate::config::WaylayKind::Src);
+            let has_prop = my.iter().any(|r| r.kind == crate::config::WaylayKind::Prop);
+            if let Some(es) = self.ebpf_state.as_ref() {
+                es.bpf.srv_clear();
+                for (i, r) in my
+                    .iter()
+                    .filter(|r| r.kind == crate::config::WaylayKind::Src)
+                    .enumerate()
+                {
+                    es.bpf.srv_rule(i, &r.from, &r.to);
+                }
+                es.bpf.srv_active(has_src);
+                if has_prop {
+                    let prop_rules: Vec<(String, String)> = my
+                        .iter()
+                        .filter(|r| r.kind == crate::config::WaylayKind::Prop)
+                        .map(|r| (r.from.clone(), r.to.clone()))
+                        .collect();
+                    crate::config::set_prop_rules(&prop_rules);
+                }
+                es.bpf.prop_file_apply(has_prop);
+            }
+            self.srv_active_cur = has_src;
+            self.prop_active_cur = has_prop;
         }
     }
 
