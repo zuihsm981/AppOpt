@@ -859,7 +859,12 @@ fn waylay_set_api(req: &Request) -> (u16, String) {
     };
     // 连接/断开 (arm 字段非 null 时执行; 独立于配置校验, 由主循环消费 KPM_ARM_REQ)
     if v.get("arm").is_some() && v["arm"].is_boolean() {
-        crate::config::set_kpm_arm_req(v["arm"].as_bool().unwrap_or(false));
+        let arm_req = v["arm"].as_bool().unwrap_or(false);
+        crate::config::set_kpm_arm_req(arm_req);
+        if !arm_req {
+            /* 断开: 同步反映 (前端 loadWaylay 立即读到未连接; 主循环 set_kpm_arm(false) 幂等) */
+            KPM_ARMED.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     let kind_max: std::collections::HashMap<&str, usize> = [
         ("src", 64usize),
