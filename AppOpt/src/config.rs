@@ -181,6 +181,31 @@ pub fn save_waylay(
             }
         }
     }
+    // 保留 redirect 配置段 (共用 waylay.conf): 原 [redirect] 段整体保留
+    if let Ok(content) = std::fs::read_to_string(WAYLAY_FILE) {
+        let mut keep_red = String::new();
+        let mut in_red = false;
+        for line in content.lines() {
+            let t = line.trim();
+            if t == "[redirect]" {
+                in_red = true;
+                keep_red.push_str(line);
+                keep_red.push('\n');
+                continue;
+            }
+            if in_red && t.starts_with('[') {
+                in_red = false;
+            }
+            if in_red {
+                keep_red.push_str(line);
+                keep_red.push('\n');
+            }
+        }
+        if !keep_red.is_empty() {
+            out.push('\n');
+            out.push_str(&keep_red);
+        }
+    }
     let tmp = format!("{}.tmp", WAYLAY_FILE);
     fs::write(&tmp, out.as_bytes())?;
     fs::rename(&tmp, WAYLAY_FILE)?;
@@ -198,6 +223,113 @@ pub fn save_waylay(
 /// 取出并复位 waylay 变更标志
 pub fn take_waylay_changed() -> bool {
     WAYLAY_CHANGED.swap(false, Ordering::AcqRel)
+}
+
+/* ================= redirect (vendor_file_contexts 伪装) 配置 =================
+ * 独立配置文件 redirect.conf (与 applist.conf 同目录):
+ *   enabled=1                       内容替换总开关
+ *   content_rule <from> <to>        内容替换规则 (等长 ASCII, ≤32)
+ *   file_rule <from> <to>           文件重定向规则 (打开 from 路径→重定向到 to 路径)
+ */
+// redirect 配置与 waylay 共用 waylay.conf 的 [redirect] 段
+pub static REDIRECT_CRULES: LazyLock<RwLock<Vec<(String, String)>>> =
+    LazyLock::new(|| RwLock::new(Vec::new()));
+pub static REDIRECT_FRULES: LazyLock<RwLock<Vec<(String, String)>>> =
+    LazyLock::new(|| RwLock::new(Vec::new()));
+pub static REDIRECT_ENABLED: AtomicBool = AtomicBool::new(false);
+pub static REDIRECT_CHANGED: AtomicBool = AtomicBool::new(false);
+
+/// 解析 redirect.conf: enabled= / content_rule / file_rule
+/// 解析 waylay.conf 的 [redirect] 段: enabled= / content_rule / file_rule.
+/// 无默认保底: 未配置 [redirect] 段 → 禁用 + 空规则。
+pub fn load_redirect() -> (bool, Vec<(String, String)>, Vec<(String, String)>) {
+    let mut enabled = false;
+    let mut crules: Vec<(String, String)> = Vec::new();
+    let mut frules: Vec<(String, String)> = Vec::new();
+    let mut in_red = false;
+    if let Ok(content) = std::fs::read_to_string(WAYLAY_FILE) {
+        for line in content.lines() {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') || t.starts_with("//") {
+                continue;
+            }
+            if t == "[redirect]" {
+                in_red = true;
+                continue;
+            }
+            if t.starts_with('[') {
+                in_red = false;
+                continue;
+            }
+            if !in_red {
+                continue;
+            }
+            if let Some(rest) = t.strip_prefix("enabled=") {
+                enabled = rest.trim() == "1";
+            } else if let Some(rest) = t.strip_prefix("content_rule ") {
+                let mut it = rest.split_whitespace();
+                if let (Some(f), Some(to)) = (it.next(), it.next()) {
+                    crules.push((f.to_string(), to.to_string()));
+                }
+            } else if let Some(rest) = t.strip_prefix("file_rule ") {
+                let mut it = rest.split_whitespace();
+                if let (Some(f), Some(to)) = (it.next(), it.next()) {
+                    frules.push((f.to_string(), to.to_string()));
+                }
+            }
+        }
+    }
+    (enabled, crules, frules)
+}
+
+/// 保存 redirect 段到 waylay.conf (保留原 waylay 非 [redirect] 内容, tmp+rename 原子写),
+/// 更新静态并置变更标志
+pub fn save_redirect(
+    enabled: bool,
+    crules: &[(String, String)],
+    frules: &[(String, String)],
+) -> io::Result<()> {
+    let mut out = String::new();
+    if let Ok(content) = std::fs::read_to_string(WAYLAY_FILE) {
+        let mut drop = false;
+        for line in content.lines() {
+            let t = line.trim();
+            if t == "[redirect]" {
+                drop = true;
+                continue;
+            }
+            if drop && t.starts_with('[') {
+                drop = false;
+            }
+            if !drop {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("[redirect]\n");
+    out.push_str(&format!("enabled={}\n", if enabled { 1 } else { 0 }));
+    for (f, t) in crules {
+        out.push_str(&format!("content_rule {} {}\n", f.trim(), t.trim()));
+    }
+    for (f, t) in frules {
+        out.push_str(&format!("file_rule {} {}\n", f.trim(), t.trim()));
+    }
+    let tmp = format!("{}.tmp", WAYLAY_FILE);
+    fs::write(&tmp, out.as_bytes())?;
+    fs::rename(&tmp, WAYLAY_FILE)?;
+    *rw_write_ignore_poison(&REDIRECT_CRULES) = crules.to_vec();
+    *rw_write_ignore_poison(&REDIRECT_FRULES) = frules.to_vec();
+    REDIRECT_ENABLED.store(enabled, Ordering::Release);
+    REDIRECT_CHANGED.store(true, Ordering::Release);
+    Ok(())
+}
+
+pub fn take_redirect_changed() -> bool {
+    REDIRECT_CHANGED.swap(false, Ordering::AcqRel)
 }
 
 /// 校验并清理规则 (供同步内核前调用): 返回 (srv 合法规则, prop 合法规则)

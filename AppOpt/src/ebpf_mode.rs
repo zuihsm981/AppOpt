@@ -168,17 +168,7 @@ impl KpmHandle {
     pub(crate) fn arm(&self) {
         self.cmd("start");
         ensure_prop_maps();   // 连接时提前 mmap 目标 tmpfs 文件并保持
-        self.vfc_apply();     // vendor_file_contexts 读取重定向 (lineage→oplus)
-        // vfc 分步调试模式 (免编译切换): /data/adb/modules/AppOpt/redirect/mode
-        // 内容 0=空转 1=strcmp 2=重定向 (缺省 0); 连接/重连生效
-        let mode_path = "/data/adb/modules/AppOpt/mode";
-        let vfc_mode = std::fs::read_to_string(mode_path)
-            .ok()
-            .and_then(|m| m.trim().parse::<i32>().ok())
-            .unwrap_or(0);
-        if (0..=2).contains(&vfc_mode) {
-            self.cmd(&format!("vfc_mode {}", vfc_mode));
-        }
+        self.vfc_apply();     // vendor_file_contexts 伪装 (内容替换)
     }
 
     /// 解除武装 (stop: 摘除全部业务探针 + 恢复 vendor_file_contexts 读取)
@@ -187,57 +177,39 @@ impl KpmHandle {
         self.vfc_disable();
     }
 
-    /// vendor_file_contexts 读取重定向 (方案 B): 内核 filp_open hook 将对该路径的 open
-    /// 精确重定向到伪装文件。伪装文件由用户自行准备 (内容自行修改, AppOpt 不做替换),
-    /// 放在 /storage/emulated/0 (FUSE, 所有应用可读)。
-    /// 同时下发原文件元数据 + security.selinux 标签, 内核 vfs_getattr/vfs_getxattr
-    /// 覆盖 fd 层查询 (fstat/fgetxattr(fd)) —— 元数据与原文件一致, 大小/标签不暴露伪装。
+    /// vendor_file_contexts 内容替换 (vfs_read 读真实文件时按 crule 规则替换内容):
+    /// 先 vfc off 清状态, 再 vfc on 启用 (普通应用读真实文件, 内容被替换)。
     pub(crate) fn vfc_apply(&self) {
-        use std::os::unix::fs::MetadataExt;
-        const VFC_ORIG: &str = "/vendor/etc/selinux/vendor_file_contexts";
-        // 内容替换版 (vfs_read 读真实文件替换内容, 不重定向):
-        // 先 vfc off 清残留重定向路径 (旧版 vfc <path> 会重定向到 FUSE → 普通应用 EACCES),
-        // 再 vfc on 启用内容替换 (vfc_path 空, open 走真实文件, 普通应用可读)。
         self.cmd("vfc off");
         self.cmd("vfc on");
         self.vfc_status_debug();
-        // 原文件元数据: size ino mode mtime(sec nsec) ctime(sec nsec)
-        if let Ok(md) = std::fs::metadata(VFC_ORIG) {
-            let sec_ns = |t: std::io::Result<std::time::SystemTime>| {
-                t.ok()
-                    .and_then(|x| x.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| (d.as_secs(), d.subsec_nanos()))
-                    .unwrap_or((0, 0))
-            };
-            let mt = sec_ns(md.modified());
-            let ct = sec_ns(md.created());
-            let stat = format!(
-                "vfc_stat {} {} {} {} {} {} {}",
-                md.len(), md.ino(), md.mode() & 0o7777, mt.0, mt.1, ct.0, ct.1
-            );
-            self.cmd(&stat);
-        }
-        // 原文件 security.selinux 标签
-        let cpath = std::ffi::CString::new(VFC_ORIG).unwrap_or_default();
-        let cname = std::ffi::CString::new("security.selinux").unwrap_or_default();
-        let mut buf = [0u8; 256];
-        let n = unsafe {
-            libc::getxattr(
-                cpath.as_ptr(),
-                cname.as_ptr(),
-                buf.as_mut_ptr() as *mut libc::c_void,
-                buf.len(),
-            )
-        };
-        if n > 0 {
-            let label = String::from_utf8_lossy(&buf[..n as usize]).to_string();
-            self.cmd(&format!("vfc_label {}", label));
-        }
     }
 
     /// 禁用 vendor_file_contexts 重定向 (摘除内核 hook, 恢复原文件读取)
     pub(crate) fn vfc_disable(&self) {
         self.cmd("vfc off");
+    }
+
+    /// 内容替换规则: 清空
+    pub(crate) fn vfc_crule_clear(&self) {
+        self.cmd("vfc_crule_clear");
+    }
+
+    /// 内容替换规则: 第 idx 组 from→to (等长 ASCII, ≤32)
+    pub(crate) fn vfc_crule(&self, idx: usize, from: &str, to: &str) {
+        let args = format!("vfc_crule {} {} {}", idx, from, to);
+        self.cmd(&args);
+    }
+
+    /// 文件重定向规则: 清空
+    pub(crate) fn vfc_frule_clear(&self) {
+        self.cmd("vfc_frule_clear");
+    }
+
+    /// 文件重定向规则: 第 idx 组 from 路径 → to 路径
+    pub(crate) fn vfc_frule(&self, idx: usize, from: &str, to: &str) {
+        let args = format!("vfc_frule {} {} {}", idx, from, to);
+        self.cmd(&args);
     }
 
     /// 诊断: 查询 vfc hook 挂载状态并写 /data/local/tmp/.appopt_vfc_status

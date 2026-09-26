@@ -217,6 +217,8 @@ fn dispatch(out: &mut TcpStream, req: &Request) {
         ("GET", "/api/refresh/status") => (200, refresh_status_json()),
         ("GET", "/api/refresh/config") => (200, refresh_config_json()),
         ("POST", "/api/refresh/config") => refresh_config_set_api(req),
+        ("GET", "/api/redirect") => (200, redirect_json()),
+        ("POST", "/api/redirect") => redirect_set_api(req),
         ("GET", "/api/waylay") => (200, waylay_json()),
         // webui 不可见 (visibilitychange hidden) 时前端触发: 提前映射 prop 目标文件
         ("GET", "/api/propmap") | ("POST", "/api/propmap") => {
@@ -829,6 +831,56 @@ pub fn settings_save() {
 // ===== waylay (service list 拦截伪装) Web API =====
 
 /// GET /api/waylay: 当前配置 (多组规则) + KPM 连接状态
+fn redirect_json() -> String {
+    let (enabled, crules, frules) = crate::config::load_redirect();
+    let c: Vec<serde_json::Value> = crules
+        .iter()
+        .map(|(f, t)| serde_json::json!({"from": f, "to": t}))
+        .collect();
+    let f: Vec<serde_json::Value> = frules
+        .iter()
+        .map(|(f, t)| serde_json::json!({"from": f, "to": t}))
+        .collect();
+    serde_json::json!({"enabled": enabled, "content_rules": c, "file_rules": f}).to_string()
+}
+
+fn redirect_set_api(req: &Request) -> (u16, String) {
+    let v: serde_json::Value = match serde_json::from_slice(&req.body) {
+        Ok(v) => v,
+        Err(_) => return err_json(400, "invalid json"),
+    };
+    let mut crules: Vec<(String, String)> = Vec::new();
+    if let Some(arr) = v["content_rules"].as_array() {
+        for r in arr {
+            let f = r["from"].as_str().unwrap_or("").to_string();
+            let t = r["to"].as_str().unwrap_or("").to_string();
+            if f.is_empty() || f.len() != t.len() || f.len() > 64
+                || !f.is_ascii() || !t.is_ascii()
+            {
+                return err_json(400, "内容替换: 原与替换字符数需一致 (ASCII, ≤64)");
+            }
+            crules.push((f, t));
+        }
+    }
+    let mut frules: Vec<(String, String)> = Vec::new();
+    if let Some(arr) = v["file_rules"].as_array() {
+        for r in arr {
+            let f = r["from"].as_str().unwrap_or("").to_string();
+            let t = r["to"].as_str().unwrap_or("").to_string();
+            if f.is_empty() || t.is_empty() || f.len() > 127 || t.len() > 255 {
+                return err_json(400, "文件重定向: 路径不能为空且长度受限");
+            }
+            frules.push((f, t));
+        }
+    }
+    // 有规则即自动启用 (无手动开关)
+    let enabled = !crules.is_empty() || !frules.is_empty();
+    match crate::config::save_redirect(enabled, &crules, &frules) {
+        Ok(_) => (200, json!({"ok": true}).to_string()),
+        Err(e) => err_json(500, &format!("save failed: {}", e)),
+    }
+}
+
 fn waylay_json() -> String {
     let rules = crate::rw_read_ignore_poison(&crate::config::WAYLAY_RULES).clone();
     let apps = crate::rw_read_ignore_poison(&crate::config::WAYLAY_APPS).clone();
@@ -862,10 +914,10 @@ fn waylay_set_api(req: &Request) -> (u16, String) {
         for r in arr {
             let f = r["from"].as_str().unwrap_or("").to_string();
             let t = r["to"].as_str().unwrap_or("").to_string();
-            if f.is_empty() || f.len() != t.len() || f.len() > 32
+            if f.is_empty() || f.len() != t.len() || f.len() > 64
                 || !f.is_ascii() || !t.is_ascii()
             {
-                return err_json(400, "拦截与替换字符数需一致 (ASCII, ≤32)");
+                return err_json(400, "拦截与替换字符数需一致 (ASCII, ≤64, 支持长服务名)");
             }
             rules.push((f, t));
         }

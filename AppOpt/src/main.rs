@@ -361,6 +361,7 @@ impl AppState {
             if arm {
                 es.bpf.arm();
                 self.sync_waylay_rules();
+                self.sync_vfc_rules();
             } else {
                 es.bpf.disarm();
                 // 断开把探针摘除 (srv_remove); 重置激活记录 → 下次前台回调重新下发
@@ -368,6 +369,27 @@ impl AppState {
                 self.srv_active_cur = false;
             }
             crate::web::KPM_ARMED.store(arm, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// 同步 redirect (vendor_file_contexts 伪装) 规则到内核: 内容替换规则
+    /// (vfc_crule) + 文件重定向规则 (vfc_frule); enabled 决定 vfc on/off
+    fn sync_vfc_rules(&self) {
+        if let Some(es) = self.ebpf_state.as_ref() {
+            let (enabled, crules, frules) = crate::config::load_redirect();
+            es.bpf.vfc_crule_clear();
+            for (i, (f, t)) in crules.iter().enumerate() {
+                es.bpf.vfc_crule(i, f, t);
+            }
+            es.bpf.vfc_frule_clear();
+            for (i, (f, t)) in frules.iter().enumerate() {
+                es.bpf.vfc_frule(i, f, t);
+            }
+            if enabled {
+                es.bpf.vfc_apply();
+            } else {
+                es.bpf.vfc_disable();
+            }
         }
     }
 
@@ -397,6 +419,10 @@ impl AppState {
             self.sync_waylay_rules();
             // 保存后: 新 prop 规则/应用提前映射
             crate::ebpf_mode::ensure_prop_maps();
+        }
+        // redirect (vendor_file_contexts 伪装) 配置保存: 重新下发规则 + 启停
+        if crate::config::take_redirect_changed() {
+            self.sync_vfc_rules();
         }
         let cpu_changed = crate::config::take_cpu_rules_changed();
         self.cfg = rw_read_ignore_poison(&CURRENT_CONFIG).clone();
