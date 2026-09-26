@@ -115,7 +115,7 @@ pub fn rebuild_pkg_by_uid() {
             let mut it = line.split_whitespace();
             let (Some(pkg), Some(uid_s)) = (it.next(), it.next()) else { continue };
             let Ok(uid) = uid_s.parse::<i32>() else { continue };
-            if uid >= 100000 && pkgs.contains(pkg) {
+            if uid > 0 && pkgs.contains(pkg) {   /* 含系统应用(uid<100000); uid 0=root 排除 */
                 m.insert(uid, pkg.to_string());
             }
         }

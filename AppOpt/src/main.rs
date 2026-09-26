@@ -418,8 +418,8 @@ impl AppState {
             }
             es.bpf.vfc_glob_count(glob_n);
             es.bpf.vfc_fg(&self.last_fg_pkg);   /* 表重建后定位当前前台包段 */
+            self.rule_cache = rows;   /* 仅成功下发后更新缓存 (未连接时不更新 → 连接后必重发) */
         }
-        self.rule_cache = rows;
     }
 
     fn reload(&mut self) {
@@ -526,11 +526,18 @@ impl AppState {
             .cloned()
             .unwrap_or_default();
         self.last_fg_pkg = fg_pkg.clone();
+        /* 诊断: on_fg 执行信息 (定位全失效: 是否触发/fg_pkg/规则条数/缓存条数) */
+        let wl_len = crate::rw_read_ignore_poison(&crate::config::WAYLAY_RULES_NEW).len();
+        let cache_len = crate::rw_read_ignore_poison(&crate::config::WAYLAY_PKG_BY_UID).len();
+        let _ = std::fs::write(
+            "/data/local/tmp/.appopt_fg_diag",
+            format!("pid={} uid={} fg_pkg={} cache={} waylay_rules={}\n", pid, uid, fg_pkg, cache_len, wl_len),
+        );
         let my: Vec<crate::config::WaylayRule> = crate::rw_read_ignore_poison(
             &crate::config::WAYLAY_RULES_NEW,
         )
         .iter()
-        .filter(|r| r.pkg == fg_pkg)
+        .filter(|r| r.pkg == fg_pkg || r.pkg == "*")   /* 含全局规则: 任何前台生效 */
         .cloned()
         .collect();
         let active = !my.is_empty();
