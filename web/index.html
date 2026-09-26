@@ -59,6 +59,14 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 .grp.open .chev{transform:rotate(90deg)}
 .grp-name{flex:1;min-width:0;word-break:break-all;font-weight:600;font-size:14px}
 .grp-count{font-size:11px;color:var(--sub);background:var(--bg);border-radius:999px;padding:2px 8px;flex-shrink:0}
+.pkg-chip{font-size:12px;color:var(--sub);background:var(--bg);border-radius:999px;padding:3px 10px;word-break:break-all}
+/* .switch 状态指示 (滑块开关) */
+.switch{position:relative;display:inline-block;width:44px;height:24px;flex-shrink:0}
+.switch input{opacity:0;width:0;height:0}
+.switch span{position:absolute;cursor:pointer;inset:0;background:var(--sub);border-radius:999px;transition:background .2s}
+.switch span:before{content:'';position:absolute;width:18px;height:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:transform .2s}
+.switch input:checked+span{background:var(--accent,#4c8dff)}
+.switch input:checked+span:before{transform:translateX(20px)}
 .grp-body{display:grid;grid-template-rows:0fr;transition:grid-template-rows .16s ease}
 .grp.open .grp-body{grid-template-rows:1fr}
 .grp-inner{overflow:hidden}
@@ -245,14 +253,14 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 </div>
 </div>
 <div class="uclamp-chips" id="w-seg" style="margin-bottom:8px">
-<button data-v="srv" class="on">系统服务伪装</button><button data-v="prop">系统属性伪装</button><button data-v="red">重定向文件</button>
+<button data-v="srv" class="on">系统服务伪装</button><button data-v="prop">系统属性伪装</button><button data-v="red">内容替换</button><button data-v="redpath">重定向文件</button>
 </div>
 <div id="w-srv-pane">
 <div class="card">
-<div class="field"><span class="label" style="white-space:nowrap">原服务名</span><input id="w-from" maxlength="32"></div>
-<div class="field"><span class="label" style="white-space:nowrap">新服务名</span><input id="w-to" maxlength="32"></div>
+<div class="field"><span class="label" style="white-space:nowrap;color:#000;font-weight:600">原服务名</span><input id="w-from" maxlength="32"></div>
+<div class="field"><span class="label" style="white-space:nowrap;color:#000;font-weight:600">新服务名</span><input id="w-to" maxlength="32"></div>
 <button class="btn" id="w-rule-add" style="width:100%;margin-top:8px">＋ 添加规则</button>
-<div class="hint">原服务名和新服务名字符数需一致 (ASCII, ≤32), 无需输入完整服务名，可以只输入关键词</div>
+<div class="hint">原服务名/新服务名字符数需一致 (ASCII ≤64), 无需输入完整服务名，可以只输入关键词</div>
 <div id="w-rules" style="margin-top:8px"></div>
 </div>
 <div class="card">
@@ -264,31 +272,49 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 </div>
 <div id="w-prop-pane" hidden>
 <div class="card">
-<div class="field"><span class="label" style="white-space:nowrap">原属性名</span><input id="wp-from" maxlength="92" placeholder="ro.boottime.vendor.lineage_health"></div>
-<div class="field"><span class="label" style="white-space:nowrap">新属性名</span><input id="wp-to" maxlength="92" placeholder="ro.boottime.vendor.opluscn_health"></div>
+<div class="field"><span class="label" style="white-space:nowrap;color:#000;font-weight:600">原属性名</span><input id="wp-from" maxlength="92" placeholder="ro.boottime.vendor.lineage_health"></div>
+<div class="field"><span class="label" style="white-space:nowrap;color:#000;font-weight:600">新属性名</span><input id="wp-to" maxlength="92" placeholder="ro.boottime.vendor.opluscn_health"></div>
 <button class="btn" id="wp-add" style="width:100%;margin-top:8px">＋ 添加替换对</button>
-<div class="hint">属性名替换对: 完整属性名, 新旧等长 (ASCII ≤92), 可添加多组; 添加/删除即保存</div>
+<div class="hint">原属性名/新属性名字符数需一致 (ASCII ≤92)</div>
 <div id="wp-rules" style="margin-top:8px"></div>
 </div>
 <div class="card">
-<div class="card-title">目标应用 <span class="hint" style="font-weight:400">(prop 伪装独立目标; 前台时激活/切走恢复)</span></div>
+<div class="card-title">目标应用 <span class="hint" style="font-weight:400">(应用在前台时自动伪装)</span></div>
 <div class="sg-wrap"><input id="wp-app" placeholder="输入包名添加目标应用"><div class="sg-box" id="wp-sg" hidden></div></div>
 <button class="btn" id="wp-add-app" style="width:100%;margin-top:8px">＋ 添加应用</button>
 <div id="wp-apps" style="margin-top:8px"></div>
 </div>
 </div>
-<div id="w-redirect-pane" hidden>
+<div id="w-red-pane" hidden>
+<div class="card" style="padding:13px 14px;display:flex;align-items:center;justify-content:space-between"><span class="label" style="color:#000;font-weight:600">全局生效</span><label class="switch"><input type="checkbox" id="rd-global"><span></span></label></div>
 <div class="card">
-<div class="field"><span class="label" style="white-space:nowrap">内容替换 原</span><input id="rd-cfrom" maxlength="32"></div>
-<div class="field"><span class="label" style="white-space:nowrap">内容替换 新</span><input id="rd-cto" maxlength="32"></div>
+<div class="field"><span class="label" style="white-space:nowrap;color:#000;font-weight:600">原内容</span><input id="rd-cfrom" maxlength="32"></div>
+<div class="field"><span class="label" style="white-space:nowrap;color:#000;font-weight:600">新内容</span><input id="rd-cto" maxlength="32"></div>
 <button class="btn" id="rd-cadd" style="width:100%;margin-top:8px">＋ 添加内容替换规则</button>
-<div class="hint">内容替换规则: 原/新字符数需一致 (ASCII ≤32)</div>
+<div class="hint">内容替换 原/新字符数需一致 (ASCII ≤64)</div>
 <div id="rd-crules" style="margin-top:8px"></div>
-<div class="field" style="margin-top:8px;flex-direction:column;align-items:stretch"><span class="label" style="margin-bottom:4px">文件重定向 原路径</span><input id="rd-ffrom" placeholder="/vendor/etc/selinux/vendor_file_contexts"></div>
-<div class="field" style="margin-top:8px;flex-direction:column;align-items:stretch"><span class="label" style="margin-bottom:4px">文件重定向 目标路径</span><input id="rd-fto" placeholder="/storage/emulated/0/vendor_file_contexts"></div>
+</div>
+<div class="card">
+<div class="card-title">目标应用 </div>
+<div class="sg-wrap"><input id="rd-app" placeholder="输入包名添加目标应用"><div class="sg-box" id="rd-sg" hidden></div></div>
+<button class="btn" id="rd-add-app" style="width:100%;margin-top:8px">＋ 添加应用</button>
+<div id="rd-apps" style="margin-top:8px"></div>
+</div>
+</div>
+<div id="w-redpath-pane" hidden>
+<div class="card" style="padding:13px 14px;display:flex;align-items:center;justify-content:space-between"><span class="label" style="color:#000;font-weight:600">全局生效</span><label class="switch"><input type="checkbox" id="rdp-global"><span></span></label></div>
+<div class="card">
+<div class="field" style="flex-direction:column;align-items:stretch"><span class="label" style="margin-bottom:4px;color:#000;font-weight:600">原路径</span><input id="rd-ffrom" placeholder="/vendor/etc/selinux/vendor_file_contexts"></div>
+<div class="field" style="margin-top:8px;flex-direction:column;align-items:stretch"><span class="label" style="margin-bottom:4px;color:#000;font-weight:600">新路径</span><input id="rd-fto" placeholder="/storage/emulated/0/vendor_file_contexts"></div>
 <button class="btn" id="rd-fadd" style="width:100%;margin-top:8px">＋ 添加文件重定向规则</button>
 <div class="hint">文件重定向: 打开原路径 → 重定向到目标路径 (目标需读取者可访问)</div>
 <div id="rd-frules" style="margin-top:8px"></div>
+</div>
+<div class="card">
+<div class="card-title">目标应用 </div>
+<div class="sg-wrap"><input id="rdp-app" placeholder="输入包名添加目标应用"><div class="sg-box" id="rdp-sg" hidden></div></div>
+<button class="btn" id="rdp-add-app" style="width:100%;margin-top:8px">＋ 添加应用</button>
+<div id="rdp-apps" style="margin-top:8px"></div>
 </div>
 </div>
 </section>
@@ -439,23 +465,30 @@ document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{
   if(t==='settings')loadCfg();
 });
 
-// ===== 隐藏 (waylay) 页: 三段 (规则+目标应用分离) — 保存/加载走新格式 <pkg>=<kind>-<from>-<to> =====
+// ===== 隐藏 (waylay) 页: 三段 (规则+目标应用分离), 保存/加载新格式 <pkg>=<kind>-<from>-<to> =====
 let wlRules=[];let wlApps=[];
 let wlPropRules=[];let wlPropApps=[];
-let rdCrules=[];let rdFrules=[];
-function rowHtml(txt,i){return `<div class="row" style="margin-bottom:4px"><span class="mono">${esc(txt)}</span><button class="icon-btn danger" data-i="${i}" title="删除">${ICO_TRASH}</button></div>`}
+let rdCrules=[];let rdFrules=[];let rdApps=[];let rdpApps=[];
+// 列表项与规则页主列表同款: .rule-row + .rule-name (普通字体)
+function rowHtml(txt,i){return `<div class="rule-row"><span class="rule-name">${esc(txt)}</span><button class="icon-btn danger" data-i="${i}" title="删除">${ICO_TRASH}</button></div>`}
+// 目标应用: 每应用一个 grp 圆角框 (规则页同款; 默认折叠)
+const grow=(a,i)=>`<div class="grp"><div class="grp-head"><svg class="chev" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg><span class="grp-name">${esc(a)}</span><span class="grp-count">0</span><button class="icon-btn danger" data-i="${i}" title="移除">${ICO_TRASH}</button></div><div class="grp-body"><div class="grp-inner"><div class="hint" style="padding:8px 14px">规则在上方「规则配置」区添加</div></div></div></div>`;
 function renderWaylayRules(){$('w-rules').innerHTML=wlRules.length?wlRules.map((r,i)=>rowHtml(`${r.from} → ${r.to}`,i)).join(''):'<div class="hint">未添加规则</div>';}
-function renderWaylayApps(){$('w-apps').innerHTML=wlApps.length?wlApps.map((a,i)=>rowHtml(a,i)).join(''):'<div class="hint">未添加目标应用</div>';}
+function renderWaylayApps(){$('w-apps').innerHTML=wlApps.length?wlApps.map((a,i)=>grow(a,i)).join(''):'<div class="hint">未添加目标应用</div>';}
 function renderWpRules(){$('wp-rules').innerHTML=wlPropRules.length?wlPropRules.map((r,i)=>rowHtml(`${r.from} → ${r.to}`,i)).join(''):'<div class="hint">未添加替换对</div>';}
-function renderWpApps(){$('wp-apps').innerHTML=wlPropApps.length?wlPropApps.map((a,i)=>rowHtml(a,i)).join(''):'<div class="hint">未添加目标应用</div>';}
+function renderWpApps(){$('wp-apps').innerHTML=wlPropApps.length?wlPropApps.map((a,i)=>grow(a,i)).join(''):'<div class="hint">未添加目标应用</div>';}
 function renderRdCrules(){if(!rdCrules.length){$('rd-crules').innerHTML='<div class="hint">未添加内容替换规则</div>';return}$('rd-crules').innerHTML=rdCrules.map((r,i)=>rowHtml(`${r.from} → ${r.to}`,i)).join('');}
 function renderRdFrules(){if(!rdFrules.length){$('rd-frules').innerHTML='<div class="hint">未添加文件重定向规则</div>';return}$('rd-frules').innerHTML=rdFrules.map((r,i)=>rowHtml(`${r.from} → ${r.to}`,i)).join('');}
+function renderRdApps(){$('rd-apps').innerHTML=rdApps.length?rdApps.map((a,i)=>grow(a,i)).join(''):'<div class="hint">未添加目标应用</div>';}
+function renderRdpApps(){$('rdp-apps').innerHTML=rdpApps.length?rdpApps.map((a,i)=>grow(a,i)).join(''):'<div class="hint">未添加目标应用</div>';}
 $('w-rules').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(!b)return;wlRules.splice(+b.dataset.i,1);renderWaylayRules();wlSaveNow();});
-$('w-apps').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(!b)return;wlApps.splice(+b.dataset.i,1);renderWaylayApps();wlSaveNow();});
+$('w-apps').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(b){wlApps.splice(+b.dataset.i,1);renderWaylayApps();wlSaveNow();return}const h=e.target.closest('.grp-head');if(h)h.parentElement.classList.toggle('open');});
 $('wp-rules').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(!b)return;wlPropRules.splice(+b.dataset.i,1);renderWpRules();wlSaveNow();});
-$('wp-apps').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(!b)return;wlPropApps.splice(+b.dataset.i,1);renderWpApps();wlSaveNow();});
+$('wp-apps').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(b){wlPropApps.splice(+b.dataset.i,1);renderWpApps();wlSaveNow();return}const h=e.target.closest('.grp-head');if(h)h.parentElement.classList.toggle('open');});
 $('rd-crules').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(!b)return;rdCrules.splice(+b.dataset.i,1);renderRdCrules();wlSaveNow();});
 $('rd-frules').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(!b)return;rdFrules.splice(+b.dataset.i,1);renderRdFrules();wlSaveNow();});
+$('rd-apps').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(b){rdApps.splice(+b.dataset.i,1);renderRdApps();wlSaveNow();return}const h=e.target.closest('.grp-head');if(h)h.parentElement.classList.toggle('open');});
+$('rdp-apps').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(b){rdpApps.splice(+b.dataset.i,1);renderRdpApps();wlSaveNow();return}const h=e.target.closest('.grp-head');if(h)h.parentElement.classList.toggle('open');});
 $('w-rule-add').onclick=()=>{
   const f=$('w-from').value.trim(),t=$('w-to').value.trim();
   if(!f.length||f.length!==t.length||f.length>64){toast('原/新服务名字符数需一致 (≤64)');return}
@@ -478,40 +511,52 @@ $('rd-fadd').onclick=()=>{
 };
 function wlAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!wlApps.includes(pkg))wlApps.push(pkg);$('w-app').value='';$('w-sg').hidden=true;renderWaylayApps();wlSaveNow();}
 function wpAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!wlPropApps.includes(pkg))wlPropApps.push(pkg);$('wp-app').value='';$('wp-sg').hidden=true;renderWpApps();wlSaveNow();}
+function rdAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!rdApps.includes(pkg))rdApps.push(pkg);$('rd-app').value='';$('rd-sg').hidden=true;renderRdApps();wlSaveNow();}
+function rdpAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!rdpApps.includes(pkg))rdpApps.push(pkg);$('rdp-app').value='';$('rdp-sg').hidden=true;renderRdpApps();wlSaveNow();}
 $('w-add').onclick=()=>wlAddApp($('w-app').value);
 $('wp-add-app').onclick=()=>wpAddApp($('wp-app').value);
+$('rd-add-app').onclick=()=>rdAddApp($('rd-app').value);
+$('rdp-add-app').onclick=()=>rdpAddApp($('rdp-app').value);
 suggest_bind($('w-app'),$('w-sg'),{onpick:wlAddApp});
 suggest_bind($('wp-app'),$('wp-sg'),{onpick:wpAddApp});
-// 三段切换
+suggest_bind($('rd-app'),$('rd-sg'),{onpick:rdAddApp});
+suggest_bind($('rdp-app'),$('rdp-sg'),{onpick:rdpAddApp});
 $('w-seg').addEventListener('click',e=>{
   const b=e.target.closest('button');if(!b)return;
   const v=b.dataset.v;
   $('w-seg').querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));
-  $('w-srv-pane').hidden=v!=='srv';
-  $('w-prop-pane').hidden=v!=='prop';
-  $('w-redirect-pane').hidden=v!=='red';
+  $('w-srv-pane').hidden=v!=='srv';$('w-prop-pane').hidden=v!=='prop';$('w-red-pane').hidden=v!=='red';$('w-redpath-pane').hidden=v!=='redpath';
 });
-// 保存构造: 新格式 rules (规则 × 目标应用 笛卡尔; red 目标沿用服务目标)
+// 保存构造: 新格式 rules (规则 × 目标应用 笛卡尔; red 目标=rdApps; 全局开关→pkg="*")
 function buildRules(){
   const out=[];
   wlApps.forEach(p=>wlRules.forEach(r=>out.push({pkg:p,kind:'src',from:r.from,to:r.to})));
   wlPropApps.forEach(p=>wlPropRules.forEach(r=>out.push({pkg:p,kind:'prop',from:r.from,to:r.to})));
-  (wlApps.length?wlApps:[]).forEach(p=>{
+  (($('rd-global')&&$('rd-global').checked)?['*']:rdApps).forEach(p=>{
     rdCrules.forEach(r=>out.push({pkg:p,kind:'red',from:r.from,to:r.to}));
+  });
+  (($('rdp-global')&&$('rdp-global').checked)?['*']:rdpApps).forEach(p=>{
     rdFrules.forEach(r=>out.push({pkg:p,kind:'red-path',from:r.from,to:r.to}));
   });
   return out;
 }
-function renderWaylayConn(c){
-  $('w-conn').textContent=c?'已连接':'未连接';
-  $('w-conn').className='badge '+(c?'kpm':'proc');
-  $('w-conn-chips').querySelectorAll('button').forEach(b=>b.classList.toggle('on',(b.dataset.v==='1')===c));
-}
+function renderWaylayConn(c){$('w-conn').textContent=c?'已连接':'未连接';$('w-conn').className='badge '+(c?'kpm':'proc');$('w-conn-chips').querySelectorAll('button').forEach(b=>b.classList.toggle('on',(b.dataset.v==='1')===c));}
 let wlSaveTimer=null;
 function wlSaveNow(){
   clearTimeout(wlSaveTimer);
   wlSaveTimer=setTimeout(async()=>{
-    try{await api('/api/waylay',{rules:buildRules()})}catch(e){toast(e.message)}
+    const rules=buildRules();
+    // 保存前检查: 非空 / 等长 / 长度 / ASCII
+    for(const r of rules){
+      const isPath=r.kind==='red-path';
+      const max=r.kind==='prop'?92:(r.kind==='src'||r.kind==='red')?64:255;
+      if(!r.from||!r.to){toast('规则不能为空');return}
+      if(isPath){if(r.from.length>127||r.to.length>255){toast('路径超限 (≤127/255)');return}continue}
+      if(r.from.length!==r.to.length){toast('需等长 (ASCII)');return}
+      if(r.from.length>max){toast('超出长度限制 (≤'+max+')');return}
+      if(!/^[ -]*$/.test(r.from)||!/^[ -]*$/.test(r.to)){toast('仅支持 ASCII 字符');return}
+    }
+    try{await api('/api/waylay',{rules})}catch(e){toast(e.message)}
   },200);
 }
 async function loadWaylay(){
@@ -523,10 +568,14 @@ async function loadWaylay(){
     wlApps=uniq(rs.filter(r=>r.kind==='src').map(r=>r.pkg));
     wlPropRules=uniq(rs.filter(r=>r.kind==='prop').map(r=>r.from+'\u0000'+r.to)).map(k=>{const [f,t]=k.split('\u0000');return {from:f,to:t}});
     wlPropApps=uniq(rs.filter(r=>r.kind==='prop').map(r=>r.pkg));
-    rdCrules=uniq(rs.filter(r=>r.kind==='red').map(r=>r.from+'\u0000'+r.to)).map(k=>{const [f,t]=k.split('\u0000');return {from:f,to:t}});
-    rdFrules=uniq(rs.filter(r=>r.kind==='red-path').map(r=>r.from+'\u0000'+r.to)).map(k=>{const [f,t]=k.split('\u0000');return {from:f,to:t}});
+    rdCrules=uniq(rs.filter(r=>r.kind==='red'&&r.pkg!=='*').map(r=>r.from+'\u0000'+r.to)).map(k=>{const [f,t]=k.split('\u0000');return {from:f,to:t}});
+    rdFrules=uniq(rs.filter(r=>r.kind==='red-path'&&r.pkg!=='*').map(r=>r.from+'\u0000'+r.to)).map(k=>{const [f,t]=k.split('\u0000');return {from:f,to:t}});
+    rdApps=uniq(rs.filter(r=>r.kind==='red'&&r.pkg!=='*').map(r=>r.pkg));
+    rdpApps=uniq(rs.filter(r=>r.kind==='red-path'&&r.pkg!=='*').map(r=>r.pkg));
+    if($('rd-global'))$('rd-global').checked=rs.some(r=>r.kind==='red'&&r.pkg==='*');
+    if($('rdp-global'))$('rdp-global').checked=rs.some(r=>r.kind==='red-path'&&r.pkg==='*');
     renderWaylayConn(!!d.connected);
-    renderWaylayRules();renderWaylayApps();renderWpRules();renderWpApps();renderRdCrules();renderRdFrules();
+    renderWaylayRules();renderWaylayApps();renderWpRules();renderWpApps();renderRdCrules();renderRdFrules();renderRdApps();renderRdpApps();
     return !!d.connected;
   }catch(e){toast(e.message);return false}
 }
