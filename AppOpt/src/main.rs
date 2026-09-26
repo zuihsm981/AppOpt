@@ -520,7 +520,7 @@ impl AppState {
     /// binder 前台回调 (pid+uid): 查 uid 表分发 CPU (冷启动 ApplyPkg + pidfd watch)
     /// 与刷新率 (包名) —— 原 EV_FG 分支主体
     fn on_fg(&mut self, pid: i32, uid: i32) {
-        // 前台包名 (查缓存 WAYLAY_PKG_BY_UID, 不读文件)
+        // 前台包名 (查缓存 — 初始化 reload 已构建 uid→包名映射)
         let fg_pkg = crate::rw_read_ignore_poison(&crate::config::WAYLAY_PKG_BY_UID)
             .get(&uid)
             .cloned()
@@ -801,8 +801,9 @@ fn main() {
     epoll_add(epfd, pkg_inotify_fd, EV_PKG);
 
     // 初始全量应用 (两种驱动模式都执行: KPM 事件驱动 / 纯用户态)
-    // 刷新率全局初始 active 已由 refresh_init 应用; launcher 前台由 FgPkg 包名驱动。
     state.apply_all();
+    // 初始加载 waylay 配置 (WAYLAY_RULES_NEW + uid→包名缓存 + src/prop 规则; on_fg 直接查缓存)
+    state.reload();
 
     let mut events = [unsafe { std::mem::zeroed::<libc::epoll_event>() }; 8];
 
