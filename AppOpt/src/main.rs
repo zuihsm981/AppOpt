@@ -397,7 +397,7 @@ impl AppState {
                 let (k, tg) = if r.kind == crate::config::WaylayKind::Red {
                     ("c", r.target.clone())
                 } else {
-                    ("p", String::new())
+                    ("p", "-".to_string())   /* 占位: 内核 sscanf 需 target 段非空 */
                 };
                 rows.push((-1, k.to_string(), tg, r.from.clone(), r.to.clone()));
             }
@@ -410,7 +410,7 @@ impl AppState {
                     let (k, tg) = if r.kind == crate::config::WaylayKind::Red {
                         ("c", r.target.clone())
                     } else {
-                        ("p", String::new())
+                        ("p", "-".to_string())   /* 占位: 内核 sscanf 需 target 段非空 */
                     };
                     rows.push((*uid, k.to_string(), tg, r.from.clone(), r.to.clone()));
                 }
