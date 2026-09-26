@@ -174,7 +174,8 @@ impl KpmHandle {
     /// 解除武装 (stop: 摘除全部业务探针 + 恢复 vendor_file_contexts 读取)
     pub(crate) fn disarm(&self) {
         self.cmd("stop");
-        self.vfc_disable();
+        self.vfc_disable();        // vfc off: 重定向/内容替换失效 (hook 常驻, 回调跳过)
+        self.prop_file_apply(false);   // prop 恢复原属性 (tmpfs 反向替换)
     }
 
     /// 激活 vfc (enabled=1 + 首次常驻挂载); 规则已由 vfc_sync 下发
