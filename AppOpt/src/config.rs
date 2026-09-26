@@ -134,7 +134,7 @@ pub fn load_waylay_rules() -> Vec<WaylayRule> {
                 continue;
             }
             let Some((pkg, rest)) = t.split_once('=') else { continue };
-            let pkg = pkg.trim().to_string();
+            let pkg = pkg.trim();
             if pkg.is_empty() {
                 continue;
             }
@@ -169,26 +169,40 @@ pub fn load_waylay_rules() -> Vec<WaylayRule> {
                     from = parts[0].to_string();
                     to = parts[1..].join("-");
                 }
+            } else if kind == WaylayKind::Red {
+                /* red 内容替换: red-<目标文件路径>-<from>-<to> (目标必为 '/' 路径, 防无差别替换) */
+                let parts: Vec<&str> = rr.split('-').collect();
+                let t0 = parts.first().unwrap_or(&"");
+                if !t0.starts_with('/') || t0.len() > 127 {
+                    continue;   /* 目标非法 → 整条丢弃 */
+                }
+                target = t0.to_string();
+                from = parts.get(1).map(|x| x.to_string()).unwrap_or_default();
+                to = parts[2..].join("-");
             } else {
                 let (f, t) = rr.split_once('-').unwrap_or(("", ""));
                 from = f.trim().to_string();
                 to = t.trim().to_string();
             }
-            if from.is_empty() || to.is_empty() {
-                continue;
+            if !from.is_empty() && !to.is_empty() {
+                out.push(WaylayRule {
+                    pkg: pkg.to_string(),
+                    kind,
+                    target,
+                    from,
+                    to,
+                });
             }
-            if kind == WaylayKind::Red && target.is_empty() {
-                target = "/vendor/etc/selinux/vendor_file_contexts".to_string();
-            }
-            out.push(WaylayRule {
-                pkg: pkg.clone(),
-                kind,
-                target,
-                from,
-                to,
-            });
         }
     }
+    /* 同步静态: 启动/重载时 waylay.conf 直接生效 (web 保存同路径) */
+    *rw_write_ignore_poison(&WAYLAY_RULES_NEW) = out.clone();
+    *rw_write_ignore_poison(&WAYLAY_BY_UID) = build_waylay_by_uid(&out);
+    WAYLAY_GLOBAL_RED.store(
+        out.iter().any(|r| r.pkg == "*" && (r.kind == WaylayKind::Red || r.kind == WaylayKind::RedPath)),
+        Ordering::Release,
+    );
+    WAYLAY_CHANGED.store(true, Ordering::Release);
     out
 }
 

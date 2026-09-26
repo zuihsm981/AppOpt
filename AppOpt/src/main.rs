@@ -377,6 +377,8 @@ impl AppState {
     }
 
     fn reload(&mut self) {
+        // waylay.conf 启动/重载直接加载 (更新 WAYLAY_RULES_NEW/BY_UID/GLOBAL_RED; web 保存已走 save)
+        crate::config::load_waylay_rules();
         // 拦截页连接/断开: 武装请求 (在模块加载/激活前提下执行)
         match crate::config::take_kpm_arm_req() {
             1 => self.set_kpm_arm(true),
