@@ -99,8 +99,6 @@ pub static WAYLAY_RULES_NEW: LazyLock<RwLock<Vec<WaylayRule>>> =
 /// uid → 该 uid 所属包的全部规则 (新格式按包激活; save 时重建)
 pub static WAYLAY_BY_UID: LazyLock<RwLock<HashMap<i32, Vec<WaylayRule>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
-/// 是否存在全局重定向规则 (pkg="*" 的 red/red-path): 有则任何前台都启用 vfc
-pub static WAYLAY_GLOBAL_RED: AtomicBool = AtomicBool::new(false);
 
 /// 重建 uid→规则 映射 (packages.list: uid→包名; 规则按包名匹配)
 pub fn build_waylay_by_uid(rules: &[WaylayRule]) -> HashMap<i32, Vec<WaylayRule>> {
@@ -201,10 +199,6 @@ pub fn load_waylay_rules() -> Vec<WaylayRule> {
         .any(|r| r.kind == WaylayKind::Red || r.kind == WaylayKind::RedPath);
     *rw_write_ignore_poison(&WAYLAY_RULES_NEW) = out.clone();
     *rw_write_ignore_poison(&WAYLAY_BY_UID) = build_waylay_by_uid(&out);
-    WAYLAY_GLOBAL_RED.store(
-        out.iter().any(|r| r.pkg == "*" && (r.kind == WaylayKind::Red || r.kind == WaylayKind::RedPath)),
-        Ordering::Release,
-    );
     WAYLAY_VFC_CHANGED.store(old_has_vfc || out.iter().any(|r| r.kind == WaylayKind::Red || r.kind == WaylayKind::RedPath), Ordering::Release);
     WAYLAY_CHANGED.store(true, Ordering::Release);
     out
@@ -254,10 +248,6 @@ pub fn save_waylay_rules(rules: &[WaylayRule]) -> io::Result<()> {
     fs::rename(&tmp, WAYLAY_FILE)?;
     *rw_write_ignore_poison(&WAYLAY_RULES_NEW) = rules.to_vec();
     *rw_write_ignore_poison(&WAYLAY_BY_UID) = build_waylay_by_uid(rules);
-    WAYLAY_GLOBAL_RED.store(
-        rules.iter().any(|r| r.pkg == "*" && (r.kind == WaylayKind::Red || r.kind == WaylayKind::RedPath)),
-        Ordering::Release,
-    );
     WAYLAY_VFC_CHANGED.store(old_has_vfc || new_has_vfc, Ordering::Release);
     WAYLAY_CHANGED.store(true, Ordering::Release);
     Ok(())

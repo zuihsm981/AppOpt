@@ -189,14 +189,9 @@ impl KpmHandle {
         self.cmd("vfc off");
     }
 
-    /// 前台包名 (前台回调下发; 空串=无前台通知 → 仅全局规则)
-    pub(crate) fn vfc_fg(&self, pkg: &str) {
-        let args = if pkg.is_empty() {
-            "vfc_fg ".to_string()
-        } else {
-            format!("vfc_fg {}", pkg)
-        };
-        self.cmd(&args);
+    /// 前台 uid (前台回调下发; <0=无前台通知 → 仅全局规则)
+    pub(crate) fn vfc_fg(&self, uid: i32) {
+        self.cmd(&format!("vfc_fg {}", uid));
     }
 
     /// 清空全部 vfc 规则 (配置重下发前)
@@ -204,9 +199,14 @@ impl KpmHandle {
         self.cmd("vfc_rule_clear");
     }
 
-    /// 统一 vfc 规则: kind "c"=内容替换(需 target, 等长) / "p"=文件重定向
-    pub(crate) fn vfc_rule(&self, idx: usize, kind: &str, pkg: &str, target: &str, from: &str, to: &str) {
-        let args = format!("vfc_rule {} {} {} {} {} {}", idx, kind, pkg, target, from, to);
+    /// 全局("*")规则段大小 (sync 分组下发: 全局规则先写, 各包规则连续)
+    pub(crate) fn vfc_glob_count(&self, n: usize) {
+        self.cmd(&format!("vfc_glob_count {}", n));
+    }
+
+    /// 统一 vfc 规则: uid(应用; -1=全局) + kind "c"=内容替换(需 target) / "p"=文件重定向
+    pub(crate) fn vfc_rule(&self, idx: usize, uid: i32, kind: &str, target: &str, from: &str, to: &str) {
+        let args = format!("vfc_rule {} {} {} {} {} {}", idx, uid, kind, target, from, to);
         self.cmd(&args);
     }
 
