@@ -582,9 +582,12 @@ function buildRules(){
 }
 function renderWaylayConn(c){$('w-conn').textContent=c?'已连接':'未连接';$('w-conn').className='badge '+(c?'kpm':'proc');$('w-conn-chips').querySelectorAll('button').forEach(b=>b.classList.toggle('on',(b.dataset.v==='1')===c));}
 let wlSaveTimer=null;
-function wlSaveNow(){
-  clearTimeout(wlSaveTimer);
-  wlSaveTimer=setTimeout(async()=>{
+/* 保存串行化: 一次只发一个请求, 期间新触发排队 (防并发写文件乱序覆盖 → 规则被清成一条) */
+let wlSaving=false,wlSaveQueued=false;
+async function wlDoSave(){
+  if(wlSaving){wlSaveQueued=true;return}
+  wlSaving=true;
+  try{
     const rules=buildRules();
     // 保存前检查: 非空 / 等长 / 长度 / ASCII
     for(const r of rules){
@@ -599,8 +602,12 @@ function wlSaveNow(){
       if(r.from.length>max){toast('超出长度限制 (≤'+max+')');return}
       if(r.from.split('').some(c=>c.charCodeAt(0)>127)||r.to.split('').some(c=>c.charCodeAt(0)>127)){toast('\u4ec5\u652f\u6301 ASCII \u5b57\u7b26');return}
     }
-    try{await api('/api/waylay',{rules})}catch(e){toast(e.message)}
-  },200);
+    try{await api('/api/waylay',{rules});await loadWaylay();}catch(e){toast(e.message)}
+  }finally{wlSaving=false;if(wlSaveQueued){wlSaveQueued=false;wlDoSave();}}
+}
+function wlSaveNow(){
+  clearTimeout(wlSaveTimer);
+  wlSaveTimer=setTimeout(wlDoSave,120);
 }
 async function loadWaylay(){
   try{
