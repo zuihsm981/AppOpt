@@ -89,6 +89,7 @@ impl WaylayKind {
 pub struct WaylayRule {
     pub pkg: String,
     pub kind: WaylayKind,
+    pub target: String,   /* 内容替换(Red)的目标文件; 其他 kind 空 */
     pub from: String,
     pub to: String,
 }
@@ -143,18 +144,48 @@ pub fn load_waylay_rules() -> Vec<WaylayRule> {
             } else {
                 rest.split_once('-').unwrap_or((rest, ""))
             };
-            let Some(kind) = WaylayKind::parse(kind_t) else { continue };
-            let (from, to) = rr.split_once('-').unwrap_or(("", ""));
-            let from = from.trim();
-            let to = to.trim();
+            let Some(mut kind) = WaylayKind::parse(kind_t) else { continue };
+            let mut target = String::new();
+            let from: String;
+            let to: String;
+            if kind == WaylayKind::RedPath {
+                /* red-path 统一判定 (内容/文件/内容带目标):
+                 *   parts[0] 非 '/'            → 内容 (默认目标)
+                 *   parts[0] '/' 且 parts[1] 非 '/' → 内容带目标: <目标>-<from>-<to>
+                 *   parts[0] '/' 且 parts[1] 也 '/' → 文件重定向: <路径from>-<路径to> */
+                let parts: Vec<&str> = rr.split('-').collect();
+                let p0 = parts.first().unwrap_or(&"");
+                if !p0.starts_with('/') {
+                    kind = WaylayKind::Red;
+                    from = parts[0].to_string();
+                    to = parts[1..].join("-");
+                } else if parts.len() >= 3 && !parts[1].starts_with('/') {
+                    kind = WaylayKind::Red;
+                    target = parts[0].to_string();
+                    from = parts[1].to_string();
+                    to = parts[2..].join("-");
+                } else {
+                    kind = WaylayKind::RedPath;
+                    from = parts[0].to_string();
+                    to = parts[1..].join("-");
+                }
+            } else {
+                let (f, t) = rr.split_once('-').unwrap_or(("", ""));
+                from = f.trim().to_string();
+                to = t.trim().to_string();
+            }
             if from.is_empty() || to.is_empty() {
                 continue;
+            }
+            if kind == WaylayKind::Red && target.is_empty() {
+                target = "/vendor/etc/selinux/vendor_file_contexts".to_string();
             }
             out.push(WaylayRule {
                 pkg: pkg.clone(),
                 kind,
-                from: from.to_string(),
-                to: to.to_string(),
+                target,
+                from,
+                to,
             });
         }
     }
@@ -166,13 +197,30 @@ pub fn save_waylay_rules(rules: &[WaylayRule]) -> io::Result<()> {
     let mut out = String::from("# waylay 新格式: <包名>=<kind>-<from>-<to>\n");
     out.push_str("# kind: src=服务伪装 prop=属性伪装 red=重定向(内容替换); from/to 等长且不含 '-'\n");
     for r in rules {
-        out.push_str(&format!(
-            "{}={}-{}-{}\n",
-            r.pkg.trim(),
-            r.kind.tag(),
-            r.from.trim(),
-            r.to.trim()
-        ));
+        let prefix = if r.kind == WaylayKind::Red || r.kind == WaylayKind::RedPath {
+            "red-path"
+        } else {
+            r.kind.tag()
+        };
+        if r.kind == WaylayKind::Red {
+            /* 内容替换带目标文件: <目标>-<from>-<to> */
+            out.push_str(&format!(
+                "{}={}-{}-{}-{}\n",
+                r.pkg.trim(),
+                prefix,
+                r.target.trim(),
+                r.from.trim(),
+                r.to.trim()
+            ));
+        } else {
+            out.push_str(&format!(
+                "{}={}-{}-{}\n",
+                r.pkg.trim(),
+                prefix,
+                r.from.trim(),
+                r.to.trim()
+            ));
+        }
     }
     let tmp = format!("{}.tmp", WAYLAY_FILE);
     fs::write(&tmp, out.as_bytes())?;

@@ -197,8 +197,8 @@ impl KpmHandle {
     }
 
     /// 内容替换规则: 第 idx 组 from→to (等长 ASCII, ≤32)
-    pub(crate) fn vfc_crule(&self, idx: usize, from: &str, to: &str) {
-        let args = format!("vfc_crule {} {} {}", idx, from, to);
+    pub(crate) fn vfc_crule(&self, idx: usize, target: &str, from: &str, to: &str) {
+        let args = format!("vfc_crule {} {} {} {}", idx, target, from, to);
         self.cmd(&args);
     }
 
@@ -439,9 +439,10 @@ fn release_prop_maps() {
 }
 
 pub(crate) fn ensure_prop_maps() {
-    // 目标应用集为空 → 移除映射 (规则为空但仍有目标应用时保持映射)
-    let has_apps = !crate::rw_read_ignore_poison(&crate::config::WAYLAY_PROP_UIDS).is_empty();
-    if !has_apps {
+    // 门控改用新格式 prop 规则 (旧 WAYLAY_PROP_UIDS 经重构后不再维护恒空):
+    // 存在 prop 规则才映射属性区文件; 规则清空时释放
+    let has_rules = !crate::rw_read_ignore_poison(&crate::config::WAYLAY_PROP_RULES).is_empty();
+    if !has_rules {
         release_prop_maps();
         return;
     }

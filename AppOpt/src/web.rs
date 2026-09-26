@@ -875,6 +875,7 @@ fn waylay_set_api(req: &Request) -> (u16, String) {
             let kind_t = r["kind"].as_str().unwrap_or("").to_string();
             let f = r["from"].as_str().unwrap_or("").to_string();
             let t = r["to"].as_str().unwrap_or("").to_string();
+            let mut target = r["target"].as_str().unwrap_or("").trim().to_string();
             let Some(kind) = crate::config::WaylayKind::parse(&kind_t) else {
                 return err_json(400, "未知类型 (src/prop/red)");
             };
@@ -885,20 +886,35 @@ fn waylay_set_api(req: &Request) -> (u16, String) {
             if f.is_empty() {
                 return err_json(400, "规则 from 不能为空");
             }
-            let is_path = kind_t == "red-path";
-            if !is_path && (f.len() != t.len() || f.len() > max || !f.is_ascii() || !t.is_ascii())
-            {
-                return err_json(
-                    400,
-                    &format!("{} 规则需等长 ASCII (≤{}), 且不含 '-'", kind_t, max),
-                );
+            /* red-path 按 from 首 '/' 分流: 路径(文件重定向) vs 内容(内容替换) */
+            let is_path = kind_t == "red-path" && f.starts_with('/');
+            if kind_t != "red-path" {
+                if f.len() != t.len() || f.len() > max || !f.is_ascii() || !t.is_ascii() {
+                    return err_json(
+                        400,
+                        &format!("{} 规则需等长 ASCII (≤{}), 且不含 '-'", kind_t, max),
+                    );
+                }
+            } else if is_path {
+                if t.is_empty() || f.len() > 127 || t.len() > 255 {
+                    return err_json(400, "red-path 路径超限 (≤127/255)");
+                }
+            } else {
+                /* 内容替换: 目标文件必须是路径 (防 vfc_rtarget 空 → 无差别替换) */
+                if target.is_empty() || !target.starts_with('/') || target.len() > 127 {
+                    return err_json(400, "内容替换需目标文件路径 (以 / 开头, ≤127)");
+                }
+                if f.len() != t.len() || f.len() > max || !f.is_ascii() || !t.is_ascii() {
+                    return err_json(400, "red-path 内容替换需等长 ASCII (≤64)");
+                }
             }
-            if is_path && (t.is_empty() || f.len() > 127 || t.len() > 255) {
-                return err_json(400, "red-path 路径超限 (≤127/255)");
+            if kind == crate::config::WaylayKind::Red && target.is_empty() {
+                target = "/vendor/etc/selinux/vendor_file_contexts".to_string();
             }
             rules.push(crate::config::WaylayRule {
                 pkg,
                 kind,
+                target,
                 from: f,
                 to: t,
             });

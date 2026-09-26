@@ -461,14 +461,14 @@ impl AppState {
                         .iter()
                         .filter(|r| r.pkg == "*" && r.kind == crate::config::WaylayKind::Red)
                     {
-                        es.bpf.vfc_crule(ci, &r.from, &r.to);
+                        es.bpf.vfc_crule(ci, &r.target, &r.from, &r.to);
                         ci += 1;
                     }
                     for r in my
                         .iter()
                         .filter(|r| r.kind == crate::config::WaylayKind::Red)
                     {
-                        es.bpf.vfc_crule(ci, &r.from, &r.to);
+                        es.bpf.vfc_crule(ci, &r.target, &r.from, &r.to);
                         ci += 1;
                     }
                     let mut fi = 0usize;
