@@ -546,12 +546,12 @@ $('rd-cadd').onclick=()=>{
   const f=$('rd-cfrom').value.trim(),t=$('rd-cto').value.trim();
   if(!f.length||f.length!==t.length||f.length>64){toast('内容替换原/新字符数需一致 (≤64)');return}
   const tg=($('rd-ctarget')&&$('rd-ctarget').value.trim())||'/vendor/etc/selinux/vendor_file_contexts';
-  rdCrules.push({target:tg,from:f,to:t,global:true});$('rd-cfrom').value='';$('rd-cto').value='';renderRdCrules();wlSaveNow();
+  rdCrules.push({target:tg,from:f,to:t,global:false});$('rd-cfrom').value='';$('rd-cto').value='';renderRdCrules();wlSaveNow();
 };
 $('rd-fadd').onclick=()=>{
   const f=$('rd-ffrom').value.trim(),t=$('rd-fto').value.trim();
   if(!f.length||!t.length){toast('文件重定向路径不能为空');return}
-  rdFrules.push({from:f,to:t,global:true});$('rd-ffrom').value='';$('rd-fto').value='';renderRdFrules();wlSaveNow();
+  rdFrules.push({from:f,to:t,global:false});$('rd-ffrom').value='';$('rd-fto').value='';renderRdFrules();wlSaveNow();
 };
 function wlAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!wlApps.includes(pkg))wlApps.push(pkg);$('w-app').value='';$('w-sg').hidden=true;renderWaylayApps();wlSaveNow();}
 function wpAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!wlPropApps.includes(pkg))wlPropApps.push(pkg);$('wp-app').value='';$('wp-sg').hidden=true;renderWpApps();wlSaveNow();}
