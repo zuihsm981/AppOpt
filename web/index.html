@@ -557,7 +557,7 @@ function buildRules(){
   wlApps.forEach(p=>wlRules.forEach(r=>out.push({pkg:p,kind:'src',from:r.from,to:r.to})));
   wlPropApps.forEach(p=>wlPropRules.forEach(r=>out.push({pkg:p,kind:'prop',from:r.from,to:r.to})));
   (($('rd-global')&&$('rd-global').checked)?['*']:rdApps).forEach(p=>{
-    rdCrules.forEach(r=>out.push({pkg:p,kind:'red-path',target:r.target||'/vendor/etc/selinux/vendor_file_contexts',from:r.from,to:r.to}));  /* 内容替换 */
+    rdCrules.forEach(r=>out.push({pkg:p,kind:'red',target:r.target||'/vendor/etc/selinux/vendor_file_contexts',from:r.from,to:r.to}));  /* 内容替换: red-<目标>-<from>-<to> */
   });
   (($('rdp-global')&&$('rdp-global').checked)?['*']:rdpApps).forEach(p=>{
     rdFrules.forEach(r=>out.push({pkg:p,kind:'red-path',from:r.from,to:r.to}));  /* 文件重定向: from 有 '/' */
@@ -576,8 +576,8 @@ function wlSaveNow(){
       const max=r.kind==='prop'?92:(r.kind==='src'||r.kind==='red')?64:255;
       if(!r.from||!r.to){toast('规则不能为空');return}
       if(isPath){if(r.from.length>127||r.to.length>255){toast('路径超限 (≤127/255)');return}continue}
-      /* 内容替换(red-path 且 from 非路径)必须指定目标文件路径; src/prop/文件重定向不校验 */
-      const isContent = r.kind==='red-path' && !r.from.startsWith('/');
+      /* 内容替换(red)必须指定目标文件路径; src/prop/文件重定向(red-path)不校验 */
+      const isContent = r.kind==='red';
       if(isContent && (!r.target||!r.target.startsWith('/'))){toast('内容替换需目标文件路径');return}
       if(r.from.length!==r.to.length){toast('需等长 (ASCII)');return}
       if(r.from.length>max){toast('超出长度限制 (≤'+max+')');return}
@@ -595,7 +595,7 @@ async function loadWaylay(){
     wlApps=uniq(rs.filter(r=>r.kind==='src').map(r=>r.pkg));
     wlPropRules=uniq(rs.filter(r=>r.kind==='prop').map(r=>r.from+'\u0000'+r.to)).map(k=>{const [f,t]=k.split('\u0000');return {from:f,to:t}});
     wlPropApps=uniq(rs.filter(r=>r.kind==='prop').map(r=>r.pkg));
-    rdCrules=uniq(rs.filter(r=>r.kind==='red-path'&&!r.from.startsWith('/')&&r.pkg!=='*').map(r=>r.from+'\u0000'+r.to+'\u0000'+(r.target||'/vendor/etc/selinux/vendor_file_contexts'))).map(k=>{const [f,t,tg]=k.split('\u0000');return {target:tg,from:f,to:t}});
+    rdCrules=uniq(rs.filter(r=>r.kind==='red'&&r.pkg!=='*').map(r=>r.from+'\u0000'+r.to+'\u0000'+(r.target||'/vendor/etc/selinux/vendor_file_contexts'))).map(k=>{const [f,t,tg]=k.split('\u0000');return {target:tg,from:f,to:t}});
     if(rdCrules.length&&$('rd-ctarget'))$('rd-ctarget').value=rdCrules[0].target;
     rdFrules=uniq(rs.filter(r=>r.kind==='red-path'&&r.from.startsWith('/')&&r.pkg!=='*').map(r=>r.from+'\u0000'+r.to)).map(k=>{const [f,t]=k.split('\u0000');return {from:f,to:t}});
     rdApps=uniq(rs.filter(r=>r.kind==='red-path'&&!r.from.startsWith('/')&&r.pkg!=='*').map(r=>r.pkg));
