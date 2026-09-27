@@ -453,7 +453,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div id="sv-add-err" hidden style="color:#e5484d;font-size:12px;margin-top:10px"></div>
 <div style="display:flex;gap:8px;margin-top:14px">
 <button class="btn" id="sv-add-ok" style="flex:1">添加</button>
-<button class="btn" id="sv-add-close" style="flex:1;background:var(--bg);color:var(--sub)">取消</button>
+<button class="btn" id="sv-add-close" style="flex:1;background:var(--bg);color:var(--sub)">关闭</button>
 </div>
 </div>
 </div>
@@ -474,7 +474,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div id="wp-add-err" hidden style="color:#e5484d;font-size:12px;margin-top:10px"></div>
 <div style="display:flex;gap:8px;margin-top:14px">
 <button class="btn" id="wp-add-ok" style="flex:1">添加</button>
-<button class="btn" id="wp-add-close" style="flex:1;background:var(--bg);color:var(--sub)">取消</button>
+<button class="btn" id="wp-add-close" style="flex:1;background:var(--bg);color:var(--sub)">关闭</button>
 </div>
 </div>
 </div>
@@ -501,7 +501,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div id="rd-field-err" hidden style="color:#e5484d;font-size:12px;margin-top:10px"></div>
 <div style="display:flex;gap:8px;margin-top:14px">
 <button class="btn" id="rd-field-ok" style="flex:1">添加</button>
-<button class="btn" id="rd-field-close" style="flex:1;background:var(--bg);color:var(--sub)">取消</button>
+<button class="btn" id="rd-field-close" style="flex:1;background:var(--bg);color:var(--sub)">关闭</button>
 </div>
 </div>
 </div>
@@ -544,7 +544,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div id="rd-add-err" hidden style="color:#e5484d;font-size:12px;margin-top:10px"></div>
 <div style="display:flex;gap:8px;margin-top:14px">
 <button class="btn" id="rd-cadd" style="flex:1">添加</button>
-<button class="btn" id="rd-add-close" style="flex:1;background:var(--bg);color:var(--sub)">取消</button>
+<button class="btn" id="rd-add-close" style="flex:1;background:var(--bg);color:var(--sub)">关闭</button>
 </div>
 </div>
 </div>
@@ -602,9 +602,9 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div id="rd-edit-title" style="font-weight:600;color:#000;margin-bottom:10px"></div>
 <div style="font-size:12px;color:var(--sub);margin-bottom:4px">目标文件</div>
 <input id="rd-edit-target" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000">
-<div style="display:flex;gap:8px;margin-top:10px">
-<div style="flex:1"><div id="rd-edit-from-label" style="font-size:12px;color:var(--sub);margin-bottom:4px">原内容</div><input id="rd-edit-from-input" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000"></div>
-<div style="flex:1"><div id="rd-edit-to-label" style="font-size:12px;color:var(--sub);margin-bottom:4px">新内容</div><input id="rd-edit-to-input" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000"></div>
+<div id="rd-edit-ft-box" style="display:flex;gap:8px;margin-top:10px">
+<div style="flex:1;min-width:0"><div id="rd-edit-from-label" style="font-size:12px;color:var(--sub);margin-bottom:4px">原内容</div><input id="rd-edit-from-input" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000"></div>
+<div style="flex:1;min-width:0"><div id="rd-edit-to-label" style="font-size:12px;color:var(--sub);margin-bottom:4px">新内容</div><input id="rd-edit-to-input" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000"></div>
 </div>
 <div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
 <div id="rd-edit-apps" style="max-height:26vh;overflow:auto;display:flex;flex-direction:column;gap:4px"></div>
@@ -619,7 +619,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div id="rd-edit-msg" style="font-size:12px;margin-top:10px;min-height:14px"></div>
 <div style="display:flex;gap:8px;margin-top:8px">
 <button class="btn" id="rd-edit-save" style="flex:1">保存</button>
-<button class="btn" id="rd-edit-close" style="flex:1;background:var(--bg);color:var(--sub)">取消</button>
+<button class="btn" id="rd-edit-close" style="flex:1;background:var(--bg);color:var(--sub)">关闭</button>
 </div>
 </div>
 </div>
@@ -657,7 +657,7 @@ let wlRules=[];let wlApps=[];
 let wlPropRules=[];let wlPropApps=[];
 let rdCrules=[];let rdFrules=[];let rdApps=[];let rdpApps=[];
 /* 规则级应用: 弹窗临时收集, 添加/编辑时写入规则 */
-let rdAddTmp=[];let rdBatchTmp=[];let rdpTmp=[];let rdEditTmp=[];
+let rdAddTmp=[];let rdBatchTmp=[];let rdpTmp=[];let rdEditTmp=[];let rdEditFromApp=null;
 let svAddTmp=[];let wpAddTmp=[];
 // 列表项与规则页主列表同款: .rule-row + .rule-name (普通字体)
 function rowHtml(txt,i){return `<div class="rule-row"><span class="rule-name">${esc(txt)}</span><button class="icon-btn danger" data-i="${i}" title="删除">${ICO_TRASH}</button></div>`}
@@ -744,13 +744,13 @@ $('fr-groups-body').addEventListener('click',e=>{
 function openFGroup(root){
   rdFGroupRoot=root;
   $('rd-fgroup-title').textContent='/' + root + ' 下的重定向';
-  const rs=rdFrules.filter(r=>(r.from||'/').split('/')[1]===root);
+  const rs=rdFrules.filter(r=>(r.apps||[]).includes(frGroupsApp)&&(r.from||'/').split('/')[1]===root);
 
   $('rd-fgroup-body').innerHTML=rs.map((r,i)=>{
     const gidx=rdFrules.indexOf(r);
     return `<div class="grp"><div class="grp-head" style="cursor:default;gap:0;align-items:center">
 <svg viewBox="0 0 24 36" style="width:22px;height:33px;overflow:visible;stroke:var(--sub);fill:none;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0"><path d="M4 1v28"/><path d="M4 1h14"/><path d="M4 29h16"/><path d="M20 29l-5-5"/><path d="M20 29l-5 5"/></svg>
-<span class="grp-name" style="display:flex;flex-direction:column;gap:2px;padding-left:6px"><span style="margin-top:-5px">${esc(r.from)}</span><span style="margin-top:10px">${esc(r.to)}</span></span>
+<span class="grp-name" style="display:flex;flex-direction:column;gap:2px;padding-left:6px;min-width:0;flex:1"><span style="margin-top:-5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%">${esc(r.from)}</span><span style="margin-top:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%">${esc(r.to)}</span></span>
 <button class="icon-btn" style="margin-left:auto;flex-shrink:0" data-fedit="${gidx}" title="编辑">${ICO_EDIT}</button><button class="icon-btn danger" style="margin-left:8px;flex-shrink:0" data-fdel="${gidx}" title="删除">${ICO_TRASH}</button>
 </div></div>`;
   }).join('');
@@ -761,12 +761,12 @@ $('rd-fgroup-close').onclick=closeFGroup;
 $('rd-fgroup-modal').addEventListener('click',e=>{if(e.target.id==='rd-fgroup-modal')closeFGroup();});
 $('rd-fgroup-body').addEventListener('click',e=>{
   const ed=e.target.closest('button[data-fedit]');
-  if(ed){openRdEdit('f',+ed.dataset.fedit);return}
+  if(ed){rdEditFromApp=null;openRdEdit('f',+ed.dataset.fedit);return}
   const b=e.target.closest('button[data-fdel]');
   if(!b)return;
   rdFrules.splice(+b.dataset.fdel,1);
   renderRdFrules(); wlSaveNow();
-  const left=rdFrules.some(r=>(r.from||'/').split('/')[1]===rdFGroupRoot);
+  const left=rdFrules.some(r=>(r.apps||[]).includes(frGroupsApp)&&(r.from||'/').split('/')[1]===rdFGroupRoot);
   if(left)openFGroup(rdFGroupRoot); else closeFGroup();
 });
 function renderRdApps(){
@@ -778,7 +778,7 @@ function renderRdApps(){
 function renderRdpApps(){$('rd-field-apps').innerHTML=rdpTmp.length?rdpTmp.map((a,i)=>grow(a,i)).join(''):'<div class="hint">未添加目标应用</div>';}
 $('w-rules').addEventListener('click',e=>{
   const ae=e.target.closest('button[data-waedit]');
-  if(ae){const app=uniq(wlRules.flatMap(r=>r.apps||[]))[+ae.dataset.waedit];const idx=wlRules.findIndex(r=>(r.apps||[]).includes(app));if(idx>=0)openRdEdit('s',idx);return}
+  if(ae){const app=uniq(wlRules.flatMap(r=>r.apps||[]))[+ae.dataset.waedit];const idx=wlRules.findIndex(r=>(r.apps||[]).includes(app));if(idx>=0){rdEditFromApp=app;openRdEdit('s',idx);}return}
   const ad=e.target.closest('button[data-wadel]');
   if(ad){const app=uniq(wlRules.flatMap(r=>r.apps||[]))[+ad.dataset.wadel];if(!app)return;wlRules.forEach(r=>{if(r.apps)r.apps=r.apps.filter(x=>x!==app)});wlRules=wlRules.filter(r=>(r.apps||[]).length);renderWaylayRules();wlSaveNow();return}
   const h=e.target.closest('[data-wapp]');
@@ -787,7 +787,7 @@ $('w-rules').addEventListener('click',e=>{
 $('sv-add-apps').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(b){svAddTmp.splice(+b.dataset.i,1);renderWaylayApps();return}const h=e.target.closest('.grp-head');if(h)h.parentElement.classList.toggle('open');});
 $('wp-rules').addEventListener('click',e=>{
   const ae=e.target.closest('button[data-wpaedit]');
-  if(ae){const app=uniq(wlPropRules.flatMap(r=>r.apps||[]))[+ae.dataset.wpaedit];const idx=wlPropRules.findIndex(r=>(r.apps||[]).includes(app));if(idx>=0)openRdEdit('p',idx);return}
+  if(ae){const app=uniq(wlPropRules.flatMap(r=>r.apps||[]))[+ae.dataset.wpaedit];const idx=wlPropRules.findIndex(r=>(r.apps||[]).includes(app));if(idx>=0){rdEditFromApp=app;openRdEdit('p',idx);}return}
   const ad=e.target.closest('button[data-wpadel]');
   if(ad){const app=uniq(wlPropRules.flatMap(r=>r.apps||[]))[+ad.dataset.wpadel];if(!app)return;wlPropRules.forEach(r=>{if(r.apps)r.apps=r.apps.filter(x=>x!==app)});wlPropRules=wlPropRules.filter(r=>(r.apps||[]).length);renderWpRules();wlSaveNow();return}
   const h=e.target.closest('[data-wpapp]');
@@ -802,7 +802,7 @@ function openWpRules(app){
     const gidx=wlPropRules.indexOf(r);
     return `<div class="grp"><div class="grp-head" style="cursor:pointer;gap:0;align-items:center" data-wpd="${gidx}">
 <svg viewBox="0 0 24 36" style="width:22px;height:33px;overflow:visible;stroke:var(--sub);fill:none;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0"><path d="M4 1v28"/><path d="M4 1h14"/><path d="M4 29h16"/><path d="M20 29l-5-5"/><path d="M20 29l-5 5"/></svg>
-<span class="grp-name" style="display:flex;flex-direction:column;gap:2px;padding-left:6px"><span style="margin-top:-5px">${esc(r.from)}</span><span style="margin-top:10px">${esc(r.to)}</span></span>
+<span class="grp-name" style="display:flex;flex-direction:column;gap:2px;padding-left:6px;min-width:0;flex:1"><span style="margin-top:-5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%">${esc(r.from)}</span><span style="margin-top:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%">${esc(r.to)}</span></span>
 <button class="icon-btn" style="margin-left:auto;flex-shrink:0" data-wpe="${gidx}" title="编辑">${ICO_EDIT}</button><button class="icon-btn danger" style="margin-left:8px;flex-shrink:0" data-wpd="${gidx}" title="删除">${ICO_TRASH}</button>
 </div></div>`;
   }).join('')||'<div class="hint" style="margin:0">无规则</div>';
@@ -812,7 +812,7 @@ $('wp-rules-close').onclick=()=>{$('wp-rules-modal').hidden=true;};
 $('wp-rules-modal').addEventListener('click',e=>{if(e.target.id==='wp-rules-modal')$('wp-rules-modal').hidden=true;});
 $('wp-rules-body').addEventListener('click',e=>{
   const ed=e.target.closest('button[data-wpe]');
-  if(ed){openRdEdit('p',+ed.dataset.wpe);return}
+  if(ed){rdEditFromApp=null;openRdEdit('p',+ed.dataset.wpe);return}
   const b=e.target.closest('button[data-wpd]');
   if(b){wlPropRules.splice(+b.dataset.wpd,1);wlSaveNow();openWpRules(wpRulesApp);if(!wlPropRules.some(r=>(r.apps||[]).includes(wpRulesApp)))$('wp-rules-modal').hidden=true;}
 });
@@ -846,7 +846,7 @@ $('rd-crules').addEventListener('click',e=>{
     const app=uniq(rdCrules.flatMap(r=>r.apps||[]))[+ae.dataset.aedit];
     if(!app)return;
     const idx=rdCrules.findIndex(r=>(r.apps||[]).includes(app));
-    if(idx>=0)openRdEdit('c',idx);
+    if(idx>=0){rdEditFromApp=app;openRdEdit('c',idx);}
     return;
   }
   const d=e.target.closest('button[data-adel]');
@@ -862,7 +862,7 @@ $('rd-crules').addEventListener('click',e=>{
 });
 $('rd-frules').addEventListener('click',e=>{
   const ae=e.target.closest('button[data-faedit]');
-  if(ae){const app=uniq(rdFrules.flatMap(r=>r.apps||[]))[+ae.dataset.faedit];const idx=rdFrules.findIndex(r=>(r.apps||[]).includes(app));if(idx>=0)openRdEdit('f',idx);return}
+  if(ae){const app=uniq(rdFrules.flatMap(r=>r.apps||[]))[+ae.dataset.faedit];const idx=rdFrules.findIndex(r=>(r.apps||[]).includes(app));if(idx>=0){rdEditFromApp=app;openRdEdit('f',idx);}return}
   const ad=e.target.closest('button[data-fadel]');
   if(ad){const app=uniq(rdFrules.flatMap(r=>r.apps||[]))[+ad.dataset.fadel];if(!app)return;rdFrules.forEach(r=>{if(r.apps)r.apps=r.apps.filter(x=>x!==app)});rdFrules=rdFrules.filter(r=>!(r.apps&&!r.apps.length&&!r.global));renderRdFrules();wlSaveNow();return}
   const h=e.target.closest('[data-fapp]');
@@ -886,7 +886,7 @@ $('wp-add-ok').onclick=()=>{
   wpAddTmp=[];renderWpApps();
   $('wp-from').value='';$('wp-to').value='';
   renderWpRules();wlSaveNow();
-  $('wp-add-modal').hidden=true;
+  $('wp-add-err').textContent='已添加';$('wp-add-err').style.color='#12a150';$('wp-add-err').hidden=false;
 };
 $('rd-cadd').onclick=()=>{
   const f=$('rd-cfrom').value.trim(),t=$('rd-cto').value.trim();
@@ -895,7 +895,8 @@ $('rd-cadd').onclick=()=>{
   const tg=($('rd-ctarget')&&$('rd-ctarget').value.trim())||'/vendor/etc/selinux/vendor_file_contexts';
   rdCrules.push({target:tg,from:f,to:t,global:$('rd-add-global').checked,apps:rdAddTmp.slice()});
   rdAddTmp=[];renderRdApps();
-  $('rd-cfrom').value='';$('rd-cto').value='';renderRdCrules();wlSaveNow();$('rd-add-modal').hidden=true;
+  $('rd-cfrom').value='';$('rd-cto').value='';renderRdCrules();wlSaveNow();
+  $('rd-add-err').textContent='已添加';$('rd-add-err').style.color='#12a150';$('rd-add-err').hidden=false;
 };
 $('rd-fshow').onclick=()=>{$('rd-field-modal').hidden=false;$('rd-field-global').checked=false;$('rd-field-apps-section').hidden=false;rdpTmp=[];renderRdpApps();};
 $('rd-field-close').onclick=()=>{$('rd-field-modal').hidden=true;};
@@ -909,7 +910,7 @@ $('rd-field-ok').onclick=()=>{
   rdpTmp=[];renderRdpApps();
   $('rd-ffrom').value='';$('rd-fto').value='';
   renderRdFrules();wlSaveNow();
-  $('rd-field-modal').hidden=true;
+  $('rd-field-err').textContent='已添加';$('rd-field-err').style.color='#12a150';$('rd-field-err').hidden=false;
 };
 function wlAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!svAddTmp.includes(pkg))svAddTmp.push(pkg);$('sv-add-app-input').value='';$('sv-add-sg').hidden=true;renderWaylayApps();}
 function wpAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!wpAddTmp.includes(pkg))wpAddTmp.push(pkg);$('wp-add-app-input').value='';$('wp-add-sg').hidden=true;renderWpApps();}
@@ -978,7 +979,7 @@ $('sv-add-ok').onclick=()=>{
   svAddTmp=[];renderWaylayApps();
   $('w-from').value='';$('w-to').value='';
   renderWaylayRules();wlSaveNow();
-  $('sv-add-modal').hidden=true;
+  $('sv-add-err').textContent='已添加';$('sv-add-err').style.color='#12a150';$('sv-add-err').hidden=false;
 };
 function renderWaylayConn(c){$('w-conn').textContent=c?'已连接':'未连接';$('w-conn').className='badge '+(c?'kpm':'proc');$('w-conn-chips').querySelectorAll('button').forEach(b=>b.classList.toggle('on',(b.dataset.v==='1')===c));}
 let wlSaveTimer=null;
@@ -1203,7 +1204,7 @@ function openRdPath(path){
     const gidx=rdCrules.indexOf(r);
     return `<div class="grp" data-rrule="${gidx}"><div class="grp-head" style="cursor:pointer;gap:0;align-items:center">
 <svg viewBox="0 0 24 36" style="width:22px;height:33px;overflow:visible;stroke:var(--sub);fill:none;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0"><path d="M4 1v28"/><path d="M4 1h14"/><path d="M4 29h16"/><path d="M20 29l-5-5"/><path d="M20 29l-5 5"/></svg>
-<span class="grp-name" style="display:flex;flex-direction:column;gap:2px;padding-left:6px"><span style="margin-top:-5px">${esc(r.from)}</span><span style="margin-top:10px">${esc(r.to)}</span></span>
+<span class="grp-name" style="display:flex;flex-direction:column;gap:2px;padding-left:6px;min-width:0;flex:1"><span style="margin-top:-5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%">${esc(r.from)}</span><span style="margin-top:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%">${esc(r.to)}</span></span>
 <button class="icon-btn" style="margin-left:auto;flex-shrink:0" data-redit="${gidx}" title="编辑">${ICO_EDIT}</button><button class="icon-btn danger" style="margin-left:8px;flex-shrink:0" data-rdel="${gidx}" title="删除">${ICO_TRASH}</button>
 </div></div>`;
   }).join('');
@@ -1281,6 +1282,7 @@ function openRdGroupEdit(i){
   $('rd-edit-from-label').textContent='原内容';
   $('rd-edit-to-label').textContent='新内容';
   $('rd-edit-add-rule').textContent='＋ 添加内容替换规则';
+  $('rd-edit-ft-box').style.flexDirection='row';
   $('rd-edit-from-input').value=t.from;$('rd-edit-from-input').readOnly=false;
   $('rd-edit-to-input').value=t.to;$('rd-edit-to-input').readOnly=false;
   $('rd-edit-global').checked=!!t.global;
@@ -1292,10 +1294,10 @@ rdEditRender=()=>{$('rd-edit-apps').innerHTML=rdEditTmp.length?rdEditTmp.map((a,
 $('rd-edit-add-rule').onclick=()=>{
   const k=rdEditKind;
   $('rd-edit-modal').hidden=true;
-  if(k==='c'){$('rd-add-modal').hidden=false;$('rd-add-global').checked=false;if($('rd-add-apps-section'))$('rd-add-apps-section').hidden=false;rdAddTmp=[];renderRdApps();}
-  else if(k==='f'){$('rd-field-modal').hidden=false;$('rd-field-global').checked=false;if($('rd-field-apps-section'))$('rd-field-apps-section').hidden=false;rdpTmp=[];renderRdpApps();}
-  else if(k==='s'){$('sv-add-modal').hidden=false;svAddTmp=[];renderWaylayApps();}
-  else if(k==='p'){$('wp-add-modal').hidden=false;wpAddTmp=[];renderWpApps();}
+  if(k==='c'){$('rd-add-modal').hidden=false;$('rd-add-global').checked=false;if($('rd-add-apps-section'))$('rd-add-apps-section').hidden=false;rdAddTmp=rdEditFromApp?[rdEditFromApp]:[];renderRdApps();}
+  else if(k==='f'){$('rd-field-modal').hidden=false;$('rd-field-global').checked=false;if($('rd-field-apps-section'))$('rd-field-apps-section').hidden=false;rdpTmp=rdEditFromApp?[rdEditFromApp]:[];renderRdpApps();}
+  else if(k==='s'){$('sv-add-modal').hidden=false;svAddTmp=rdEditFromApp?[rdEditFromApp]:[];renderWaylayApps();}
+  else if(k==='p'){$('wp-add-modal').hidden=false;wpAddTmp=rdEditFromApp?[rdEditFromApp]:[];renderWpApps();}
 };
 $('rd-edit-app-add').onclick=()=>{
   const v=$('rd-edit-app-input').value.trim();
@@ -1349,8 +1351,6 @@ $('rd-edit-save').onclick=()=>{
     renderRdFrules();
     if(rdFGroupRoot)openFGroup(rdFGroupRoot);
   }
-  rdEditIdx=-1;
-  $('rd-edit-modal').hidden=true;
   wlSaveNow();
   $('rd-edit-msg').textContent='已保存';$('rd-edit-msg').style.color='#12a150';
   }catch(err){$('rd-edit-msg').textContent='保存失败: '+err.message;$('rd-edit-msg').style.color='#e5484d'}
@@ -1364,7 +1364,7 @@ function openSRules(app){
     const gidx=wlRules.indexOf(r);
     return `<div class="grp"><div class="grp-head" style="cursor:pointer;gap:0;align-items:center">
 <svg viewBox="0 0 24 36" style="width:22px;height:33px;overflow:visible;stroke:var(--sub);fill:none;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0"><path d="M4 1v28"/><path d="M4 1h14"/><path d="M4 29h16"/><path d="M20 29l-5-5"/><path d="M20 29l-5 5"/></svg>
-<span class="grp-name" style="display:flex;flex-direction:column;gap:2px;padding-left:6px"><span style="margin-top:-5px">${esc(r.from)}</span><span style="margin-top:10px">${esc(r.to)}</span></span>
+<span class="grp-name" style="display:flex;flex-direction:column;gap:2px;padding-left:6px;min-width:0;flex:1"><span style="margin-top:-5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%">${esc(r.from)}</span><span style="margin-top:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%">${esc(r.to)}</span></span>
 <button class="icon-btn" style="margin-left:auto;flex-shrink:0" data-sre="${gidx}" title="编辑">${ICO_EDIT}</button><button class="icon-btn danger" style="margin-left:8px;flex-shrink:0" data-srd="${gidx}" title="删除">${ICO_TRASH}</button>
 </div></div>`;
   }).join('')||'';
@@ -1374,7 +1374,7 @@ $('sr-rules-close').onclick=()=>{$('sr-rules-modal').hidden=true;};
 $('sr-rules-modal').addEventListener('click',e=>{if(e.target.id==='sr-rules-modal')$('sr-rules-modal').hidden=true;});
 $('sr-rules-body').addEventListener('click',e=>{
   const ed=e.target.closest('button[data-sre]');
-  if(ed){openRdEdit('s',+ed.dataset.sre);return}
+  if(ed){rdEditFromApp=null;openRdEdit('s',+ed.dataset.sre);return}
   const b=e.target.closest('button[data-srd]');
   if(b){wlRules.splice(+b.dataset.srd,1);wlSaveNow();openSRules(srRulesApp);if(!wlRules.some(r=>(r.apps||[]).includes(srRulesApp)))$('sr-rules-modal').hidden=true;}
 });
@@ -1388,6 +1388,7 @@ function openRdEdit(kind,i){
   if(isC)$('rd-edit-target').value=r.target||'/vendor/etc/selinux/vendor_file_contexts';
   const addRuleBtn={c:'＋ 添加内容替换规则',f:'＋ 添加文件重定向规则',s:'＋ 添加服务伪装规则',p:'＋ 添加伪装规则'};
   $('rd-edit-add-rule').textContent=addRuleBtn[kind]||'＋ 添加规则';
+  $('rd-edit-ft-box').style.flexDirection=(kind==='f')?'column':'row';
   $('rd-edit-from-label').textContent=kind==='c'?'原内容':(kind==='s'?'原服务名':(kind==='p'?'原属性名':'原路径'));
   $('rd-edit-to-label').textContent=kind==='c'?'新内容':(kind==='s'?'新服务名':(kind==='p'?'新属性名':'新路径'));
   $('rd-edit-from-input').value=r.from;$('rd-edit-from-input').readOnly=false;
@@ -1397,7 +1398,7 @@ function openRdEdit(kind,i){
   $('rd-edit-msg').textContent='';
   $('rd-edit-modal').hidden=false;
 }
-function closeRdEdit(){$('rd-edit-modal').hidden=true;rdEditIdx=-1;rdEditKind='';}
+function closeRdEdit(){$('rd-edit-modal').hidden=true;rdEditIdx=-1;rdEditKind='';rdEditFromApp=null;}
 $('rd-edit-close').onclick=closeRdEdit;
 $('rd-edit-modal').addEventListener('click',e=>{if(e.target.id==='rd-edit-modal')closeRdEdit();});
 $('rd-edit-global').addEventListener('change',e=>{
