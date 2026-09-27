@@ -377,7 +377,8 @@ impl AppState {
             }
         }
         if arm {
-            /* 连接: 先下发 uid 规则表 (sync_vfc_rules 需 &mut self, 移出 es 借用块) */
+            /* 连接: 强制全量下发 — 模块可能重载/内核表已空, 旧 rule_cache 会使 changed=false 导致规则失效 */
+            self.rule_cache = Vec::new();
             self.sync_vfc_rules();
         }
         if let Some(es) = self.ebpf_state.as_ref() {
