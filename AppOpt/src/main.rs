@@ -469,8 +469,10 @@ impl AppState {
                         .enumerate()
                     {
                         es.bpf.srv_rule(i, &r.from, &r.to);
+                        es.bpf.srv_rule_uid(i, self.last_fg_uid);
                     }
                     es.bpf.srv_active(has_src);
+                    es.bpf.srv_uid_active(has_src);   /* getService 常驻: 配置变化即生效 (不依赖前台回调) */
                     if has_prop {
                         let prop_rules: Vec<(String, String)> = my
                             .iter()
@@ -566,6 +568,7 @@ impl AppState {
                     es.bpf.srv_clear();
                     for (i, r) in my.iter().filter(|r| r.kind == crate::config::WaylayKind::Src).enumerate() {
                         es.bpf.srv_rule(i, &r.from, &r.to);
+                        es.bpf.srv_rule_uid(i, uid);
                     }
                 }
                 es.bpf.srv_active(active);
