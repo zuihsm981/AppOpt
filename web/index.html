@@ -610,6 +610,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div id="rd-edit-apps" style="max-height:26vh;overflow:auto;display:flex;flex-direction:column;gap:4px"></div>
 <div class="sg-wrap" style="margin-top:6px"><input id="rd-edit-app-input" placeholder="输入包名添加目标应用" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:8px 12px;font-size:13px;color:#000;outline:none"><div class="sg-box" id="rd-edit-sg" hidden></div></div>
 <button class="btn" id="rd-edit-app-add" style="width:100%;margin-top:6px">＋ 添加应用</button>
+<button class="btn" id="rd-edit-add-rule" style="width:100%;margin-top:6px;background:var(--blue,#007aff);color:#fff">＋ 添加规则</button>
 </div>
 <div style="display:flex;align-items:center;justify-content:space-between;margin-top:12px">
 <span style="color:#000;font-weight:600">全局生效</span>
@@ -676,6 +677,7 @@ function renderWaylayRules(){
   $('w-rules').innerHTML=apps.length?apps.map((a,i)=>
 `<div class="grp"><div class="grp-head" style="cursor:pointer;gap:0;align-items:center" data-wapp="${esc(a)}">
 <span style="font-weight:700;font-size:14px;color:#000;padding-left:8px;flex:1">${esc(a)}</span>
+<button class="icon-btn" style="flex-shrink:0" data-waedit="${i}" title="编辑">${ICO_EDIT}</button>
 <button class="icon-btn danger" style="flex-shrink:0;margin-right:6px" data-wadel="${i}" title="删除">${ICO_TRASH}</button>
 </div></div>`).join(''):'';
 }
@@ -686,6 +688,7 @@ function renderWpRules(){
   $('wp-rules').innerHTML=apps.length?apps.map((a,i)=>
 `<div class="grp"><div class="grp-head" style="cursor:pointer;gap:0;align-items:center" data-wpapp="${esc(a)}">
 <span style="font-weight:700;font-size:14px;color:#000;padding-left:8px;flex:1">${esc(a)}</span>
+<button class="icon-btn" style="flex-shrink:0" data-wpaedit="${i}" title="编辑">${ICO_EDIT}</button>
 <button class="icon-btn danger" style="flex-shrink:0;margin-right:6px" data-wpadel="${i}" title="删除">${ICO_TRASH}</button>
 </div></div>`).join(''):'';
 }
@@ -774,6 +777,8 @@ function renderRdApps(){
 }
 function renderRdpApps(){$('rd-field-apps').innerHTML=rdpTmp.length?rdpTmp.map((a,i)=>grow(a,i)).join(''):'<div class="hint">未添加目标应用</div>';}
 $('w-rules').addEventListener('click',e=>{
+  const ae=e.target.closest('button[data-waedit]');
+  if(ae){const app=uniq(wlRules.flatMap(r=>r.apps||[]))[+ae.dataset.waedit];const idx=wlRules.findIndex(r=>(r.apps||[]).includes(app));if(idx>=0)openRdEdit('s',idx);return}
   const ad=e.target.closest('button[data-wadel]');
   if(ad){const app=uniq(wlRules.flatMap(r=>r.apps||[]))[+ad.dataset.wadel];if(!app)return;wlRules.forEach(r=>{if(r.apps)r.apps=r.apps.filter(x=>x!==app)});wlRules=wlRules.filter(r=>(r.apps||[]).length);renderWaylayRules();wlSaveNow();return}
   const h=e.target.closest('[data-wapp]');
@@ -781,6 +786,8 @@ $('w-rules').addEventListener('click',e=>{
 });
 $('sv-add-apps').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(b){svAddTmp.splice(+b.dataset.i,1);renderWaylayApps();return}const h=e.target.closest('.grp-head');if(h)h.parentElement.classList.toggle('open');});
 $('wp-rules').addEventListener('click',e=>{
+  const ae=e.target.closest('button[data-wpaedit]');
+  if(ae){const app=uniq(wlPropRules.flatMap(r=>r.apps||[]))[+ae.dataset.wpaedit];const idx=wlPropRules.findIndex(r=>(r.apps||[]).includes(app));if(idx>=0)openRdEdit('p',idx);return}
   const ad=e.target.closest('button[data-wpadel]');
   if(ad){const app=uniq(wlPropRules.flatMap(r=>r.apps||[]))[+ad.dataset.wpadel];if(!app)return;wlPropRules.forEach(r=>{if(r.apps)r.apps=r.apps.filter(x=>x!==app)});wlPropRules=wlPropRules.filter(r=>(r.apps||[]).length);renderWpRules();wlSaveNow();return}
   const h=e.target.closest('[data-wpapp]');
@@ -1273,6 +1280,7 @@ function openRdGroupEdit(i){
   $('rd-edit-target').value=t.target||'/vendor/etc/selinux/vendor_file_contexts';
   $('rd-edit-from-label').textContent='原内容';
   $('rd-edit-to-label').textContent='新内容';
+  $('rd-edit-add-rule').textContent='＋ 添加内容替换规则';
   $('rd-edit-from-input').value=t.from;$('rd-edit-from-input').readOnly=false;
   $('rd-edit-to-input').value=t.to;$('rd-edit-to-input').readOnly=false;
   $('rd-edit-global').checked=!!t.global;
@@ -1281,6 +1289,14 @@ function openRdGroupEdit(i){
   $('rd-edit-modal').hidden=false;
 }
 rdEditRender=()=>{$('rd-edit-apps').innerHTML=rdEditTmp.length?rdEditTmp.map((a,i)=>`<div style="display:flex;align-items:center;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:12px;color:#000">${esc(a)}<button class="icon-btn danger" style="margin-left:auto;flex-shrink:0" data-i="${i}" title="删除">${ICO_TRASH}</button></div>`).join(''):'<div class="hint" style="margin:0">未添加目标应用</div>';};
+$('rd-edit-add-rule').onclick=()=>{
+  const k=rdEditKind;
+  $('rd-edit-modal').hidden=true;
+  if(k==='c'){$('rd-add-modal').hidden=false;$('rd-add-global').checked=false;if($('rd-add-apps-section'))$('rd-add-apps-section').hidden=false;rdAddTmp=[];renderRdApps();}
+  else if(k==='f'){$('rd-field-modal').hidden=false;$('rd-field-global').checked=false;if($('rd-field-apps-section'))$('rd-field-apps-section').hidden=false;rdpTmp=[];renderRdpApps();}
+  else if(k==='s'){$('sv-add-modal').hidden=false;svAddTmp=[];renderWaylayApps();}
+  else if(k==='p'){$('wp-add-modal').hidden=false;wpAddTmp=[];renderWpApps();}
+};
 $('rd-edit-app-add').onclick=()=>{
   const v=$('rd-edit-app-input').value.trim();
   if(v&&!rdEditTmp.includes(v))rdEditTmp.push(v);
@@ -1370,8 +1386,10 @@ function openRdEdit(kind,i){
   $('rd-edit-target').style.display=isC?'':'none';
   $('rd-edit-global').parentElement.style.display=(kind==='p')?'none':'';
   if(isC)$('rd-edit-target').value=r.target||'/vendor/etc/selinux/vendor_file_contexts';
-  $('rd-edit-from-label').textContent=kind==='c'?'原内容':(kind==='s'?'原服务名':'原路径');
-  $('rd-edit-to-label').textContent=kind==='c'?'新内容':(kind==='s'?'新服务名':'新路径');
+  const addRuleBtn={c:'＋ 添加内容替换规则',f:'＋ 添加文件重定向规则',s:'＋ 添加服务伪装规则',p:'＋ 添加伪装规则'};
+  $('rd-edit-add-rule').textContent=addRuleBtn[kind]||'＋ 添加规则';
+  $('rd-edit-from-label').textContent=kind==='c'?'原内容':(kind==='s'?'原服务名':(kind==='p'?'原属性名':'原路径'));
+  $('rd-edit-to-label').textContent=kind==='c'?'新内容':(kind==='s'?'新服务名':(kind==='p'?'新属性名':'新路径'));
   $('rd-edit-from-input').value=r.from;$('rd-edit-from-input').readOnly=false;
   $('rd-edit-to-input').value=r.to;$('rd-edit-to-input').readOnly=false;
   $('rd-edit-global').checked=!!r.global;
