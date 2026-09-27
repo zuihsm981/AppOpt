@@ -144,16 +144,6 @@ impl KpmHandle {
         let args = format!("srv_rule {} {} {}", idx, from, to);
         self.cmd(&args);
     }
-    /* 规则目标 uid (-1=全局); 内核按 current uid 精确匹配, 非目标应用不替换 */
-    pub(crate) fn srv_rule_uid(&self, idx: usize, uid: i32) {
-        let args = format!("srv_rule_uid {} {}", idx, uid);
-        self.cmd(&args);
-    }
-    /* getService 常驻门控: sync 配置变化置 (内核按 uid 匹配, 不依赖前台回调) */
-    pub(crate) fn srv_uid_active(&self, on: bool) {
-        let args = format!("srv_uid_active {}", if on { 1 } else { 0 });
-        self.cmd(&args);
-    }
 
     /// 武装 KPM (start: affinity 拦截 + 清理探针 + service list 伪装)
     pub(crate) fn arm(&self) {

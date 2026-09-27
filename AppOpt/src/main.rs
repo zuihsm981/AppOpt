@@ -468,11 +468,9 @@ impl AppState {
                 }
                 let has_src = !src_list.is_empty();
                 es.bpf.srv_clear();
-                for (i, (u, f, t)) in src_list.iter().enumerate() {
+                for (i, (_u, f, t)) in src_list.iter().enumerate() {
                     es.bpf.srv_rule(i, f, t);
-                    es.bpf.srv_rule_uid(i, *u);
                 }
-                es.bpf.srv_uid_active(has_src);
                 if prop_any {
                     let mut prop_rules: Vec<(String, String)> = Vec::new();
                     for (_u2, r2) in self.uid_rules.iter() {
