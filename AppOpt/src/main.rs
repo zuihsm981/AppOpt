@@ -453,38 +453,40 @@ impl AppState {
                 es.bpf.vfc_fg(self.last_fg_uid);   /* 表重建后定位当前前台 uid 段 */
                 self.rule_cache = rows;   /* 仅成功下发后更新缓存 (未连接时不更新 → 连接后必重发) */
             }
-            /* src/prop: 当前前台 uid 规则 — 配置任何变化都重发 (prop/src 修改立即生效) */
-            if self.last_fg_uid > 0 {
-                if let Some(my) = self.uid_rules.get(&self.last_fg_uid) {
-                    let has_src = my
-                        .iter()
-                        .any(|r| r.kind == crate::config::WaylayKind::Src);
-                    let has_prop = my
-                        .iter()
-                        .any(|r| r.kind == crate::config::WaylayKind::Prop);
-                    es.bpf.srv_clear();
-                    for (i, r) in my
-                        .iter()
-                        .filter(|r| r.kind == crate::config::WaylayKind::Src)
-                        .enumerate()
-                    {
-                        es.bpf.srv_rule(i, &r.from, &r.to);
-                        es.bpf.srv_rule_uid(i, self.last_fg_uid);
+            /* src/prop: 全量下发 — getService 由内核按 current uid 匹配 (不依赖前台回调) */
+            {
+                let mut src_list: Vec<(i32, &str, &str)> = Vec::new();
+                let mut prop_any = false;
+                for (u, rules) in self.uid_rules.iter() {
+                    for r in rules {
+                        if r.kind == crate::config::WaylayKind::Src {
+                            src_list.push((*u, r.from.as_str(), r.to.as_str()));
+                        } else if r.kind == crate::config::WaylayKind::Prop {
+                            prop_any = true;
+                        }
                     }
-                    es.bpf.srv_active(has_src);
-                    es.bpf.srv_uid_active(has_src);   /* getService 常驻: 配置变化即生效 (不依赖前台回调) */
-                    if has_prop {
-                        let prop_rules: Vec<(String, String)> = my
-                            .iter()
-                            .filter(|r| r.kind == crate::config::WaylayKind::Prop)
-                            .map(|r| (r.from.clone(), r.to.clone()))
-                            .collect();
-                        crate::config::set_prop_rules(&prop_rules);
-                    }
-                    es.bpf.prop_file_apply(has_prop);
-                    self.srv_active_cur = has_src;
-                    self.prop_active_cur = has_prop;
                 }
+                let has_src = !src_list.is_empty();
+                es.bpf.srv_clear();
+                for (i, (u, f, t)) in src_list.iter().enumerate() {
+                    es.bpf.srv_rule(i, f, t);
+                    es.bpf.srv_rule_uid(i, *u);
+                }
+                es.bpf.srv_uid_active(has_src);
+                if prop_any {
+                    let mut prop_rules: Vec<(String, String)> = Vec::new();
+                    for (_u2, r2) in self.uid_rules.iter() {
+                        for r in r2 {
+                            if r.kind == crate::config::WaylayKind::Prop {
+                                prop_rules.push((r.from.clone(), r.to.clone()));
+                            }
+                        }
+                    }
+                    crate::config::set_prop_rules(&prop_rules);
+                }
+                es.bpf.prop_file_apply(prop_any);
+                self.srv_active_cur = has_src;
+                self.prop_active_cur = prop_any;
             }
         }
     }
@@ -564,13 +566,7 @@ impl AppState {
         if active != self.srv_active_cur {
             self.srv_active_cur = active;
             if let Some(es) = self.ebpf_state.as_ref() {
-                if active {
-                    es.bpf.srv_clear();
-                    for (i, r) in my.iter().filter(|r| r.kind == crate::config::WaylayKind::Src).enumerate() {
-                        es.bpf.srv_rule(i, &r.from, &r.to);
-                        es.bpf.srv_rule_uid(i, uid);
-                    }
-                }
+                /* 规则已由 sync_vfc_rules 全量下发 (带 uid); on_fg 只做 listServices 前台门控 */
                 es.bpf.srv_active(active);
             }
         }
