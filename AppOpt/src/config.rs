@@ -173,6 +173,11 @@ pub fn load_waylay_rules() -> Vec<WaylayRule> {
     out
 }
 
+/// 只读快照: GET /api/waylay 用内存静态, 不触发读盘/写静态/置 changed (副作用修复)
+pub fn waylay_rules_snapshot() -> Vec<WaylayRule> {
+    rw_read_ignore_poison(&WAYLAY_RULES_NEW).clone()
+}
+
 /// 保存 waylay.conf 新格式 (tmp+rename 原子写), 更新静态并置变更标志
 static WAYLAY_SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -181,11 +186,7 @@ pub fn save_waylay_rules(rules: &[WaylayRule]) -> io::Result<()> {
     let mut out = String::from("# waylay 新格式: <包名>=<kind>-<from>-<to>\n");
     out.push_str("# kind: src=服务伪装 prop=属性伪装 red=重定向(内容替换); from/to 等长且不含 '-'\n");
     for r in rules {
-        let prefix = match r.kind {
-            WaylayKind::Red => "red",
-            WaylayKind::RedPath => "red-path",
-            _ => r.kind.tag(),
-        };
+        let prefix = r.kind.tag();
         if r.kind == WaylayKind::Red {
             /* 内容替换带目标文件: <目标>-<from>-<to> */
             out.push_str(&format!(

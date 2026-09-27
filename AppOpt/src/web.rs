@@ -830,7 +830,7 @@ pub fn settings_save() {
 
 /// GET /api/waylay: 当前配置 (多组规则) + KPM 连接状态
 fn waylay_json() -> String {
-    let rules = crate::config::load_waylay_rules();
+    let rules = crate::config::waylay_rules_snapshot();
     json!({
         // 已连接 = KPM 模块已武装 (拦截功能随 start/stop)
         "connected": KPM_ARMED.load(Ordering::Relaxed),
@@ -866,14 +866,6 @@ fn waylay_set_api(req: &Request) -> (u16, String) {
             KPM_ARMED.store(false, std::sync::atomic::Ordering::Relaxed);
         }
     }
-    let kind_max: std::collections::HashMap<&str, usize> = [
-        ("src", 64usize),
-        ("prop", 92usize),
-        ("red", 64usize),
-    ]
-    .iter()
-    .cloned()
-    .collect();
     let mut rules: Vec<crate::config::WaylayRule> = Vec::new();
     if let Some(arr) = v["rules"].as_array() {
         for r in arr {
@@ -888,7 +880,12 @@ fn waylay_set_api(req: &Request) -> (u16, String) {
             if pkg.is_empty() || pkg.len() > 256 {
                 return err_json(400, "包名非法");
             }
-            let max = *kind_max.get(kind_t.as_str()).unwrap_or(&64);
+            let max = match kind_t.as_str() {
+                "src" => 64usize,
+                "prop" => 92usize,
+                "red" => 64usize,
+                _ => 64usize,
+            };
             if f.is_empty() {
                 return err_json(400, "规则 from 不能为空");
             }

@@ -432,7 +432,7 @@ impl AppState {
                 rows.push((*uid, k.to_string(), tg, r.from.clone(), r.to.clone()));
             }
         }
-        rows.sort_by(|a, b| a.0.cmp(&b.0));   /* uid=-1 全局段在前, 同 uid 规则连续 */
+        rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));   /* 稳定排序 + 同 uid 内按 from 序 (防误报 changed) */
         self.uid_rules = tbl;
         self.vfc_uid_set = rows.iter().filter(|x| x.0 >= 0).map(|x| x.0).collect();
         let changed = rows != self.rule_cache;
@@ -551,13 +551,6 @@ impl AppState {
             .get(&uid)
             .cloned()
             .unwrap_or_default();
-        /* 诊断: on_fg 执行信息 (定位失效: 是否触发/uid/规则条数/表条数) */
-        let wl_len = crate::rw_read_ignore_poison(&crate::config::WAYLAY_RULES_NEW).len();
-        let cache_len = self.uid_rules.len();
-        let _ = std::fs::write(
-            "/data/local/tmp/.appopt_fg_diag",
-            format!("pid={} uid={} uid_rules={} uid_tbl={} waylay_rules={}\n", pid, uid, my.len(), cache_len, wl_len),
-        );
         let active = !my.is_empty();
         // ---- 前台 uid 通知内核: uid 在 vfc 规则表 → 执行该 uid 全部规则; 否则仅全局 ----
         if let Some(es) = self.ebpf_state.as_ref() {

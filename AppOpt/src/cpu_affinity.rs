@@ -58,8 +58,6 @@ static CPU_FG_TX: OnceLock<Mutex<mpsc::Sender<CpuMsg>>> = OnceLock::new();
 
 /// 冷热身份: uid -> (前台主 pid, 该 uid 全部 pid 列表); 主线程每次 binder 前台
 /// 回调都读 (高频只读) -> RwLock, 仅冷启动/退出时写
-/// 冷热身份: uid -> (前台主 pid, 该 uid 全部 pid 列表); 主线程每次 binder 前台
-/// 回调都读 (高频只读) -> RwLock, 仅冷启动/退出时写
 pub static CPU_KNOWN: std::sync::LazyLock<RwLock<HashMap<i32, (i32, Vec<i32>)>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
