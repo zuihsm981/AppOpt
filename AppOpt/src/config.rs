@@ -329,8 +329,10 @@ pub fn rebuild_prop_ctx_cache() {
     let rules = rw_read_ignore_poison(&WAYLAY_PROP_RULES).clone();
     let mut out: Vec<(String, String)> = Vec::new();
     for (from, _) in &rules {
-        if let Some(ctx) = prop_context_for(from) {
-            out.push((from.clone(), ctx));
+        /* 值替换 (属性名=原值): 属性名取 '=' 前 — 否则查不到 context, 不映射则不生效 */
+        let name = from.split('=').next().unwrap_or(from);
+        if let Some(ctx) = prop_context_for(name) {
+            out.push((name.to_string(), ctx));
         }
     }
     *rw_write_ignore_poison(&WAYLAY_PROP_CTX) = out;
