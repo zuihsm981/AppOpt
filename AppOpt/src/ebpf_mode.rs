@@ -212,10 +212,7 @@ impl KpmHandle {
         ensure_prop_maps();   // 懒补充 (保存后新增 context 时补映射)
         let rules =
             crate::rw_read_ignore_poison(&crate::config::WAYLAY_PROP_RULES).clone();
-        let ctxs = crate::rw_read_ignore_poison(&crate::config::WAYLAY_PROP_CTX).clone();
         let maps = crate::lock_ignore_poison(&PROP_MAPS);
-        let mut diag_repl: usize = 0;
-        let mut diag_val_repl: usize = 0;
         for (_, ptr, len) in maps.iter() {
             let len = *len;
             unsafe {
@@ -236,30 +233,22 @@ impl KpmHandle {
                         if n1.is_empty() || v1.is_empty() || n2.is_empty() || v2.is_empty() {
                             continue;
                         }
-                    /* /dev/__properties__ 条目: <name>\0 <value_len BE u32> <value> (hexdump: adb_root\0 00 00 00 07 running)
-                     * pat = 名\0 + 值长BE4 + 原值 ; rep = 新名\0 + 值长BE4 + 新值 (值等长) */
-                    let mut p0 = Vec::new();
-                    p0.extend_from_slice(n1.as_bytes());
-                    p0.push(0);
-                    p0.extend_from_slice(&(v1.len() as u32).to_be_bytes());
-                    p0.extend_from_slice(v1.as_bytes());
-                    let mut r = Vec::new();
-                    r.extend_from_slice(n2.as_bytes());
-                    r.push(0);
-                    r.extend_from_slice(&(v2.len() as u32).to_be_bytes());
-                    r.extend_from_slice(v2.as_bytes());
-                    if p0.len() == r.len() {
+                    /* 精确值条目替换: 属性区值为 <值长 BE u32> + <值> (实测 00 00 00 01 31).
+                     * 扫描 "值长BE4 + 原值" 条目 — 文件内唯一则替换 (等长), 多处同名值跳过防误伤. */
+                        let mut p0 = Vec::new();
+                        p0.extend_from_slice(&(v1.len() as u32).to_be_bytes());
+                        p0.extend_from_slice(v1.as_bytes());
+                        let mut r = Vec::new();
+                        r.extend_from_slice(&(v2.len() as u32).to_be_bytes());
+                        r.extend_from_slice(v2.as_bytes());
+                        let (p0, r) = if p0.len() == r.len() { (p0, r) } else { continue; };
                         (p0, r)
-                    } else {
-                        continue;
-                    }
                     } else {
                         (from.as_bytes().to_vec(), to.as_bytes().to_vec())
                     };
                     if pat.is_empty() || pat.len() != rep.len() {
                         continue;
                     }
-                    let is_val = fv.is_some() && tv.is_some();
                     if !on {
                         std::mem::swap(&mut pat, &mut rep);
                     }
@@ -271,8 +260,6 @@ impl KpmHandle {
                         if std::slice::from_raw_parts(base.add(i), pat.len()) == &pat[..] {
                             std::ptr::copy_nonoverlapping(rep.as_ptr(), base.add(i), pat.len());
                             i += pat.len();
-                            diag_repl += 1;
-                            if is_val { diag_val_repl += 1; }
                         } else {
                             i += 1;
                         }
@@ -281,14 +268,6 @@ impl KpmHandle {
                 // tmpfs: MAP_SHARED 写入即进 page cache, 其他进程映射同页立即可见
             }
         }
-        let val_cnt = rules.iter().filter(|(f, _)| f.contains('=')).count();
-        let _ = std::fs::write(
-            "/data/local/tmp/.appopt_prop_status",
-            format!(
-                "on={} rules={} maps={} ctxs={} valrules={} replaced={} valrepl={}\n",
-                on, rules.len(), maps.len(), ctxs.len(), val_cnt, diag_repl, diag_val_repl
-            ),
-        );
     }
 
 
