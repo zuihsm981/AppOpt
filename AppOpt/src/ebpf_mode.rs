@@ -233,20 +233,13 @@ impl KpmHandle {
                         if n1.is_empty() || v1.is_empty() || n2.is_empty() || v2.is_empty() {
                             continue;
                         }
-                    /* 精确值条目替换: 属性区值为 <值长 BE u32> + <值> (实测 00 00 00 01 31).
-                     * 扫描 "值长BE4 + 原值" 条目 — 文件内唯一则替换 (等长), 多处同名值跳过防误伤. */
-                        let mut p0 = Vec::new();
-                        p0.extend_from_slice(&(v1.len() as u32).to_be_bytes());
-                        p0.extend_from_slice(v1.as_bytes());
-                        let mut r = Vec::new();
-                        r.extend_from_slice(&(v2.len() as u32).to_be_bytes());
-                        r.extend_from_slice(v2.as_bytes());
-                        let (p0, r) = if p0.len() == r.len() { (p0, r) } else { continue; };
-                        (p0, r)
+                        (Vec::new(), Vec::new())   /* 值替换走下方"精确按名(名-92)"块, 不需 pat/rep */
                     } else {
                         (from.as_bytes().to_vec(), to.as_bytes().to_vec())
                     };
-                    if pat.is_empty() || pat.len() != rep.len() {
+                    if !(fv.is_some() && tv.is_some())
+                        && (pat.is_empty() || pat.len() != rep.len())
+                    {
                         continue;
                     }
                     if !on {
