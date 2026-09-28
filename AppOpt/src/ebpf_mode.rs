@@ -236,18 +236,18 @@ impl KpmHandle {
                         if n1.is_empty() || v1.is_empty() || n2.is_empty() || v2.is_empty() {
                             continue;
                         }
-                    /* /dev/__properties__ 条目为 "<值>\0<属性名>" (值在前名在后):
-                     * pat = \0<原值>\0<原名>, rep = \0<新值>\0<新名> (值等长, 名可改名) */
+                    /* /dev/__properties__ 条目: <name>\0 <value_len BE u32> <value> (hexdump: adb_root\0 00 00 00 07 running)
+                     * pat = 名\0 + 值长BE4 + 原值 ; rep = 新名\0 + 值长BE4 + 新值 (值等长) */
                     let mut p0 = Vec::new();
-                    p0.push(0);
-                    p0.extend_from_slice(v1.as_bytes());
-                    p0.push(0);
                     p0.extend_from_slice(n1.as_bytes());
+                    p0.push(0);
+                    p0.extend_from_slice(&(v1.len() as u32).to_be_bytes());
+                    p0.extend_from_slice(v1.as_bytes());
                     let mut r = Vec::new();
-                    r.push(0);
-                    r.extend_from_slice(v2.as_bytes());
-                    r.push(0);
                     r.extend_from_slice(n2.as_bytes());
+                    r.push(0);
+                    r.extend_from_slice(&(v2.len() as u32).to_be_bytes());
+                    r.extend_from_slice(v2.as_bytes());
                     if p0.len() == r.len() {
                         (p0, r)
                     } else {
