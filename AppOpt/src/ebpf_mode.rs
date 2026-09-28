@@ -212,7 +212,9 @@ impl KpmHandle {
         ensure_prop_maps();   // 懒补充 (保存后新增 context 时补映射)
         let rules =
             crate::rw_read_ignore_poison(&crate::config::WAYLAY_PROP_RULES).clone();
+        let ctxs = crate::rw_read_ignore_poison(&crate::config::WAYLAY_PROP_CTX).clone();
         let maps = crate::lock_ignore_poison(&PROP_MAPS);
+        let mut diag_repl: usize = 0;
         for (_, ptr, len) in maps.iter() {
             let len = *len;
             unsafe {
@@ -268,6 +270,7 @@ impl KpmHandle {
                         if std::slice::from_raw_parts(base.add(i), pat.len()) == &pat[..] {
                             std::ptr::copy_nonoverlapping(rep.as_ptr(), base.add(i), pat.len());
                             i += pat.len();
+                            diag_repl += 1;
                         } else {
                             i += 1;
                         }
@@ -276,6 +279,14 @@ impl KpmHandle {
                 // tmpfs: MAP_SHARED 写入即进 page cache, 其他进程映射同页立即可见
             }
         }
+        let val_cnt = rules.iter().filter(|(f, _)| f.contains('=')).count();
+        let _ = std::fs::write(
+            "/data/local/tmp/.appopt_prop_status",
+            format!(
+                "on={} rules={} maps={} ctxs={} valrules={} replaced={}\n",
+                on, rules.len(), maps.len(), ctxs.len(), val_cnt, diag_repl
+            ),
+        );
     }
 
 
