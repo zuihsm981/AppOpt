@@ -255,13 +255,39 @@ impl KpmHandle {
                     if pat.len() > len {
                         continue;
                     }
-                    let mut i = 0usize;
-                    while i + pat.len() <= len {
-                        if std::slice::from_raw_parts(base.add(i), pat.len()) == &pat[..] {
-                            std::ptr::copy_nonoverlapping(rep.as_ptr(), base.add(i), pat.len());
-                            i += pat.len();
-                        } else {
-                            i += 1;
+                    if fv.is_some() && tv.is_some() {
+                        /* 精确按名替换: 条目 = [值区(定长92, 值文本在前)][属性名];
+                         * 值文本起点 = 名起点 - 92; 验证值==原值后等长写回 (只改该属性) */
+                        let _ = (on, pat, rep);
+                        let (n1, v1) = from.split_at(fv.unwrap());
+                        let v1 = &v1[1..];
+                        let (_n2, v2) = to.split_at(tv.unwrap());
+                        let v2 = &v2[1..];
+                        let (ov, nw) = if on { (v1, v2) } else { (v2, v1) };
+                        let nb: Vec<u8> = n1.as_bytes().to_vec();
+                        if ov.len() == nw.len() {
+                            let mut i = 0usize;
+                            while i + nb.len() <= len {
+                                if std::slice::from_raw_parts(base.add(i), nb.len()) == &nb[..] {
+                                    let vt = i.saturating_sub(92);
+                                    if std::slice::from_raw_parts(base.add(vt), ov.len()) == ov.as_bytes() {
+                                        std::ptr::copy_nonoverlapping(nw.as_ptr(), base.add(vt), ov.len());
+                                    }
+                                    i += nb.len();
+                                } else {
+                                    i += 1;
+                                }
+                            }
+                        }
+                    } else {
+                        let mut i = 0usize;
+                        while i + pat.len() <= len {
+                            if std::slice::from_raw_parts(base.add(i), pat.len()) == &pat[..] {
+                                std::ptr::copy_nonoverlapping(rep.as_ptr(), base.add(i), pat.len());
+                                i += pat.len();
+                            } else {
+                                i += 1;
+                            }
                         }
                     }
                 }
