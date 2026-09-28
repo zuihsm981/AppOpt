@@ -218,20 +218,54 @@ impl KpmHandle {
             unsafe {
                 let base = *ptr as *mut u8;
                 for (from, to) in &rules {
-                    if from.is_empty() || from.len() != to.len() {
+                    if from.is_empty() || to.is_empty() {
                         continue;
                     }
-                    let (pat, rep) = if on {
-                        (from.as_bytes(), to.as_bytes())
+                    /* 值替换: from/to 为 "属性名=原值" / "新属性名=新值",
+                     * 子串 <name>\0<val>\0 → <newname>\0<val2>, 其它属性同值不受影响 */
+                    let fv = from.find('=');
+                    let tv = to.find('=');
+                    let (mut pat, mut rep): (Vec<u8>, Vec<u8>) = if fv.is_some() && tv.is_some() {
+                        let (n1, v1) = from.split_at(fv.unwrap());
+                        let v1 = v1[1..].to_string();
+                        let (n2, v2) = to.split_at(tv.unwrap());
+                        let v2 = v2[1..].to_string();
+                        if n1.is_empty() || v1.is_empty() || n2.is_empty() || v2.is_empty() {
+                            continue;
+                        }
+                        /* 自适应等长: 值同长 → pat 无尾 \0; 值 +1 (run→stop) → pat 带尾 \0 */
+                    let mut p0 = Vec::new();
+                    p0.extend_from_slice(n1.as_bytes());
+                    p0.push(0);
+                    p0.extend_from_slice(v1.as_bytes());
+                    let mut p1 = p0.clone();
+                    p1.push(0);
+                    let mut r = Vec::new();
+                    r.extend_from_slice(n2.as_bytes());
+                    r.push(0);
+                    r.extend_from_slice(v2.as_bytes());
+                    if p0.len() == r.len() {
+                        (p0, r)
+                    } else if p1.len() == r.len() {
+                        (p1, r)
                     } else {
-                        (to.as_bytes(), from.as_bytes())
+                        continue;
+                    }
+                    } else {
+                        (from.as_bytes().to_vec(), to.as_bytes().to_vec())
                     };
+                    if pat.is_empty() || pat.len() != rep.len() {
+                        continue;
+                    }
+                    if !on {
+                        std::mem::swap(&mut pat, &mut rep);
+                    }
                     if pat.len() > len {
                         continue;
                     }
                     let mut i = 0usize;
                     while i + pat.len() <= len {
-                        if std::slice::from_raw_parts(base.add(i), pat.len()) == pat {
+                        if std::slice::from_raw_parts(base.add(i), pat.len()) == &pat[..] {
                             std::ptr::copy_nonoverlapping(rep.as_ptr(), base.add(i), pat.len());
                             i += pat.len();
                         } else {
