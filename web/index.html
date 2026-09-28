@@ -409,6 +409,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="sg-wrap"><input id="sv-apps-input" placeholder="输入包名添加目标应用" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:9px 12px;font-size:14px;color:#000;outline:none"><div class="sg-box" id="sv-apps-sg" hidden></div></div>
 <button class="btn" id="sv-apps-add" style="width:100%;margin-top:8px">＋ 添加应用</button>
 </div>
+<button class="btn" data-addkind="s" data-addapp="" style="width:100%;margin-top:8px">＋ 添加规则</button>
 <button class="btn" id="sv-apps-modal-close" style="width:100%;margin-top:14px">关闭</button>
 </div>
 </div>
@@ -416,6 +417,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="card" style="width:min(440px,92vw);padding:16px;margin:0;max-height:88vh;display:flex;flex-direction:column">
 <div id="wp-rules-title" style="font-weight:700;color:#000;margin-bottom:10px"></div>
 <div id="wp-rules-body" style="height:55vh;overflow-y:auto;-webkit-overflow-scrolling:touch;display:block"></div>
+<button class="btn" data-addkind="p" style="width:100%;margin-top:8px">＋ 添加规则</button>
 <button class="btn" id="wp-rules-close" style="width:100%;margin-top:14px">关闭</button>
 </div>
 </div>
@@ -427,6 +429,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="sg-wrap"><input id="wp-apps-input" placeholder="输入包名添加目标应用" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:9px 12px;font-size:14px;color:#000;outline:none"><div class="sg-box" id="wp-apps-sg" hidden></div></div>
 <button class="btn" id="wp-apps-add" style="width:100%;margin-top:8px">＋ 添加应用</button>
 </div>
+<button class="btn" data-addkind="p" data-addapp="" style="width:100%;margin-top:8px">＋ 添加规则</button>
 <button class="btn" id="wp-apps-modal-close" style="width:100%;margin-top:14px">关闭</button>
 </div>
 </div>
@@ -434,6 +437,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="card" style="width:min(440px,92vw);padding:16px;margin:0;max-height:88vh;display:flex;flex-direction:column">
 <div id="sr-rules-title" style="font-weight:700;color:#000;margin-bottom:10px"></div>
 <div id="sr-rules-body" style="height:55vh;overflow-y:auto;-webkit-overflow-scrolling:touch;display:block"></div>
+<button class="btn" data-addkind="s" style="width:100%;margin-top:8px">＋ 添加规则</button>
 <button class="btn" id="sr-rules-close" style="width:100%;margin-top:14px">关闭</button>
 </div>
 </div>
@@ -462,7 +466,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="card" style="width:min(440px,92vw);padding:16px;margin:0">
 <div style="font-weight:600;color:#000;margin-bottom:10px">添加系统属性伪装规则</div>
 <div style="font-size:12px;color:var(--sub);margin-bottom:4px">原属性名</div>
-<input id="wp-from" maxlength="92" placeholder="ro.boottime.vendor.lineage_health" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000">
+<input id="wp-from" maxlength="92" placeholder="属性名:原值 (值替换) 或 ro.boottime.vendor.lineage_health" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000">
 <div style="font-size:12px;color:var(--sub);margin-bottom:4px;margin-top:10px">新属性名</div>
 <input id="wp-to" maxlength="92" placeholder="ro.boottime.vendor.opluscn_health" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000">
 <div style="font-size:11px;color:var(--sub);margin-top:6px">原/新属性名字符数需一致 (ASCII ≤92)</div>
@@ -510,6 +514,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="card" style="width:min(420px,90vw);padding:16px;margin:0">
 <div id="fr-groups-title" style="font-weight:600;color:#000;margin-bottom:10px"></div>
 <div id="fr-groups-body" style="max-height:50vh;overflow:auto;display:flex;flex-direction:column;gap:6px"></div>
+<button class="btn" data-addkind="f" style="width:100%;margin-top:8px">＋ 添加规则</button>
 <button class="btn" id="fr-groups-close" style="width:100%;margin-top:14px">关闭</button>
 </div>
 </div>
@@ -517,6 +522,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="card" style="width:min(440px,92vw);padding:16px;margin:0;max-height:88vh;display:flex;flex-direction:column">
 <div id="rd-fgroup-title" style="font-weight:700;color:#000;margin-bottom:10px"></div>
 <div id="rd-fgroup-body" style="height:55vh;overflow-y:auto;-webkit-overflow-scrolling:touch;display:block"></div>
+<button class="btn" data-addkind="f" style="width:100%;margin-top:8px">＋ 添加规则</button>
 <button class="btn" id="rd-fgroup-close" style="width:100%;margin-top:14px">关闭</button>
 </div>
 </div>
@@ -581,6 +587,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="card" style="width:min(420px,90vw);padding:16px;margin:0">
 <div id="rd-groups-title" style="font-weight:600;color:#000;margin-bottom:10px"></div>
 <div id="rd-groups-body" style="max-height:50vh;overflow:auto;display:flex;flex-direction:column;gap:6px"></div>
+<button class="btn" data-addkind="c" style="width:100%;margin-top:8px">＋ 添加规则</button>
 <button class="btn" id="rd-groups-close" style="width:100%;margin-top:14px">关闭</button>
 </div>
 </div>
@@ -588,6 +595,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="card" style="width:min(440px,92vw);padding:16px;margin:0">
 <div id="rd-paths-title" style="font-weight:700;color:#000;margin-bottom:10px"></div>
 <div id="rd-paths-body" style="max-height:55vh;overflow:auto;display:flex;flex-direction:column;gap:6px"></div>
+<button class="btn" data-addkind="c" style="width:100%;margin-top:8px">＋ 添加规则</button>
 <button class="btn" id="rd-paths-close" style="width:100%;margin-top:14px">关闭</button>
 </div>
 </div>
@@ -595,6 +603,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="card" style="width:min(440px,92vw);padding:16px;margin:0;max-height:88vh;display:flex;flex-direction:column">
 <div id="rd-path-title" style="font-weight:700;color:#000;margin-bottom:10px;word-break:break-all"></div>
 <div id="rd-path-body" style="height:55vh;overflow-y:auto;-webkit-overflow-scrolling:touch;display:block"></div>
+<button class="btn" data-addkind="c" style="width:100%;margin-top:8px">＋ 添加规则</button>
 <button class="btn" id="rd-path-close" style="width:100%;margin-top:14px">关闭</button>
 </div>
 </div>
@@ -892,7 +901,12 @@ $('wp-add-modal').addEventListener('click',e=>{if(e.target.id==='wp-add-modal')$
 $('wp-add-ok').onclick=()=>{
   const f=$('wp-from').value.trim(),t=$('wp-to').value.trim();
   if(!f.length||!t.length){$('wp-add-err').textContent='原/新属性名不能为空';$('wp-add-err').hidden=false;return}else{$('wp-add-err').hidden=true}
-  if(f.length!==t.length||f.length>92){$('wp-add-err').textContent='原/新属性名字符数需一致 (ASCII ≤92)';$('wp-add-err').hidden=false;return}else{$('wp-add-err').hidden=true}
+  if(f.indexOf(':')<0&&t.indexOf(':')<0){
+    if(f.length!==t.length||f.length>92){$('wp-add-err').textContent='原/新属性名字符数需一致 (ASCII ≤92)';$('wp-add-err').hidden=false;return}else{$('wp-add-err').hidden=true}
+  }else{
+    /* 值替换: 属性名:原值 → 新属性名:新值 — 后端按 <name>\0<val>\0 子串等长校验 */
+    if(f.indexOf(':')<0||t.indexOf(':')<0){$('wp-add-err').textContent='值替换需同时填 "属性名:原值" 与 "新属性名:新值"';$('wp-add-err').hidden=false;return}else{$('wp-add-err').hidden=true}
+  }
   if(!wpAddTmp.length){$('wp-add-err').textContent='无法保存: 需要添加目标应用';$('wp-add-err').hidden=false;return}else{$('wp-add-err').hidden=true}
   wlPropRules.push({from:f,to:t,apps:wpAddTmp.slice()});
   $('wp-from').value='';$('wp-to').value='';
@@ -1321,14 +1335,27 @@ function openRdGroupEdit(i){
   $('rd-edit-modal').hidden=false;
 }
 rdEditRender=()=>{$('rd-edit-apps').innerHTML=rdEditTmp.length?rdEditTmp.map((a,i)=>`<div style="display:flex;align-items:center;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:12px;color:#000">${esc(a)}<button class="icon-btn danger" style="margin-left:auto;flex-shrink:0" data-i="${i}" title="删除">${ICO_TRASH}</button></div>`).join(''):'<div class="hint" style="margin:0">未添加目标应用</div>';};
+/* 编辑弹窗 "＋ 添加规则" (生效应用场景) — 按 rdEditKind 打开添加 */
 $('rd-edit-add-rule').onclick=()=>{
   const k=rdEditKind;
   $('rd-edit-modal').hidden=true;
-  if(k==='c'){$('rd-add-modal').hidden=false;$('rd-add-global').checked=false;if($('rd-add-apps-section'))$('rd-add-apps-section').hidden=false;rdAddTmp=rdEditFromApp?[rdEditFromApp]:[];$('rd-ctarget').value='';$('rd-cfrom').value='';$('rd-cto').value='';$('rd-add-err').hidden=true;renderRdApps();}
+  if(k==='c'){$('rd-add-modal').hidden=false;$('rd-add-global').checked=false;if($('rd-add-apps-section'))$('rd-add-apps-section').hidden=false;rdAddTmp=rdEditFromApp?[rdEditFromApp]:[];$('rd-ctarget').value=rdPathCur||'';$('rd-cfrom').value='';$('rd-cto').value='';$('rd-add-err').hidden=true;renderRdApps();}
   else if(k==='f'){$('rd-field-modal').hidden=false;$('rd-field-global').checked=false;if($('rd-field-apps-section'))$('rd-field-apps-section').hidden=false;rdpTmp=rdEditFromApp?[rdEditFromApp]:[];$('rd-ffrom').value='';$('rd-fto').value='';$('rd-field-err').hidden=true;renderRdpApps();}
   else if(k==='s'){$('sv-add-modal').hidden=false;svAddTmp=rdEditFromApp?[rdEditFromApp]:[];$('w-from').value='';$('w-to').value='';$('sv-add-err').hidden=true;renderWaylayApps();}
   else if(k==='p'){$('wp-add-modal').hidden=false;wpAddTmp=rdEditFromApp?[rdEditFromApp]:[];$('wp-from').value='';$('wp-to').value='';$('wp-add-err').hidden=true;renderWpApps();}
 };
+/* 列表弹窗 "＋ 添加规则" 统一入口: data-addkind → 打开对应添加弹窗, 预填当前应用 */
+document.addEventListener('click',e=>{
+  const ab=e.target.closest('[data-addkind]');
+  if(!ab)return;
+  const k=ab.dataset.addkind;
+  rdEditFromApp=(ab.dataset.addapp!==undefined)?ab.dataset.addapp:(k==='f')?frGroupsApp:(k==='c')?groupsLayerApp:(k==='s')?srRulesApp:wpRulesApp;
+  $('rd-edit-modal').hidden=true;
+  if(k==='c'){$('rd-add-modal').hidden=false;$('rd-add-global').checked=false;if($('rd-add-apps-section'))$('rd-add-apps-section').hidden=false;rdAddTmp=rdEditFromApp?[rdEditFromApp]:[];$('rd-ctarget').value=rdPathCur||'';$('rd-cfrom').value='';$('rd-cto').value='';$('rd-add-err').hidden=true;renderRdApps();}
+  else if(k==='f'){$('rd-field-modal').hidden=false;$('rd-field-global').checked=false;if($('rd-field-apps-section'))$('rd-field-apps-section').hidden=false;rdpTmp=rdEditFromApp?[rdEditFromApp]:[];$('rd-ffrom').value='';$('rd-fto').value='';$('rd-field-err').hidden=true;renderRdpApps();}
+  else if(k==='s'){$('sv-add-modal').hidden=false;svAddTmp=rdEditFromApp?[rdEditFromApp]:[];$('w-from').value='';$('w-to').value='';$('sv-add-err').hidden=true;renderWaylayApps();}
+  else if(k==='p'){$('wp-add-modal').hidden=false;wpAddTmp=rdEditFromApp?[rdEditFromApp]:[];$('wp-from').value='';$('wp-to').value='';$('wp-add-err').hidden=true;renderWpApps();}
+});
 $('rd-edit-app-add').onclick=()=>{
   const v=$('rd-edit-app-input').value.trim();
   if(v&&!rdEditTmp.includes(v))rdEditTmp.push(v);
