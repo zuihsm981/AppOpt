@@ -466,7 +466,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="card" style="width:min(440px,92vw);padding:16px;margin:0">
 <div style="font-weight:600;color:#000;margin-bottom:10px">添加系统属性伪装规则</div>
 <div style="font-size:12px;color:var(--sub);margin-bottom:4px">原属性名</div>
-<input id="wp-from" maxlength="92" placeholder="属性名:原值 (值替换) 或 ro.boottime.vendor.lineage_health" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000">
+<input id="wp-from" maxlength="92" placeholder="属性名=原值 (值替换) 或 ro.boottime.vendor.lineage_health" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000">
 <div style="font-size:12px;color:var(--sub);margin-bottom:4px;margin-top:10px">新属性名</div>
 <input id="wp-to" maxlength="92" placeholder="ro.boottime.vendor.opluscn_health" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000">
 <div style="font-size:11px;color:var(--sub);margin-top:6px">原/新属性名字符数需一致 (ASCII ≤92)</div>
@@ -901,11 +901,13 @@ $('wp-add-modal').addEventListener('click',e=>{if(e.target.id==='wp-add-modal')$
 $('wp-add-ok').onclick=()=>{
   const f=$('wp-from').value.trim(),t=$('wp-to').value.trim();
   if(!f.length||!t.length){$('wp-add-err').textContent='原/新属性名不能为空';$('wp-add-err').hidden=false;return}else{$('wp-add-err').hidden=true}
-  if(f.indexOf(':')<0&&t.indexOf(':')<0){
+  const fsep=f.indexOf('=')>=0;
+  const tsep=t.indexOf('=')>=0;
+  if(!fsep&&!tsep){
     if(f.length!==t.length||f.length>92){$('wp-add-err').textContent='原/新属性名字符数需一致 (ASCII ≤92)';$('wp-add-err').hidden=false;return}else{$('wp-add-err').hidden=true}
   }else{
-    /* 值替换: 属性名:原值 → 新属性名:新值 — 后端按 <name>\0<val>\0 子串等长校验 */
-    if(f.indexOf(':')<0||t.indexOf(':')<0){$('wp-add-err').textContent='值替换需同时填 "属性名:原值" 与 "新属性名:新值"';$('wp-add-err').hidden=false;return}else{$('wp-add-err').hidden=true}
+    /* 值替换: 属性名=原值 → 新属性名=新值 — 后端按 <name>\0<val> 子串等长校验 */
+    if(!fsep||!tsep){$('wp-add-err').textContent='值替换需同时填 "属性名=原值" 与 "新属性名=新值"';$('wp-add-err').hidden=false;return}else{$('wp-add-err').hidden=true}
   }
   if(!wpAddTmp.length){$('wp-add-err').textContent='无法保存: 需要添加目标应用';$('wp-add-err').hidden=false;return}else{$('wp-add-err').hidden=true}
   wlPropRules.push({from:f,to:t,apps:wpAddTmp.slice()});
