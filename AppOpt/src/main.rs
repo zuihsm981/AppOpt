@@ -95,7 +95,7 @@ pub(crate) fn for_each_proc_pid(mut f: impl FnMut(i32)) {
 }
 
 /// vfc 规则表构建: 读 packages.list 建 包名→uid (应用 uid)
-fn pkg_to_uid_map() -> HashMap<String, i32> {
+pub(crate) fn pkg_to_uid_map() -> HashMap<String, i32> {
     let mut m: HashMap<String, i32> = HashMap::new();
     if let Ok(content) = std::fs::read_to_string("/data/system/packages.list") {
         for line in content.lines() {
@@ -109,6 +109,59 @@ fn pkg_to_uid_map() -> HashMap<String, i32> {
         }
     }
     m
+}
+
+/// 统一 waylay 规则 → 内核下行映射 (与 sync_vfc_rules 完全一致):
+/// 返回 (uid→规则表, vfc rows, srv list); rows/srows 的索引即内核下发 idx。
+/// main 下发与 WebUI 保存前校验共用, 避免两套映射漂移。
+pub(crate) fn build_rule_rows(
+    all: &[crate::config::WaylayRule],
+    pkguid: &HashMap<String, i32>,
+) -> (
+    HashMap<i32, Vec<crate::config::WaylayRule>>,
+    Vec<(i32, String, String, String, String)>,
+    Vec<(i32, String, String)>,
+) {
+    let mut tbl: HashMap<i32, Vec<crate::config::WaylayRule>> = HashMap::new();
+    for r in all.iter() {
+        let u = if r.pkg == "*" {
+            -1
+        } else if let Some(u) = pkguid.get(&r.pkg) {
+            *u
+        } else {
+            continue;   /* 未安装包 → 跳过 */
+        };
+        tbl.entry(u).or_default().push(r.clone());
+    }
+    /* vfc 指纹 (red/redpath) — 稳定排序 (同 uid 内按 kind 序) */
+    let mut rows: Vec<(i32, String, String, String, String)> = Vec::new();
+    for (uid, rules) in tbl.iter() {
+        for r in rules.iter() {
+            if r.kind != crate::config::WaylayKind::Red
+                && r.kind != crate::config::WaylayKind::RedPath
+            {
+                continue;
+            }
+            let (k, tg) = if r.kind == crate::config::WaylayKind::Red {
+                ("c", r.target.clone())
+            } else {
+                ("p", "-".to_string())   /* 占位: 内核 sscanf 需 target 段非空 */
+            };
+            rows.push((*uid, k.to_string(), tg, r.from.clone(), r.to.clone()));
+        }
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    /* srv list — 同 uid 内按 from 序, 保证内核 idx 稳定 */
+    let mut srows: Vec<(i32, String, String)> = Vec::new();
+    for (u, rules) in tbl.iter() {
+        for r in rules.iter() {
+            if r.kind == crate::config::WaylayKind::Src {
+                srows.push((*u, r.from.clone(), r.to.clone()));
+            }
+        }
+    }
+    srows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    (tbl, rows, srows)
 }
 
 /// CPU 规则包 → uid: 从 main 维护的反向表过滤 (不直接读 packages.list)
@@ -401,43 +454,20 @@ impl AppState {
     /// 用户态配置驱动: uid 规则表下发。构建指纹 (uid, kind, target, from, to) 对比缓存,
     /// 有新增/删除才 clear + 重发 (无变化零动作); 全局(pkg="*")→uid=-1 段在前。
     fn sync_vfc_rules(&mut self) {
-        /* 四功能统一 uid 规则表: 规则 pkg → 读 packages.list 转 uid (全局 "*"→-1; 未安装包跳过) */
+        /* 四功能统一 uid 规则表 + 内核行映射 (与 WebUI 校验共用 build_rule_rows) */
         let all = crate::rw_read_ignore_poison(&crate::config::WAYLAY_RULES_NEW);
         let pkguid = pkg_to_uid_map();
-        let mut tbl: std::collections::HashMap<i32, Vec<crate::config::WaylayRule>> =
-            std::collections::HashMap::new();
-        for r in all.iter() {
-            let u = if r.pkg == "*" {
-                -1
-            } else if let Some(u) = pkguid.get(&r.pkg) {
-                *u
-            } else {
-                continue;   /* 未安装包 → 跳过 */
-            };
-            tbl.entry(u).or_default().push(r.clone());
-        }
-        /* vfc 指纹 (red/redpath) — 对比缓存, 无变化不重发 */
-        let mut rows: Vec<(i32, String, String, String, String)> = Vec::new();
-        for (uid, rules) in tbl.iter() {
-            for r in rules.iter() {
-                if r.kind != crate::config::WaylayKind::Red
-                    && r.kind != crate::config::WaylayKind::RedPath
-                {
-                    continue;
-                }
-                let (k, tg) = if r.kind == crate::config::WaylayKind::Red {
-                    ("c", r.target.clone())
-                } else {
-                    ("p", "-".to_string())   /* 占位: 内核 sscanf 需 target 段非空 */
-                };
-                rows.push((*uid, k.to_string(), tg, r.from.clone(), r.to.clone()));
-            }
-        }
-        rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));   /* 稳定排序 + 同 uid 内按 from 序 (防误报 changed) */
+        let (tbl, rows, srows) = build_rule_rows(&all, &pkguid);
         self.uid_rules = tbl;
         self.vfc_uid_set = rows.iter().filter(|x| x.0 >= 0).map(|x| x.0).collect();
         let changed = rows != self.rule_cache;
         if let Some(es) = self.ebpf_state.as_ref() {
+            /* L1 全量预检: 任何非法规则 → 整组不下发 (静默: WebUI 保存时已反馈) */
+            let all_errs = crate::ebpf_mode::validate_rule_set(&rows, &srows);
+            if !all_errs.is_empty() {
+                let _ = all_errs;
+                return;
+            }
             if changed {
                 let glob_n = rows.iter().filter(|x| x.0 == -1).count().min(512);
                 es.bpf.vfc_rule_clear();
@@ -446,30 +476,33 @@ impl AppState {
                     if i >= 512 {
                         break;
                     }
-                    es.bpf.vfc_rule(i, *uid, kind, tg, from, to);
+                    if let Err(e) = es.bpf.vfc_rule(i, *uid, kind, tg, from, to) {
+                        let _ = e;   /* 静默: 失败即停, 缓存不更新 → 下次重发 */
+                        break;
+                    }
                     i += 1;
                 }
                 es.bpf.vfc_glob_count(glob_n);
                 es.bpf.vfc_fg(self.last_fg_uid);   /* 表重建后定位当前前台 uid 段 */
-                self.rule_cache = rows;   /* 仅成功下发后更新缓存 (未连接时不更新 → 连接后必重发) */
+                self.rule_cache = rows;   /* 全部成功后才更新缓存 */
             }
             /* src/prop: 全量下发 — getService 由内核按 current uid 匹配 (不依赖前台回调) */
             {
-                let mut src_list: Vec<(i32, &str, &str)> = Vec::new();
                 let mut prop_any = false;
-                for (u, rules) in self.uid_rules.iter() {
+                for (_u, rules) in self.uid_rules.iter() {
                     for r in rules {
-                        if r.kind == crate::config::WaylayKind::Src {
-                            src_list.push((*u, r.from.as_str(), r.to.as_str()));
-                        } else if r.kind == crate::config::WaylayKind::Prop {
+                        if r.kind == crate::config::WaylayKind::Prop {
                             prop_any = true;
                         }
                     }
                 }
-                let has_src = !src_list.is_empty();
+                let has_src = !srows.is_empty();
                 es.bpf.srv_clear();
-                for (i, (_u, f, t)) in src_list.iter().enumerate() {
-                    es.bpf.srv_rule(i, f, t);
+                for (i, (_u, f, t)) in srows.iter().enumerate() {
+                    if let Err(e) = es.bpf.srv_rule(i, f, t) {
+                        let _ = e;   /* 静默 */
+                        break;
+                    }
                 }
                 if prop_any {
                     let mut prop_rules: Vec<(String, String)> = Vec::new();
@@ -788,6 +821,7 @@ fn main() {
     const EV_PKG: u64 = 7; // packages.list inotify (安装/卸载/替换)
     const EV_TOUCH: u64 = 8; // 用户态 /dev/input 触摸/输入活动 (替代 4.19 内核 input hook)
     const EV_EXIT_PID: u64 = 9; // pidfd 进程退出监听 (全模式统一退出来源)
+    const EV_WAYLAY: u64 = 10; // waylay.conf inotify (外部编辑/原子替换 → 重读校验全量下发)
 
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epfd < 0 {
@@ -816,6 +850,11 @@ fn main() {
     // pkglist_path 保留供 EV_PKG 重挂 watch 用)
     let pkglist_path = CString::new("/data/system/packages.list").unwrap_or_default();
     epoll_add(epfd, pkg_inotify_fd, EV_PKG);
+    // waylay.conf inotify: 外部编辑 (WebUI 之外) 修改规则文件 → 重读+校验+全量下发
+    let waylay_fd = crate::config::init_waylay_inotify();
+    if waylay_fd > 0 {
+        epoll_add(epfd, waylay_fd, EV_WAYLAY);
+    }
 
     // 初始全量应用 (两种驱动模式都执行: KPM 事件驱动 / 纯用户态)
     state.apply_all();
@@ -885,6 +924,55 @@ fn main() {
                             }
                         }
                         state.rebuild_uid_tables();
+                    }
+                }
+                EV_WAYLAY => {
+                    // waylay.conf 变化 (外部编辑/原子 rename) → 重读+校验+全量下发
+                    if waylay_fd > 0 {
+                        let mut buf = [0u8; 4096];
+                        let mut dirty = false;
+                        loop {
+                            let len = unsafe {
+                                libc::read(
+                                    waylay_fd,
+                                    buf.as_mut_ptr() as *mut libc::c_void,
+                                    buf.len(),
+                                )
+                            };
+                            if len <= 0 {
+                                break;
+                            }
+                            let hdr = std::mem::size_of::<libc::inotify_event>();
+                            let mut off = 0usize;
+                            while off + hdr <= len as usize {
+                                let ev = unsafe {
+                                    &*(buf.as_ptr().add(off) as *const libc::inotify_event)
+                                };
+                                if ev.len > 0 {
+                                    let name = unsafe {
+                                        std::ffi::CStr::from_ptr(
+                                            buf.as_ptr().add(off + hdr) as *const u8,
+                                        )
+                                    }
+                                    .to_string_lossy()
+                                    .into_owned();
+                                    if name == crate::config::WAYLAY_FILE
+                                        && ev.mask
+                                            & (libc::IN_CLOSE_WRITE
+                                                | libc::IN_MOVED_TO
+                                                | libc::IN_CREATE)
+                                                != 0
+                                    {
+                                        dirty = true;
+                                    }
+                                }
+                                off += hdr + ev.len as usize;
+                            }
+                        }
+                        if dirty {
+                            /* reload(): load_waylay_rules + L1 全量校验 + 全量下发 */
+                            state.reload();
+                        }
                     }
                 }
                 EV_FG => {

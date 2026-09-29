@@ -1112,6 +1112,32 @@ pub(crate) fn init_pkg_inotify() -> i32 {
     }
 }
 
+/// 监听 waylay.conf 所在目录 (原子 rename 保存 / 首次创建均可捕获)。
+/// 返回 inotify fd (失败 -1); 事件在主循环按 name=="waylay.conf" 过滤。
+/// 与主配置 (init_inotify) / packages.list (init_pkg_inotify) 各自独立 fd。
+pub(crate) fn init_waylay_inotify() -> i32 {
+    let dir = match std::ffi::CString::new(".") {
+        Ok(d) => d,
+        Err(_) => return -1,
+    };
+    unsafe {
+        let ifd = libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK);
+        if ifd < 0 {
+            return -1; // inotify 不可用 (如 SELinux 拦截)
+        }
+        let wd = libc::inotify_add_watch(
+            ifd,
+            dir.as_ptr(),
+            libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO | libc::IN_CREATE,
+        );
+        if wd < 0 {
+            libc::close(ifd);
+            return -1;
+        }
+        ifd
+    }
+}
+
 pub fn init_inotify(config_file: &str) {
     let inotify_fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
     if inotify_fd < 0 {

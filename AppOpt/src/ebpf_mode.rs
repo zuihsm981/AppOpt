@@ -34,6 +34,113 @@ fn cstr(s: &str) -> CString {
     CString::new(s).unwrap_or_default()
 }
 
+/* ================= L1: 规则下发前用户态校验 =================
+ * 内核 ctl0 解析为空格分隔文本: 字段含空白/控制字符会解析错位;
+ * vfc_rule 的 sscanf %127s/%255s 与 srv_rule 的定长循环会静默截断超长输入。
+ * 下发前在此拒绝, 把"静默错误"变成"显式报错"。 */
+
+/// 与内核 appopt_kpm.c 对齐的容量/长度上限
+pub(crate) const SRV_MAX_RULES: usize = 16;    /* srv_rules 表容量 */
+pub(crate) const SRV_MAX_CHARS: usize = 64;    /* srv_rule from/to 单字段上限 (字符) */
+pub(crate) const VFC_RULE_MAX: usize = 512;    /* vfc_rules 表容量 */
+pub(crate) const VFC_TARGET_MAX: usize = 127;  /* vfc_rule target (内核 sscanf %127s) */
+pub(crate) const VFC_FROM_MAX: usize = 127;    /* vfc_rule from  (%127s) */
+pub(crate) const VFC_TO_MAX: usize = 255;      /* vfc_rule to    (%255s) */
+
+fn field_ok(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| !c.is_whitespace() && !c.is_control())
+}
+
+/// 校验 srv_rule: 等长 + ASCII(内核按单字节转 utf16) + 无空白/控制字符 + 长度上限
+pub(crate) fn validate_srv_rule(idx: usize, from: &str, to: &str) -> Result<(), String> {
+    if idx >= SRV_MAX_RULES {
+        return Err(format!("srv_rule 索引 {idx} 超出表容量 {SRV_MAX_RULES}"));
+    }
+    if !field_ok(from) || !field_ok(to) {
+        return Err(format!("srv_rule from/to 为空或含空白/控制字符: '{from}' -> '{to}'"));
+    }
+    if !from.is_ascii() || !to.is_ascii() {
+        return Err(format!("srv_rule 仅支持 ASCII (内核按字节转 utf16): '{from}' -> '{to}'"));
+    }
+    if from.len() > SRV_MAX_CHARS || to.len() > SRV_MAX_CHARS {
+        return Err(format!("srv_rule 字段超限 (>{SRV_MAX_CHARS}): '{from}' -> '{to}'"));
+    }
+    if from.len() != to.len() {
+        return Err(format!(
+            "srv_rule 必须等长 (等长替换): {} vs {} 字节: '{from}' -> '{to}'",
+            from.len(),
+            to.len()
+        ));
+    }
+    Ok(())
+}
+
+/// 校验 vfc_rule: 长度上限(防内核 sscanf 静默截断) + 无空白/控制字符 + kind/路径语义
+pub(crate) fn validate_vfc_rule(
+    idx: usize,
+    uid: i32,
+    kind: &str,
+    target: &str,
+    from: &str,
+    to: &str,
+) -> Result<(), String> {
+    if idx >= VFC_RULE_MAX {
+        return Err(format!("vfc_rule 索引 {idx} 超出表容量 {VFC_RULE_MAX}"));
+    }
+    if kind != "c" && kind != "p" {
+        return Err(format!("vfc_rule kind 非法: '{kind}' (仅 c/p)"));
+    }
+    if !field_ok(target) {
+        return Err(format!("vfc_rule target 为空或含空白/控制字符: '{target}'"));
+    }
+    if !field_ok(from) || !field_ok(to) {
+        return Err(format!("vfc_rule from/to 为空或含空白/控制字符: '{from}' -> '{to}'"));
+    }
+    if target.len() > VFC_TARGET_MAX {
+        return Err(format!(
+            "vfc_rule target 超限 (>{VFC_TARGET_MAX}, 内核 sscanf 会静默截断): '{target}'"
+        ));
+    }
+    if from.len() > VFC_FROM_MAX {
+        return Err(format!("vfc_rule from 超限 (>{VFC_FROM_MAX}): '{from}'"));
+    }
+    if to.len() > VFC_TO_MAX {
+        return Err(format!("vfc_rule to 超限 (>{VFC_TO_MAX}): '{to}'"));
+    }
+    if kind == "c" && from.len() != to.len() {
+        return Err(format!(
+            "vfc_rule kind=c 内容替换必须等长: {} vs {} 字节: '{from}' -> '{to}'",
+            from.len(),
+            to.len()
+        ));
+    }
+    if kind == "p" && !from.starts_with('/') {
+        return Err(format!("vfc_rule kind=p 路径规则 from 必须以 '/' 开头: '{from}'"));
+    }
+    let _ = uid;   /* uid 仅透传 (含 -1 全局), 无需校验 */
+    Ok(())
+}
+
+/// 聚合校验一组已映射的规则 (vfc rows + srv list, 索引即内核下发 idx)。
+/// WebUI 保存前与主循环下发前共用; 返回全部错误, 非空则整组不下发。
+pub(crate) fn validate_rule_set(
+    vrows: &[(i32, String, String, String, String)],
+    srows: &[(i32, String, String)],
+) -> Vec<String> {
+    let mut errs = Vec::new();
+    for (i, (uid, kind, tg, from, to)) in vrows.iter().enumerate() {
+        if let Err(e) = validate_vfc_rule(i, *uid, kind, tg, from, to) {
+            errs.push(format!("vfc #{i}: {e}"));
+        }
+    }
+    for (i, (_u, from, to)) in srows.iter().enumerate() {
+        if let Err(e) = validate_srv_rule(i, from, to) {
+            errs.push(format!("srv #{i}: {e}"));
+        }
+    }
+    errs
+}
+
 // 事件环当前只流动 INPUT (内核事件已停用, 临时注释)
 // pub const EBPF_EVENT_INPUT: u32 = 5;
 
@@ -139,10 +246,15 @@ impl KpmHandle {
         self.cmd("srv_clear");
     }
 
-    /// 设置第 idx 组等长替换规则 (from→to, 字符数一致)
-    pub(crate) fn srv_rule(&self, idx: usize, from: &str, to: &str) {
+    /// 设置第 idx 组等长替换规则 (from→to, 字符数一致); L1 校验后下发
+    pub(crate) fn srv_rule(&self, idx: usize, from: &str, to: &str) -> Result<(), String> {
+        validate_srv_rule(idx, from, to)?;
         let args = format!("srv_rule {} {} {}", idx, from, to);
-        self.cmd(&args);
+        let r = self.cmd(&args);
+        if r < 0 {
+            return Err(format!("内核拒绝 srv_rule #{}: 返回 {}", idx, r));
+        }
+        Ok(())
     }
 
     /// 武装 KPM (start: affinity 拦截 + 清理探针 + service list 伪装)
@@ -186,10 +298,23 @@ impl KpmHandle {
         self.cmd(&format!("vfc_glob_count {}", n));
     }
 
-    /// 统一 vfc 规则: uid(应用; -1=全局) + kind "c"=内容替换(需 target) / "p"=文件重定向
-    pub(crate) fn vfc_rule(&self, idx: usize, uid: i32, kind: &str, target: &str, from: &str, to: &str) {
+    /// 统一 vfc 规则: uid(应用; -1=全局) + kind "c"=内容替换(需 target) / "p"=文件重定向; L1 校验后下发
+    pub(crate) fn vfc_rule(
+        &self,
+        idx: usize,
+        uid: i32,
+        kind: &str,
+        target: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<(), String> {
+        validate_vfc_rule(idx, uid, kind, target, from, to)?;
         let args = format!("vfc_rule {} {} {} {} {} {}", idx, uid, kind, target, from, to);
-        self.cmd(&args);
+        let r = self.cmd(&args);
+        if r < 0 {
+            return Err(format!("内核拒绝 vfc_rule #{}: 返回 {}", idx, r));
+        }
+        Ok(())
     }
 
     /// 诊断: 查询 vfc hook 挂载状态并写 /data/local/tmp/.appopt_vfc_status

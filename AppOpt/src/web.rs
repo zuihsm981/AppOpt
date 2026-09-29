@@ -925,6 +925,13 @@ fn waylay_set_api(req: &Request) -> (u16, String) {
             });
         }
     }
+    /* L1: 复用主循环同一套映射+校验, 保存前即时反馈全部错误 (编号与内核下发一致) */
+    let pkguid = crate::pkg_to_uid_map();
+    let (_tbl, vrows, srows) = crate::build_rule_rows(&rules, &pkguid);
+    let errs = crate::ebpf_mode::validate_rule_set(&vrows, &srows);
+    if !errs.is_empty() {
+        return (400, json!({ "error": "规则校验失败", "items": errs }).to_string());
+    }
     if let Err(e) = crate::config::save_waylay_rules(&rules) {
         return err_json(500, &format!("保存失败: {}", e));
     }
