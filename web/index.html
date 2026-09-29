@@ -259,26 +259,42 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div id="w-srv-pane">
 <div class="card">
 <button class="btn" id="sv-fshow" style="width:100%;margin-bottom:8px">＋ 添加服务伪装规则</button>
-<div id="w-rules" style="margin-top:8px"></div>
+<div class="seg" id="w-srv-tabs" style="margin-top:8px">
+<button data-v="apps" class="on">应用列表</button><button data-v="rules">规则列表</button>
+</div>
+<div id="w-srv-apps" style="margin-top:8px"><div id="w-rules"></div></div>
+<div id="w-srv-rules" style="margin-top:8px" hidden></div>
 </div>
 </div>
 <div id="w-prop-pane" hidden>
 <div class="card">
 <button class="btn" id="wp-fshow" style="width:100%;margin-bottom:8px">＋ 添加伪装规则</button>
-<div id="wp-rules" style="margin-top:8px"></div>
+<div class="seg" id="w-prop-tabs" style="margin-top:8px">
+<button data-v="apps" class="on">应用列表</button><button data-v="rules">规则列表</button>
+</div>
+<div id="w-prop-apps" style="margin-top:8px"><div id="wp-rules"></div></div>
+<div id="w-prop-rules" style="margin-top:8px" hidden></div>
 </div>
 </div>
 <div id="w-red-pane" hidden>
 <div class="card">
 <button class="btn" id="rd-cimport" style="width:100%;margin-bottom:8px">⤓ 批量导入</button>
 <button class="btn" id="rd-cshow" style="width:100%;margin-bottom:8px">＋ 添加内容替换规则</button>
-<div id="rd-crules" style="margin-top:8px"></div>
+<div class="seg" id="w-red-tabs" style="margin-top:8px">
+<button data-v="apps" class="on">应用列表</button><button data-v="rules">规则列表</button>
+</div>
+<div id="w-red-apps" style="margin-top:8px"><div id="rd-crules"></div></div>
+<div id="w-red-rules" style="margin-top:8px" hidden></div>
 </div>
 </div>
 <div id="w-redpath-pane" hidden>
 <div class="card">
 <button class="btn" id="rd-fshow" style="width:100%;margin-bottom:8px">＋ 添加文件重定向规则</button>
-<div id="rd-frules" style="margin-top:8px"></div>
+<div class="seg" id="w-redpath-tabs" style="margin-top:8px">
+<button data-v="apps" class="on">应用列表</button><button data-v="rules">规则列表</button>
+</div>
+<div id="w-redpath-apps" style="margin-top:8px"><div id="rd-frules"></div></div>
+<div id="w-redpath-rules" style="margin-top:8px" hidden></div>
 </div>
 </div>
 </section>
@@ -663,70 +679,43 @@ document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{
 });
 
 // ===== 隐藏 (waylay) 页: 三段 (规则+目标应用分离), 保存/加载新格式 <pkg>=<kind>-<from>-<to> =====
-let wlRules=[];let wlApps=[];
-let wlPropRules=[];let wlPropApps=[];
-let rdCrules=[];let rdFrules=[];let rdApps=[];let rdpApps=[];
+let wlRules=[];
+let wlPropRules=[];
+let rdCrules=[];let rdFrules=[];let rdApps=[];
 /* 规则级应用: 弹窗临时收集, 添加/编辑时写入规则 */
 let rdAddTmp=[];let rdBatchTmp=[];let rdpTmp=[];let rdEditTmp=[];let rdEditFromApp=null;
 let svAddTmp=[];let wpAddTmp=[];
-// 列表项与规则页主列表同款: .rule-row + .rule-name (普通字体)
-function rowHtml(txt,i){return `<div class="rule-row"><span class="rule-name">${esc(txt)}</span><button class="icon-btn danger" data-i="${i}" title="删除">${ICO_TRASH}</button></div>`}
 // 目标应用: 每应用一个 grp 圆角框 (规则页同款; 默认折叠)
 const grow=(a,i)=>`<div class="grp"><div class="grp-head"><svg class="chev" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg><span class="grp-name">${esc(a)}</span><span class="grp-count">0</span><button class="icon-btn danger" data-i="${i}" title="移除">${ICO_TRASH}</button></div><div class="grp-body"><div class="grp-inner"><div class="hint" style="padding:8px 14px">规则在上方「规则配置」区添加</div></div></div></div>`;
-// 规则项: 每条一个 grp 圆角框 (与目标应用列表同款)
-// 规则项: 每条一个 grp 圆角框; 规则对竖排 (from ▼ to)
-// 规则项: grp 圆角框; 一体式连线图标 (顶横线+竖线+底部箭头) + from/to 两行
-const growRule=(f,t,i)=>`
-<div class="grp"><div class="grp-head" style="cursor:default;gap:0">
-<svg viewBox="0 0 24 36" style="width:22px;height:33px;overflow:visible;margin-top:5px;stroke:var(--sub);fill:none;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0"><path d="M4 1v28"/><path d="M4 1h14"/><path d="M4 29h16"/><path d="M20 29l-5-5"/><path d="M20 29l-5 5"/></svg>
-<span class="grp-name" style="display:flex;flex-direction:column;gap:2px;padding-left:6px;margin-top:5px"><span style="margin-top:-5px">${esc(f)}</span><span style="margin-top:10px">${esc(t)}</span></span>
-<button class="icon-btn danger" style="margin-left:auto" data-i="${i}" title="删除">${ICO_TRASH}</button>
-</div></div>`;
-function renderWaylayRules(){
-  const apps=uniq(wlRules.flatMap(r=>r.apps||[]));
-  $('w-rules').innerHTML=apps.length?apps.map((a,i)=>
-`<div class="grp"><div class="grp-head" style="cursor:pointer;gap:0;align-items:center" data-wapp="${esc(a)}">
+const appRowsHtml=(list,appAttr,editAttr,delAttr,empty)=>{
+  const apps=uniq(list.flatMap(r=>r.apps||[]));
+  return apps.length?apps.map((a,i)=>`<div class="grp"><div class="grp-head" style="cursor:pointer;gap:0;align-items:center" data-${appAttr}="${esc(a)}">
 <span style="font-weight:700;font-size:14px;color:#000;padding-left:8px;flex:1">${esc(a)}</span>
-<button class="icon-btn" style="flex-shrink:0" data-waedit="${i}" title="编辑">${ICO_EDIT}</button>
-<button class="icon-btn danger" style="flex-shrink:0;margin-right:6px" data-wadel="${i}" title="删除">${ICO_TRASH}</button>
-</div></div>`).join(''):'';
+<button class="icon-btn" style="flex-shrink:0" data-${editAttr}="${i}" title="编辑">${ICO_EDIT}</button>
+<button class="icon-btn danger" style="flex-shrink:0;margin-right:6px" data-${delAttr}="${i}" title="删除">${ICO_TRASH}</button>
+</div></div>`).join(''):empty;
+};
+function renderWaylayRules(){
+  $('w-rules').innerHTML=appRowsHtml(wlRules,'wapp','waedit','wadel','');
+  renderWaylayRuleList();
 }
-function renderWaylayApps(){$('sv-add-apps').innerHTML=svAddTmp.length?svAddTmp.map((a,i)=>grow(a,i)).join(''):'<div class="hint">未添加目标应用</div>';}
+const renderTmpApps=(id,arr)=>{const el=$(id);if(el)el.innerHTML=arr.length?arr.map((a,i)=>grow(a,i)).join(''):'<div class="hint">未添加目标应用</div>';}
+function renderWaylayApps(){renderTmpApps('sv-add-apps',svAddTmp)}
 function renderWpRules(){
   /* 主列表: 生效应用 (应用 + 删除; 点击进入规则弹窗) */
-  const apps=uniq(wlPropRules.flatMap(r=>r.apps||[]));
-  $('wp-rules').innerHTML=apps.length?apps.map((a,i)=>
-`<div class="grp"><div class="grp-head" style="cursor:pointer;gap:0;align-items:center" data-wpapp="${esc(a)}">
-<span style="font-weight:700;font-size:14px;color:#000;padding-left:8px;flex:1">${esc(a)}</span>
-<button class="icon-btn" style="flex-shrink:0" data-wpaedit="${i}" title="编辑">${ICO_EDIT}</button>
-<button class="icon-btn danger" style="flex-shrink:0;margin-right:6px" data-wpadel="${i}" title="删除">${ICO_TRASH}</button>
-</div></div>`).join(''):'';
+  $('wp-rules').innerHTML=appRowsHtml(wlPropRules,'wpapp','wpaedit','wpadel','');
+  renderWpRuleList();
 }
-function renderWpApps(){$('wp-add-apps').innerHTML=wpAddTmp.length?wpAddTmp.map((a,i)=>grow(a,i)).join(''):'<div class="hint">未添加目标应用</div>';}
-// 内容替换规则: 与其他 tab 完全同款 (标准图标/from-to 布局), 路径单独圆角框
-const grpItem=(root,rs)=>`<div class="grp"><div class="grp-head" style="cursor:pointer;gap:0;align-items:center" data-root="${esc(root)}">
-<span style="font-weight:700;font-size:14px;color:#000;padding-left:8px;flex:1">${esc(root)}</span>
-<span style="color:var(--sub);font-size:11px;padding-right:8px">${rs.length} 条</span>
-</div></div>`;
+function renderWpApps(){renderTmpApps('wp-add-apps',wpAddTmp)}
 function renderRdCrules(){
   /* 第一层: 生效应用列表 (应用 + 删除图标) */
-  const apps=uniq(rdCrules.flatMap(r=>r.apps||[]));
-  $('rd-crules').innerHTML=apps.length?apps.map((a,i)=>
-`<div class="grp"><div class="grp-head" style="cursor:pointer;gap:0;align-items:center" data-app="${esc(a)}">
-<span style="font-weight:700;font-size:14px;color:#000;padding-left:8px;flex:1">${esc(a)}</span>
-<button class="icon-btn" style="flex-shrink:0" data-aedit="${i}" title="编辑">${ICO_EDIT}</button>
-<button class="icon-btn danger" style="flex-shrink:0;margin-right:6px" data-adel="${i}" title="删除">${ICO_TRASH}</button>
-</div></div>`).join(''):'<div class="hint">未添加内容替换规则</div>';
+  $('rd-crules').innerHTML=appRowsHtml(rdCrules,'app','aedit','adel','<div class="hint">未添加内容替换规则</div>');
+  renderRdCRuleList();
 }
 function renderRdFrules(){
   /* 主列表: 生效应用 (应用 + 编辑 + 删除) */
-  const apps=uniq(rdFrules.flatMap(r=>r.apps||[]));
-  $('rd-frules').innerHTML=apps.length?apps.map((a,i)=>
-`<div class="grp"><div class="grp-head" style="cursor:pointer;gap:0;align-items:center" data-fapp="${esc(a)}">
-<span style="font-weight:700;font-size:14px;color:#000;padding-left:8px;flex:1">${esc(a)}</span>
-<button class="icon-btn" style="flex-shrink:0" data-faedit="${i}" title="编辑">${ICO_EDIT}</button>
-<button class="icon-btn danger" style="flex-shrink:0;margin-right:6px" data-fadel="${i}" title="删除">${ICO_TRASH}</button>
-</div></div>`).join(''):'';
+  $('rd-frules').innerHTML=appRowsHtml(rdFrules,'fapp','faedit','fadel','');
+  renderRdFRuleList();
 }
 /* 组弹层: 该组规则 (图标 + from/to + 编辑/删除) */
 let rdFGroupRoot='';
@@ -737,10 +726,10 @@ function openFGroupsLayer(app){
   $('fr-groups-title').textContent=app+' 的分组';
   const rs=rdFrules.filter(r=>(r.apps||[]).includes(app));
   const groups={};
-  rs.forEach(r=>{const root=((r.from||'/').split('/')[1]||'?');(groups[root]=groups[root]||[]).push(r)});
+  rs.forEach(r=>{const root=dirName(r.from)||'/'; (groups[root]=groups[root]||[]).push(r)});
   $('fr-groups-body').innerHTML=Object.keys(groups).map(root=>
 `<div class="grp"><div class="grp-head" style="cursor:pointer;gap:0;align-items:center" data-fgroot="${esc(root)}">
-<span style="font-weight:700;font-size:14px;color:#000;padding-left:8px;flex:1">${esc(root)}</span>
+<span style="font-weight:700;font-size:14px;color:#000;padding-left:8px;flex:1;word-break:break-all">${esc(root)}</span>
 <span style="color:var(--sub);font-size:11px;padding-right:8px">${groups[root].length} 条</span>
 </div></div>`).join('')||'<div class="hint" style="margin:0">无分组</div>';
   $('fr-groups-modal').hidden=false;
@@ -753,14 +742,14 @@ $('fr-groups-body').addEventListener('click',e=>{
 });
 function openFGroup(root){
   rdFGroupRoot=root;
-  $('rd-fgroup-title').textContent='/' + root + ' 下的重定向';
-  const rs=rdFrules.filter(r=>(r.apps||[]).includes(frGroupsApp)&&(r.from||'/').split('/')[1]===root);
+  $('rd-fgroup-title').textContent=root + ' 下的重定向';
+  const rs=rdFrules.filter(r=>(r.apps||[]).includes(frGroupsApp)&&dirName(r.from)===root);
 
   $('rd-fgroup-body').innerHTML=rs.map((r,i)=>{
     const gidx=rdFrules.indexOf(r);
     return `<div class="grp"><div class="grp-head" style="cursor:default;gap:0;align-items:center">
-<svg viewBox="0 0 24 36" style="width:22px;height:33px;overflow:visible;stroke:var(--sub);fill:none;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0"><path d="M4 1v28"/><path d="M4 1h14"/><path d="M4 29h16"/><path d="M20 29l-5-5"/><path d="M20 29l-5 5"/></svg>
-<span class="grp-name" style="display:flex;flex-direction:column;gap:2px;padding-left:6px;min-width:0;flex:1"><span style="margin-top:-5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%">${esc(r.from)}</span><span style="margin-top:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%">${esc(r.to)}</span></span>
+${ICO_FLOW}
+<span class="grp-name" style="display:flex;flex-direction:column;gap:2px;padding-left:6px;min-width:0;flex:1"><span style="margin-top:-5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%">${esc(baseName(r.from))}</span><span style="margin-top:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%">${esc(baseName(r.to))}</span></span>
 <button class="icon-btn" style="margin-left:auto;flex-shrink:0" data-fedit="${gidx}" title="编辑">${ICO_EDIT}</button><button class="icon-btn danger" style="margin-left:8px;flex-shrink:0" data-fdel="${gidx}" title="删除">${ICO_TRASH}</button>
 </div></div>`;
   }).join('');
@@ -781,16 +770,14 @@ $('rd-fgroup-body').addEventListener('click',e=>{
     if(!((r.apps||[]).length) && !r.global) rdFrules.splice(rdFrules.indexOf(r),1);
   }
   renderRdFrules(); wlSaveNow();
-  const left=rdFrules.some(r=>(r.apps||[]).includes(frGroupsApp)&&(r.from||'/').split('/')[1]===rdFGroupRoot);
+  const left=rdFrules.some(r=>(r.apps||[]).includes(frGroupsApp)&&dirName(r.from)===rdFGroupRoot);
   if(left)openFGroup(rdFGroupRoot); else closeFGroup();
 });
 function renderRdApps(){
-  const h1=rdAddTmp.length?rdAddTmp.map((a,i)=>grow(a,i)).join(''):'<div class="hint">未添加目标应用</div>';
-  if($('rd-add-apps'))$('rd-add-apps').innerHTML=h1;
-  const h2=rdBatchTmp.length?rdBatchTmp.map((a,i)=>grow(a,i)).join(''):'<div class="hint">未添加目标应用</div>';
-  if($('rd-batch-apps'))$('rd-batch-apps').innerHTML=h2;
+  renderTmpApps('rd-add-apps',rdAddTmp);
+  renderTmpApps('rd-batch-apps',rdBatchTmp);
 }
-function renderRdpApps(){$('rd-field-apps').innerHTML=rdpTmp.length?rdpTmp.map((a,i)=>grow(a,i)).join(''):'<div class="hint">未添加目标应用</div>';}
+function renderRdpApps(){renderTmpApps('rd-field-apps',rdpTmp)}
 $('w-rules').addEventListener('click',e=>{
   const ae=e.target.closest('button[data-waedit]');
   if(ae){const app=uniq(wlRules.flatMap(r=>r.apps||[]))[+ae.dataset.waedit];const idx=wlRules.findIndex(r=>(r.apps||[]).includes(app));if(idx>=0){rdEditFromApp=app;openRdEdit('s',idx);}return}
@@ -816,7 +803,7 @@ function openWpRules(app){
   $('wp-rules-body').innerHTML=rs.map((r,i)=>{
     const gidx=wlPropRules.indexOf(r);
     return `<div class="grp"><div class="grp-head" style="cursor:pointer;gap:0;align-items:center" data-wpd="${gidx}">
-<svg viewBox="0 0 24 36" style="width:22px;height:33px;overflow:visible;stroke:var(--sub);fill:none;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0"><path d="M4 1v28"/><path d="M4 1h14"/><path d="M4 29h16"/><path d="M20 29l-5-5"/><path d="M20 29l-5 5"/></svg>
+${ICO_FLOW}
 <span class="grp-name" style="display:flex;flex-direction:column;gap:2px;padding-left:6px;min-width:0;flex:1"><span style="margin-top:-5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%">${esc(r.from)}</span><span style="margin-top:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%">${esc(r.to)}</span></span>
 <button class="icon-btn" style="margin-left:auto;flex-shrink:0" data-wpe="${gidx}" title="编辑">${ICO_EDIT}</button><button class="icon-btn danger" style="margin-left:8px;flex-shrink:0" data-wpd="${gidx}" title="删除">${ICO_TRASH}</button>
 </div></div>`;
@@ -912,6 +899,7 @@ $('wp-add-ok').onclick=()=>{
   if(!wpAddTmp.length){$('wp-add-err').textContent='无法保存: 需要添加目标应用';$('wp-add-err').hidden=false;return}else{$('wp-add-err').hidden=true}
   wlPropRules.push({from:f,to:t,apps:wpAddTmp.slice()});
   $('wp-from').value='';$('wp-to').value='';
+  if(!$('wp-rules-modal').hidden&&wpRulesApp)openWpRules(wpRulesApp);
   renderWpApps();renderWpRules();wlSaveNow();
   $('wp-add-err').textContent='已添加';$('wp-add-err').style.color='#12a150';$('wp-add-err').hidden=false;
 };
@@ -921,7 +909,9 @@ $('rd-cadd').onclick=()=>{
   if(!$('rd-add-global').checked&&!rdAddTmp.length){$('rd-add-err').textContent='无法保存: 需要添加目标应用或者开启全局';$('rd-add-err').hidden=false;return}else{$('rd-add-err').hidden=true}
   const tg=($('rd-ctarget')&&$('rd-ctarget').value.trim())||'/vendor/etc/selinux/vendor_file_contexts';
   rdCrules.push({target:tg,from:f,to:t,global:$('rd-add-global').checked,apps:rdAddTmp.slice()});
-  $('rd-cfrom').value='';$('rd-cto').value='';renderRdApps();renderRdCrules();wlSaveNow();
+  $('rd-cfrom').value='';$('rd-cto').value='';
+  if(!$('rd-path-modal').hidden&&rdPathCur)openRdPath(rdPathCur);
+  renderRdApps();renderRdCrules();wlSaveNow();
   $('rd-add-err').textContent='已添加';$('rd-add-err').style.color='#12a150';$('rd-add-err').hidden=false;
 };
 $('rd-fshow').onclick=()=>{$('rd-field-modal').hidden=false;$('rd-field-global').checked=false;$('rd-field-apps-section').hidden=false;rdpTmp=[];$('rd-ffrom').value='';$('rd-fto').value='';$('rd-field-err').hidden=true;renderRdpApps();};
@@ -970,6 +960,94 @@ $('w-seg').addEventListener('click',e=>{
   const v=b.dataset.v;
   $('w-seg').querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));
   $('w-srv-pane').hidden=v!=='srv';$('w-prop-pane').hidden=v!=='prop';$('w-red-pane').hidden=v!=='red';$('w-redpath-pane').hidden=v!=='redpath';
+});
+// ===== 隐藏页: 各功能主界面新增 「应用列表 / 规则列表」 tab (生效应用列表移入应用列表 tab) =====
+/* 规则行文本: rdcrule=灰色目标文件+原/新内容; rdfrule=黑色 原/新路径文件名 (仅最后文件名, 恢复默认字号) */
+const baseName=p=>{p=(p||'');const i=p.lastIndexOf('/');return i>=0?p.slice(i+1):p;}
+const dirName=p=>{p=(p||'');const i=p.lastIndexOf('/');if(i<0)return p;return i===0?'/':p.slice(0,i);}
+const wlRuleText=(r,tag)=>tag==='rdfrule'
+  ?`<span style="margin-top:-5px;color:#000;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%">${esc(baseName(r.from))}</span><span style="margin-top:6px;color:#000;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%">${esc(baseName(r.to))}</span>`
+  :`${r.target?`<span style="margin-top:-5px;font-size:11px;color:var(--sub);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%">${esc(r.target)}</span>`:''}<span style="margin-top:${r.target?'6px':'-5px'};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%">${esc(r.from)}</span><span style="margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%">${esc(r.to)}</span>`;
+const wlRuleRow=(r,i,tag)=>`<div class="grp"><div class="grp-head" style="cursor:default;gap:0;align-items:center">
+<svg viewBox="0 0 24 36" style="width:22px;height:33px;overflow:visible;${tag==='rdcrule'?'margin-top:20px;':''}stroke:var(--sub);fill:none;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0"><path d="M4 1v28"/><path d="M4 1h14"/><path d="M4 29h16"/><path d="M20 29l-5-5"/><path d="M20 29l-5 5"/></svg>
+<span class="grp-name" style="display:flex;flex-direction:column;gap:2px;padding-left:6px;min-width:0;flex:1">${wlRuleText(r,tag)}</span>
+${r.global?'<span class="grp-count">全局</span>':''}<span class="grp-count">${(r.apps||[]).length} 应用</span>
+<button class="icon-btn" style="flex-shrink:0" data-${tag}edit="${i}" title="编辑">${ICO_EDIT}</button>
+<button class="icon-btn danger" style="flex-shrink:0;margin-left:8px;margin-right:6px" data-${tag}del="${i}" title="删除">${ICO_TRASH}</button>
+</div></div>`;
+/* 规则列表去重: 相同规则(from/to[,target])只显示一条, 合并其目标应用 (a/b 共用同一规则时仅一条) */
+function mergeWlRules(list,withTarget){
+  const m=new Map();
+  list.forEach(r=>{
+    const key=(withTarget?(r.target||''):'')+'\u0000'+r.from+'\u0000'+r.to;
+    if(m.has(key)){
+      const e=m.get(key);
+      e.apps=uniq([...(e.apps||[]),...(r.apps||[])]);
+      e.global=!!(e.global||r.global);
+    }else m.set(key,{from:r.from,to:r.to,target:r.target,global:!!r.global,apps:uniq(r.apps||[])});
+  });
+  return [...m.values()];
+}
+function renderWaylayRuleList(){
+  const box=$('w-srv-rules');if(!box)return;
+  wlRules=mergeWlRules(wlRules,false);
+  box.innerHTML=wlRules.map((r,i)=>wlRuleRow(r,i,'srvrule')).join('')||'<div class="hint">暂无规则</div>';
+}
+function renderWpRuleList(){
+  const box=$('w-prop-rules');if(!box)return;
+  wlPropRules=mergeWlRules(wlPropRules,false);
+  box.innerHTML=wlPropRules.map((r,i)=>wlRuleRow(r,i,'wprule')).join('')||'<div class="hint">暂无规则</div>';
+}
+function renderRdCRuleList(){
+  const box=$('w-red-rules');if(!box)return;
+  rdCrules=mergeWlRules(rdCrules,true);
+  box.innerHTML=rdCrules.map((r,i)=>wlRuleRow(r,i,'rdcrule')).join('')||'<div class="hint">暂无规则</div>';
+}
+function renderRdFRuleList(){
+  const box=$('w-redpath-rules');if(!box)return;
+  rdFrules=mergeWlRules(rdFrules,false);
+  box.innerHTML=rdFrules.map((r,i)=>wlRuleRow(r,i,'rdfrule')).join('')||'<div class="hint">暂无规则</div>';
+}
+[['w-srv-tabs','w-srv-apps','w-srv-rules'],['w-prop-tabs','w-prop-apps','w-prop-rules'],['w-red-tabs','w-red-apps','w-red-rules'],['w-redpath-tabs','w-redpath-apps','w-redpath-rules']].forEach(([segId,appsId,rulesId])=>{
+  const seg=$(segId),apps=$(appsId),rules=$(rulesId);
+  if(!seg)return;
+  seg.addEventListener('click',e=>{
+    const b=e.target.closest('button');if(!b)return;
+    seg.querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));
+    apps.hidden=b.dataset.v!=='apps';rules.hidden=b.dataset.v!=='rules';
+  });
+});
+$('w-srv-rules').addEventListener('click',e=>{
+  const ed=e.target.closest('button[data-srvruleedit]');
+  if(ed){rdEditFromApp=null;openRdEdit('s',+ed.dataset.srvruleedit,true);return}
+  const b=e.target.closest('button[data-srvruledel]');
+  if(!b)return;
+  wlRules.splice(+b.dataset.srvruledel,1);
+  renderWaylayRules();wlSaveNow();
+});
+$('w-prop-rules').addEventListener('click',e=>{
+  const ed=e.target.closest('button[data-wpruleedit]');
+  if(ed){rdEditFromApp=null;openRdEdit('p',+ed.dataset.wpruleedit,true);return}
+  const b=e.target.closest('button[data-wpruledel]');
+  if(!b)return;
+  wlPropRules.splice(+b.dataset.wpruledel,1);
+  renderWpRules();wlSaveNow();
+});
+$('w-red-rules').addEventListener('click',e=>{
+  const ed=e.target.closest('button[data-rdcruleedit]');
+  if(ed){rdEditFromApp=null;openRdEdit('c',+ed.dataset.rdcruleedit,true);return}
+  const b=e.target.closest('button[data-rdcruledel]');
+  if(!b)return;
+  rdCrules.splice(+b.dataset.rdcruledel,1);
+  renderRdCrules();wlSaveNow();
+});
+$('w-redpath-rules').addEventListener('click',e=>{
+  const ed=e.target.closest('button[data-rdfruleedit]');
+  if(ed){rdEditFromApp=null;openRdEdit('f',+ed.dataset.rdfruleedit,true);return}
+  const b=e.target.closest('button[data-rdfruledel]');
+  if(!b)return;
+  rdFrules.splice(+b.dataset.rdfruledel,1);
+  renderRdFrules();wlSaveNow();
 });
 // 保存构造: 新格式 rules (规则 × 目标应用 笛卡尔; red 目标=rdApps; 全局开关→pkg="*")
 function buildRules(){
@@ -1054,14 +1132,11 @@ async function loadWaylay(){
     const rs=d.rules||[];
     const uniq=(a)=>[...new Set(a)];
     wlRules=uniq(rs.filter(r=>r.kind==='src').map(r=>r.from+'\u0000'+r.to)).map(k=>{const [f,t]=k.split('\u0000');const same=rs.filter(x=>x.kind==='src'&&x.from===f&&x.to===t);return {from:f,to:t,apps:uniq(same.map(x=>x.pkg))}});
-    wlApps=uniq(wlRules.flatMap(r=>r.apps||[]));
     wlPropRules=uniq(rs.filter(r=>r.kind==='prop').map(r=>r.from+'\u0000'+r.to)).map(k=>{const [f,t]=k.split('\u0000');const same=rs.filter(x=>x.kind==='prop'&&x.from===f&&x.to===t);return {from:f,to:t,apps:uniq(same.map(x=>x.pkg))}});
-    wlPropApps=uniq(wlPropRules.flatMap(r=>r.apps||[]));
     rdCrules=uniq(rs.filter(r=>r.kind==='red').map(r=>r.from+'\u0000'+r.to+'\u0000'+(r.target||'/vendor/etc/selinux/vendor_file_contexts'))).map(k=>{const [f,t,tg]=k.split('\u0000');const same=rs.filter(x=>x.kind==='red'&&x.from===f&&x.to===t&&(x.target||'/vendor/etc/selinux/vendor_file_contexts')===tg);return {target:tg,from:f,to:t,global:same.some(x=>x.pkg==='*'),apps:uniq(same.filter(x=>x.pkg!=='*').map(x=>x.pkg))}});
     if(rdCrules.length&&$('rd-ctarget'))$('rd-ctarget').value=rdCrules[0].target;
     rdFrules=uniq(rs.filter(r=>r.kind==='red-path'&&r.from.startsWith('/')).map(r=>r.from+'\u0000'+r.to)).map(k=>{const [f,t]=k.split('\u0000');const same=rs.filter(x=>x.kind==='red-path'&&x.from===f&&x.to===t);return {from:f,to:t,global:same.some(x=>x.pkg==='*'),apps:uniq(same.filter(x=>x.pkg!=='*').map(x=>x.pkg))}});
     rdApps=uniq(rdCrules.flatMap(r=>r.apps||[]));
-    rdpApps=uniq(rdFrules.flatMap(r=>r.apps||[]));
     renderWaylayConn(!!d.connected);
     renderWaylayRules();renderWaylayApps();renderWpRules();renderWpApps();renderRdCrules();renderRdFrules();renderRdApps();renderRdpApps();
     return !!d.connected;
@@ -1198,6 +1273,7 @@ function chipCls(s){return s==='e-core'?'e':s==='p-core'?'p':s==='hp-core'?'h':'
 function chipHtml(s){return `<span class="chip ${chipCls(s)}">${esc(s)}</span>`}
 const ICO_TRASH='<svg viewBox="0 0 24 24" style="width:17px;height:17px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round"><path d="M4 7h16M9 7V4h6v3m-8 0l1 13h8l1-13"/></svg>';
 const ICO_EDIT=`<svg viewBox="0 0 24 24" style="width:17px;height:17px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>`;
+const ICO_FLOW='<svg viewBox="0 0 24 36" style="width:22px;height:33px;overflow:visible;stroke:var(--sub);fill:none;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0"><path d="M4 1v28"/><path d="M4 1h14"/><path d="M4 29h16"/><path d="M20 29l-5-5"/><path d="M20 29l-5 5"/></svg>';
 /* 规则编辑面板 (全局生效开关不放在规则行内) */
 let rdEditIdx=-1,rdEditKind='';
 $('rd-cshow').onclick=()=>{$('rd-add-modal').hidden=false;$('rd-add-global').checked=false;$('rd-add-apps-section').hidden=false;rdAddTmp=[];$('rd-ctarget').value='';$('rd-cfrom').value='';$('rd-cto').value='';$('rd-add-err').hidden=true;renderRdApps();};
@@ -1243,7 +1319,7 @@ function openRdPath(path){
   $('rd-path-body').innerHTML=rs.map((r,i)=>{
     const gidx=rdCrules.indexOf(r);
     return `<div class="grp" data-rrule="${gidx}"><div class="grp-head" style="cursor:pointer;gap:0;align-items:center">
-<svg viewBox="0 0 24 36" style="width:22px;height:33px;overflow:visible;stroke:var(--sub);fill:none;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0"><path d="M4 1v28"/><path d="M4 1h14"/><path d="M4 29h16"/><path d="M20 29l-5-5"/><path d="M20 29l-5 5"/></svg>
+${ICO_FLOW}
 <span class="grp-name" style="display:flex;flex-direction:column;gap:2px;padding-left:6px;min-width:0;flex:1"><span style="margin-top:-5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%">${esc(r.from)}</span><span style="margin-top:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%">${esc(r.to)}</span></span>
 <button class="icon-btn" style="margin-left:auto;flex-shrink:0" data-redit="${gidx}" title="编辑">${ICO_EDIT}</button><button class="icon-btn danger" style="margin-left:8px;flex-shrink:0" data-rdel="${gidx}" title="删除">${ICO_TRASH}</button>
 </div></div>`;
@@ -1285,38 +1361,44 @@ $('rd-groups-body').addEventListener('click',e=>{
   const h=e.target.closest('[data-groot]');
   if(h)openPathsLayer(h.dataset.groot);
 });
-/* 第三层: 路径列表 */
+/* 第二层(合并): 该分组下该应用的全部替换规则 (移除原路径列表层) */
 function openPathsLayer(root){
   rdGroupRoot=root; /* 供编辑定位分组 */
-  $('rd-paths-title').textContent='/'+root+' 下的路径 ('+groupsLayerApp+')';
+  $('rd-paths-title').textContent='/'+root+' 的规则 ('+groupsLayerApp+')';
   const rs=rdCrules.filter(r=>(r.apps||[]).includes(groupsLayerApp)&&!r.global&&(r.target||'/').split('/')[1]===root);
-  const paths=uniq(rs.map(r=>r.target||''));
-  $('rd-paths-body').innerHTML=paths.map(p=>
-`<div style="display:flex;align-items:center;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font-size:12px;color:#000;word-break:break-all" data-ppath="${esc(p)}">${esc(p)}<button class="icon-btn" style="margin-left:auto;flex-shrink:0" data-pedit="${esc(p)}" title="编辑">${ICO_EDIT}</button><button class="icon-btn danger" style="margin-left:8px;flex-shrink:0" data-pdel="${esc(p)}" title="删除">${ICO_TRASH}</button></div>`).join('')||'<div class="hint" style="margin:0">无路径</div>';
+  $('rd-paths-body').innerHTML=rs.length?rs.map((r,i)=>{
+    const gidx=rdCrules.indexOf(r);
+    return `<div class="grp"><div class="grp-head" style="cursor:default;gap:0;align-items:center">
+<svg viewBox="0 0 24 36" style="width:22px;height:33px;overflow:visible;margin-top:20px;stroke:var(--sub);fill:none;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0"><path d="M4 1v28"/><path d="M4 1h14"/><path d="M4 29h16"/><path d="M20 29l-5-5"/><path d="M20 29l-5 5"/></svg>
+<span class="grp-name" style="display:flex;flex-direction:column;gap:2px;padding-left:6px;min-width:0;flex:1"><span style="margin-top:-5px;font-size:11px;color:var(--sub);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%">${esc(r.target)}</span><span style="margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%">${esc(r.from)}</span><span style="margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%">${esc(r.to)}</span></span>
+<button class="icon-btn" style="margin-left:auto;flex-shrink:0" data-redit="${gidx}" title="编辑">${ICO_EDIT}</button><button class="icon-btn danger" style="margin-left:8px;flex-shrink:0" data-rdel="${gidx}" title="删除">${ICO_TRASH}</button>
+</div></div>`;
+  }).join(''):'<div class="hint" style="margin:0">无规则</div>';
   $('rd-groups-modal').hidden=true;
   $('rd-paths-modal').hidden=false;
 }
 $('rd-paths-close').onclick=()=>{$('rd-paths-modal').hidden=true;$('rd-groups-modal').hidden=false;};
 $('rd-paths-modal').addEventListener('click',e=>{if(e.target.id==='rd-paths-modal'){$('rd-paths-modal').hidden=true;$('rd-groups-modal').hidden=false;}});
 $('rd-paths-body').addEventListener('click',e=>{
-  const pe=e.target.closest('button[data-pedit]');
-  if(pe){
-    const old=pe.dataset.pedit;
-    const idx=rdCrules.findIndex(r=>(r.target||'')===old);
-    if(idx>=0)openRdEdit('c',idx);
+  const ed=e.target.closest('button[data-redit]');
+  if(ed){
+    const r=rdCrules[+ed.dataset.redit];
+    if(r){rdEditFromApp=groupsLayerApp;openRdEdit('c',+ed.dataset.redit);}
     return;
   }
-  const pd=e.target.closest('button[data-pdel]');
-  if(pd){
-    const old=pd.dataset.pdel;
-    rdCrules=rdCrules.filter(r=>(r.target||'')!==old);
+  const b=e.target.closest('button[data-rdel]');
+  if(b){
+    const r=rdCrules[+b.dataset.rdel];
+    if(r){
+      /* 单应用删除: 只移除该应用的关联 */
+      if((r.apps||[]).includes(groupsLayerApp)) r.apps=r.apps.filter(x=>x!==groupsLayerApp);
+      if(!((r.apps||[]).length) && !r.global) rdCrules.splice(rdCrules.indexOf(r),1);
+    }
     renderRdCrules();wlSaveNow();
-    const rs=rdCrules.filter(r=>(r.apps||[]).includes(groupsLayerApp)&&!r.global&&(r.target||'/').split('/')[1]===rdGroupRoot);
-    if(rs.length)openPathsLayer(rdGroupRoot);else $('rd-paths-modal').hidden=true;
+    const left=rdCrules.some(x=>(x.apps||[]).includes(groupsLayerApp)&&!x.global&&(x.target||'/').split('/')[1]===rdGroupRoot);
+    if(left)openPathsLayer(rdGroupRoot);else{$('rd-paths-modal').hidden=true;$('rd-groups-modal').hidden=false;}
     return;
   }
-  const h=e.target.closest('[data-ppath]');
-  if(h&&!e.target.closest('button')){$('rd-paths-modal').hidden=true;openRdPath(h.dataset.ppath);}
 });
 function openRdGroupEdit(i){
   const rs=rdGroupRoot==='全局'?rdCrules.filter(r=>r.global):rdCrules.filter(r=>!r.global&&(r.target||'/').split('/')[1]===rdGroupRoot);
@@ -1328,6 +1410,7 @@ function openRdGroupEdit(i){
   $('rd-edit-from-label').textContent='原内容';
   $('rd-edit-to-label').textContent='新内容';
   $('rd-edit-add-rule').textContent='＋ 添加内容替换规则';
+  $('rd-edit-add-rule').style.display='';
   $('rd-edit-ft-box').style.flexDirection='row';
   $('rd-edit-from-input').value=t.from;$('rd-edit-from-input').readOnly=false;
   $('rd-edit-to-input').value=t.to;$('rd-edit-to-input').readOnly=false;
@@ -1338,25 +1421,22 @@ function openRdGroupEdit(i){
 }
 rdEditRender=()=>{$('rd-edit-apps').innerHTML=rdEditTmp.length?rdEditTmp.map((a,i)=>`<div style="display:flex;align-items:center;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:12px;color:#000">${esc(a)}<button class="icon-btn danger" style="margin-left:auto;flex-shrink:0" data-i="${i}" title="删除">${ICO_TRASH}</button></div>`).join(''):'<div class="hint" style="margin:0">未添加目标应用</div>';};
 /* 编辑弹窗 "＋ 添加规则" (生效应用场景) — 按 rdEditKind 打开添加 */
-$('rd-edit-add-rule').onclick=()=>{
-  const k=rdEditKind;
+/* 统一打开各添加弹窗 (编辑面板与列表 data-addkind 共用) */
+function openAddModal(k){
   $('rd-edit-modal').hidden=true;
   if(k==='c'){$('rd-add-modal').hidden=false;$('rd-add-global').checked=false;if($('rd-add-apps-section'))$('rd-add-apps-section').hidden=false;rdAddTmp=rdEditFromApp?[rdEditFromApp]:[];$('rd-ctarget').value=rdPathCur||'';$('rd-cfrom').value='';$('rd-cto').value='';$('rd-add-err').hidden=true;renderRdApps();}
   else if(k==='f'){$('rd-field-modal').hidden=false;$('rd-field-global').checked=false;if($('rd-field-apps-section'))$('rd-field-apps-section').hidden=false;rdpTmp=rdEditFromApp?[rdEditFromApp]:[];$('rd-ffrom').value='';$('rd-fto').value='';$('rd-field-err').hidden=true;renderRdpApps();}
   else if(k==='s'){$('sv-add-modal').hidden=false;svAddTmp=rdEditFromApp?[rdEditFromApp]:[];$('w-from').value='';$('w-to').value='';$('sv-add-err').hidden=true;renderWaylayApps();}
   else if(k==='p'){$('wp-add-modal').hidden=false;wpAddTmp=rdEditFromApp?[rdEditFromApp]:[];$('wp-from').value='';$('wp-to').value='';$('wp-add-err').hidden=true;renderWpApps();}
-};
+}
+$('rd-edit-add-rule').onclick=()=>openAddModal(rdEditKind);
 /* 列表弹窗 "＋ 添加规则" 统一入口: data-addkind → 打开对应添加弹窗, 预填当前应用 */
 document.addEventListener('click',e=>{
   const ab=e.target.closest('[data-addkind]');
   if(!ab)return;
   const k=ab.dataset.addkind;
   rdEditFromApp=(ab.dataset.addapp!==undefined)?ab.dataset.addapp:(k==='f')?frGroupsApp:(k==='c')?groupsLayerApp:(k==='s')?srRulesApp:wpRulesApp;
-  $('rd-edit-modal').hidden=true;
-  if(k==='c'){$('rd-add-modal').hidden=false;$('rd-add-global').checked=false;if($('rd-add-apps-section'))$('rd-add-apps-section').hidden=false;rdAddTmp=rdEditFromApp?[rdEditFromApp]:[];$('rd-ctarget').value=rdPathCur||'';$('rd-cfrom').value='';$('rd-cto').value='';$('rd-add-err').hidden=true;renderRdApps();}
-  else if(k==='f'){$('rd-field-modal').hidden=false;$('rd-field-global').checked=false;if($('rd-field-apps-section'))$('rd-field-apps-section').hidden=false;rdpTmp=rdEditFromApp?[rdEditFromApp]:[];$('rd-ffrom').value='';$('rd-fto').value='';$('rd-field-err').hidden=true;renderRdpApps();}
-  else if(k==='s'){$('sv-add-modal').hidden=false;svAddTmp=rdEditFromApp?[rdEditFromApp]:[];$('w-from').value='';$('w-to').value='';$('sv-add-err').hidden=true;renderWaylayApps();}
-  else if(k==='p'){$('wp-add-modal').hidden=false;wpAddTmp=rdEditFromApp?[rdEditFromApp]:[];$('wp-from').value='';$('wp-to').value='';$('wp-add-err').hidden=true;renderWpApps();}
+  openAddModal(k);
 });
 $('rd-edit-app-add').onclick=()=>{
   const v=$('rd-edit-app-input').value.trim();
@@ -1422,7 +1502,7 @@ function openSRules(app){
   $('sr-rules-body').innerHTML=rs.map((r,i)=>{
     const gidx=wlRules.indexOf(r);
     return `<div class="grp"><div class="grp-head" style="cursor:pointer;gap:0;align-items:center">
-<svg viewBox="0 0 24 36" style="width:22px;height:33px;overflow:visible;stroke:var(--sub);fill:none;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0"><path d="M4 1v28"/><path d="M4 1h14"/><path d="M4 29h16"/><path d="M20 29l-5-5"/><path d="M20 29l-5 5"/></svg>
+${ICO_FLOW}
 <span class="grp-name" style="display:flex;flex-direction:column;gap:2px;padding-left:6px;min-width:0;flex:1"><span style="margin-top:-5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%">${esc(r.from)}</span><span style="margin-top:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%">${esc(r.to)}</span></span>
 <button class="icon-btn" style="margin-left:auto;flex-shrink:0" data-sre="${gidx}" title="编辑">${ICO_EDIT}</button><button class="icon-btn danger" style="margin-left:8px;flex-shrink:0" data-srd="${gidx}" title="删除">${ICO_TRASH}</button>
 </div></div>`;
@@ -1443,7 +1523,7 @@ $('sr-rules-body').addEventListener('click',e=>{
     }
     renderWaylayRules();wlSaveNow();openSRules(srRulesApp);if(!wlRules.some(r=>(r.apps||[]).includes(srRulesApp)))$('sr-rules-modal').hidden=true;}
 });
-function openRdEdit(kind,i){
+function openRdEdit(kind,i,hideAdd){
   const list=kind==='c'?rdCrules:(kind==='p'?wlPropRules:(kind==='s'?wlRules:rdFrules));const r=list[i];if(!r)return;
   rdEditIdx=i;rdEditKind=kind;
   $('rd-edit-title').textContent=kind==='c'?'编辑内容替换':(kind==='p'?'编辑属性伪装':(kind==='s'?'编辑服务伪装':'编辑文件重定向'));
@@ -1453,6 +1533,7 @@ function openRdEdit(kind,i){
   if(isC)$('rd-edit-target').value=r.target||'/vendor/etc/selinux/vendor_file_contexts';
   const addRuleBtn={c:'＋ 添加内容替换规则',f:'＋ 添加文件重定向规则',s:'＋ 添加服务伪装规则',p:'＋ 添加伪装规则'};
   $('rd-edit-add-rule').textContent=addRuleBtn[kind]||'＋ 添加规则';
+  $('rd-edit-add-rule').style.display=hideAdd?'none':'';
   $('rd-edit-ft-box').style.flexDirection=(kind==='f')?'column':'row';
   $('rd-edit-from-label').textContent=kind==='c'?'原内容':(kind==='s'?'原服务名':(kind==='p'?'原属性名':'原路径'));
   $('rd-edit-to-label').textContent=kind==='c'?'新内容':(kind==='s'?'新服务名':(kind==='p'?'新属性名':'新路径'));
