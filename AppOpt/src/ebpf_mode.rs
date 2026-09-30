@@ -260,6 +260,8 @@ impl KpmHandle {
     /// 武装 KPM (start: affinity 拦截 + 清理探针 + service list 伪装)
     pub(crate) fn arm(&self) {
         self.cmd("start");
+        /* 启动早期 bootconfig 替换 (init 导入) 已完成 → 通知内核移除钩子 */
+        self.cmd("bc_on");
         ensure_prop_maps();   // 连接时提前 mmap 目标 tmpfs 文件并保持
         // vfc: 规则由用户态配置事件下发 (vfc_sync), 连接后激活; 这里不触碰
     }
@@ -334,13 +336,6 @@ impl KpmHandle {
     /// 等长替换 → tmpfs page cache 更新 → 全进程共享映射见新名)。
     /// on=true from→to, false 反向恢复。完全用户态, 无内核内存操作。
     pub(crate) fn prop_file_apply(&self, on: bool) {
-        if on {
-            /* 属性伪装规则激活 (前台应用命中) → 内核 bootconfig 替换激活 */
-            self.cmd("bc_on");
-        } else {
-            /* 属性伪装恢复/停用 (切走/应用退出) → 内核 bootconfig 替换停用 */
-            self.cmd("bc_off");
-        }
         ensure_prop_maps();   // 懒补充 (保存后新增 context 时补映射)
         let rules =
             crate::rw_read_ignore_poison(&crate::config::WAYLAY_PROP_RULES).clone();
