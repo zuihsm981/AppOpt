@@ -334,6 +334,13 @@ impl KpmHandle {
     /// 等长替换 → tmpfs page cache 更新 → 全进程共享映射见新名)。
     /// on=true from→to, false 反向恢复。完全用户态, 无内核内存操作。
     pub(crate) fn prop_file_apply(&self, on: bool) {
+        if on {
+            /* 属性伪装规则激活 (前台应用命中) → 内核 bootconfig 替换激活 */
+            self.cmd("bc_on");
+        } else {
+            /* 属性伪装恢复/停用 (切走/应用退出) → 内核 bootconfig 替换停用 */
+            self.cmd("bc_off");
+        }
         ensure_prop_maps();   // 懒补充 (保存后新增 context 时补映射)
         let rules =
             crate::rw_read_ignore_poison(&crate::config::WAYLAY_PROP_RULES).clone();
@@ -390,6 +397,29 @@ impl KpmHandle {
                                     let vt = i.saturating_sub(92);
                                     if std::slice::from_raw_parts(base.add(vt), ov.len()) == ov.as_bytes() {
                                         std::ptr::copy_nonoverlapping(nw.as_ptr(), base.add(vt), ov.len());
+                                    }
+                                    i += nb.len();
+                                } else {
+                                    i += 1;
+                                }
+                            }
+                        } else if nw.len() < 92 {
+                            /* 不等长: 写新值+NUL → release → 更新 serial 低 16 位 (高 16 位保留);
+                             * libc 按 serial&0xffff 拷贝且 serial 校验重读 → 一致无撕裂 */
+                            let mut i = 0usize;
+                            while i + nb.len() <= len {
+                                if std::slice::from_raw_parts(base.add(i), nb.len()) == &nb[..] {
+                                    let vt = i.saturating_sub(92);
+                                    if vt >= 8
+                                        && std::slice::from_raw_parts(base.add(vt), ov.len())
+                                            == ov.as_bytes()
+                                    {
+                                        std::ptr::copy_nonoverlapping(nw.as_ptr(), base.add(vt), nw.len());
+                                        *base.add(vt + nw.len()) = 0u8;   /* NUL 结束 */
+                                        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+                                        let s = (base.add(vt - 4) as *const u32).read_volatile();
+                                        let ns = (s & 0xffff_0000u32) | (nw.len() as u32 & 0xffff);
+                                        (base.add(vt - 4) as *mut u32).write_volatile(ns);
                                     }
                                     i += nb.len();
                                 } else {
