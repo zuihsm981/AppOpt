@@ -121,25 +121,42 @@ pub fn load_waylay_rules() -> Vec<WaylayRule> {
             let from: String;
             let to: String;
             if kind == WaylayKind::RedPath {
-                /* red-path 仅文件重定向: red-path-<from路径>-<to路径> (split_once 取首个 '-') */
-                let (f, t) = rr.split_once('-').unwrap_or(("", ""));
-                let f = f.trim();
-                let t = t.trim();
-                if f.starts_with('/') && t.starts_with('/') {
-                    from = f.to_string();
-                    to = t.to_string();
-                } else if f.starts_with('/') && !t.starts_with('/') && t.len() > 2 {
-                    /* 兼容旧错误格式: red-path-<target>-<from>-<to> (内容带目标, 救回) */
-                    if let Some((from1, to1)) = t.split_once('-') {
-                        kind = WaylayKind::Red;
-                        target = f.to_string();
-                        from = from1.to_string();
-                        to = to1.to_string();
+                /* red-path 文件重定向: red-path-<from路径>-<to路径>
+                 * 分隔符 = 首个 "-/" (紧接 '/' 的 '-') — from/to 路径或文件名本身可含 '-' (如 platform-res.apk) */
+                let b = rr.as_bytes();
+                let mut sep = None;
+                for i in 0..b.len() {
+                    if b[i] == b'-' && i + 1 < b.len() && b[i + 1] == b'/' {
+                        sep = Some(i);
+                        break;
+                    }
+                }
+                if let Some(i) = sep {
+                    let f = rr[..i].trim();
+                    let t = rr[i + 1..].trim();
+                    if f.starts_with('/') && t.starts_with('/') {
+                        from = f.to_string();
+                        to = t.to_string();
                     } else {
-                        continue;
+                        continue;   /* 非路径 → 整条丢弃 */
                     }
                 } else {
-                    continue;   /* 非路径 → 整条丢弃 */
+                    /* 兼容旧错误格式: red-path-<target>-<from>-<to> (内容带目标, 救回) */
+                    let (f, t) = rr.split_once('-').unwrap_or(("", ""));
+                    let f = f.trim();
+                    let t = t.trim();
+                    if f.starts_with('/') && !t.starts_with('/') && t.len() > 2 {
+                        if let Some((from1, to1)) = t.split_once('-') {
+                            kind = WaylayKind::Red;
+                            target = f.to_string();
+                            from = from1.to_string();
+                            to = to1.to_string();
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        continue;   /* 非路径 → 整条丢弃 */
+                    }
                 }
             } else if kind == WaylayKind::Red {
                 /* red 内容替换: red-<目标文件路径>-<from>-<to> (目标必为 '/' 路径, 防无差别替换) */
