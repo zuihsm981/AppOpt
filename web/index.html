@@ -256,47 +256,6 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="uclamp-chips" id="w-seg" style="margin-bottom:8px">
 <button data-v="srv" class="on">系统服务伪装</button><button data-v="prop">系统属性伪装</button><button data-v="red">文件内容替换</button><button data-v="redpath">重定向文件</button>
 </div>
-<div id="w-srv-pane">
-<div class="card">
-<button class="btn" id="sv-fshow" style="width:100%;margin-bottom:8px">＋ 添加服务伪装规则</button>
-<div class="seg" id="w-srv-tabs" style="margin-top:8px">
-<button data-v="apps" class="on">应用列表</button><button data-v="rules">规则列表</button>
-</div>
-<div id="w-srv-apps" style="margin-top:8px"><div id="w-rules"></div></div>
-<div id="w-srv-rules" style="margin-top:8px" hidden></div>
-</div>
-</div>
-<div id="w-prop-pane" hidden>
-<div class="card">
-<button class="btn" id="wp-fshow" style="width:100%;margin-bottom:8px">＋ 添加伪装规则</button>
-<div class="seg" id="w-prop-tabs" style="margin-top:8px">
-<button data-v="apps" class="on">应用列表</button><button data-v="rules">规则列表</button>
-</div>
-<div id="w-prop-apps" style="margin-top:8px"><div id="wp-rules"></div></div>
-<div id="w-prop-rules" style="margin-top:8px" hidden></div>
-</div>
-</div>
-<div id="w-red-pane" hidden>
-<div class="card">
-<button class="btn" id="rd-cimport" style="width:100%;margin-bottom:8px">⤓ 批量导入</button>
-<button class="btn" id="rd-cshow" style="width:100%;margin-bottom:8px">＋ 添加内容替换规则</button>
-<div class="seg" id="w-red-tabs" style="margin-top:8px">
-<button data-v="apps" class="on">应用列表</button><button data-v="rules">规则列表</button>
-</div>
-<div id="w-red-apps" style="margin-top:8px"><div id="rd-crules"></div></div>
-<div id="w-red-rules" style="margin-top:8px" hidden></div>
-</div>
-</div>
-<div id="w-redpath-pane" hidden>
-<div class="card">
-<button class="btn" id="rd-fshow" style="width:100%;margin-bottom:8px">＋ 添加文件重定向规则</button>
-<div class="seg" id="w-redpath-tabs" style="margin-top:8px">
-<button data-v="apps" class="on">应用列表</button><button data-v="rules">规则列表</button>
-</div>
-<div id="w-redpath-apps" style="margin-top:8px"><div id="rd-frules"></div></div>
-<div id="w-redpath-rules" style="margin-top:8px" hidden></div>
-</div>
-</div>
 </section>
 
 <section id="tab-settings" class="panel" hidden>
@@ -359,6 +318,79 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="card-title">作者</div>
 <div class="row"><span class="label">作者</span><span class="value">Suto</span></div>
 <div class="row"><span class="label">主页</span><span class="value mono">http://appopt.suto.top</span></div>
+</div>
+</div>
+</section>
+
+<section id="page-w-srv" class="page">
+<div class="navbar">
+<button class="back" data-wpback="srv"><svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg>后退</button>
+<span class="nav-title">系统服务伪装</span>
+</div>
+<div class="panel">
+<div class="card">
+<button class="btn" id="sv-fshow" style="width:100%;margin-bottom:8px">＋ 添加服务伪装规则</button>
+<button class="btn" id="sv-allapps" style="width:100%;margin-bottom:8px;background:var(--bg);color:var(--sub)">为所有系统服务伪装规则添加应用</button>
+<div class="seg" id="w-srv-tabs" style="margin-top:8px">
+<button data-v="apps" class="on">应用列表</button><button data-v="rules">规则列表</button>
+</div>
+<div id="w-srv-apps" style="margin-top:8px"><div id="w-rules"></div></div>
+<div id="w-srv-rules" style="margin-top:8px" hidden></div>
+</div>
+</div>
+</section>
+
+<section id="page-w-prop" class="page">
+<div class="navbar">
+<button class="back" data-wpback="prop"><svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg>后退</button>
+<span class="nav-title">系统属性伪装</span>
+</div>
+<div class="panel">
+<div class="card">
+<button class="btn" id="wp-fshow" style="width:100%;margin-bottom:8px">＋ 添加伪装规则</button>
+<button class="btn" id="wp-allapps" style="width:100%;margin-bottom:8px;background:var(--bg);color:var(--sub)">为所有系统属性伪装规则添加应用</button>
+<div class="seg" id="w-prop-tabs" style="margin-top:8px">
+<button data-v="apps" class="on">应用列表</button><button data-v="rules">规则列表</button>
+</div>
+<div id="w-prop-apps" style="margin-top:8px"><div id="wp-rules"></div></div>
+<div id="w-prop-rules" style="margin-top:8px" hidden></div>
+</div>
+</div>
+</section>
+
+<section id="page-w-red" class="page">
+<div class="navbar">
+<button class="back" data-wpback="red"><svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg>后退</button>
+<span class="nav-title">文件内容替换</span>
+</div>
+<div class="panel">
+<div class="card">
+<button class="btn" id="rd-cimport" style="width:100%;margin-bottom:8px">⤓ 批量导入</button>
+<button class="btn" id="rd-cshow" style="width:100%;margin-bottom:8px">＋ 添加内容替换规则</button>
+<button class="btn" id="rd-allapps" style="width:100%;margin-bottom:8px;background:var(--bg);color:var(--sub)">为所有文件内容替换规则添加应用</button>
+<div class="seg" id="w-red-tabs" style="margin-top:8px">
+<button data-v="apps" class="on">应用列表</button><button data-v="rules">规则列表</button>
+</div>
+<div id="w-red-apps" style="margin-top:8px"><div id="rd-crules"></div></div>
+<div id="w-red-rules" style="margin-top:8px" hidden></div>
+</div>
+</div>
+</section>
+
+<section id="page-w-redpath" class="page">
+<div class="navbar">
+<button class="back" data-wpback="redpath"><svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg>后退</button>
+<span class="nav-title">重定向文件</span>
+</div>
+<div class="panel">
+<div class="card">
+<button class="btn" id="rd-fshow" style="width:100%;margin-bottom:8px">＋ 添加文件重定向规则</button>
+<button class="btn" id="rdf-allapps" style="width:100%;margin-bottom:8px;background:var(--bg);color:var(--sub)">为所有重定向文件规则添加应用</button>
+<div class="seg" id="w-redpath-tabs" style="margin-top:8px">
+<button data-v="apps" class="on">应用列表</button><button data-v="rules">规则列表</button>
+</div>
+<div id="w-redpath-apps" style="margin-top:8px"><div id="rd-frules"></div></div>
+<div id="w-redpath-rules" style="margin-top:8px" hidden></div>
 </div>
 </div>
 </section>
@@ -447,6 +479,17 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 </div>
 <button class="btn" data-addkind="p" data-addapp="" style="width:100%;margin-top:8px">＋ 添加规则</button>
 <button class="btn" id="wp-apps-modal-close" style="width:100%;margin-top:14px">关闭</button>
+</div>
+</div>
+<div id="all-apps-modal" hidden style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:999">
+<div class="card" style="width:min(420px,90vw);padding:16px;margin:0">
+<div id="all-apps-title" style="font-weight:600;color:#000;margin-bottom:10px"></div>
+<div id="all-apps-list" style="max-height:40vh;overflow:auto;display:flex;flex-direction:column;gap:6px"></div>
+<div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
+<div class="sg-wrap"><input id="all-apps-input" placeholder="输入包名添加目标应用" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:9px 12px;font-size:14px;color:#000;outline:none"><div class="sg-box" id="all-apps-sg" hidden></div></div>
+<button class="btn" id="all-apps-add" style="width:100%;margin-top:8px">＋ 添加应用</button>
+</div>
+<button class="btn" id="all-apps-close" style="width:100%;margin-top:14px">关闭</button>
 </div>
 </div>
 <div id="sr-rules-modal" hidden style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:999">
@@ -847,6 +890,59 @@ $('wp-apps-modal-list').addEventListener('click',e=>{
   }
   wpAppsRender();
 });
+// ===== 为所有规则添加应用: 四个功能共用弹窗 (弹窗内添加的应用加入该功能全部非全局规则) =====
+let allAppsKind='',allAppsTmp=[];
+const allAppsNames={srv:'系统服务伪装',prop:'系统属性伪装',red:'文件内容替换',redpath:'重定向文件'};
+const allAppsList=()=>allAppsKind==='srv'?wlRules:allAppsKind==='prop'?wlPropRules:allAppsKind==='red'?rdCrules:rdFrules;
+function allAppsRenderMain(){
+  if(allAppsKind==='srv')renderWaylayRules();
+  else if(allAppsKind==='prop')renderWpRules();
+  else if(allAppsKind==='red')renderRdCrules();
+  else renderRdFrules();
+}
+function renderAllApps(){
+  $('all-apps-list').innerHTML=allAppsTmp.length?allAppsTmp.map((a,i)=>grow(a,i)).join(''):'<div class="hint" style="margin:0">未添加目标应用</div>';
+}
+function openAllApps(kind){
+  allAppsKind=kind;
+  $('all-apps-title').textContent='为所有'+allAppsNames[kind]+'规则添加应用';
+  allAppsTmp=[];
+  renderAllApps();
+  $('all-apps-modal').hidden=false;
+}
+function allAppsAdd(pkg){
+  pkg=(pkg||'').trim();if(!pkg)return;
+  if(!allAppsTmp.includes(pkg))allAppsTmp.push(pkg);
+  allAppsList().forEach(r=>{if(!r.global&&!(r.apps||[]).includes(pkg))(r.apps=r.apps||[]).push(pkg)});
+  $('all-apps-input').value='';$('all-apps-sg').hidden=true;
+  renderAllApps();allAppsRenderMain();wlSaveNow();
+}
+function allAppsDel(i){
+  const pkg=allAppsTmp[i];
+  allAppsTmp.splice(i,1);
+  if(pkg){
+    allAppsList().forEach(r=>{if(r.apps)r.apps=r.apps.filter(x=>x!==pkg)});
+    if(allAppsKind==='srv')wlRules=wlRules.filter(r=>(r.apps||[]).length);
+    else if(allAppsKind==='prop')wlPropRules=wlPropRules.filter(r=>(r.apps||[]).length);
+    else if(allAppsKind==='red')rdCrules=rdCrules.filter(r=>r.global||(r.apps||[]).length);
+    else rdFrules=rdFrules.filter(r=>r.global||(r.apps||[]).length);
+  }
+  renderAllApps();allAppsRenderMain();wlSaveNow();
+}
+$('all-apps-add').onclick=()=>allAppsAdd($('all-apps-input').value);
+suggest_bind($('all-apps-input'),$('all-apps-sg'),{onpick:allAppsAdd});
+$('all-apps-close').onclick=()=>{$('all-apps-modal').hidden=true;};
+$('all-apps-modal').addEventListener('click',e=>{if(e.target.id==='all-apps-modal')$('all-apps-modal').hidden=true;});
+$('all-apps-list').addEventListener('click',e=>{
+  const b=e.target.closest('[data-i]');
+  if(b){allAppsDel(+b.dataset.i);return}
+  const h=e.target.closest('.grp-head');
+  if(h)h.parentElement.classList.toggle('open');
+});
+$('sv-allapps').onclick=()=>openAllApps('srv');
+$('wp-allapps').onclick=()=>openAllApps('prop');
+$('rd-allapps').onclick=()=>openAllApps('red');
+$('rdf-allapps').onclick=()=>openAllApps('redpath');
 $('wp-add-apps').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(b){wpAddTmp.splice(+b.dataset.i,1);renderWpApps();return}const h=e.target.closest('.grp-head');if(h)h.parentElement.classList.toggle('open');});
 $('rd-crules').addEventListener('click',e=>{
   const ae=e.target.closest('button[data-aedit]');
@@ -959,7 +1055,11 @@ $('w-seg').addEventListener('click',e=>{
   const b=e.target.closest('button');if(!b)return;
   const v=b.dataset.v;
   $('w-seg').querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));
-  $('w-srv-pane').hidden=v!=='srv';$('w-prop-pane').hidden=v!=='prop';$('w-red-pane').hidden=v!=='red';$('w-redpath-pane').hidden=v!=='redpath';
+  $('page-w-'+v).classList.add('show');
+});
+/* 隐藏页: 四个功能的全屏管理弹窗返回 (顶部返回按钮) */
+document.querySelectorAll('[data-wpback]').forEach(btn=>btn.onclick=()=>{
+  $('page-w-'+btn.dataset.wpback).classList.remove('show');
 });
 // ===== 隐藏页: 各功能主界面新增 「应用列表 / 规则列表」 tab (生效应用列表移入应用列表 tab) =====
 /* 规则行文本: rdcrule=灰色目标文件+原/新内容; rdfrule=黑色 原/新路径文件名 (仅最后文件名, 恢复默认字号) */
