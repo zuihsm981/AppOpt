@@ -277,7 +277,6 @@ impl KpmHandle {
     pub(crate) fn vfc_apply(&self) {
         self.cmd("vfc off");   // 清 file* 表与应用侧残留
         self.cmd("vfc on");
-        self.vfc_status_debug();
     }
 
     /// 禁用 vendor_file_contexts 重定向 (摘除内核 hook, 恢复原文件读取)
@@ -317,19 +316,6 @@ impl KpmHandle {
             return Err(format!("内核拒绝 vfc_rule #{}: 返回 {}", idx, r));
         }
         Ok(())
-    }
-
-    /// 诊断: 查询 vfc hook 挂载状态并写 /data/local/tmp/.appopt_vfc_status
-    fn vfc_status_debug(&self) {
-        let args = cstr("vfc_status");
-        let mut out = [0u8; 64];
-        let r = kpm_ctl0(&self.key, &args, &mut out);
-        let end = out.iter().position(|&x| x == 0).unwrap_or(out.len());
-        let s = String::from_utf8_lossy(&out[..end]);
-        let _ = std::fs::write(
-            "/data/local/tmp/.appopt_vfc_status",
-            format!("ret={} {}\n", r, s),
-        );
     }
 
     /// property 区用户态文件写替换 (root 读写 /dev/__properties__/<ctx> 文件,
