@@ -1106,18 +1106,20 @@ async function wlDoSave(){
     if(rdCrules.some(r=>!r.global&&!(r.apps||[]).length)){toast('内容替换: 无法保存, 需要添加目标应用或者开启全局');return}
     if(rdFrules.some(r=>!r.global&&!(r.apps||[]).length)){toast('文件重定向: 无法保存, 需要添加目标应用或者开启全局');return}
     const rules=buildRules();
-    // 保存前检查: 非空 / 等长 / 长度 / ASCII
+    // 保存前检查: 非空 / 等长 / 长度 / ASCII (提示具体规则类型)
+    const kindName={src:'系统服务伪装',prop:'系统属性伪装',red:'内容替换',['red-path']:'文件重定向'};
     for(const r of rules){
       const isPath=r.kind==='red-path';
       const max=r.kind==='prop'?92:(r.kind==='src'||r.kind==='red')?64:255;
-      if(!r.from||!r.to){toast('规则不能为空');return}
-      if(isPath){if(r.from.length>127||r.to.length>255){toast('路径超限 (≤127/255)');return}continue}
+      const label=kindName[r.kind]||r.kind;
+      if(!r.from||!r.to){toast(label+'规则不能为空');return}
+      if(isPath){if(r.from.length>127||r.to.length>255){toast(label+'路径超限 (≤127/255)');return}continue}
       /* 内容替换(red)必须指定目标文件路径; src/prop/文件重定向(red-path)不校验 */
       const isContent = r.kind==='red';
-      if(isContent && (!r.target||!r.target.startsWith('/'))){toast('内容替换需目标文件路径');return}
-      if(r.from.length!==r.to.length){toast('需等长 (ASCII)');return}
-      if(r.from.length>max){toast('超出长度限制 (≤'+max+')');return}
-      if(r.from.split('').some(c=>c.charCodeAt(0)>127)||r.to.split('').some(c=>c.charCodeAt(0)>127)){toast('\u4ec5\u652f\u6301 ASCII \u5b57\u7b26');return}
+      if(isContent && (!r.target||!r.target.startsWith('/'))){toast(label+'需目标文件路径');return}
+      if(r.from.length!==r.to.length){toast(label+'规则需等长 (ASCII): '+r.from+' → '+r.to);return}
+      if(r.from.length>max){toast(label+'规则超出长度限制 (≤'+max+')');return}
+      if(r.from.split('').some(c=>c.charCodeAt(0)>127)||r.to.split('').some(c=>c.charCodeAt(0)>127)){toast(label+'规则仅支持 ASCII 字符');return}
     }
     try{await api('/api/waylay',{rules});await loadWaylay();}catch(e){toast(e.message)}
   }finally{wlSaving=false;if(wlSaveQueued){wlSaveQueued=false;wlDoSave();}}
