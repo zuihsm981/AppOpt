@@ -903,9 +903,13 @@ fn waylay_set_api(req: &Request) -> (u16, String) {
                     return err_json(400, "red-path 路径超限 (≤127/255)");
                 }
             } else if kind_t == "red-path" {
-                /* 兼容旧格式: red-path-<from>-<to> 内容 (默认目标) */
-                if f.len() != t.len() || f.len() > max || !f.is_ascii() || !t.is_ascii() {
-                    return err_json(400, "red-path 内容替换需等长 ASCII (≤64)");
+                /* 文件重定向 (含兼容格式): 无等长限制 — 原/新路径文件名、长度可任意不同;
+                 * 仅校验路径语义与长度上限 (不同名规则不受等长检查约束) */
+                if !f.starts_with('/') || !t.starts_with('/') {
+                    return err_json(400, "red-path 原/新路径必须以 / 开头");
+                }
+                if f.len() > 127 || t.len() > 255 {
+                    return err_json(400, "red-path 路径超限 (≤127/255)");
                 }
             } else if f.len() != t.len() || f.len() > max || !f.is_ascii() || !t.is_ascii() {
                 return err_json(
