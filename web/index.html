@@ -698,7 +698,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="card" style="width:min(440px,92vw);padding:16px;margin:0;max-height:84vh;display:flex;flex-direction:column">
 <div style="font-weight:600;color:#000;margin-bottom:10px">选择应用</div>
 <div class="seg" id="ap-seg" style="margin-bottom:8px">
-<button data-v="user" class="on">用户应用</button><button data-v="all">全部应用</button>
+<button data-v="user" class="on">用户应用</button><button data-v="system">系统应用</button>
 </div>
 <input id="ap-q" placeholder="搜索应用包名" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px 12px;font-size:13px;color:#000;outline:none;margin-bottom:8px">
 <div id="ap-list" style="flex:1;overflow:auto;min-height:38vh;max-height:52vh;display:flex;flex-direction:column;gap:4px"></div>
@@ -2300,17 +2300,17 @@ $('fs-list').addEventListener('click',e=>{
   $('fs-picker-modal').hidden=true;
 });
 // ===== 应用列表选择 (隐藏页四个功能添加目标应用; 默认仅用户应用) =====
-let apPick=null, apData=[], apShowUser=true;
+let apPick=null, apData=[], apMode='user';
 async function apLoad(){
   try{apData=(await api('/api/apps')).apps||[];apRender();}catch(e){toast(e.message)}
 }
 function apRender(){
   const q=$('ap-q').value.trim().toLowerCase();
-  const list=apData.filter(a=>(!apShowUser||!a.system)&&(!q||a.pkg.toLowerCase().includes(q)));
+  const list=apData.filter(a=>(apMode==='user'?!a.system:a.system)&&(!q||a.pkg.toLowerCase().includes(q)));
   $('ap-list').innerHTML=list.map(a=>`<div class="fs-entry" data-pkg="${esc(a.pkg)}"><span>${esc(a.pkg)}</span><span style="color:var(--sub);font-size:11px;flex-shrink:0">uid ${a.uid}</span>${a.system?'<span class="badge" style="flex-shrink:0;background:rgba(142,142,147,.16);color:#636366">系统</span>':''}</div>`).join('')||'<div class="hint" style="margin:0">无匹配应用</div>';
 }
 function openAppPick(kind){
-  apPick=kind;apShowUser=true;
+  apPick=kind;apMode='user';
   $('ap-seg').querySelectorAll('button').forEach(b=>b.classList.toggle('on',b.dataset.v==='user'));
   $('ap-q').value='';
   $('app-pick-modal').hidden=false;
@@ -2323,7 +2323,7 @@ document.addEventListener('click',e=>{
 });
 $('ap-seg').addEventListener('click',e=>{
   const b=e.target.closest('button');if(!b)return;
-  apShowUser=b.dataset.v==='user';
+  apMode=b.dataset.v==='user'?'user':'system';
   $('ap-seg').querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));
   apRender();
 });
