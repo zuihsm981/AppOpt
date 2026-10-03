@@ -548,16 +548,15 @@ fn suggest_api(req: &Request) -> (u16, String) {
     (200, json!({ "ok": true, "list": list }).to_string())
 }
 
-/// 枚举包名
+/// 枚举包名 (读已安装应用缓存, 不再扫 /data/data; 缓存为空时先补一次)
 fn installed_pkgs() -> Vec<String> {
-    fs::read_dir("/data/data")
-        .map(|dirs| {
-            dirs.flatten()
-                .map(|d| d.file_name().to_string_lossy().into_owned())
-                .filter(|n| n.contains('.') && !n.starts_with('.'))
-                .collect()
-        })
-        .unwrap_or_default()
+    if crate::rw_read_ignore_poison(&APPS_CACHE).is_empty() {
+        refresh_apps_cache();
+    }
+    crate::rw_read_ignore_poison(&APPS_CACHE)
+        .iter()
+        .map(|(p, _, _)| p.clone())
+        .collect()
 }
 
 /// 排序键
@@ -935,7 +934,7 @@ fn waylay_set_api(req: &Request) -> (u16, String) {
         }
     }
     /* L1: 复用主循环同一套映射+校验, 保存前即时反馈全部错误 (编号与内核下发一致) */
-    let pkguid = crate::pkg_to_uid_map();
+    let pkguid = pkg_uid_map();   /* 全量缓存, 不再每次读 packages.list */
     let (_tbl, vrows, srows) = crate::build_rule_rows(&rules, &pkguid);
     let errs = crate::ebpf_mode::validate_rule_set(&vrows, &srows);
     if !errs.is_empty() {
@@ -989,6 +988,14 @@ fn fs_list_api(req: &Request) -> (u16, String) {
 /// 已安装应用缓存: (pkg, uid, system); 初始化 / packages.list 变化时刷新,
 /// /api/apps 直接读缓存, 不重复读盘。
 pub static APPS_CACHE: RwLock<Vec<(String, i64, bool)>> = RwLock::new(Vec::new());
+/// 全量 包名→uid 表 (packages.list 缓存; 供 waylay 规则表构建, EV_PKG 时随 APPS_CACHE 刷新)
+pub static PKG_UID_CACHE: std::sync::LazyLock<RwLock<HashMap<String, i32>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// 全量 包名→uid 表读锁 (read guard, deref 到 &HashMap; 替代每次读盘 pkg_to_uid_map)
+pub fn pkg_uid_map() -> std::sync::RwLockReadGuard<'static, HashMap<String, i32>> {
+    crate::rw_read_ignore_poison(&PKG_UID_CACHE)
+}
 
 /// 刷新已安装应用缓存 (初始化 / EV_PKG packages.list inotify 时调用)
 pub fn refresh_apps_cache() {
@@ -1007,7 +1014,12 @@ pub fn refresh_apps_cache() {
         }
     }
     apps.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut uid_map: HashMap<String, i32> = HashMap::with_capacity(apps.len());
+    for (p, u, _) in &apps {
+        uid_map.insert(p.clone(), *u as i32);
+    }
     *crate::rw_write_ignore_poison(&APPS_CACHE) = apps;
+    *crate::rw_write_ignore_poison(&PKG_UID_CACHE) = uid_map;
 }
 
 /// GET /api/apps: 返回已安装应用列表 (读预缓存, 按包名排序)。

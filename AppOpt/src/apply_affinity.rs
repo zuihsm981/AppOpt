@@ -1,13 +1,47 @@
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 
 use crate::{MAX_PKG_LEN, MAX_THREAD_LEN};
 
-/// 栈上构建 /proc/{pid}/{suffix} 路径读取文件
+/// 栈上构建 /proc/{pid}/{suffix} 路径 (无堆分配, 供 read_proc_file/task_tids 复用)
+fn proc_path<'a>(pid: i32, suffix: &str, out: &'a mut [u8]) -> Option<&'a std::path::Path> {
+    const PREFIX: &[u8] = b"/proc/";
+    if PREFIX.len() + 12 + 1 + suffix.len() > out.len() {
+        return None;
+    }
+    let mut n = 0;
+    out[n..n + PREFIX.len()].copy_from_slice(PREFIX);
+    n += PREFIX.len();
+    let mut v = pid as u32;
+    let mut tmp = [0u8; 12];
+    let mut t = 0;
+    if v == 0 {
+        tmp[t] = b'0';
+        t += 1;
+    } else {
+        while v > 0 {
+            tmp[t] = b'0' + (v % 10) as u8;
+            t += 1;
+            v /= 10;
+        }
+    }
+    for j in 0..t {
+        out[n + j] = tmp[t - 1 - j];
+    }
+    n += t;
+    out[n] = b'/';
+    n += 1;
+    out[n..n + suffix.len()].copy_from_slice(suffix.as_bytes());
+    n += suffix.len();
+    Some(std::path::Path::new(std::ffi::OsStr::from_bytes(&out[..n])))
+}
+
+/// /proc/{pid}/{suffix} 读取 (路径构建零分配; 每次栈上拼装)
 fn read_proc_file<'a>(pid: i32, suffix: &str, buf: &'a mut [u8]) -> Option<&'a [u8]> {
-    // 使用 format! 动态构建路径，避免固定缓冲区溢出的风险
-    let path = format!("/proc/{}/{}", pid, suffix);
-    let file = fs::File::open(&path).ok()?;
+    let mut path_buf = [0u8; 64];
+    let path = proc_path(pid, suffix, &mut path_buf)?;
+    let file = fs::File::open(path).ok()?;
     let n = file.read_at(buf, 0).ok()?;
     (n > 0).then_some(&buf[..n])
 }
@@ -37,9 +71,9 @@ pub(crate) fn tid_comm(tid: i32) -> Option<String> {
 }
 
 pub(crate) fn task_tids(pid: i32) -> Option<Vec<i32>> {
-    // 使用 format! 动态构建路径
-    let task_path = format!("/proc/{}/task", pid);
-    let task_dir = fs::read_dir(&task_path).ok()?;
+    let mut path_buf = [0u8; 64];
+    let task_path = proc_path(pid, "task", &mut path_buf)?;
+    let task_dir = fs::read_dir(task_path).ok()?;
     Some(
         task_dir
             .flatten()

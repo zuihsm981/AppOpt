@@ -233,6 +233,8 @@ impl CpuAffinity {
         };
         let mut aff: Vec<(i32, CpuSet, String)> = Vec::new();
         let mut uclamps: Vec<(i32, i32, i32)> = Vec::new();
+        /* 命中 tid 先收集, 最后一次性登记 managed (pkg.to_string/entry 只做一次) */
+        let mut managed_tids: Vec<i32> = Vec::new();
         for p in pids {
             let Some(tids) = crate::apply_affinity::task_tids(*p) else { continue };
             for tid in tids {
@@ -261,7 +263,13 @@ impl CpuAffinity {
                 if rule.util_min >= 0 || rule.util_max >= 0 {
                     uclamps.push((tid, rule.util_min, rule.util_max));
                 }
-                self.managed.entry(pkg.to_string()).or_default().insert(tid);
+                managed_tids.push(tid);
+            }
+        }
+        if !managed_tids.is_empty() {
+            let s = self.managed.entry(pkg.to_string()).or_default();
+            for t in managed_tids {
+                s.insert(t);
             }
         }
         (aff, uclamps)

@@ -464,7 +464,7 @@ impl AppState {
     fn sync_vfc_rules(&mut self) {
         /* 四功能统一 uid 规则表 + 内核行映射 (与 WebUI 校验共用 build_rule_rows) */
         let all = crate::rw_read_ignore_poison(&crate::config::WAYLAY_RULES_NEW);
-        let pkguid = pkg_to_uid_map();
+        let pkguid = crate::web::pkg_uid_map();   /* 全量缓存, 不再每次读 packages.list */
         let (tbl, rows, srows) = build_rule_rows(&all, &pkguid);
         self.uid_rules = tbl;
         self.vfc_uid_set = rows.iter().filter(|x| x.0 >= 0).map(|x| x.0).collect();

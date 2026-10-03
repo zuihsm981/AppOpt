@@ -3,7 +3,7 @@ use std::ffi::CString;
 use std::fs;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicI32, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
 use std::time::UNIX_EPOCH;
 
 use crate::{lock_ignore_poison, rw_read_ignore_poison, rw_write_ignore_poison, MAX_PKG_LEN, MAX_THREAD_LEN};
@@ -272,35 +272,45 @@ pub fn take_waylay_changed() -> bool {
  * 加载/保存统一走 load_waylay_rules / save_waylay_rules (WAYLAY_RULES_NEW);
  * 内容替换 red-<目标>-<from>-<to>, 文件重定向 red-path-<from路径>-<to路径>,
  * 服务伪装 src-, 属性伪装 prop-; 规则带 pkg (全局 "*" 已移除, 不再支持)。 */
-/// 属性名 → selinux context: 读各 property_contexts 取最长匹配前缀的 context
-fn prop_context_for(name: &str) -> Option<String> {
-    const FILES: &[&str] = &[
-        "/system/etc/selinux/plat_property_contexts",
-        "/vendor/etc/selinux/vendor_property_contexts",
-        "/odm/etc/selinux/odm_property_contexts",
-        "/system_ext/etc/selinux/system_ext_property_contexts",
-        "/product/etc/selinux/product_property_contexts",
-    ];
-    let mut best: Option<(usize, String)> = None;
-    for f in FILES {
-        if let Ok(c) = std::fs::read_to_string(f) {
-            for line in c.lines() {
-                let t = line.trim();
-                if t.is_empty() || t.starts_with('#') {
-                    continue;
-                }
-                let mut it = t.split_whitespace();
-                let (Some(pre), Some(ctx)) = (it.next(), it.next()) else { continue };
-                if name.starts_with(pre) {
-                    let l = pre.len();
-                    if best.as_ref().map(|(bl, _)| l > *bl).unwrap_or(true) {
-                        best = Some((l, ctx.to_string()));
+/// 属性名前缀 → selinux context 表 (进程级缓存, 首次解析一次; property_contexts 基本不变)
+static PROP_CTX_TABLE: LazyLock<OnceLock<HashMap<String, String>>> =
+    LazyLock::new(OnceLock::new);
+
+fn prop_context_table() -> &'static HashMap<String, String> {
+    PROP_CTX_TABLE.get_or_init(|| {
+        const FILES: &[&str] = &[
+            "/system/etc/selinux/plat_property_contexts",
+            "/vendor/etc/selinux/vendor_property_contexts",
+            "/odm/etc/selinux/odm_property_contexts",
+            "/system_ext/etc/selinux/system_ext_property_contexts",
+            "/product/etc/selinux/product_property_contexts",
+        ];
+        let mut m: HashMap<String, String> = HashMap::new();
+        for f in FILES {
+            if let Ok(c) = std::fs::read_to_string(f) {
+                for line in c.lines() {
+                    let t = line.trim();
+                    if t.is_empty() || t.starts_with('#') {
+                        continue;
                     }
+                    let mut it = t.split_whitespace();
+                    let (Some(pre), Some(ctx)) = (it.next(), it.next()) else { continue };
+                    /* 同前缀保留先出现的 (与原逐行逻辑一致); 查询按最长前缀匹配 */
+                    m.entry(pre.to_string()).or_insert_with(|| ctx.to_string());
                 }
             }
         }
-    }
-    best.map(|(_, c)| c)
+        m
+    })
+}
+
+/// 属性名 → selinux context: 查缓存表取最长匹配前缀 (不再每次读 5 个文件)
+fn prop_context_for(name: &str) -> Option<String> {
+    prop_context_table()
+        .iter()
+        .filter(|(pre, _)| name.starts_with(pre.as_str()))
+        .max_by_key(|(pre, _)| pre.len())
+        .map(|(_, ctx)| ctx.clone())
 }
 
 /// red-path 规则 to 文件: 同步 from 的权限 (DAC mode) 与 SELinux 上下文。
@@ -713,7 +723,7 @@ fn is_skip_line(t: &str) -> bool {
     t.is_empty() || t.starts_with('#') || t.starts_with("//")
 }
 
-/// 配置行分类 (organize_config_file / pkg_set_of_config 共用)
+/// 配置行分类 (organize_lines / pkg_set_of_config 共用)
 enum LineKind {
     /// 空行/注释
     Skip,
@@ -769,9 +779,10 @@ fn pkg_set_of_config(content: &str) -> HashSet<String> {
     s
 }
 
-/// 原子写配置文件 (tmp+rename) + 保存后自动整理; 供 rule_edit/refresh 写接口共用
+/// 原子写配置文件 (tmp+rename): 先在内存整理再一次性写入, 避免 写→读→可能再写 双重 IO
 pub(crate) fn save_config_lines(path: &str, lines: &[String]) -> bool {
-    let mut out = lines.join("\n");
+    let organized = organize_lines(lines);
+    let mut out = organized.join("\n");
     out.push('\n');
     let tmp = format!("{}.tmp", path);
     let ok = fs::File::create(&tmp)
@@ -781,25 +792,18 @@ pub(crate) fn save_config_lines(path: &str, lines: &[String]) -> bool {
             f.sync_all()
         })
         .and_then(|_| fs::rename(&tmp, path));
-    if ok.is_err() {
-        return false;
-    }
-    organize_config_file(path);
-    true
+    ok.is_ok()
 }
 
-/// 保存配置后自动整理: 注释/空行/全局设置(refresh_*)保持原序置顶;
+/// 配置行整理 (纯函数, 不读写盘): 注释/空行/全局设置(refresh_*)保持原序置顶;
 /// 各包属性行(规则/刷新率/移入cpuset)按包名分组, 包内规则在前、属性在后,
-/// 块规则(含 '{')作为整体随包移动。
-pub(crate) fn organize_config_file(path: &str) {
+/// 块规则(含 '{')作为整体随包移动。仅“规则应用集合”相对 CURRENT_CONFIG
+/// 变化 (新增/移除应用) 时重排 (只调整数值/核集不重排)。
+fn organize_lines(lines: &[String]) -> Vec<String> {
     use std::collections::BTreeMap;
-    let Ok(content) = fs::read_to_string(path) else { return };
-    // 仅“规则应用集合”相对 CURRENT_CONFIG 变化 (新增/移除应用) 时重排;
-    // 只调整数值/核集不重排
-    if pkg_set_of_config(&content) == current_config_pkg_set() {
-        return;
+    if pkg_set_of_config(&lines.join("\n")) == current_config_pkg_set() {
+        return lines.to_vec();   /* 集合未变: 保持原序 */
     }
-    let lines: Vec<String> = content.lines().map(String::from).collect();
     let mut head: Vec<String> = Vec::new();
     let mut pkgs: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut i = 0;
@@ -837,7 +841,7 @@ pub(crate) fn organize_config_file(path: &str) {
         out.extend(rules);
         out.extend(attrs);
     }
-    let _ = fs::write(path, out.join("\n") + "\n");
+    out
 }
 
 /// 只读取统一主配置文件中的刷新率字段。

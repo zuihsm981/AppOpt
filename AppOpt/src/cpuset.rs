@@ -53,10 +53,6 @@ impl CpuSet {
         }
     }
 
-    pub fn is_set(&self, cpu: usize) -> bool {
-        cpu < CPU_SETSIZE && self.bits[cpu / CPU_WORD_BITS] & (1u64 << (cpu % CPU_WORD_BITS)) != 0
-    }
-
     pub fn count(&self) -> usize {
         self.bits.iter().map(|&b| b.count_ones() as usize).sum()
     }
@@ -177,12 +173,18 @@ pub fn parse_cpu_ranges(spec: &str, present: Option<&CpuSet>) -> CpuSet {
             }
             (a, a)
         };
-        for i in lo..=hi.min(CPU_SETSIZE - 1) {
-            if let Some(present) = present
-                && !present.is_set(i) {
-                    continue;
-                }
-            set.set(i);
+        // 位掩码一次置多个 word (替代逐位 set; 与 present 掩码按 word 与, 语义不变)
+        let hi = hi.min(CPU_SETSIZE - 1);
+        for w in lo / CPU_WORD_BITS..=hi / CPU_WORD_BITS {
+            let wlo = w * CPU_WORD_BITS;
+            let a = if lo > wlo { lo - wlo } else { 0 };
+            let b = if hi < wlo + CPU_WORD_BITS - 1 { hi - wlo } else { CPU_WORD_BITS - 1 };
+            let mut m = (!0u64 << a)
+                & (if b >= CPU_WORD_BITS - 1 { !0u64 } else { (1u64 << (b + 1)) - 1 });
+            if let Some(present) = present {
+                m &= present.bits[w];
+            }
+            set.bits[w] |= m;
         }
     }
     set
