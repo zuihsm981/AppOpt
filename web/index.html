@@ -234,7 +234,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 </div>
 <div class="card">
 <div class="card-title">全局配置</div>
-<div class="row"><span class="label">最大刷新率</span>
+<div class="row"><span class="label">活跃刷新率</span>
 <div class="core-chips" id="rf-active-chips"></div></div>
 <div class="row"><span class="label">空闲刷新率</span>
 <div class="core-chips" id="rf-idle-chips"></div></div>
@@ -407,6 +407,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="modal">
 <h3 id="mr-title">添加应用</h3>
 <div class="sg-wrap"><input id="mr-pkg" placeholder="输入应用包名"><div class="sg-box" id="sg-pkg" hidden></div></div>
+<button class="btn" data-pick="mr" style="width:100%;margin-top:8px">＋ 添加应用</button>
 <div class="seg" id="mr-seg" hidden>
 <button data-tab="cpu" class="on">线程配置</button>
 <button data-tab="rf">刷新率配置</button>
@@ -415,11 +416,11 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <button class="rule-add" id="mr-addrow" hidden>＋ 线程规则</button>
 <div id="mr-rf-box" hidden>
 <div class="tree-row">
-<div class="tr-head"><span class="tr-tag">最大刷新率·可选</span></div>
+<div class="tr-head"><span class="tr-tag">活跃刷新率·可选</span></div>
 <div class="core-chips" id="mr-rf-active-chips"></div>
 </div>
 <div class="tree-row">
-<div class="tr-head"><span class="tr-tag">静止刷新率·可选</span></div>
+<div class="tr-head"><span class="tr-tag">空闲刷新率·可选</span></div>
 <div class="core-chips" id="mr-rf-idle-chips"></div>
 </div>
 <div class="tr-head"><span class="tr-tag">空闲超时(秒)</span></div>
@@ -517,7 +518,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
 <div style="font-size:12px;color:var(--sub);margin-bottom:6px">目标应用</div>
 <div class="sg-wrap"><input id="sv-add-app-input" placeholder="输入包名添加目标应用" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:9px 12px;font-size:14px;color:#000;outline:none"><div class="sg-box" id="sv-add-sg" hidden></div></div>
-<button class="btn" id="sv-add-app-btn" style="width:100%;margin-top:8px">＋ 添加应用</button>
+<button class="btn" id="sv-add-app-btn" data-pick="sv" style="width:100%;margin-top:8px">＋ 添加应用</button>
 <div id="sv-add-apps" style="margin-top:8px"></div>
 </div>
 <div id="sv-add-err" hidden style="color:#e5484d;font-size:12px;margin-top:10px"></div>
@@ -538,7 +539,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
 <div style="font-size:12px;color:var(--sub);margin-bottom:6px">目标应用</div>
 <div class="sg-wrap"><input id="wp-add-app-input" placeholder="输入包名添加目标应用" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:9px 12px;font-size:14px;color:#000;outline:none"><div class="sg-box" id="wp-add-sg" hidden></div></div>
-<button class="btn" id="wp-add-app-btn" style="width:100%;margin-top:8px">＋ 添加应用</button>
+<button class="btn" id="wp-add-app-btn" data-pick="wp" style="width:100%;margin-top:8px">＋ 添加应用</button>
 <div id="wp-add-apps" style="margin-top:8px"></div>
 </div>
 <div id="wp-add-err" hidden style="color:#e5484d;font-size:12px;margin-top:10px"></div>
@@ -551,16 +552,16 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div id="rd-field-modal" hidden style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:1000">
 <div class="card" style="width:min(440px,92vw);padding:16px;margin:0">
 <div style="font-weight:600;color:#000;margin-bottom:10px">添加文件重定向规则</div>
-<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px"><button class="icon-btn" data-fs="rd-ffrom" title="浏览选择文件"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button><span style="font-size:12px;color:var(--sub)">原路径</span></div>
+<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px"><span style="font-size:12px;color:var(--sub)">原路径</span><button class="icon-btn" data-fs="rd-ffrom" title="浏览选择文件"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button></div>
 <input id="rd-ffrom" placeholder="/vendor/etc/selinux/vendor_file_contexts" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000">
-<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;margin-top:10px"><button class="icon-btn" data-fs="rd-fto" title="浏览选择文件"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button><span style="font-size:12px;color:var(--sub)">新路径</span></div>
+<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;margin-top:10px"><span style="font-size:12px;color:var(--sub)">新路径</span><button class="icon-btn" data-fs="rd-fto" title="浏览选择文件"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button></div>
 <input id="rd-fto" placeholder="/storage/emulated/0/vendor_file_contexts" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000">
 <div style="font-size:11px;color:var(--sub);margin-top:6px">目标需读取者可访问</div>
 <div id="rd-field-apps-section">
 <div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
 <div style="font-size:12px;color:var(--sub);margin-bottom:6px">目标应用</div>
 <div class="sg-wrap"><input id="rd-field-app-input" placeholder="输入包名添加目标应用" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:9px 12px;font-size:14px;color:#000;outline:none"><div class="sg-box" id="rd-field-sg" hidden></div></div>
-<button class="btn" id="rd-field-app-btn" style="width:100%;margin-top:8px">＋ 添加应用</button>
+<button class="btn" id="rd-field-app-btn" data-pick="field" style="width:100%;margin-top:8px">＋ 添加应用</button>
 <div id="rd-field-apps" style="margin-top:8px"></div>
 </div>
 </div>
@@ -590,7 +591,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div id="rd-add-modal" hidden style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:1000">
 <div class="card" style="width:min(420px,90vw);padding:16px;margin:0">
 <div style="font-weight:600;color:#000;margin-bottom:10px">添加内容替换规则</div>
-<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px"><button class="icon-btn" data-fs="rd-ctarget" title="浏览选择文件"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button><span style="font-size:12px;color:var(--sub)">目标文件</span></div>
+<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px"><span style="font-size:12px;color:var(--sub)">目标文件</span><button class="icon-btn" data-fs="rd-ctarget" title="浏览选择文件"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button></div>
 <input id="rd-ctarget" placeholder="/vendor/etc/selinux/vendor_file_contexts" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000">
 <div style="display:flex;gap:8px;margin-top:10px">
 <div style="flex:1"><div style="font-size:12px;color:var(--sub);margin-bottom:4px">原内容</div><input id="rd-cfrom" maxlength="32" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000"></div>
@@ -601,7 +602,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
 <div style="font-size:12px;color:var(--sub);margin-bottom:4px">目标应用</div>
 <div class="sg-wrap"><input id="rd-add-app-input" placeholder="输入包名添加目标应用" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:9px 12px;font-size:14px;color:#000;outline:none"><div class="sg-box" id="rd-add-sg" hidden></div></div>
-<button class="btn" id="rd-add-app-btn" style="width:100%;margin-top:8px">＋ 添加应用</button>
+<button class="btn" id="rd-add-app-btn" data-pick="rd" style="width:100%;margin-top:8px">＋ 添加应用</button>
 <div id="rd-add-apps" style="margin-top:8px"></div>
 </div>
 </div>
@@ -615,7 +616,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div id="rd-batch-modal" hidden style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:1000">
 <div class="card" style="width:min(460px,92vw);padding:16px;margin:0">
 <div style="font-weight:600;color:#000;margin-bottom:10px">批量导入内容替换</div>
-<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px"><button class="icon-btn" data-fs="rd-batch-targets" data-fs-multi="1" title="浏览选择文件"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button><span style="font-size:12px;color:var(--sub)">目标文件（每行一个路径）</span></div>
+<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px"><span style="font-size:12px;color:var(--sub)">目标文件（每行一个路径）</span><button class="icon-btn" data-fs="rd-batch-targets" data-fs-multi="1" title="浏览选择文件"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button></div>
 <textarea id="rd-batch-targets" rows="5" placeholder="/vendor/etc/selinux/vendor_hwservice_contexts&#10;/vendor/etc/selinux/vendor_file_contexts&#10;/vendor/etc/selinux/vendor_file" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000;resize:vertical"></textarea>
 <div style="display:flex;gap:8px;margin-top:10px">
 <div style="flex:1"><div style="font-size:12px;color:var(--sub);margin-bottom:4px">原内容</div><input id="rd-batch-from" placeholder="lineage" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000"></div>
@@ -625,7 +626,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
 <div style="font-size:12px;color:var(--sub);margin-bottom:6px">目标应用</div>
 <div class="sg-wrap"><input id="rd-batch-app-input" placeholder="输入包名添加目标应用" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:9px 12px;font-size:14px;color:#000;outline:none"><div class="sg-box" id="rd-batch-sg" hidden></div></div>
-<button class="btn" id="rd-batch-app-btn" style="width:100%;margin-top:8px">＋ 添加应用</button>
+<button class="btn" id="rd-batch-app-btn" data-pick="batch" style="width:100%;margin-top:8px">＋ 添加应用</button>
 <div id="rd-batch-apps" style="margin-top:8px"></div>
 </div>
 </div>
@@ -663,7 +664,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div id="rd-edit-modal" hidden style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:999">
 <div class="card" style="width:min(420px,90vw);padding:16px;margin:0">
 <div id="rd-edit-title" style="font-weight:600;color:#000;margin-bottom:10px"></div>
-<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px"><button class="icon-btn" data-fs="rd-edit-target" title="浏览选择文件"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button><span style="font-size:12px;color:var(--sub)">目标文件</span></div>
+<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px"><span style="font-size:12px;color:var(--sub)">目标文件</span><button class="icon-btn" data-fs="rd-edit-target" title="浏览选择文件"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button></div>
 <input id="rd-edit-target" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000">
 <div id="rd-edit-ft-box" style="display:flex;gap:8px;margin-top:10px">
 <div style="flex:1;min-width:0"><div id="rd-edit-from-label" style="font-size:12px;color:var(--sub);margin-bottom:4px">原内容</div><input id="rd-edit-from-input" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000"></div>
@@ -672,7 +673,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
 <div id="rd-edit-apps" style="max-height:26vh;overflow:auto;display:flex;flex-direction:column;gap:4px"></div>
 <div class="sg-wrap" style="margin-top:6px"><input id="rd-edit-app-input" placeholder="输入包名添加目标应用" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:8px 12px;font-size:13px;color:#000;outline:none"><div class="sg-box" id="rd-edit-sg" hidden></div></div>
-<button class="btn" id="rd-edit-app-add" style="width:100%;margin-top:6px">＋ 添加应用</button>
+<button class="btn" id="rd-edit-app-add" data-pick="edit" style="width:100%;margin-top:6px">＋ 添加应用</button>
 <button class="btn" id="rd-edit-add-rule" style="width:100%;margin-top:6px;background:var(--blue,#007aff);color:#fff">＋ 添加规则</button>
 </div>
 <div id="rd-edit-msg" style="font-size:12px;margin-top:10px;min-height:14px"></div>
@@ -691,6 +692,17 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 </div>
 <div id="fs-list" style="flex:1;overflow:auto;min-height:38vh;max-height:52vh;display:flex;flex-direction:column;gap:4px"></div>
 <button class="btn" id="fs-cancel" style="width:100%;margin-top:10px;background:var(--bg);color:var(--sub)">取消</button>
+</div>
+</div>
+<div id="app-pick-modal" hidden style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:1000">
+<div class="card" style="width:min(440px,92vw);padding:16px;margin:0;max-height:84vh;display:flex;flex-direction:column">
+<div style="font-weight:600;color:#000;margin-bottom:10px">选择应用</div>
+<div class="seg" id="ap-seg" style="margin-bottom:8px">
+<button data-v="user" class="on">用户应用</button><button data-v="all">全部应用</button>
+</div>
+<input id="ap-q" placeholder="搜索应用包名" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px 12px;font-size:13px;color:#000;outline:none;margin-bottom:8px">
+<div id="ap-list" style="flex:1;overflow:auto;min-height:38vh;max-height:52vh;display:flex;flex-direction:column;gap:4px"></div>
+<button class="btn" id="ap-cancel" style="width:100%;margin-top:10px;background:var(--bg);color:var(--sub)">取消</button>
 </div>
 </div>
 <script>
@@ -1036,17 +1048,12 @@ function wpAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!wpAddTmp.includes
 function rdAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!rdAddTmp.includes(pkg))rdAddTmp.push(pkg);$('rd-add-app-input').value='';$('rd-add-sg').hidden=true;renderRdApps();}
 function rdBatchAdd(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!rdBatchTmp.includes(pkg))rdBatchTmp.push(pkg);$('rd-batch-app-input').value='';$('rd-batch-sg').hidden=true;renderRdApps();}
 function rdpAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!rdpTmp.includes(pkg))rdpTmp.push(pkg);$('rd-field-app-input').value='';$('rd-field-sg').hidden=true;renderRdpApps();}
-$('sv-add-app-btn').onclick=()=>wlAddApp($('sv-add-app-input').value);
-$('wp-add-app-btn').onclick=()=>wpAddApp($('wp-add-app-input').value);
-$('rd-add-app-btn').onclick=()=>rdAddApp($('rd-add-app-input').value);
-$('rd-batch-app-btn').onclick=()=>rdBatchAdd($('rd-batch-app-input').value);
 suggest_bind($('rd-batch-app-input'),$('rd-batch-sg'),{onpick:rdBatchAdd});
 $('rd-batch-apps').addEventListener('click',e=>{
   const b=e.target.closest('[data-i]');
   if(!b)return;
   rdBatchTmp.splice(+b.dataset.i,1);renderRdApps();
 });
-$('rd-field-app-btn').onclick=()=>rdpAddApp($('rd-field-app-input').value);
 suggest_bind($('sv-add-app-input'),$('sv-add-sg'),{onpick:wlAddApp});
 suggest_bind($('wp-add-app-input'),$('wp-add-sg'),{onpick:wpAddApp});
 suggest_bind($('rd-add-app-input'),$('rd-add-sg'),{onpick:rdAddApp});
@@ -1537,12 +1544,6 @@ document.addEventListener('click',e=>{
   rdEditFromApp=(ab.dataset.addapp!==undefined)?ab.dataset.addapp:(k==='f')?frGroupsApp:(k==='c')?groupsLayerApp:(k==='s')?srRulesApp:wpRulesApp;
   openAddModal(k);
 });
-$('rd-edit-app-add').onclick=()=>{
-  const v=$('rd-edit-app-input').value.trim();
-  if(v&&!rdEditTmp.includes(v))rdEditTmp.push(v);
-  $('rd-edit-app-input').value='';$('rd-edit-sg').hidden=true;
-  rdEditRender();
-};
 suggest_bind($('rd-edit-app-input'),$('rd-edit-sg'),{onpick:v=>{if(v&&!rdEditTmp.includes(v))rdEditTmp.push(v);$('rd-edit-app-input').value='';$('rd-edit-sg').hidden=true;rdEditRender();}});
 $('rd-edit-apps').addEventListener('click',e=>{
   const b=e.target.closest('[data-i]');
@@ -2297,6 +2298,50 @@ $('fs-list').addEventListener('click',e=>{
     else inp.value=el.dataset.path;
   }
   $('fs-picker-modal').hidden=true;
+});
+// ===== 应用列表选择 (隐藏页四个功能添加目标应用; 默认仅用户应用) =====
+let apPick=null, apData=[], apShowUser=true;
+async function apLoad(){
+  try{apData=(await api('/api/apps')).apps||[];apRender();}catch(e){toast(e.message)}
+}
+function apRender(){
+  const q=$('ap-q').value.trim().toLowerCase();
+  const list=apData.filter(a=>(!apShowUser||!a.system)&&(!q||a.pkg.toLowerCase().includes(q)));
+  $('ap-list').innerHTML=list.map(a=>`<div class="fs-entry" data-pkg="${esc(a.pkg)}"><span>${esc(a.pkg)}</span><span style="color:var(--sub);font-size:11px;flex-shrink:0">uid ${a.uid}</span>${a.system?'<span class="badge" style="flex-shrink:0;background:rgba(142,142,147,.16);color:#636366">系统</span>':''}</div>`).join('')||'<div class="hint" style="margin:0">无匹配应用</div>';
+}
+function openAppPick(kind){
+  apPick=kind;apShowUser=true;
+  $('ap-seg').querySelectorAll('button').forEach(b=>b.classList.toggle('on',b.dataset.v==='user'));
+  $('ap-q').value='';
+  $('app-pick-modal').hidden=false;
+  if(!apData.length)apLoad();else apRender();
+}
+document.addEventListener('click',e=>{
+  const b=e.target.closest('[data-pick]');
+  if(!b)return;
+  openAppPick(b.dataset.pick);
+});
+$('ap-seg').addEventListener('click',e=>{
+  const b=e.target.closest('button');if(!b)return;
+  apShowUser=b.dataset.v==='user';
+  $('ap-seg').querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));
+  apRender();
+});
+$('ap-q').addEventListener('input',apRender);
+$('ap-cancel').onclick=()=>{$('app-pick-modal').hidden=true;};
+$('app-pick-modal').addEventListener('click',e=>{if(e.target.id==='app-pick-modal')$('app-pick-modal').hidden=true;});
+$('ap-list').addEventListener('click',e=>{
+  const el=e.target.closest('[data-pkg]');
+  if(!el)return;
+  const pkg=el.dataset.pkg;
+  if(apPick==='sv'){if(!svAddTmp.includes(pkg))svAddTmp.push(pkg);renderWaylayApps();}
+  else if(apPick==='wp'){if(!wpAddTmp.includes(pkg))wpAddTmp.push(pkg);renderWpApps();}
+  else if(apPick==='rd'){if(!rdAddTmp.includes(pkg))rdAddTmp.push(pkg);renderRdApps();}
+  else if(apPick==='batch'){if(!rdBatchTmp.includes(pkg))rdBatchTmp.push(pkg);renderRdApps();}
+  else if(apPick==='field'){if(!rdpTmp.includes(pkg))rdpTmp.push(pkg);renderRdpApps();}
+  else if(apPick==='edit'){if(!rdEditTmp.includes(pkg))rdEditTmp.push(pkg);rdEditRender();}
+  else if(apPick==='mr'){$('mr-pkg').value=pkg;}
+  $('app-pick-modal').hidden=true;
 });
 startStat();
 </script>
