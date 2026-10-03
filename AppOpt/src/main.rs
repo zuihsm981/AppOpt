@@ -432,6 +432,9 @@ impl AppState {
         if arm && self.ebpf_state.is_none() {
             if let Some(es) = crate::ebpf_mode::ebpf_init(String::new()) {
                 self.ebpf_state = Some(es);
+                /* KPM_ACTIVE 只在启动时置位; 模块后加载 (连接时重试初始化成功) 需同步,
+                   否则 /api/status connected=false + mode=kpm → 线程状态 UI 误显示"未连接" */
+                crate::web::KPM_ACTIVE.store(true, Ordering::Relaxed);
             }
         }
         if arm {
