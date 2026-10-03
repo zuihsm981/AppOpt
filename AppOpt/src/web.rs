@@ -227,6 +227,7 @@ fn dispatch(out: &mut TcpStream, req: &Request) {
         ("GET", "/api/refresh/apps") => (200, refresh_apps_json()),
         ("POST", "/api/refresh/app") => refresh_app_add_api(req),
         ("POST", "/api/refresh/app/del") => refresh_app_del_api(req),
+        ("POST", "/api/fs/list") => fs_list_api(req),
         _ => err_json(404, "not found"),
     };
     resp_send(out, status, "application/json", body.as_bytes(), !req.keep_alive);
@@ -944,6 +945,42 @@ fn waylay_set_api(req: &Request) -> (u16, String) {
     }
     crate::config::request_config_reload();
     (200, json!({"ok": true}).to_string())
+}
+
+// ===== 文件浏览器 API (重定向/内容替换路径选择) =====
+
+/// POST /api/fs/list: 列出目录 {path} 下的条目 (dirs 在前, 再按名称排序)。
+/// 仅本机 webui 使用; 校验绝对路径 / 禁 ".." / 禁控制字符。
+fn fs_list_api(req: &Request) -> (u16, String) {
+    let v = match parse_json(req) { Ok(v) => v, Err(e) => return e };
+    let Some(p) = v["path"].as_str() else {
+        return err_json(400, "缺少 path 字段");
+    };
+    let p = p.trim();
+    let ok = !p.is_empty()
+        && p.starts_with('/')
+        && !p.contains("..")
+        && !p.bytes().any(|b| b < 0x20 || b == 0x7f);
+    if !ok {
+        return err_json(400, "路径非法");
+    }
+    let mut entries: Vec<(bool, String)> = Vec::new();
+    match std::fs::read_dir(p) {
+        Ok(rd) => {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                entries.push((dir, name));
+            }
+        }
+        Err(_) => return err_json(500, "无法读取目录"),
+    }
+    entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let arr: Vec<serde_json::Value> = entries
+        .into_iter()
+        .map(|(dir, name)| json!({ "name": name, "dir": dir }))
+        .collect();
+    (200, json!({ "ok": true, "path": p, "entries": arr }).to_string())
 }
 
 // ===== 刷新率 Web API =====
