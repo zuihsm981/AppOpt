@@ -563,9 +563,11 @@ impl AppState {
         apply_config(cpu_changed, self.cfg.as_deref(), &self.pkg_uid);
     }
 
-    /// packages.list 变化 (安装/卸载/替换) → 整表重建 cpu uid 表。
+    /// packages.list 变化 (安装/卸载/替换) → 整表重建 cpu uid 表 + 刷新已安装应用缓存。
     /// waylay 四功能统一包名 (规则不依赖 packages.list; on_fg 实时查包名) → 无需重建。
     fn rebuild_uid_tables(&mut self) {
+        /* 已安装应用列表缓存: packages.list 变化 → 同步刷新 */
+        crate::web::refresh_apps_cache();
         if let Some(cfg) = self.cfg.as_ref() {
             (self.uid_map, self.pkg_uid) = build_uid_tables(cfg);
         }
@@ -967,6 +969,8 @@ fn main() {
 
     // 初始全量应用 (两种驱动模式都执行: KPM 事件驱动 / 纯用户态)
     state.apply_all();
+    // 预缓存已安装应用列表 (packages.list; 之后 EV_PKG 变化时由 rebuild_uid_tables 刷新)
+    crate::web::refresh_apps_cache();
     // 初始加载 waylay 配置 (WAYLAY_RULES_NEW + uid→包名缓存 + src/prop 规则; on_fg 直接查缓存)
     state.reload();
 

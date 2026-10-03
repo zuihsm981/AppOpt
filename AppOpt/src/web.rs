@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -228,6 +228,7 @@ fn dispatch(out: &mut TcpStream, req: &Request) {
         ("POST", "/api/refresh/app") => refresh_app_add_api(req),
         ("POST", "/api/refresh/app/del") => refresh_app_del_api(req),
         ("POST", "/api/fs/list") => fs_list_api(req),
+        ("GET", "/api/apps") => (200, apps_json()),
         _ => err_json(404, "not found"),
     };
     resp_send(out, status, "application/json", body.as_bytes(), !req.keep_alive);
@@ -981,6 +982,46 @@ fn fs_list_api(req: &Request) -> (u16, String) {
         .map(|(dir, name)| json!({ "name": name, "dir": dir }))
         .collect();
     (200, json!({ "ok": true, "path": p, "entries": arr }).to_string())
+}
+
+// ===== 已安装应用列表 API (隐藏页添加目标应用选择) =====
+
+/// 已安装应用缓存: (pkg, uid, system); 初始化 / packages.list 变化时刷新,
+/// /api/apps 直接读缓存, 不重复读盘。
+pub static APPS_CACHE: RwLock<Vec<(String, i64, bool)>> = RwLock::new(Vec::new());
+
+/// 刷新已安装应用缓存 (初始化 / EV_PKG packages.list inotify 时调用)
+pub fn refresh_apps_cache() {
+    let mut apps: Vec<(String, i64, bool)> = Vec::new();
+    if let Ok(content) = std::fs::read_to_string("/data/system/packages.list") {
+        for line in content.lines() {
+            let mut it = line.split_whitespace();
+            let Some(pkg) = it.next() else { continue };
+            let Some(uid) = it.next().and_then(|s| s.parse::<i64>().ok()) else { continue };
+            if uid <= 0 || uid >= 100000 {
+                continue;   /* 仅当前用户 (与 cpu/waylay uid 表一致) */
+            }
+            // 列: pkg uid debug dataDir seinfo sdk codePath flags ...
+            // 已消费 2 列, nth(5) 取第 7 列 = flags (%x); FLAG_SYSTEM = 0x1
+            let flags = it
+                .nth(5)
+                .and_then(|s| i64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0);
+            apps.push((pkg.to_string(), uid, (flags & 0x1) != 0));
+        }
+    }
+    apps.sort_by(|a, b| a.0.cmp(&b.0));
+    *crate::rw_write_ignore_poison(&APPS_CACHE) = apps;
+}
+
+/// GET /api/apps: 返回已安装应用列表 (读预缓存, 按包名排序)。
+fn apps_json() -> String {
+    let apps = crate::rw_read_ignore_poison(&APPS_CACHE);
+    let arr: Vec<serde_json::Value> = apps
+        .iter()
+        .map(|(pkg, uid, sys)| json!({ "pkg": pkg, "uid": uid, "system": *sys }))
+        .collect();
+    json!({ "apps": arr }).to_string()
 }
 
 // ===== 刷新率 Web API =====
