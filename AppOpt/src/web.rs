@@ -1001,13 +1001,9 @@ pub fn refresh_apps_cache() {
             if uid <= 0 || uid >= 100000 {
                 continue;   /* 仅当前用户 (与 cpu/waylay uid 表一致) */
             }
-            // 列: pkg uid debug dataDir seinfo sdk codePath flags ...
-            // 已消费 2 列, nth(5) 取第 7 列 = flags (%x); FLAG_SYSTEM = 0x1
-            let flags = it
-                .nth(5)
-                .and_then(|s| i64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-                .unwrap_or(0);
-            apps.push((pkg.to_string(), uid, (flags & 0x1) != 0));
+            /* 应用类别: 条目末尾标记 @system=系统应用, @null=用户应用 */
+            let system = line.trim_end().ends_with("@system");
+            apps.push((pkg.to_string(), uid, system));
         }
     }
     apps.sort_by(|a, b| a.0.cmp(&b.0));
