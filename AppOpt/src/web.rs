@@ -880,6 +880,9 @@ fn waylay_set_api(req: &Request) -> (u16, String) {
             if pkg.is_empty() || pkg.len() > 256 {
                 return err_json(400, "包名非法");
             }
+            if pkg == "*" {
+                continue;   /* 全局规则已移除: 保存时丢弃 */
+            }
             let max = match kind_t.as_str() {
                 "src" => 64usize,
                 "prop" => 92usize,

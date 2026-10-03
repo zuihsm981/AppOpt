@@ -110,6 +110,9 @@ pub fn load_waylay_rules() -> Vec<WaylayRule> {
             if pkg.is_empty() {
                 continue;
             }
+            if pkg == "*" {
+                continue;   /* 全局规则已移除: 不加载 */
+            }
             let rest = rest.trim();   /* 容忍 '= ' 后空格 */
             let (kind_t, rr) = if let Some(r) = rest.strip_prefix("red-path-") {
                 ("red-path", r)
@@ -203,6 +206,9 @@ pub fn save_waylay_rules(rules: &[WaylayRule]) -> io::Result<()> {
     let mut out = String::from("# waylay 新格式: <包名>=<kind>-<from>-<to>\n");
     out.push_str("# kind: src=服务伪装 prop=属性伪装 red=重定向(内容替换); from/to 等长且不含 '-'\n");
     for r in rules {
+        if r.pkg.trim() == "*" {
+            continue;   /* 全局规则已移除: 不落盘 */
+        }
         let prefix = r.kind.tag();
         if r.kind == WaylayKind::Red {
             /* 内容替换带目标文件: <目标>-<from>-<to> */
@@ -227,7 +233,8 @@ pub fn save_waylay_rules(rules: &[WaylayRule]) -> io::Result<()> {
     let tmp = format!("{}.tmp", WAYLAY_FILE);
     fs::write(&tmp, out.as_bytes())?;
     fs::rename(&tmp, WAYLAY_FILE)?;
-    *rw_write_ignore_poison(&WAYLAY_RULES_NEW) = rules.to_vec();
+    *rw_write_ignore_poison(&WAYLAY_RULES_NEW) =
+        rules.iter().filter(|r| r.pkg.trim() != "*").cloned().collect();
     WAYLAY_CHANGED.store(true, Ordering::Release);
     Ok(())
 }
@@ -264,7 +271,7 @@ pub fn take_waylay_changed() -> bool {
 /* ===== waylay 规则 (新格式 <pkg>=<kind>-<from>-<to>) =====
  * 加载/保存统一走 load_waylay_rules / save_waylay_rules (WAYLAY_RULES_NEW);
  * 内容替换 red-<目标>-<from>-<to>, 文件重定向 red-path-<from路径>-<to路径>,
- * 服务伪装 src-, 属性伪装 prop-; 规则带 pkg (全局为 "*")。 */
+ * 服务伪装 src-, 属性伪装 prop-; 规则带 pkg (全局 "*" 已移除, 不再支持)。 */
 /// 属性名 → selinux context: 读各 property_contexts 取最长匹配前缀的 context
 fn prop_context_for(name: &str) -> Option<String> {
     const FILES: &[&str] = &[

@@ -124,14 +124,13 @@ pub(crate) fn build_rule_rows(
 ) {
     let mut tbl: HashMap<i32, Vec<crate::config::WaylayRule>> = HashMap::new();
     for r in all.iter() {
-        let u = if r.pkg == "*" {
-            -1
-        } else if let Some(u) = pkguid.get(&r.pkg) {
-            *u
-        } else {
+        if r.pkg == "*" {
+            continue;   /* 全局规则已移除: 不下发内核 (用户态/内核态均无全局段) */
+        }
+        let Some(u) = pkguid.get(&r.pkg) else {
             continue;   /* 未安装包 → 跳过 */
         };
-        tbl.entry(u).or_default().push(r.clone());
+        tbl.entry(*u).or_default().push(r.clone());
     }
     /* vfc 指纹 (red/redpath) — 稳定排序 (同 uid 内按 kind 序) */
     let mut rows: Vec<(i32, String, String, String, String)> = Vec::new();
@@ -388,6 +387,10 @@ struct AppState {
     uid_rules: std::collections::HashMap<i32, Vec<crate::config::WaylayRule>>,
     /// 已下发给内核的 property 区伪装开关 (独立目标应用集)
     prop_active_cur: bool,
+    /// 刷新率规则应用主 pid 监听表: pid → 包名 (top-app cpuset 保持; 主 pid 退出移除)
+    rfr_monitored: HashMap<i32, String>,
+    /// waylay 规则应用主 pid 记录表: pid → uid (内核 vfc_fg 下发保护; 主 pid 退出移除)
+    waylay_monitored: HashMap<i32, i32>,
 }
 
 impl AppState {
@@ -411,6 +414,8 @@ impl AppState {
             rfr_pkgs_set,
             srv_active_cur: false,
             last_fg_uid: -1,
+            rfr_monitored: HashMap::new(),
+            waylay_monitored: HashMap::new(),
             rule_cache: Vec::new(),
             vfc_uid_set: std::collections::HashSet::new(),
             uid_rules: std::collections::HashMap::new(),
@@ -452,7 +457,7 @@ impl AppState {
     }
 
     /// 用户态配置驱动: uid 规则表下发。构建指纹 (uid, kind, target, from, to) 对比缓存,
-    /// 有新增/删除才 clear + 重发 (无变化零动作); 全局(pkg="*")→uid=-1 段在前。
+    /// 有新增/删除才 clear + 重发 (无变化零动作); 全局(pkg="*")已移除, 仅按包下发。
     fn sync_vfc_rules(&mut self) {
         /* 四功能统一 uid 规则表 + 内核行映射 (与 WebUI 校验共用 build_rule_rows) */
         let all = crate::rw_read_ignore_poison(&crate::config::WAYLAY_RULES_NEW);
@@ -469,7 +474,6 @@ impl AppState {
                 return;
             }
             if changed {
-                let glob_n = rows.iter().filter(|x| x.0 == -1).count().min(512);
                 es.bpf.vfc_rule_clear();
                 let mut i = 0usize;
                 for (uid, kind, tg, from, to) in rows.iter() {
@@ -482,7 +486,6 @@ impl AppState {
                     }
                     i += 1;
                 }
-                es.bpf.vfc_glob_count(glob_n);
                 es.bpf.vfc_fg(self.last_fg_uid);   /* 表重建后定位当前前台 uid 段 */
                 self.rule_cache = rows;   /* 全部成功后才更新缓存 */
             }
@@ -577,6 +580,18 @@ impl AppState {
         }
     }
 
+    /// 读 /proc/<pid>/cpuset: 判断该 pid 是否处于 top-app cpuset (Android cpuset 分层)。
+    /// 前台回调变化时若当前驱动刷新率的主 pid 仍为 top-app → 保持刷新率规则不变;
+    /// pid 已退出/读取失败 → 视为非 top-app (放行切换)。
+    fn pid_in_top_app(pid: i32) -> bool {
+        if pid <= 0 {
+            return false;
+        }
+        std::fs::read_to_string(format!("/proc/{}/cpuset", pid))
+            .map(|s| s.contains("top-app"))
+            .unwrap_or(false)
+    }
+
     /// binder 前台回调 (pid+uid): 查 uid 表分发 CPU (冷启动 ApplyPkg + pidfd watch)
     /// 与刷新率 (包名) —— 原 EV_FG 分支主体
     fn on_fg(&mut self, pid: i32, uid: i32) {
@@ -588,10 +603,32 @@ impl AppState {
             .cloned()
             .unwrap_or_default();
         let active = !my.is_empty();
-        // ---- 前台 uid 通知内核: uid 在 vfc 规则表 → 执行该 uid 全部规则; 否则仅全局 ----
+        // ---- 前台 uid 通知内核 (vfc_fg): 规则应用 → 记录主 pid 后下发 uid
+        //      (已记录直接下发, 不检查 cpuset); 非规则应用 → 已记录主 pid 有
+        //      top-app 则不下发 uid (内核保持当前前台 uid 段), 否则下发 -1 (仅全局) ----
+        let in_vfc = self.vfc_uid_set.contains(&uid);
+        let fg_uid: Option<i32> = if in_vfc {
+            if !self.waylay_monitored.contains_key(&pid) {
+                self.waylay_monitored.insert(pid, uid);
+                crate::event_probe::watch(pid);
+            }
+            Some(uid)
+        } else {
+            // 非规则应用回调: 先检查是否有记录; 空 → 不做任何动作 (不再下发 -1);
+            // 有记录 → 检查 top-app: 有 top → 不下发 (保持); 无 top → 下发 -1 (停止)
+            if self.waylay_monitored.is_empty() {
+                None
+            } else {
+                match self.waylay_top_uid() {
+                    Some(_) => None,  // 有 top → 不下发
+                    None => Some(-1), // 有记录但无 top → 停止
+                }
+            }
+        };
         if let Some(es) = self.ebpf_state.as_ref() {
-            let in_vfc = self.vfc_uid_set.contains(&uid);
-            es.bpf.vfc_fg(if in_vfc { uid } else { -1i32 });
+            if let Some(u) = fg_uid {
+                es.bpf.vfc_fg(u);
+            }
         }
         // ---- src (系统服务伪装): 该包 src 规则 + 开关 ----
         if active != self.srv_active_cur {
@@ -617,21 +654,93 @@ impl AppState {
                 es.bpf.prop_file_apply(want_prop);
             }
         }
-        let Some(e) = self.uid_map.get(&uid) else { return };
-        // CPU 规则: 冷热判断 (cpu_known 中 uid+pid 一致=热);
-        // 冷时注册 pidfd 监听 (退出清理由 EV_EXIT_PID 驱动)
-        if e.cpu && !crate::cpu_affinity::cpu_known_is_hot(uid, pid) {
-            crate::event_probe::watch(pid);
-            if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
-                let _ = tx.send(crate::cpu_affinity::CpuMsg::ApplyPkg(
-                    pid, uid, e.pkg.clone(),
-                ));
+        // 提前取出 uid 表条目 (克隆), 避免持有 self 借用时再 &mut self
+        let entry = self.uid_map.get(&uid).map(|e| (e.cpu, e.rfr, e.pkg.clone()));
+        match entry {
+            Some((cpu, rfr, pkg)) => {
+                // CPU 规则: 冷热判断 (cpu_known 中 uid+pid 一致=热);
+                // 冷时注册 pidfd 监听 (退出清理由 EV_EXIT_PID 驱动)
+                if cpu && !crate::cpu_affinity::cpu_known_is_hot(uid, pid) {
+                    crate::event_probe::watch(pid);
+                    if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
+                        let _ = tx.send(crate::cpu_affinity::CpuMsg::ApplyPkg(
+                            pid, uid, pkg.clone(),
+                        ));
+                    }
+                }
+                // 刷新率: 桌面 (非规则) → 检查已监听主 pid 是否有 top-app;
+                // 规则应用 → 应用规则并监听主 pid (已监听则不检查 cpuset 直接应用)
+                if rfr {
+                    if pkg == crate::config::DEFAULT_REFRESH_PACKAGE {
+                        self.refresh_keep_top();
+                    } else {
+                        self.refresh_fg_rule_app(pid, &pkg);
+                    }
+                }
+            }
+            None => {
+                // 非规则应用回调 (不在 uid 表): 刷新率保持 top-app 主 pid 规则;
+                // 无 top-app 时回落全局默认
+                self.refresh_keep_top();
             }
         }
-        // 刷新率: 命中 → 发包名给刷新率线程
-        if e.rfr {
-            crate::refresh::refresh_send_fg_pkg(e.pkg.clone());
+    }
+
+    /// 刷新率应用规则: 主线程命中后下发包名给刷新率线程
+    fn refresh_apply(&mut self, pkg: String) {
+        crate::refresh::refresh_send_fg_pkg(pkg);
+    }
+
+    /// 规则应用前台回调: 未监听 → 应用规则并开始监听主 pid (cpuset + 退出);
+    /// 已监听 → 不检查 cpuset 直接应用规则。
+    fn refresh_fg_rule_app(&mut self, pid: i32, pkg: &str) {
+        if self.rfr_monitored.contains_key(&pid) {
+            self.refresh_apply(pkg.to_string());
+            return;
         }
+        // 首次回调: 应用规则 + 入监听表 (主 pid 退出时 EV_EXIT_PID 移除)
+        self.rfr_monitored.insert(pid, pkg.to_string());
+        crate::event_probe::watch(pid);
+        self.refresh_apply(pkg.to_string());
+    }
+
+    /// 非规则应用前台回调: 扫描已监听主 pid, 有仍处于 top-app 的 → 应用其规则 (保持);
+    /// 无 top-app → 回落全局默认 (桌面配置); 顺带移除已退出主 pid 的监听。
+    fn refresh_keep_top(&mut self) {
+        let mut top: Option<String> = None;
+        self.rfr_monitored.retain(|p, pkg| {
+            if Self::pid_in_top_app(*p) {
+                if top.is_none() {
+                    top = Some(pkg.clone());
+                }
+                true
+            } else {
+                // 已退出 (cpuset 文件消失) → 移除监听; 仍存活但不在 top → 保留
+                std::path::Path::new(&format!("/proc/{}/cpuset", p)).exists()
+            }
+        });
+        match top {
+            Some(pkg) => self.refresh_apply(pkg),
+            None => self.refresh_apply(crate::config::DEFAULT_REFRESH_PACKAGE.to_string()),
+        }
+    }
+
+    /// 非规则应用前台回调: 检查已记录 waylay 主 pid 的 cpuset, 返回其中 top-app 的 uid
+    /// (有 → 不下发 uid, 内核保持当前前台 uid 段); 顺带移除已退出主 pid 的记录。
+    fn waylay_top_uid(&mut self) -> Option<i32> {
+        let mut top: Option<i32> = None;
+        self.waylay_monitored.retain(|p, u| {
+            if Self::pid_in_top_app(*p) {
+                if top.is_none() {
+                    top = Some(*u);
+                }
+                true
+            } else {
+                // 已退出 (cpuset 文件消失) → 移除记录; 仍存活但不在 top → 保留
+                std::path::Path::new(&format!("/proc/{}/cpuset", p)).exists()
+            }
+        });
+        top
     }
 }
 
@@ -1023,6 +1132,14 @@ fn main() {
                             if let Some(uid) = crate::cpu_affinity::cpu_known_pid_to_uid(pid) {
                                 if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
                                     let _ = tx.send(crate::cpu_affinity::CpuMsg::EvictUid(uid));
+                                }
+                            }
+                            // 刷新率: 主 pid 退出 → 移除监听
+                            state.rfr_monitored.remove(&pid);
+                            // waylay: 主 pid 退出 → 移除记录 + 下发 -1 停止内核规则
+                            if state.waylay_monitored.remove(&pid).is_some() {
+                                if let Some(es) = state.ebpf_state.as_ref() {
+                                    es.bpf.vfc_fg(-1);
                                 }
                             }
                         }

@@ -294,12 +294,7 @@ impl KpmHandle {
         self.cmd("vfc_rule_clear");
     }
 
-    /// 全局("*")规则段大小 (sync 分组下发: 全局规则先写, 各包规则连续)
-    pub(crate) fn vfc_glob_count(&self, n: usize) {
-        self.cmd(&format!("vfc_glob_count {}", n));
-    }
-
-    /// 统一 vfc 规则: uid(应用; -1=全局) + kind "c"=内容替换(需 target) / "p"=文件重定向; L1 校验后下发
+    /// 统一 vfc 规则: uid(应用) + kind "c"=内容替换(需 target) / "p"=文件重定向; L1 校验后下发
     pub(crate) fn vfc_rule(
         &self,
         idx: usize,
