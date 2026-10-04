@@ -552,9 +552,9 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div id="rd-field-modal" hidden style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:1000">
 <div class="card" style="width:min(440px,92vw);padding:16px;margin:0">
 <div style="font-weight:600;color:#000;margin-bottom:10px">添加文件重定向规则</div>
-<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px"><span style="font-size:12px;color:var(--sub)">原路径</span><button class="icon-btn" data-fs="rd-ffrom" title="浏览选择文件"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button></div>
+<div data-fs="rd-ffrom" title="点击选择文件" style="display:flex;align-items:center;gap:6px;margin-bottom:4px;cursor:pointer"><button class="icon-btn" title="浏览选择文件"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button><span style="font-size:12px;color:var(--sub)">原路径</span></div>
 <input id="rd-ffrom" placeholder="/vendor/etc/selinux/vendor_file_contexts" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000">
-<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;margin-top:10px"><span style="font-size:12px;color:var(--sub)">新路径</span><button class="icon-btn" data-fs="rd-fto" title="浏览选择文件"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button></div>
+<div data-fs="rd-fto" title="点击选择文件" style="display:flex;align-items:center;gap:6px;margin-bottom:4px;margin-top:10px;cursor:pointer"><button class="icon-btn" title="浏览选择文件"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button><span style="font-size:12px;color:var(--sub)">新路径</span></div>
 <input id="rd-fto" placeholder="/storage/emulated/0/vendor_file_contexts" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000">
 <div style="font-size:11px;color:var(--sub);margin-top:6px">目标需读取者可访问</div>
 <div id="rd-field-apps-section">
@@ -591,7 +591,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div id="rd-add-modal" hidden style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:1000">
 <div class="card" style="width:min(420px,90vw);padding:16px;margin:0">
 <div style="font-weight:600;color:#000;margin-bottom:10px">添加内容替换规则</div>
-<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px"><span style="font-size:12px;color:var(--sub)">目标文件</span><button class="icon-btn" data-fs="rd-ctarget" title="浏览选择文件"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button></div>
+<div data-fs="rd-ctarget" title="点击选择文件" style="display:flex;align-items:center;gap:6px;margin-bottom:4px;cursor:pointer"><button class="icon-btn" title="浏览选择文件"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button><span style="font-size:12px;color:var(--sub)">目标文件</span></div>
 <input id="rd-ctarget" placeholder="/vendor/etc/selinux/vendor_file_contexts" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000">
 <div style="display:flex;gap:8px;margin-top:10px">
 <div style="flex:1"><div style="font-size:12px;color:var(--sub);margin-bottom:4px">原内容</div><input id="rd-cfrom" maxlength="32" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000"></div>
@@ -616,7 +616,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div id="rd-batch-modal" hidden style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:1000">
 <div class="card" style="width:min(460px,92vw);padding:16px;margin:0">
 <div style="font-weight:600;color:#000;margin-bottom:10px">批量导入内容替换</div>
-<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px"><span style="font-size:12px;color:var(--sub)">目标文件（每行一个路径）</span><button class="icon-btn" data-fs="rd-batch-targets" data-fs-multi="1" title="浏览选择文件"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button></div>
+<div data-fs="rd-batch-targets" data-fs-multi="1" title="点击选择文件" style="display:flex;align-items:center;gap:6px;margin-bottom:6px;cursor:pointer"><button class="icon-btn" title="浏览选择文件"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button><span style="font-size:12px;color:var(--sub)">目标文件（每行一个路径）</span></div>
 <textarea id="rd-batch-targets" rows="5" placeholder="/vendor/etc/selinux/vendor_hwservice_contexts&#10;/vendor/etc/selinux/vendor_file_contexts&#10;/vendor/etc/selinux/vendor_file" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000;resize:vertical"></textarea>
 <div style="display:flex;gap:8px;margin-top:10px">
 <div style="flex:1"><div style="font-size:12px;color:var(--sub);margin-bottom:4px">原内容</div><input id="rd-batch-from" placeholder="lineage" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000"></div>
@@ -664,11 +664,11 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div id="rd-edit-modal" hidden style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:999">
 <div class="card" style="width:min(420px,90vw);padding:16px;margin:0">
 <div id="rd-edit-title" style="font-weight:600;color:#000;margin-bottom:10px"></div>
-<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px"><span style="font-size:12px;color:var(--sub)">目标文件</span><button class="icon-btn" data-fs="rd-edit-target" title="浏览选择文件"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button></div>
+<div id="rd-edit-target-label" data-fs="rd-edit-target" title="点击选择文件" style="display:flex;align-items:center;gap:6px;margin-bottom:4px;cursor:pointer"><button class="icon-btn" title="浏览选择文件"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button><span style="font-size:12px;color:var(--sub)">目标文件</span></div>
 <input id="rd-edit-target" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000">
 <div id="rd-edit-ft-box" style="display:flex;gap:8px;margin-top:10px">
-<div style="flex:1;min-width:0"><div id="rd-edit-from-label" style="font-size:12px;color:var(--sub);margin-bottom:4px">原内容</div><input id="rd-edit-from-input" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000"></div>
-<div style="flex:1;min-width:0"><div id="rd-edit-to-label" style="font-size:12px;color:var(--sub);margin-bottom:4px">新内容</div><input id="rd-edit-to-input" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000"></div>
+<div style="flex:1;min-width:0"><div style="display:flex;align-items:center;gap:6px;margin-bottom:4px"><button class="icon-btn" id="rd-edit-from-fs" data-fs="rd-edit-from-input" title="浏览选择文件" hidden><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button><span id="rd-edit-from-label" style="font-size:12px;color:var(--sub)">原内容</span></div><input id="rd-edit-from-input" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000"></div>
+<div style="flex:1;min-width:0"><div style="display:flex;align-items:center;gap:6px;margin-bottom:4px"><button class="icon-btn" id="rd-edit-to-fs" data-fs="rd-edit-to-input" title="浏览选择文件" hidden><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button><span id="rd-edit-to-label" style="font-size:12px;color:var(--sub)">新内容</span></div><input id="rd-edit-to-input" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000"></div>
 </div>
 <div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
 <div id="rd-edit-apps" style="max-height:26vh;overflow:auto;display:flex;flex-direction:column;gap:4px"></div>
@@ -690,6 +690,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <button class="btn-outline" id="fs-up" style="padding:6px 12px;flex-shrink:0">↑ 上级</button>
 <div id="fs-path" style="flex:1;min-width:0;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:12px;color:#000;word-break:break-all"></div>
 </div>
+<input id="fs-q" placeholder="搜索当前目录文件" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px 12px;font-size:13px;color:#000;outline:none;margin-bottom:8px">
 <div id="fs-list" style="flex:1;overflow:auto;min-height:38vh;max-height:52vh;display:flex;flex-direction:column;gap:4px"></div>
 <button class="btn" id="fs-cancel" style="width:100%;margin-top:10px;background:var(--bg);color:var(--sub)">取消</button>
 </div>
@@ -1513,6 +1514,10 @@ function openRdGroupEdit(i){
   const gidx=rdCrules.indexOf(t);
   rdEditIdx=gidx;rdEditKind='c';
   $('rd-edit-title').textContent='编辑内容替换';
+  $('rd-edit-target').style.display='';
+  $('rd-edit-target-label').style.display='';
+  $('rd-edit-from-fs').hidden=true;
+  $('rd-edit-to-fs').hidden=true;
   $('rd-edit-target').value=t.target||'/vendor/etc/selinux/vendor_file_contexts';
   $('rd-edit-from-label').textContent='原内容';
   $('rd-edit-to-label').textContent='新内容';
@@ -1629,7 +1634,12 @@ function openRdEdit(kind,i,hideAdd){
   $('rd-edit-title').textContent=kind==='c'?'编辑内容替换':(kind==='p'?'编辑属性伪装':(kind==='s'?'编辑服务伪装':'编辑文件重定向'));
   const isC=kind==='c';
   $('rd-edit-target').style.display=isC?'':'none';
+  $('rd-edit-target-label').style.display=isC?'':'none';
   if(isC)$('rd-edit-target').value=r.target||'/vendor/etc/selinux/vendor_file_contexts';
+  /* 原/新路径选择器图标: 仅文件重定向 (f) 显示 */
+  const isPath=kind==='f';
+  $('rd-edit-from-fs').hidden=!isPath;
+  $('rd-edit-to-fs').hidden=!isPath;
   const addRuleBtn={c:'＋ 添加内容替换规则',f:'＋ 添加文件重定向规则',s:'＋ 添加服务伪装规则',p:'＋ 添加伪装规则'};
   $('rd-edit-add-rule').textContent=addRuleBtn[kind]||'＋ 添加规则';
   $('rd-edit-add-rule').style.display=hideAdd?'none':'';
@@ -2254,7 +2264,7 @@ $('rf-save').onclick=async()=>{
   catch(e){toast(e.message)}
 };
 // ===== 文件浏览器 (重定向/内容替换路径选择): 点击文件夹图标打开, 选择后回填输入框 =====
-let fsTarget=null,fsCur='/';
+let fsTarget=null,fsCur='/',fsEntries=[],fsQ='';
 async function fsList(path){
   const r=await fetch('/api/fs/list',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path})});
   const d=await r.json().catch(()=>({}));
@@ -2264,17 +2274,20 @@ async function fsList(path){
 function fsPathJoin(base,name){return (base==='/'?'/':base+'/')+name;}
 function fsRender(d){
   fsCur=d.path;
+  fsEntries=d.entries||[];
   $('fs-path').textContent=d.path;
+  const q=fsQ.trim().toLowerCase();
+  const list=fsEntries.filter(e=>!q||e.name.toLowerCase().includes(q));
   const box=$('fs-list');
-  box.innerHTML=(d.entries||[]).map(e=>{
+  box.innerHTML=list.map(e=>{
     const full=fsPathJoin(fsCur,e.name);
     return `<div class="fs-entry" data-path="${esc(full)}" data-dir="${e.dir?1:0}">
 ${e.dir?'<svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>':'<svg viewBox="0 0 24 24"><path d="M6 3h12v18H6z"/><path d="M9 7h6M9 11h6M9 15h4"/></svg>'}
 <span>${esc(e.name)}</span></div>`;
-  }).join('')||'<div class="hint" style="margin:0">空目录</div>';
+  }).join('')||(fsEntries.length?'<div class="hint" style="margin:0">无匹配文件</div>':'<div class="hint" style="margin:0">空目录</div>');
 }
 async function fsOpen(path){try{fsRender(await fsList(path));}catch(e){toast(e.message)}}
-function openFsPicker(target,multiline){fsTarget={id:target,multiline:!!multiline};$('fs-picker-modal').hidden=false;fsOpen('/');}
+function openFsPicker(target,multiline){fsTarget={id:target,multiline:!!multiline};fsQ='';$('fs-q').value='';$('fs-picker-modal').hidden=false;fsOpen('/');}
 document.addEventListener('click',e=>{
   const b=e.target.closest('[data-fs]');
   if(!b)return;
@@ -2288,6 +2301,7 @@ $('fs-up').onclick=()=>{
   const i=p.lastIndexOf('/');
   fsOpen(i<=0?'/':p.slice(0,i));
 };
+$('fs-q').addEventListener('input',e=>{fsQ=e.target.value;fsRender({path:fsCur,entries:fsEntries});});
 $('fs-list').addEventListener('click',e=>{
   const el=e.target.closest('[data-path]');
   if(!el)return;
@@ -2307,7 +2321,7 @@ async function apLoad(){
 function apRender(){
   const q=$('ap-q').value.trim().toLowerCase();
   const list=apData.filter(a=>(apMode==='user'?!a.system:a.system)&&(!q||a.pkg.toLowerCase().includes(q)));
-  $('ap-list').innerHTML=list.map(a=>`<div class="fs-entry" data-pkg="${esc(a.pkg)}"><span>${esc(a.pkg)}</span><span style="color:var(--sub);font-size:11px;flex-shrink:0">uid ${a.uid}</span>${a.system?'<span class="badge" style="flex-shrink:0;background:rgba(142,142,147,.16);color:#636366">系统</span>':''}</div>`).join('')||'<div class="hint" style="margin:0">无匹配应用</div>';
+  $('ap-list').innerHTML=list.map(a=>`<div class="fs-entry" data-pkg="${esc(a.pkg)}"><span>${esc(a.pkg)}</span><span style="flex:0 0 auto;margin-left:auto;color:var(--sub);font-size:11px">uid ${a.uid}</span></div>`).join('')||'<div class="hint" style="margin:0">无匹配应用</div>';
 }
 function openAppPick(kind){
   apPick=kind;apMode='user';
