@@ -667,8 +667,8 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div id="rd-edit-target-label" data-fs="rd-edit-target" title="点击选择文件" style="display:flex;align-items:center;gap:6px;margin-bottom:4px;cursor:pointer"><button class="icon-btn" title="浏览选择文件"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button><span style="font-size:12px;color:var(--sub)">目标文件</span></div>
 <input id="rd-edit-target" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000">
 <div id="rd-edit-ft-box" style="display:flex;gap:8px;margin-top:10px">
-<div style="flex:1;min-width:0"><div style="display:flex;align-items:center;gap:6px;margin-bottom:4px"><button class="icon-btn" id="rd-edit-from-fs" data-fs="rd-edit-from-input" title="浏览选择文件" hidden><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button><span id="rd-edit-from-label" style="font-size:12px;color:var(--sub)">原内容</span></div><input id="rd-edit-from-input" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000"></div>
-<div style="flex:1;min-width:0"><div style="display:flex;align-items:center;gap:6px;margin-bottom:4px"><button class="icon-btn" id="rd-edit-to-fs" data-fs="rd-edit-to-input" title="浏览选择文件" hidden><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button><span id="rd-edit-to-label" style="font-size:12px;color:var(--sub)">新内容</span></div><input id="rd-edit-to-input" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000"></div>
+<div style="flex:1;min-width:0"><div id="rd-edit-from-fs-row" title="点击选择文件" style="display:flex;align-items:center;gap:6px;margin-bottom:4px"><button class="icon-btn" id="rd-edit-from-fs" title="浏览选择文件" hidden><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button><span id="rd-edit-from-label" style="font-size:12px;color:var(--sub)">原内容</span></div><input id="rd-edit-from-input" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000"></div>
+<div style="flex:1;min-width:0"><div id="rd-edit-to-fs-row" title="点击选择文件" style="display:flex;align-items:center;gap:6px;margin-bottom:4px"><button class="icon-btn" id="rd-edit-to-fs" title="浏览选择文件" hidden><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button><span id="rd-edit-to-label" style="font-size:12px;color:var(--sub)">新内容</span></div><input id="rd-edit-to-input" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000"></div>
 </div>
 <div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
 <div id="rd-edit-apps" style="max-height:26vh;overflow:auto;display:flex;flex-direction:column;gap:4px"></div>
@@ -1518,6 +1518,8 @@ function openRdGroupEdit(i){
   $('rd-edit-target-label').style.display='';
   $('rd-edit-from-fs').hidden=true;
   $('rd-edit-to-fs').hidden=true;
+  delete $('rd-edit-from-fs-row').dataset.fs;$('rd-edit-from-fs-row').style.cursor='';
+  delete $('rd-edit-to-fs-row').dataset.fs;$('rd-edit-to-fs-row').style.cursor='';
   $('rd-edit-target').value=t.target||'/vendor/etc/selinux/vendor_file_contexts';
   $('rd-edit-from-label').textContent='原内容';
   $('rd-edit-to-label').textContent='新内容';
@@ -1636,10 +1638,18 @@ function openRdEdit(kind,i,hideAdd){
   $('rd-edit-target').style.display=isC?'':'none';
   $('rd-edit-target-label').style.display=isC?'':'none';
   if(isC)$('rd-edit-target').value=r.target||'/vendor/etc/selinux/vendor_file_contexts';
-  /* 原/新路径选择器图标: 仅文件重定向 (f) 显示 */
+  /* 原/新路径选择器图标: 仅文件重定向 (f) 显示; 整行可点击打开文件管理器 */
   const isPath=kind==='f';
   $('rd-edit-from-fs').hidden=!isPath;
   $('rd-edit-to-fs').hidden=!isPath;
+  const frow=$('rd-edit-from-fs-row'), trow=$('rd-edit-to-fs-row');
+  if(isPath){
+    frow.dataset.fs='rd-edit-from-input';frow.style.cursor='pointer';
+    trow.dataset.fs='rd-edit-to-input';trow.style.cursor='pointer';
+  }else{
+    delete frow.dataset.fs;frow.style.cursor='';
+    delete trow.dataset.fs;trow.style.cursor='';
+  }
   const addRuleBtn={c:'＋ 添加内容替换规则',f:'＋ 添加文件重定向规则',s:'＋ 添加服务伪装规则',p:'＋ 添加伪装规则'};
   $('rd-edit-add-rule').textContent=addRuleBtn[kind]||'＋ 添加规则';
   $('rd-edit-add-rule').style.display=hideAdd?'none':'';
