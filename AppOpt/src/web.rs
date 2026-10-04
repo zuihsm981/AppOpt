@@ -548,14 +548,14 @@ fn suggest_api(req: &Request) -> (u16, String) {
     (200, json!({ "ok": true, "list": list }).to_string())
 }
 
-/// 枚举包名 (读已安装应用缓存, 不再扫 /data/data; 缓存为空时先补一次)
+/// 枚举包名 (读 pkg→(uid,system) 缓存, 不再扫 /data/data; 缓存为空时先补一次)
 fn installed_pkgs() -> Vec<String> {
-    if crate::rw_read_ignore_poison(&APPS_CACHE).is_empty() {
-        refresh_apps_cache();
+    if crate::rw_read_ignore_poison(&PKG_UID_CACHE).is_empty() {
+        refresh_pkg_cache();
     }
-    crate::rw_read_ignore_poison(&APPS_CACHE)
-        .iter()
-        .map(|(p, _, _)| p.clone())
+    crate::rw_read_ignore_poison(&PKG_UID_CACHE)
+        .keys()
+        .cloned()
         .collect()
 }
 
@@ -985,49 +985,44 @@ fn fs_list_api(req: &Request) -> (u16, String) {
 
 // ===== 已安装应用列表 API (隐藏页添加目标应用选择) =====
 
-/// 已安装应用缓存: (pkg, uid, system); 初始化 / packages.list 变化时刷新,
-/// /api/apps 直接读缓存, 不重复读盘。
-pub static APPS_CACHE: RwLock<Vec<(String, i64, bool)>> = RwLock::new(Vec::new());
-/// 全量 包名→uid 表 (packages.list 缓存; 供 waylay 规则表构建, EV_PKG 时随 APPS_CACHE 刷新)
-pub static PKG_UID_CACHE: std::sync::LazyLock<RwLock<HashMap<String, i32>>> =
+/// 全量 包名→(uid, system) 缓存 (packages.list; 初始化 / EV_PKG 时刷新)。
+/// 同时供 waylay 规则表构建 (pkg→uid) 与 /api/apps 应用列表 (应用列表预缓存已移除,
+/// 每次 webui 请求时由本缓存重建)。
+pub static PKG_UID_CACHE: std::sync::LazyLock<RwLock<HashMap<String, (i32, bool)>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
-/// 全量 包名→uid 表读锁 (read guard, deref 到 &HashMap; 替代每次读盘 pkg_to_uid_map)
-pub fn pkg_uid_map() -> std::sync::RwLockReadGuard<'static, HashMap<String, i32>> {
+/// 全量 包名→(uid, system) 表读锁 (read guard, deref 到 &HashMap; 替代每次读盘 pkg_to_uid_map)
+pub fn pkg_uid_map() -> std::sync::RwLockReadGuard<'static, HashMap<String, (i32, bool)>> {
     crate::rw_read_ignore_poison(&PKG_UID_CACHE)
 }
 
-/// 刷新已安装应用缓存 (初始化 / EV_PKG packages.list inotify 时调用)
-pub fn refresh_apps_cache() {
-    let mut apps: Vec<(String, i64, bool)> = Vec::new();
+/// 刷新 pkg→(uid, system) 缓存 (初始化 / EV_PKG packages.list inotify 时调用)
+pub fn refresh_pkg_cache() {
+    let mut m: HashMap<String, (i32, bool)> = HashMap::new();
     if let Ok(content) = std::fs::read_to_string("/data/system/packages.list") {
         for line in content.lines() {
             let mut it = line.split_whitespace();
             let Some(pkg) = it.next() else { continue };
-            let Some(uid) = it.next().and_then(|s| s.parse::<i64>().ok()) else { continue };
+            let Some(uid) = it.next().and_then(|s| s.parse::<i32>().ok()) else { continue };
             if uid <= 0 || uid >= 100000 {
                 continue;   /* 仅当前用户 (与 cpu/waylay uid 表一致) */
             }
             /* 应用类别: 条目末尾标记 @system=系统应用, @null=用户应用 */
             let system = line.trim_end().ends_with("@system");
-            apps.push((pkg.to_string(), uid, system));
+            m.insert(pkg.to_string(), (uid, system));
         }
     }
-    apps.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut uid_map: HashMap<String, i32> = HashMap::with_capacity(apps.len());
-    for (p, u, _) in &apps {
-        uid_map.insert(p.clone(), *u as i32);
-    }
-    *crate::rw_write_ignore_poison(&APPS_CACHE) = apps;
-    *crate::rw_write_ignore_poison(&PKG_UID_CACHE) = uid_map;
+    *crate::rw_write_ignore_poison(&PKG_UID_CACHE) = m;
 }
 
-/// GET /api/apps: 返回已安装应用列表 (读预缓存, 按包名排序)。
+/// GET /api/apps: 每次请求由 pkg→(uid,system) 缓存重建应用列表 (按包名排序)。
 fn apps_json() -> String {
-    let apps = crate::rw_read_ignore_poison(&APPS_CACHE);
-    let arr: Vec<serde_json::Value> = apps
+    let cache = crate::rw_read_ignore_poison(&PKG_UID_CACHE);
+    let mut entries: Vec<(&String, &(i32, bool))> = cache.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    let arr: Vec<serde_json::Value> = entries
         .iter()
-        .map(|(pkg, uid, sys)| json!({ "pkg": pkg, "uid": uid, "system": *sys }))
+        .map(|(pkg, (uid, sys))| json!({ "pkg": pkg, "uid": uid, "system": *sys }))
         .collect();
     json!({ "apps": arr }).to_string()
 }

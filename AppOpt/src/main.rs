@@ -116,7 +116,7 @@ pub(crate) fn pkg_to_uid_map() -> HashMap<String, i32> {
 /// main 下发与 WebUI 保存前校验共用, 避免两套映射漂移。
 pub(crate) fn build_rule_rows(
     all: &[crate::config::WaylayRule],
-    pkguid: &HashMap<String, i32>,
+    pkguid: &HashMap<String, (i32, bool)>,
 ) -> (
     HashMap<i32, Vec<crate::config::WaylayRule>>,
     Vec<(i32, String, String, String, String)>,
@@ -127,10 +127,10 @@ pub(crate) fn build_rule_rows(
         if r.pkg == "*" {
             continue;   /* 全局规则已移除: 不下发内核 (用户态/内核态均无全局段) */
         }
-        let Some(u) = pkguid.get(&r.pkg) else {
+        let Some(&(u, _)) = pkguid.get(&r.pkg) else {
             continue;   /* 未安装包 → 跳过 */
         };
-        tbl.entry(*u).or_default().push(r.clone());
+        tbl.entry(u).or_default().push(r.clone());
     }
     /* vfc 指纹 (red/redpath) — 稳定排序 (同 uid 内按 kind 序) */
     let mut rows: Vec<(i32, String, String, String, String)> = Vec::new();
@@ -570,7 +570,7 @@ impl AppState {
     /// waylay 四功能统一包名 (规则不依赖 packages.list; on_fg 实时查包名) → 无需重建。
     fn rebuild_uid_tables(&mut self) {
         /* 已安装应用列表缓存: packages.list 变化 → 同步刷新 */
-        crate::web::refresh_apps_cache();
+        crate::web::refresh_pkg_cache();
         if let Some(cfg) = self.cfg.as_ref() {
             (self.uid_map, self.pkg_uid) = build_uid_tables(cfg);
         }
@@ -972,8 +972,8 @@ fn main() {
 
     // 初始全量应用 (两种驱动模式都执行: KPM 事件驱动 / 纯用户态)
     state.apply_all();
-    // 预缓存已安装应用列表 (packages.list; 之后 EV_PKG 变化时由 rebuild_uid_tables 刷新)
-    crate::web::refresh_apps_cache();
+    // 预缓存 pkg→(uid,system) 表 (packages.list; 之后 EV_PKG 变化时由 rebuild_uid_tables 刷新)
+    crate::web::refresh_pkg_cache();
     // 初始加载 waylay 配置 (WAYLAY_RULES_NEW + uid→包名缓存 + src/prop 规则; on_fg 直接查缓存)
     state.reload();
 
