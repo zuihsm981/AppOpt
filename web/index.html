@@ -2413,8 +2413,8 @@ async function apLoad(){
 }
 function apRender(){
   const q=$('ap-q').value.trim().toLowerCase();
-  const list=apData.filter(a=>(apMode==='user'?!a.system:a.system)&&(!q||a.pkg.toLowerCase().includes(q)));
-  $('ap-list').innerHTML=list.map(a=>`<div class="fs-entry" data-pkg="${esc(a.pkg)}"><span>${esc(a.pkg)}</span><span style="flex:0 0 auto;margin-left:auto;color:var(--sub);font-size:11px">uid ${a.uid}</span></div>`).join('')||'<div class="hint" style="margin:0">无匹配应用</div>';
+  const list=apData.filter(a=>(apMode==='user'?!a.system:a.system)&&(!q||(a.label||a.pkg).toLowerCase().includes(q)));
+  $('ap-list').innerHTML=list.map(a=>`<div class="fs-entry" data-pkg="${esc(a.pkg)}"><span>${esc(a.system?a.pkg:(a.label||a.pkg))}</span><span style="flex:0 0 auto;margin-left:auto;color:var(--sub);font-size:11px">uid ${a.uid}</span></div>`).join('')||'<div class="hint" style="margin:0">无匹配应用</div>';
 }
 function openAppPick(kind){
   apPick=kind;apMode='user';
