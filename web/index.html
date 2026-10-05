@@ -1751,7 +1751,7 @@ function grpInner(g,gi){
   return `
 <div class="grp-head">
 <svg class="chev" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>
-<span class="grp-name">${esc(g.pkg)}</span>
+<span class="grp-name">${esc(g.label || g.pkg)}</span>
 <span class="grp-count">${g.items.length}</span>
 <button class="icon-btn" data-editapp="${gi}" title="编辑应用">${ICO_EDIT}</button>
 <button class="icon-btn danger" data-delpkg="${gi}" title="删除该应用全部规则">${ICO_TRASH}</button>
@@ -1769,7 +1769,7 @@ ${chipHtml(it.spec.replace(/\s*util_(min|max)=\d+/g,'')) /* 显示剥离 util, �
 }
 function renderRules(){
   const f=$('r-filter').value.trim().toLowerCase();
-  const idx=rulesData.map((g,gi)=>gi).filter(gi=>!f||rulesData[gi].pkg.toLowerCase().includes(f));
+  const idx=rulesData.map((g,gi)=>gi).filter(gi=>!f||((rulesData[gi].label||rulesData[gi].pkg)+' '+rulesData[gi].pkg).toLowerCase().includes(f));
   $('r-filter').placeholder=f?`匹配 ${idx.length}/${rulesData.length} 个应用`:`共 ${rulesData.length} 个应用`;
   const box=$('r-list');
   const shown=new Set(idx);
