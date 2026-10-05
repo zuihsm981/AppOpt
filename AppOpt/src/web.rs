@@ -1006,6 +1006,24 @@ static PKG_LABEL_CACHE: std::sync::LazyLock<RwLock<HashMap<String, String>>> =
 const LABELS_FILE: &str = "./AppOpt.labels.json";
 /// 异步 aapt2 提取进行中 (防并发重复跑)
 static LABEL_EXTRACTING: AtomicBool = AtomicBool::new(false);
+/// aapt2 缺失/spawn 失败只告警一次
+static AAPT2_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// 诊断日志 (stderr 被 nohup 丢弃 → 追加到模块目录 AppOpt.log)
+fn log_err(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("./AppOpt.log") {
+        let _ = writeln!(f, "[AppOpt] {}", msg);
+    }
+}
+
+/// 异步提取期间自动释放 LABEL_EXTRACTING (线程 panic/提前返回兜底, 防止门卡死)
+struct LabelExtractGuard;
+impl Drop for LabelExtractGuard {
+    fn drop(&mut self) {
+        LABEL_EXTRACTING.store(false, Ordering::Release);
+    }
+}
 
 /// aapt2 路径 (Magisk 模块部署): bin/ 优先, 回退模块根目录
 const AAPT2_PATHS: &[&str] = &[
@@ -1068,21 +1086,29 @@ fn apk_for<'a>(pkg: &str, apk_dirs: &'a [(String, String)]) -> Option<&'a str> {
 }
 
 /// aapt2 dump badging 提取应用 label: 优先中文 (zh-rCN → 任意 zh → 默认)。
-/// 以低权限 (shell 2000) + 超时 (3s) + rlimit (CPU/内存/文件数/core) 运行,
+/// 以低权限 (shell 2000, 仅 root) + 超时 (5s) + rlimit (CPU/内存/文件数/core) 运行,
 /// 避免 root 解析不可信 APK 被提权 / 恶意包卡死阻塞。
 fn aapt2_label(apk: &str) -> Option<String> {
     use std::io::Read;
     use std::os::unix::process::CommandExt;
-    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-    let aapt2 = AAPT2_PATHS.iter().find(|p| std::path::Path::new(p).exists())?;
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    let Some(aapt2) = AAPT2_PATHS.iter().find(|p| std::path::Path::new(p).exists()) else {
+        if !AAPT2_WARNED.swap(true, Ordering::AcqRel) {
+            log_err("aapt2 未找到 (期望 /data/adb/modules/AppOpt/bin/aapt2)");
+        }
+        return None;
+    };
     let mut cmd = std::process::Command::new(aapt2);
     cmd.args(["dump", "badging"]).arg(apk);
-    cmd.uid(2000).gid(2000);   /* shell 用户: /data/app apk 可读, 无法访问 AppOpt 配置/内核态 */
+    /* 仅 root 降权到 shell; 非 root 环境按自身身份运行 (避免 setuid EPERM 导致全失败) */
+    if unsafe { libc::geteuid() } == 0 {
+        cmd.uid(2000).gid(2000);
+    }
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::null());
     unsafe {
         cmd.pre_exec(|| {
-            libc::setrlimit(libc::RLIMIT_CPU, &libc::rlimit { rlim_cur: 2u64, rlim_max: 2u64 });
+            libc::setrlimit(libc::RLIMIT_CPU, &libc::rlimit { rlim_cur: 5u64, rlim_max: 5u64 });
             libc::setrlimit(
                 libc::RLIMIT_AS,
                 &libc::rlimit { rlim_cur: 512u64 << 20, rlim_max: 512u64 << 20 },
@@ -1092,7 +1118,15 @@ fn aapt2_label(apk: &str) -> Option<String> {
             Ok(())
         });
     }
-    let mut child = cmd.spawn().ok()?;
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            if !AAPT2_WARNED.swap(true, Ordering::AcqRel) {
+                log_err(&format!("aapt2 spawn 失败: {} (非 root 或权限受限?)", e));
+            }
+            return None;
+        }
+    };
     let deadline = std::time::Instant::now() + TIMEOUT;
     let status = loop {
         match child.try_wait() {
@@ -1100,6 +1134,7 @@ fn aapt2_label(apk: &str) -> Option<String> {
             Ok(None) if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
+                log_err("aapt2 超时被终止 (apk 解析卡死)");
                 return None;
             }
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(15)),
@@ -1229,22 +1264,24 @@ pub fn refresh_pkg_cache() {
     if !pending.is_empty() && !LABEL_EXTRACTING.swap(true, Ordering::AcqRel) {
         let apk_dirs = scan_apk_dirs();
         std::thread::spawn(move || {
+            let _g = LabelExtractGuard;   /* 线程退出/panic 自动释放门 */
             let fresh = extract_labels(&pending, &apk_dirs);
-            if !fresh.is_empty() {
-                crate::rw_write_ignore_poison(&PKG_LABEL_CACHE).extend(fresh.clone());
-                save_label_cache();
-                /* 回填 PKG_UID_CACHE label (仅缺失项) */
-                let mut u = crate::rw_write_ignore_poison(&PKG_UID_CACHE);
-                for (pkg, (_, system, label)) in u.iter_mut() {
-                    if *system || !label.is_empty() {
-                        continue;
-                    }
-                    if let Some(l) = fresh.get(pkg) {
-                        *label = l.clone();
-                    }
+            if fresh.is_empty() {
+                log_err(&format!("label 提取全部失败: {} 个包 (aapt2 缺失/权限/超时?)", pending.len()));
+                return;
+            }
+            crate::rw_write_ignore_poison(&PKG_LABEL_CACHE).extend(fresh.clone());
+            save_label_cache();
+            /* 回填 PKG_UID_CACHE label (仅缺失项) */
+            let mut u = crate::rw_write_ignore_poison(&PKG_UID_CACHE);
+            for (pkg, (_, system, label)) in u.iter_mut() {
+                if *system || !label.is_empty() {
+                    continue;
+                }
+                if let Some(l) = fresh.get(pkg) {
+                    *label = l.clone();
                 }
             }
-            LABEL_EXTRACTING.store(false, Ordering::Release);
         });
     }
 }
