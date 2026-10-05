@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -848,6 +848,7 @@ fn waylay_json() -> String {
             .map(|r| {
                 json!({
                     "pkg": r.pkg,
+                    "label": app_label_of(&r.pkg),
                     "kind": r.kind.tag(),
                     "target": r.target,
                     "from": r.from,
@@ -1014,16 +1015,6 @@ impl Drop for LabelExtractGuard {
     }
 }
 
-/// 诊断日志 (追加到模块目录 AppOpt.log)
-fn log_err(msg: &str) {
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("./AppOpt.log") {
-        let _ = writeln!(f, "[AppOpt] {}", msg);
-    }
-}
-/// aapt2 失败逐条计数 (防刷屏, 只记前 N 条)
-static AAPT2_FAIL_N: AtomicUsize = AtomicUsize::new(0);
-
 /// aapt2 路径 (Magisk 模块部署): bin/ 优先, 回退模块根目录
 const AAPT2_PATHS: &[&str] = &[
     "/data/adb/modules/AppOpt/bin/aapt2",
@@ -1099,22 +1090,9 @@ fn build_aapt2_cmd(aapt2: &str, apk: &str) -> std::process::Command {
 /// 以 daemon 身份 (root) + 超时 (5s) + rlimit 运行。
 fn aapt2_label(apk: &str) -> Option<String> {
     use std::io::Read;
-    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-    let Some(aapt2) = AAPT2_PATHS.iter().find(|p| std::path::Path::new(p).exists()) else {
-        if AAPT2_FAIL_N.fetch_add(1, Ordering::Relaxed) < 3 {
-            log_err("aapt2 未找到 (期望 /data/adb/modules/AppOpt/bin/aapt2)");
-        }
-        return None;
-    };
-    let mut child = match build_aapt2_cmd(aapt2, apk).spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            if AAPT2_FAIL_N.fetch_add(1, Ordering::Relaxed) < 3 {
-                log_err(&format!("aapt2 spawn 失败: {} apk={}", e, apk));
-            }
-            return None;
-        }
-    };
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+    let aapt2 = AAPT2_PATHS.iter().find(|p| std::path::Path::new(p).exists())?;
+    let mut child = build_aapt2_cmd(aapt2, apk).spawn().ok()?;
     /* 等待期间并发 drain stdout/stderr (防管道满 64KB 死锁被超时误杀 — 大应用 badging 输出可超 64KB) */
     let mut so = child.stdout.take();
     let mut se = child.stderr.take();
@@ -1139,9 +1117,6 @@ fn aapt2_label(apk: &str) -> Option<String> {
             Ok(None) if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                if AAPT2_FAIL_N.fetch_add(1, Ordering::Relaxed) < 3 {
-                    log_err(&format!("aapt2 超时被终止 apk={}", apk));
-                }
                 return None;
             }
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(15)),
@@ -1150,19 +1125,8 @@ fn aapt2_label(apk: &str) -> Option<String> {
     };
     let ok = status.success();
     let out = hout.and_then(|h| h.join().ok()).unwrap_or_default();
-    let err = herr.and_then(|h| h.join().ok()).unwrap_or_default();
+    let _ = herr.and_then(|h| h.join().ok());   /* 排空 stderr 防死锁, 内容丢弃 */
     if !ok {
-        if AAPT2_FAIL_N.fetch_add(1, Ordering::Relaxed) < 5 {
-            use std::os::unix::process::ExitStatusExt;
-            let tail: String = String::from_utf8_lossy(&err).chars().take(200).collect();
-            log_err(&format!(
-                "aapt2 退出 code={:?} sig={:?} apk={} :: {}",
-                status.code(),
-                status.signal(),
-                apk,
-                tail
-            ));
-        }
         return None;
     }
     let text = String::from_utf8_lossy(&out);
@@ -1199,7 +1163,6 @@ fn save_label_cache() {
             return;
         }
     }
-    log_err(&format!("label 缓存落盘失败: {} (CWD 不可写?)", LABELS_FILE));
 }
 
 /// 单个未缓存用户包 → label (aapt2; 找不到返回空)
@@ -1275,26 +1238,14 @@ pub fn refresh_pkg_cache() {
             save_label_cache();
         }
     }
-    let pkg_n = m.len();
     *crate::rw_write_ignore_poison(&PKG_UID_CACHE) = m;
 
     /* 缺失 label: 异步并行解析 (不阻塞主循环; 复用单次 /data/app 扫描; 进行中不重复跑) */
     if !pending.is_empty() && !LABEL_EXTRACTING.swap(true, Ordering::AcqRel) {
         let apk_dirs = scan_apk_dirs();
-        log_err(&format!(
-            "refresh_pkg_cache: packages={} pending={} apk_dirs={}",
-            pkg_n,
-            pending.len(),
-            apk_dirs.len()
-        ));
         std::thread::spawn(move || {
             let _g = LabelExtractGuard;   /* 线程退出/panic 自动释放门 */
             let fresh = extract_labels(&pending, &apk_dirs);
-            log_err(&format!(
-                "label 提取完成: {}/{} 成功",
-                fresh.len(),
-                pending.len()
-            ));
             if fresh.is_empty() {
                 return;
             }
