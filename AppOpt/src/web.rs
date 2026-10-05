@@ -1129,6 +1129,23 @@ fn aapt2_label(apk: &str) -> Option<String> {
             return None;
         }
     };
+    /* 等待期间并发 drain stdout/stderr (防管道满 64KB 死锁被超时误杀 — 大应用 badging 输出可超 64KB) */
+    let mut so = child.stdout.take();
+    let mut se = child.stderr.take();
+    let hout = so
+        .take()
+        .map(|mut s| std::thread::spawn(move || {
+            let mut v = Vec::new();
+            let _ = s.read_to_end(&mut v);
+            v
+        }));
+    let herr = se
+        .take()
+        .map(|mut s| std::thread::spawn(move || {
+            let mut v = Vec::new();
+            let _ = s.read_to_end(&mut v);
+            v
+        }));
     let deadline = std::time::Instant::now() + TIMEOUT;
     let status = loop {
         match child.try_wait() {
@@ -1146,14 +1163,8 @@ fn aapt2_label(apk: &str) -> Option<String> {
         }
     };
     let ok = status.success();
-    let mut out = Vec::new();
-    let mut err = Vec::new();
-    if let Some(mut so) = child.stdout.take() {
-        let _ = so.read_to_end(&mut out);
-    }
-    if let Some(mut se) = child.stderr.take() {
-        let _ = se.read_to_end(&mut err);
-    }
+    let out = hout.and_then(|h| h.join().ok()).unwrap_or_default();
+    let err = herr.and_then(|h| h.join().ok()).unwrap_or_default();
     if !ok {
         if AAPT2_FAIL_N.fetch_add(1, Ordering::Relaxed) < 5 {
             let tail: String = String::from_utf8_lossy(&err).chars().take(200).collect();
