@@ -156,6 +156,9 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 .rr-uclamp-del{margin-left:auto}
 .rr-uclamp-row .label{font-size:12px;font-weight:600;color:var(--fg);white-space:nowrap}
 .uclamp-chips{display:flex;gap:8px;flex-wrap:wrap}
+/* 隐藏页功能 chip: 2 列网格, 文件名伪装与系统属性伪装上下对齐 (同列) */
+#w-seg{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+#w-seg button{width:100%}
 .uclamp-chips button{padding:7px 12px;border-radius:999px;font-size:12px;background:rgba(118,118,128,.12);transition:all .15s;cursor:pointer;min-width:56px;text-align:center}
 .uclamp-chips button.on{background:var(--blue);color:#fff;font-weight:600}
 .uclamp-custom{width:110px;padding:7px 10px;border-radius:999px;font-size:12px;background:var(--bg);border:1px solid var(--border);outline:none;font-family:inherit;color:var(--fg);text-align:center}
@@ -260,7 +263,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 </div>
 </div>
 <div class="uclamp-chips" id="w-seg" style="margin-bottom:8px">
-<button data-v="srv" class="on">系统服务伪装</button><button data-v="prop">系统属性伪装</button><button data-v="red">文件内容替换</button><button data-v="redpath">重定向文件</button>
+<button data-v="srv" class="on">系统服务伪装</button><button data-v="prop">系统属性伪装</button><button data-v="red">文件内容替换</button><button data-v="name">文件名伪装</button><button data-v="redpath">路径重定向</button>
 </div>
 </section>
 
@@ -386,17 +389,35 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <section id="page-w-redpath" class="page">
 <div class="navbar">
 <button class="back" data-wpback="redpath"><svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg>后退</button>
-<span class="nav-title">重定向文件</span>
+<span class="nav-title">路径重定向</span>
 </div>
 <div class="panel">
 <div class="card">
-<button class="btn" id="rd-fshow" style="width:100%;margin-bottom:8px">＋ 添加文件重定向规则</button>
-<button class="btn" id="rdf-allapps" style="width:100%;margin-bottom:8px;background:var(--bg);color:var(--sub)">同步应用到全部重定向文件规则</button>
+<button class="btn" id="rd-fshow" style="width:100%;margin-bottom:8px">＋ 添加路径重定向规则</button>
+<button class="btn" id="rdf-allapps" style="width:100%;margin-bottom:8px;background:var(--bg);color:var(--sub)">同步应用到全部路径重定向规则</button>
 <div class="seg" id="w-redpath-tabs" style="margin-top:8px">
 <button data-v="apps" class="on">应用列表</button><button data-v="rules">规则列表</button>
 </div>
 <div id="w-redpath-apps" style="margin-top:8px"><div id="rd-frules"></div></div>
 <div id="w-redpath-rules" style="margin-top:8px" hidden></div>
+</div>
+</div>
+</section>
+
+<section id="page-w-name" class="page">
+<div class="navbar">
+<button class="back" data-wpback="name"><svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg>后退</button>
+<span class="nav-title">文件名伪装</span>
+</div>
+<div class="panel">
+<div class="card">
+<button class="btn" id="rd-nshow" style="width:100%;margin-bottom:8px">＋ 添加文件名伪装规则</button>
+<button class="btn" id="rdn-allapps" style="width:100%;margin-bottom:8px;background:var(--bg);color:var(--sub)">同步应用到全部文件名伪装规则</button>
+<div class="seg" id="w-name-tabs" style="margin-top:8px">
+<button data-v="apps" class="on">应用列表</button><button data-v="rules">规则列表</button>
+</div>
+<div id="w-name-apps" style="margin-top:8px"><div id="rd-name-rules"></div></div>
+<div id="w-name-rules" style="margin-top:8px" hidden></div>
 </div>
 </div>
 </section>
@@ -577,14 +598,39 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <button class="btn" id="rd-fgroup-close" style="width:100%;margin-top:14px">关闭</button>
 </div>
 </div>
+<div id="rd-name-modal" hidden style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:1000">
+<div class="card" style="width:min(440px,92vw);padding:16px;margin:0">
+<div style="font-weight:600;color:#000;margin-bottom:10px">添加文件名伪装规则</div>
+<div data-fs="rd-name-target" title="点击选择文件" style="display:flex;align-items:center;gap:6px;margin-bottom:4px;cursor:pointer"><button class="icon-btn" title="浏览选择文件"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button><span style="font-size:12px;color:var(--sub)">目标文件</span></div>
+<input id="rd-name-target" placeholder="/vendor/etc/selinux/vendor_file_contexts" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000">
+<div style="font-size:12px;color:var(--sub);margin-bottom:4px;margin-top:10px">原文件名</div>
+<input id="rd-name-from" readonly style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#999">
+<div style="font-size:12px;color:var(--sub);margin-bottom:4px;margin-top:10px">新文件名</div>
+<input id="rd-name-to" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000">
+<div style="font-size:11px;color:var(--sub);margin-top:6px">目标文件选择后原文件名自动填充; 仅重命名文件名 (目录不变)</div>
+<div id="rd-name-apps-section">
+<div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
+<div style="font-size:12px;color:var(--sub);margin-bottom:6px">目标应用</div>
+<div class="sg-wrap"><input id="rd-name-app-input" placeholder="输入包名添加目标应用" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:9px 12px;font-size:14px;color:#000;outline:none"><div class="sg-box" id="rd-name-sg" hidden></div></div>
+<button class="btn" id="rd-name-app-btn" data-pick="name" style="width:100%;margin-top:8px">＋ 添加应用</button>
+<div id="rd-name-apps" style="margin-top:8px"></div>
+</div>
+</div>
+<div id="rd-name-err" hidden style="color:#e5484d;font-size:12px;margin-top:10px"></div>
+<div style="display:flex;gap:8px;margin-top:14px">
+<button class="btn" id="rd-name-ok" style="flex:1">添加</button>
+<button class="btn" id="rd-name-close" style="flex:1;background:var(--bg);color:var(--sub)">关闭</button>
+</div>
+</div>
+</div>
 <div id="rd-add-modal" hidden style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:1000">
 <div class="card" style="width:min(420px,90vw);padding:16px;margin:0">
 <div style="font-weight:600;color:#000;margin-bottom:10px">添加内容替换规则</div>
 <div data-fs="rd-ctarget" title="点击选择文件" style="display:flex;align-items:center;gap:6px;margin-bottom:4px;cursor:pointer"><button class="icon-btn" title="浏览选择文件"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button><span style="font-size:12px;color:var(--sub)">目标文件</span></div>
 <input id="rd-ctarget" placeholder="/vendor/etc/selinux/vendor_file_contexts" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000">
 <div style="display:flex;gap:8px;margin-top:10px">
-<div style="flex:1"><div style="font-size:12px;color:var(--sub);margin-bottom:4px">原内容</div><input id="rd-cfrom" maxlength="32" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000"></div>
-<div style="flex:1"><div style="font-size:12px;color:var(--sub);margin-bottom:4px">新内容</div><input id="rd-cto" maxlength="32" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000"></div>
+<div style="flex:1"><div style="font-size:12px;color:var(--sub);margin-bottom:4px">原内容</div><input id="rd-cfrom" data-content data-content-title="原内容" readonly placeholder="点击编辑内容" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000;cursor:pointer"></div>
+<div style="flex:1"><div style="font-size:12px;color:var(--sub);margin-bottom:4px">新内容</div><input id="rd-cto" data-content data-content-title="新内容" readonly placeholder="点击编辑内容" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000;cursor:pointer"></div>
 </div>
 <div style="font-size:11px;color:var(--sub);margin-top:6px">原/新字符数需一致 (ASCII ≤64)</div>
 <div id="rd-add-apps-section">
@@ -608,8 +654,8 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div data-fs="rd-batch-targets" data-fs-multi="1" title="点击选择文件" style="display:flex;align-items:center;gap:6px;margin-bottom:6px;cursor:pointer"><button class="icon-btn" title="浏览选择文件"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button><span style="font-size:12px;color:var(--sub)">目标文件（每行一个路径）</span></div>
 <textarea id="rd-batch-targets" rows="5" placeholder="/vendor/etc/selinux/vendor_hwservice_contexts&#10;/vendor/etc/selinux/vendor_file_contexts&#10;/vendor/etc/selinux/vendor_file" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000;resize:vertical"></textarea>
 <div style="display:flex;gap:8px;margin-top:10px">
-<div style="flex:1"><div style="font-size:12px;color:var(--sub);margin-bottom:4px">原内容</div><input id="rd-batch-from" placeholder="lineage" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000"></div>
-<div style="flex:1"><div style="font-size:12px;color:var(--sub);margin-bottom:4px">新内容</div><input id="rd-batch-to" placeholder="hyperos" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000"></div>
+<div style="flex:1"><div style="font-size:12px;color:var(--sub);margin-bottom:4px">原内容</div><input id="rd-batch-from" data-content data-content-title="原内容" readonly placeholder="点击编辑内容" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000;cursor:pointer"></div>
+<div style="flex:1"><div style="font-size:12px;color:var(--sub);margin-bottom:4px">新内容</div><input id="rd-batch-to" data-content data-content-title="新内容" readonly placeholder="点击编辑内容" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:12px;color:#000;cursor:pointer"></div>
 </div>
 <div id="rd-batch-apps-section">
 <div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
@@ -695,6 +741,17 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <button class="btn" id="ap-cancel" style="width:100%;margin-top:10px;background:var(--bg);color:var(--sub)">取消</button>
 </div>
 </div>
+<div id="rd-content-modal" hidden style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:1001">
+<div class="card" style="width:min(480px,92vw);padding:16px;margin:0;display:flex;flex-direction:column">
+<div style="font-weight:600;color:#000;margin-bottom:10px" id="rd-content-title">编辑内容</div>
+<textarea id="rd-content-area" rows="8" placeholder="输入内容" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px;font-size:14px;color:#000;resize:vertical;min-height:38vh;outline:none"></textarea>
+<div style="font-size:11px;color:var(--sub);margin-top:6px" id="rd-content-hint">内容等长 ASCII (≤64)</div>
+<div style="display:flex;gap:8px;margin-top:12px">
+<button class="btn" id="rd-content-ok" style="flex:1">确定</button>
+<button class="btn" id="rd-content-cancel" style="flex:1;background:var(--bg);color:var(--sub)">取消</button>
+</div>
+</div>
+</div>
 <script>
 const uniq=(a)=>[...new Set(a)];
 const $=id=>document.getElementById(id);
@@ -759,9 +816,19 @@ function renderRdCrules(){
   renderRdCRuleList();
 }
 function renderRdFrules(){
-  /* 主列表: 生效应用 (应用 + 编辑 + 删除) */
-  $('rd-frules').innerHTML=appRowsHtml(rdFrules,'fapp','faedit','fadel','');
+  /* 主列表: 路径重定向生效应用 (from/to basename 同名) */
+  $('rd-frules').innerHTML=appRowsHtml(rdFrules.filter(r=>!isNameRule(r)),'fapp','faedit','fadel','');
   renderRdFRuleList();
+  renderRdNameRules();
+  renderRdNameRuleList();
+}
+/* 文件名伪装: 生效应用列表 (from/to basename 不同名) + 规则列表 */
+function renderRdNameRules(){
+  $('rd-name-rules').innerHTML=appRowsHtml(rdFrules.filter(isNameRule),'fapp','faedit','fadel','');
+}
+function renderRdNameRuleList(){
+  const box=$('w-name-rules');if(!box)return;
+  box.innerHTML=rdFrules.filter(isNameRule).map((r,i)=>wlRuleRow(r,i,'rdfrule')).join('')||'<div class="hint">暂无规则</div>';
 }
 /* 组弹层: 该组规则 (图标 + from/to + 编辑/删除) */
 let rdFGroupRoot='';
@@ -895,8 +962,9 @@ $('wp-apps-modal-list').addEventListener('click',e=>{
 });
 // ===== 为所有规则同步应用: 点击直接取该功能全部规则的目标应用并集, 同步到每条规则 =====
 // (不再弹窗: 如 a 规则={1}, b 规则={2}, c 规则={3} → 点击后全部 = {1,2,3})
-const allAppsNames={srv:'系统服务伪装',prop:'系统属性伪装',red:'文件内容替换',redpath:'重定向文件'};
-const allAppsListOf=(kind)=>kind==='srv'?wlRules:kind==='prop'?wlPropRules:kind==='red'?rdCrules:rdFrules;
+const allAppsNames={srv:'系统服务伪装',prop:'系统属性伪装',red:'文件内容替换',redpath:'路径重定向',name:'文件名伪装'};
+const isNameRule=r=>baseName(r.from)!==baseName(r.to);   /* 文件名伪装: from/to basename 不同名 */
+const allAppsListOf=(kind)=>kind==='srv'?wlRules:kind==='prop'?wlPropRules:kind==='red'?rdCrules:kind==='redpath'?rdFrules.filter(r=>!isNameRule(r)):rdFrules.filter(isNameRule);
 function allAppsSync(kind){
   const list=allAppsListOf(kind);
   if(!list.length){toast('当前无'+allAppsNames[kind]+'规则');return}
@@ -914,6 +982,7 @@ $('sv-allapps').onclick=()=>allAppsSync('srv');
 $('wp-allapps').onclick=()=>allAppsSync('prop');
 $('rd-allapps').onclick=()=>allAppsSync('red');
 $('rdf-allapps').onclick=()=>allAppsSync('redpath');
+$('rdn-allapps').onclick=()=>allAppsSync('name');
 $('wp-add-apps').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(b){wpAddTmp.splice(+b.dataset.i,1);renderWpApps();return}const h=e.target.closest('.grp-head');if(h)h.parentElement.classList.toggle('open');});
 $('rd-crules').addEventListener('click',e=>{
   const ae=e.target.closest('button[data-aedit]');
@@ -940,6 +1009,14 @@ $('rd-frules').addEventListener('click',e=>{
   if(ae){const app=uniq(rdFrules.flatMap(r=>r.apps||[]))[+ae.dataset.faedit];const idx=rdFrules.findIndex(r=>(r.apps||[]).includes(app));if(idx>=0){rdEditFromApp=app;openRdEdit('f',idx);}return}
   const ad=e.target.closest('button[data-fadel]');
   if(ad){const app=uniq(rdFrules.flatMap(r=>r.apps||[]))[+ad.dataset.fadel];if(!app)return;rdFrules.forEach(r=>{if(r.apps)r.apps=r.apps.filter(x=>x!==app)});rdFrules=rdFrules.filter(r=>!(r.apps&&!r.apps.length&&!r.global));renderRdFrules();wlSaveNow();return}
+  const h=e.target.closest('[data-fapp]');
+  if(h)openFGroupsLayer(h.dataset.fapp);
+});
+$('rd-name-rules').addEventListener('click',e=>{
+  const ae=e.target.closest('button[data-faedit]');
+  if(ae){const app=uniq(rdFrules.filter(isNameRule).flatMap(r=>r.apps||[]))[+ae.dataset.faedit];const idx=rdFrules.findIndex(r=>(r.apps||[]).includes(app));if(idx>=0){rdEditFromApp=app;openRdEdit('f',idx);}return}
+  const ad=e.target.closest('button[data-fadel]');
+  if(ad){const app=uniq(rdFrules.filter(isNameRule).flatMap(r=>r.apps||[]))[+ad.dataset.fadel];if(!app)return;rdFrules.forEach(r=>{if(r.apps)r.apps=r.apps.filter(x=>x!==app)});rdFrules=rdFrules.filter(r=>!(r.apps&&!r.apps.length&&!r.global));renderRdFrules();wlSaveNow();return}
   const h=e.target.closest('[data-fapp]');
   if(h)openFGroupsLayer(h.dataset.fapp);
 });
@@ -982,6 +1059,34 @@ $('rd-cadd').onclick=()=>{
   $('rd-add-err').textContent='已添加';$('rd-add-err').style.color='#12a150';$('rd-add-err').hidden=false;
 };
 $('rd-fshow').onclick=()=>{$('rd-field-modal').hidden=false;rdpTmp=[];$('rd-ffrom').value='';$('rd-fto').value='';$('rd-field-err').hidden=true;renderRdpApps();};
+/* ===== 文件名伪装规则 (目标文件 + 原文件名只读自动填充 + 新文件名) ===== */
+let rdNameTmp=[];
+function renderRdNameApps(){$('rd-name-apps').innerHTML=rdNameTmp.length?rdNameTmp.map((a,i)=>grow(a,i)).join(''):'<div class="hint">未添加目标应用</div>';}
+function rdNameSyncFrom(){
+  const v=$('rd-name-target').value.trim();
+  const parts=v.split('/').filter(Boolean);
+  $('rd-name-from').value=parts.length?parts[parts.length-1]:v;
+}
+$('rd-name-target').addEventListener('input',rdNameSyncFrom);
+$('rd-nshow').onclick=()=>{$('rd-name-modal').hidden=false;rdNameTmp=[];$('rd-name-target').value='';$('rd-name-from').value='';$('rd-name-to').value='';$('rd-name-err').hidden=true;renderRdNameApps();};
+$('rd-name-close').onclick=()=>{$('rd-name-modal').hidden=true;};
+$('rd-name-modal').addEventListener('click',e=>{if(e.target.id==='rd-name-modal')$('rd-name-modal').hidden=true;});
+function rdNameAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!rdNameTmp.includes(pkg))rdNameTmp.push(pkg);$('rd-name-app-input').value='';$('rd-name-sg').hidden=true;renderRdNameApps();}
+suggest_bind($('rd-name-app-input'),$('rd-name-sg'),{onpick:rdNameAddApp});
+$('rd-name-apps').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(b){rdNameTmp.splice(+b.dataset.i,1);renderRdNameApps();return}const h=e.target.closest('.grp-head');if(h)h.parentElement.classList.toggle('open');});
+$('rd-name-ok').onclick=()=>{
+  const tg=$('rd-name-target').value.trim();
+  const nn=$('rd-name-to').value.trim();
+  if(!tg.startsWith('/')||tg.length>127){$('rd-name-err').textContent='目标文件需以 / 开头 (≤127)';$('rd-name-err').hidden=false;return}else{$('rd-name-err').hidden=true}
+  if(!nn||nn.includes('/')||nn.length>255||nn.split('').some(c=>c.charCodeAt(0)<0x20||c.charCodeAt(0)===0x7f)){$('rd-name-err').textContent='新文件名需为非空文件名 (不含 /, ≤255)';$('rd-name-err').hidden=false;return}else{$('rd-name-err').hidden=true}
+  if(!rdNameTmp.length){$('rd-name-err').textContent='无法保存: 需要添加目标应用';$('rd-name-err').hidden=false;return}else{$('rd-name-err').hidden=true}
+  const i=tg.lastIndexOf('/');
+  const dir=i>0?tg.slice(0,i):'/';
+  rdFrules.push({from:tg,to:dir+'/'+nn,apps:rdNameTmp.slice()});
+  $('rd-name-target').value='';$('rd-name-from').value='';$('rd-name-to').value='';
+  renderRdNameApps();renderRdFrules();wlSaveNow();
+  $('rd-name-err').textContent='已添加';$('rd-name-err').style.color='#12a150';$('rd-name-err').hidden=false;
+};
 $('rd-field-close').onclick=()=>{closeRdField();};
 function closeRdField(){
   $('rd-field-modal').hidden=true;
@@ -1071,9 +1176,9 @@ function renderRdCRuleList(){
 function renderRdFRuleList(){
   const box=$('w-redpath-rules');if(!box)return;
   rdFrules=mergeWlRules(rdFrules,false);
-  box.innerHTML=rdFrules.map((r,i)=>wlRuleRow(r,i,'rdfrule')).join('')||'<div class="hint">暂无规则</div>';
+  box.innerHTML=rdFrules.filter(r=>!isNameRule(r)).map((r,i)=>wlRuleRow(r,i,'rdfrule')).join('')||'<div class="hint">暂无规则</div>';
 }
-[['w-srv-tabs','w-srv-apps','w-srv-rules'],['w-prop-tabs','w-prop-apps','w-prop-rules'],['w-red-tabs','w-red-apps','w-red-rules'],['w-redpath-tabs','w-redpath-apps','w-redpath-rules']].forEach(([segId,appsId,rulesId])=>{
+[['w-srv-tabs','w-srv-apps','w-srv-rules'],['w-prop-tabs','w-prop-apps','w-prop-rules'],['w-red-tabs','w-red-apps','w-red-rules'],['w-redpath-tabs','w-redpath-apps','w-redpath-rules'],['w-name-tabs','w-name-apps','w-name-rules']].forEach(([segId,appsId,rulesId])=>{
   const seg=$(segId),apps=$(appsId),rules=$(rulesId);
   if(!seg)return;
   seg.addEventListener('click',e=>{
@@ -1483,8 +1588,10 @@ function openRdGroupEdit(i){
   $('rd-edit-add-rule').textContent='＋ 添加内容替换规则';
   $('rd-edit-add-rule').style.display='';
   $('rd-edit-ft-box').style.flexDirection='row';
-  $('rd-edit-from-input').value=t.from;$('rd-edit-from-input').readOnly=false;
-  $('rd-edit-to-input').value=t.to;$('rd-edit-to-input').readOnly=false;
+  $('rd-edit-from-input').value=t.from;$('rd-edit-from-input').readOnly=true;
+  $('rd-edit-to-input').value=t.to;$('rd-edit-to-input').readOnly=true;
+  $('rd-edit-from-input').dataset.content='1';$('rd-edit-from-input').dataset.contentTitle='原内容';
+  $('rd-edit-to-input').dataset.content='1';$('rd-edit-to-input').dataset.contentTitle='新内容';
   rdEditTmp=(t.apps||[]).slice();rdEditRender();
   $('rd-edit-msg').textContent='';
   $('rd-edit-modal').hidden=false;
@@ -1613,8 +1720,16 @@ function openRdEdit(kind,i,hideAdd){
   $('rd-edit-ft-box').style.flexDirection=(kind==='f')?'column':'row';
   $('rd-edit-from-label').textContent=kind==='c'?'原内容':(kind==='s'?'原服务名':(kind==='p'?'原属性名':'原路径'));
   $('rd-edit-to-label').textContent=kind==='c'?'新内容':(kind==='s'?'新服务名':(kind==='p'?'新属性名':'新路径'));
-  $('rd-edit-from-input').value=r.from;$('rd-edit-from-input').readOnly=false;
-  $('rd-edit-to-input').value=r.to;$('rd-edit-to-input').readOnly=false;
+  $('rd-edit-from-input').value=r.from;$('rd-edit-from-input').readOnly=isC;
+  $('rd-edit-to-input').value=r.to;$('rd-edit-to-input').readOnly=isC;
+  /* 内容替换 (c): 原/新内容改为点击弹大编辑窗 (只读显示 + data-content 触发) */
+  if(isC){
+    $('rd-edit-from-input').dataset.content='1';$('rd-edit-from-input').dataset.contentTitle='原内容';
+    $('rd-edit-to-input').dataset.content='1';$('rd-edit-to-input').dataset.contentTitle='新内容';
+  }else{
+    delete $('rd-edit-from-input').dataset.content;delete $('rd-edit-from-input').dataset.contentTitle;
+    delete $('rd-edit-to-input').dataset.content;delete $('rd-edit-to-input').dataset.contentTitle;
+  }
   rdEditTmp=(r.apps||[]).slice();rdEditRender();
   $('rd-edit-msg').textContent='';
   $('rd-edit-modal').hidden=false;
@@ -2277,6 +2392,7 @@ $('fs-list').addEventListener('click',e=>{
   if(inp){
     if(fsTarget.multiline){const v=inp.value.trim();inp.value=v?(v+'\n'+el.dataset.path):el.dataset.path;}
     else inp.value=el.dataset.path;
+    inp.dispatchEvent(new Event('input'));   /* 触发目标输入的 input 监听 (如 原文件名自动填充) */
   }
   $('fs-picker-modal').hidden=true;
 });
@@ -2321,8 +2437,30 @@ $('ap-list').addEventListener('click',e=>{
   else if(apPick==='batch'){if(!rdBatchTmp.includes(pkg))rdBatchTmp.push(pkg);renderRdApps();}
   else if(apPick==='field'){if(!rdpTmp.includes(pkg))rdpTmp.push(pkg);renderRdpApps();}
   else if(apPick==='edit'){if(!rdEditTmp.includes(pkg))rdEditTmp.push(pkg);rdEditRender();}
+  else if(apPick==='name'){if(!rdNameTmp.includes(pkg))rdNameTmp.push(pkg);renderRdNameApps();}
   else if(apPick==='mr'){$('mr-pkg').value=pkg;}
   $('app-pick-modal').hidden=true;
+});
+// ===== 内容替换 原/新内容大编辑窗 (点击只读输入框弹出) =====
+let rdContentTarget=null;
+function openRdContent(id,title){
+  rdContentTarget=id;
+  const inp=$(id);
+  $('rd-content-title').textContent=title||'编辑内容';
+  $('rd-content-area').value=inp?inp.value:'';
+  $('rd-content-modal').hidden=false;
+}
+$('rd-content-ok').onclick=()=>{
+  if(rdContentTarget){const inp=$(rdContentTarget);if(inp)inp.value=$('rd-content-area').value;}
+  $('rd-content-modal').hidden=true;
+};
+$('rd-content-cancel').onclick=()=>{$('rd-content-modal').hidden=true;};
+$('rd-content-modal').addEventListener('click',e=>{if(e.target.id==='rd-content-modal')$('rd-content-modal').hidden=true;});
+document.addEventListener('click',e=>{
+  const t=e.target.closest('[data-content]');
+  if(!t)return;
+  e.preventDefault();
+  openRdContent(t.id,t.dataset.contentTitle);
 });
 startStat();
 </script>
