@@ -978,7 +978,7 @@ function allAppsSync(kind){
   else if(kind==='red')renderRdCrules();
   else renderRdFrules();
   wlSaveNow();
-  toast('已同步: 全部'+allAppsNames[kind]+'规则目标应用 = '+union.join(', '));
+  toast('已同步规则');
 }
 $('sv-allapps').onclick=()=>allAppsSync('srv');
 $('wp-allapps').onclick=()=>allAppsSync('prop');
