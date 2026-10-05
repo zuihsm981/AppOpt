@@ -45,7 +45,20 @@ pub(crate) fn write_global_refresh_defaults(path: &str, active: i32, idle: i32) 
     if !has("refresh_idle") {
         pre.push(format!("refresh_idle={}", idle));
     }
-    if !has("refresh_timeout") {
+    /* 文件已保存 活跃==空闲 (refresh_active == refresh_idle) → 不补写 refresh_timeout,
+     * 与 refresh_set_config 同率保存删行保持一致 (避免重启把超时默认补回) */
+    let val_of = |k: &str| -> Option<String> {
+        content.lines().find_map(|l| {
+            let t = l.trim();
+            let (kk, v) = t.split_once('=')?;
+            (kk.trim() == k).then(|| v.trim().to_string())
+        })
+    };
+    let file_same = match (val_of("refresh_active"), val_of("refresh_idle")) {
+        (Some(a), Some(i)) => a == i,
+        _ => false,
+    };
+    if !has("refresh_timeout") && !file_same {
         pre.push("refresh_timeout=30".to_string());
     }
     if pre.is_empty() {
@@ -536,6 +549,7 @@ pub fn refresh_set_config(timeout: i32, active: &str, idle: &str) {
     let mut found_timeout = false;
     let mut found_active = false;
     let mut found_idle = false;
+    let same = active == idle;   /* 活跃==空闲: 不再保存 refresh_timeout */
 
     let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
     for line in lines.iter_mut() {
@@ -543,8 +557,10 @@ pub fn refresh_set_config(timeout: i32, active: &str, idle: &str) {
         let Some((k, _v)) = trimmed.split_once('=') else { continue };
         match k.trim() {
             "refresh_timeout" => {
-                *line = format!("refresh_timeout={}", timeout);
                 found_timeout = true;
+                if !same {
+                    *line = format!("refresh_timeout={}", timeout);
+                }
             }
             "refresh_active" => {
                 *line = format!("refresh_active={}", active);
@@ -556,6 +572,11 @@ pub fn refresh_set_config(timeout: i32, active: &str, idle: &str) {
             }
             _ => {}
         }
+    }
+    if same {
+        // 活跃==空闲: 移除旧 refresh_timeout 行, 且不补写
+        lines.retain(|l| !l.trim().starts_with("refresh_timeout="));
+        found_timeout = true;
     }
     // 缺失字段插头部 (与 write_global_refresh_defaults 一致), 保持分区整齐
     let missing: Vec<String> = [
@@ -615,8 +636,13 @@ pub fn refresh_add_app(pkg: &str, timeout: i32, active: &str, idle: &str) {
     let path = config_path();
     let content = fs::read_to_string(&path).unwrap_or_default();
     let mut lines: Vec<String> = content.lines().map(String::from).collect();
-    // 新格式: pkg=refresh-<timeout>-<active>-<idle>
-    let new_line = format!("{}=refresh-{}-{}-{}", pkg, timeout, active, idle);
+    // 新格式: 活跃==空闲 → pkg=refresh-<active>-<idle> (省略超时);
+    //          活跃!=空闲 → pkg=refresh-<timeout>-<active>-<idle>
+    let new_line = if active == idle {
+        format!("{}=refresh-{}-{}", pkg, active, idle)
+    } else {
+        format!("{}=refresh-{}-{}-{}", pkg, timeout, active, idle)
+    };
     let mut found = false;
     for line in lines.iter_mut() {
         if line.trim().starts_with('#') || line.trim().is_empty() {

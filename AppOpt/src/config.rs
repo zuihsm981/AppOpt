@@ -670,7 +670,7 @@ pub fn is_refresh_config_line(line: &str) -> bool {
         if matches!(key.trim(), "refresh_timeout" | "refresh_active" | "refresh_idle") {
             return true;
         }
-        // 应用级刷新率行: pkg=refresh-<t>-<a>-<i> (与 route_pkg_val_line 一致)
+        // 应用级刷新率行: pkg=refresh-<a>-<i>(同) 或 pkg=refresh-<t>-<a>-<i>(异) (与 route_pkg_val_line 一致)
         if value.trim().starts_with("refresh-") {
             return true;
         }
@@ -679,7 +679,7 @@ pub fn is_refresh_config_line(line: &str) -> bool {
 }
 
 /// 解析全局刷新率三字段 (refresh_timeout/active/idle)。
-/// 应用级刷新率 (pkg=refresh-<t>-<a>-<i>) 由 route_pkg_val_line 路由
+/// 应用级刷新率 (pkg=refresh-<a>-<i>(同) / pkg=refresh-<t>-<a>-<i>(异)) 由 route_pkg_val_line 路由
 /// (load_config 主循环与 load_refresh_config 均如此; 旧 refresh_app,逗号 格式已废弃)。
 fn parse_refresh_config_line(
     line: &str,
@@ -710,7 +710,7 @@ fn parse_refresh_config_line(
     }
 }
 
-/// pkg=refresh-<timeout>-<active>-<idle> 前缀路由
+/// pkg=refresh-<active>-<idle> (活跃==空闲) 或 refresh-<timeout>-<active>-<idle> 前缀路由
 fn route_pkg_val_line(
     pkg: &str,
     val: &str,
@@ -718,7 +718,12 @@ fn route_pkg_val_line(
 ) -> bool {
     if !pkg.is_empty() && val.starts_with("refresh-") {
         let parts: Vec<&str> = val.split('-').collect();
-        if parts.len() == 4 && !parts[1].is_empty() {  // ["refresh", t, a, i]
+        if parts.len() == 3 && !parts[1].is_empty() {
+            // 活跃==空闲: refresh-<a>-<i> (保存时省略超时; 该场景超时无意义, 用默认 30)
+            let a = parse_refresh_mode(parts[1]);
+            let i = parse_refresh_mode(parts[2]);
+            apps.insert(pkg.to_string(), (30, a, i));
+        } else if parts.len() == 4 && !parts[1].is_empty() {  // ["refresh", t, a, i]
             let t = parts[1].parse::<i32>().unwrap_or(30).max(1);
             let a = parse_refresh_mode(parts[2]);
             let i = parse_refresh_mode(parts[3]);
