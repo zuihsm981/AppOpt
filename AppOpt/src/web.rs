@@ -1006,17 +1006,6 @@ static PKG_LABEL_CACHE: std::sync::LazyLock<RwLock<HashMap<String, String>>> =
 const LABELS_FILE: &str = "./AppOpt.labels.json";
 /// 异步 aapt2 提取进行中 (防并发重复跑)
 static LABEL_EXTRACTING: AtomicBool = AtomicBool::new(false);
-/// aapt2 缺失/spawn 失败只告警一次
-static AAPT2_WARNED: AtomicBool = AtomicBool::new(false);
-
-/// 诊断日志 (stderr 被 nohup 丢弃 → 追加到模块目录 AppOpt.log)
-fn log_err(msg: &str) {
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("./AppOpt.log") {
-        let _ = writeln!(f, "[AppOpt] {}", msg);
-    }
-}
-
 /// 异步提取期间自动释放 LABEL_EXTRACTING (线程 panic/提前返回兜底, 防止门卡死)
 struct LabelExtractGuard;
 impl Drop for LabelExtractGuard {
@@ -1085,25 +1074,13 @@ fn apk_for<'a>(pkg: &str, apk_dirs: &'a [(String, String)]) -> Option<&'a str> {
     })
 }
 
-/// aapt2 dump badging 提取应用 label: 优先中文 (zh-rCN → 任意 zh → 默认)。
-/// 以低权限 (shell 2000, 仅 root) + 超时 (5s) + rlimit (CPU/内存/文件数/core) 运行,
-/// 避免 root 解析不可信 APK 被提权 / 恶意包卡死阻塞。
-fn aapt2_label(apk: &str) -> Option<String> {
-    use std::io::Read;
+/// aapt2 命令构造: rlimit 防护 (CPU/内存/文件数/core)。
+/// 设备实测 SELinux 仅 root 可执行 aapt2 (shell 域对 magisk_file 无 execute),
+/// 故以 daemon 自身身份 (root) 执行; 由 固定模块路径 + 符号链接校验 + 超时 + rlimit 兜底。
+fn build_aapt2_cmd(aapt2: &str, apk: &str) -> std::process::Command {
     use std::os::unix::process::CommandExt;
-    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-    let Some(aapt2) = AAPT2_PATHS.iter().find(|p| std::path::Path::new(p).exists()) else {
-        if !AAPT2_WARNED.swap(true, Ordering::AcqRel) {
-            log_err("aapt2 未找到 (期望 /data/adb/modules/AppOpt/bin/aapt2)");
-        }
-        return None;
-    };
     let mut cmd = std::process::Command::new(aapt2);
     cmd.args(["dump", "badging"]).arg(apk);
-    /* 仅 root 降权到 shell; 非 root 环境按自身身份运行 (避免 setuid EPERM 导致全失败) */
-    if unsafe { libc::geteuid() } == 0 {
-        cmd.uid(2000).gid(2000);
-    }
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::null());
     unsafe {
@@ -1118,15 +1095,16 @@ fn aapt2_label(apk: &str) -> Option<String> {
             Ok(())
         });
     }
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            if !AAPT2_WARNED.swap(true, Ordering::AcqRel) {
-                log_err(&format!("aapt2 spawn 失败: {} (非 root 或权限受限?)", e));
-            }
-            return None;
-        }
-    };
+    cmd
+}
+
+/// aapt2 dump badging 提取应用 label: 优先中文 (zh-rCN → 任意 zh → 默认)。
+/// 以 daemon 身份 (root) + 超时 (5s) + rlimit 运行。
+fn aapt2_label(apk: &str) -> Option<String> {
+    use std::io::Read;
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    let aapt2 = AAPT2_PATHS.iter().find(|p| std::path::Path::new(p).exists())?;
+    let mut child = build_aapt2_cmd(aapt2, apk).spawn().ok()?;
     let deadline = std::time::Instant::now() + TIMEOUT;
     let status = loop {
         match child.try_wait() {
@@ -1134,7 +1112,6 @@ fn aapt2_label(apk: &str) -> Option<String> {
             Ok(None) if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                log_err("aapt2 超时被终止 (apk 解析卡死)");
                 return None;
             }
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(15)),
@@ -1267,7 +1244,6 @@ pub fn refresh_pkg_cache() {
             let _g = LabelExtractGuard;   /* 线程退出/panic 自动释放门 */
             let fresh = extract_labels(&pending, &apk_dirs);
             if fresh.is_empty() {
-                log_err(&format!("label 提取全部失败: {} 个包 (aapt2 缺失/权限/超时?)", pending.len()));
                 return;
             }
             crate::rw_write_ignore_poison(&PKG_LABEL_CACHE).extend(fresh.clone());
