@@ -336,7 +336,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="panel">
 <div class="card">
 <button class="btn" id="sv-fshow" style="width:100%;margin-bottom:8px">＋ 添加服务伪装规则</button>
-<button class="btn" id="sv-allapps" style="width:100%;margin-bottom:8px;background:var(--bg);color:var(--sub)">为所有系统服务伪装规则添加应用</button>
+<button class="btn" id="sv-allapps" style="width:100%;margin-bottom:8px;background:var(--bg);color:var(--sub)">同步应用到全部系统服务伪装规则</button>
 <div class="seg" id="w-srv-tabs" style="margin-top:8px">
 <button data-v="apps" class="on">应用列表</button><button data-v="rules">规则列表</button>
 </div>
@@ -354,7 +354,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="panel">
 <div class="card">
 <button class="btn" id="wp-fshow" style="width:100%;margin-bottom:8px">＋ 添加伪装规则</button>
-<button class="btn" id="wp-allapps" style="width:100%;margin-bottom:8px;background:var(--bg);color:var(--sub)">为所有系统属性伪装规则添加应用</button>
+<button class="btn" id="wp-allapps" style="width:100%;margin-bottom:8px;background:var(--bg);color:var(--sub)">同步应用到全部系统属性伪装规则</button>
 <div class="seg" id="w-prop-tabs" style="margin-top:8px">
 <button data-v="apps" class="on">应用列表</button><button data-v="rules">规则列表</button>
 </div>
@@ -373,7 +373,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="card">
 <button class="btn" id="rd-cimport" style="width:100%;margin-bottom:8px">⤓ 批量导入</button>
 <button class="btn" id="rd-cshow" style="width:100%;margin-bottom:8px">＋ 添加内容替换规则</button>
-<button class="btn" id="rd-allapps" style="width:100%;margin-bottom:8px;background:var(--bg);color:var(--sub)">为所有文件内容替换规则添加应用</button>
+<button class="btn" id="rd-allapps" style="width:100%;margin-bottom:8px;background:var(--bg);color:var(--sub)">同步应用到全部文件内容替换规则</button>
 <div class="seg" id="w-red-tabs" style="margin-top:8px">
 <button data-v="apps" class="on">应用列表</button><button data-v="rules">规则列表</button>
 </div>
@@ -391,7 +391,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="panel">
 <div class="card">
 <button class="btn" id="rd-fshow" style="width:100%;margin-bottom:8px">＋ 添加文件重定向规则</button>
-<button class="btn" id="rdf-allapps" style="width:100%;margin-bottom:8px;background:var(--bg);color:var(--sub)">为所有重定向文件规则添加应用</button>
+<button class="btn" id="rdf-allapps" style="width:100%;margin-bottom:8px;background:var(--bg);color:var(--sub)">同步应用到全部重定向文件规则</button>
 <div class="seg" id="w-redpath-tabs" style="margin-top:8px">
 <button data-v="apps" class="on">应用列表</button><button data-v="rules">规则列表</button>
 </div>
@@ -486,17 +486,6 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 </div>
 <button class="btn" data-addkind="p" data-addapp="" style="width:100%;margin-top:8px">＋ 添加规则</button>
 <button class="btn" id="wp-apps-modal-close" style="width:100%;margin-top:14px">关闭</button>
-</div>
-</div>
-<div id="all-apps-modal" hidden style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:999">
-<div class="card" style="width:min(420px,90vw);padding:16px;margin:0">
-<div id="all-apps-title" style="font-weight:600;color:#000;margin-bottom:10px"></div>
-<div id="all-apps-list" style="max-height:40vh;overflow:auto;display:flex;flex-direction:column;gap:6px"></div>
-<div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px">
-<div class="sg-wrap"><input id="all-apps-input" placeholder="输入包名添加目标应用" style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:9px 12px;font-size:14px;color:#000;outline:none"><div class="sg-box" id="all-apps-sg" hidden></div></div>
-<button class="btn" id="all-apps-add" style="width:100%;margin-top:8px">＋ 添加应用</button>
-</div>
-<button class="btn" id="all-apps-close" style="width:100%;margin-top:14px">关闭</button>
 </div>
 </div>
 <div id="sr-rules-modal" hidden style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:999">
@@ -904,59 +893,27 @@ $('wp-apps-modal-list').addEventListener('click',e=>{
   }
   wpAppsRender();
 });
-// ===== 为所有规则添加应用: 四个功能共用弹窗 (弹窗内添加的应用加入该功能全部规则) =====
-let allAppsKind='',allAppsTmp=[];
+// ===== 为所有规则同步应用: 点击直接取该功能全部规则的目标应用并集, 同步到每条规则 =====
+// (不再弹窗: 如 a 规则={1}, b 规则={2}, c 规则={3} → 点击后全部 = {1,2,3})
 const allAppsNames={srv:'系统服务伪装',prop:'系统属性伪装',red:'文件内容替换',redpath:'重定向文件'};
-const allAppsList=()=>allAppsKind==='srv'?wlRules:allAppsKind==='prop'?wlPropRules:allAppsKind==='red'?rdCrules:rdFrules;
-function allAppsRenderMain(){
-  if(allAppsKind==='srv')renderWaylayRules();
-  else if(allAppsKind==='prop')renderWpRules();
-  else if(allAppsKind==='red')renderRdCrules();
+const allAppsListOf=(kind)=>kind==='srv'?wlRules:kind==='prop'?wlPropRules:kind==='red'?rdCrules:rdFrules;
+function allAppsSync(kind){
+  const list=allAppsListOf(kind);
+  if(!list.length){toast('当前无'+allAppsNames[kind]+'规则');return}
+  const union=uniq(list.flatMap(r=>r.apps||[]));
+  if(!union.length){toast('当前无目标应用可同步');return}
+  list.forEach(r=>{r.apps=union.slice()});
+  if(kind==='srv')renderWaylayRules();
+  else if(kind==='prop')renderWpRules();
+  else if(kind==='red')renderRdCrules();
   else renderRdFrules();
+  wlSaveNow();
+  toast('已同步: 全部'+allAppsNames[kind]+'规则目标应用 = '+union.join(', '));
 }
-function renderAllApps(){
-  $('all-apps-list').innerHTML=allAppsTmp.length?allAppsTmp.map((a,i)=>grow(a,i)).join(''):'<div class="hint" style="margin:0">未添加目标应用</div>';
-}
-function openAllApps(kind){
-  allAppsKind=kind;
-  $('all-apps-title').textContent='为所有'+allAppsNames[kind]+'规则添加应用';
-  allAppsTmp=[];
-  renderAllApps();
-  $('all-apps-modal').hidden=false;
-}
-function allAppsAdd(pkg){
-  pkg=(pkg||'').trim();if(!pkg)return;
-  if(!allAppsTmp.includes(pkg))allAppsTmp.push(pkg);
-  allAppsList().forEach(r=>{if(!r.global&&!(r.apps||[]).includes(pkg))(r.apps=r.apps||[]).push(pkg)});
-  $('all-apps-input').value='';$('all-apps-sg').hidden=true;
-  renderAllApps();allAppsRenderMain();wlSaveNow();
-}
-function allAppsDel(i){
-  const pkg=allAppsTmp[i];
-  allAppsTmp.splice(i,1);
-  if(pkg){
-    allAppsList().forEach(r=>{if(r.apps)r.apps=r.apps.filter(x=>x!==pkg)});
-    if(allAppsKind==='srv')wlRules=wlRules.filter(r=>(r.apps||[]).length);
-    else if(allAppsKind==='prop')wlPropRules=wlPropRules.filter(r=>(r.apps||[]).length);
-    else if(allAppsKind==='red')rdCrules=rdCrules.filter(r=>r.global||(r.apps||[]).length);
-    else rdFrules=rdFrules.filter(r=>r.global||(r.apps||[]).length);
-  }
-  renderAllApps();allAppsRenderMain();wlSaveNow();
-}
-$('all-apps-add').onclick=()=>allAppsAdd($('all-apps-input').value);
-suggest_bind($('all-apps-input'),$('all-apps-sg'),{onpick:allAppsAdd});
-$('all-apps-close').onclick=()=>{$('all-apps-modal').hidden=true;};
-$('all-apps-modal').addEventListener('click',e=>{if(e.target.id==='all-apps-modal')$('all-apps-modal').hidden=true;});
-$('all-apps-list').addEventListener('click',e=>{
-  const b=e.target.closest('[data-i]');
-  if(b){allAppsDel(+b.dataset.i);return}
-  const h=e.target.closest('.grp-head');
-  if(h)h.parentElement.classList.toggle('open');
-});
-$('sv-allapps').onclick=()=>openAllApps('srv');
-$('wp-allapps').onclick=()=>openAllApps('prop');
-$('rd-allapps').onclick=()=>openAllApps('red');
-$('rdf-allapps').onclick=()=>openAllApps('redpath');
+$('sv-allapps').onclick=()=>allAppsSync('srv');
+$('wp-allapps').onclick=()=>allAppsSync('prop');
+$('rd-allapps').onclick=()=>allAppsSync('red');
+$('rdf-allapps').onclick=()=>allAppsSync('redpath');
 $('wp-add-apps').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(b){wpAddTmp.splice(+b.dataset.i,1);renderWpApps();return}const h=e.target.closest('.grp-head');if(h)h.parentElement.classList.toggle('open');});
 $('rd-crules').addEventListener('click',e=>{
   const ae=e.target.closest('button[data-aedit]');
