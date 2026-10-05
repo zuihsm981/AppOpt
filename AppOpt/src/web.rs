@@ -357,6 +357,14 @@ fn rf_stats(cfg: Option<&crate::config::AppConfig>) -> serde_json::Map<String, s
     m
 }
 
+/// 包名 → 应用名 (PKG_UID_CACHE; 无则空串, 前端回退显示包名)
+fn app_label_of(pkg: &str) -> String {
+    crate::rw_read_ignore_poison(&PKG_UID_CACHE)
+        .get(pkg)
+        .map(|(_, _, l)| l.clone())
+        .unwrap_or_default()
+}
+
 fn rules_json() -> String {
     let Some(cfg) = crate::config::current_cfg() else {
         return json!({ "rules": [] }).to_string();
@@ -365,7 +373,7 @@ fn rules_json() -> String {
     let mut index: HashMap<&str, usize> = HashMap::new();
     for r in &cfg.rules {
         let gi = *index.entry(r.pkg.as_str()).or_insert_with(|| {
-            groups.push(json!({ "pkg": r.pkg, "items": [] }));
+            groups.push(json!({ "pkg": r.pkg, "label": app_label_of(r.pkg.as_str()), "items": [] }));
             groups.len() - 1
         });
         // spec 携带 util token (util_min=/util_max=): 前端 parseSpec 提取回填 chips;
@@ -385,7 +393,7 @@ fn rules_json() -> String {
     // 仅刷新率配置 (无 CPU 规则) 的应用也必须列出, 否则 web 规则项看不到它们
     for pkg in cfg.app_refresh_configs.keys() {
         if !index.contains_key(pkg.as_str()) {
-            groups.push(json!({ "pkg": pkg, "items": [] }));
+            groups.push(json!({ "pkg": pkg, "label": app_label_of(pkg.as_str()), "items": [] }));
         }
     }
     json!({ "rules": groups }).to_string()
@@ -991,9 +999,11 @@ fn fs_list_api(req: &Request) -> (u16, String) {
 pub static PKG_UID_CACHE: std::sync::LazyLock<RwLock<HashMap<String, (i32, bool, String)>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
-/// 应用 label 缓存 (pkg→可读应用名; 避免每次刷新重复跑 aapt2)
+/// 应用 label 缓存 (pkg→可读应用名; 内存 + 磁盘持久化, 避免重启/刷新重复跑 aapt2)
 static PKG_LABEL_CACHE: std::sync::LazyLock<RwLock<HashMap<String, String>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+/// label 缓存落盘文件 (与 AppOpt.json 同目录, 模块 CWD)
+const LABELS_FILE: &str = "./AppOpt.labels.json";
 
 /// aapt2 路径 (Magisk 模块部署): bin/ 优先, 回退模块根目录
 const AAPT2_PATHS: &[&str] = &[
@@ -1031,7 +1041,7 @@ fn apk_path_for(pkg: &str) -> Option<String> {
     None
 }
 
-/// aapt2 dump badging 提取应用 label (application-label:'...')
+/// aapt2 dump badging 提取应用 label: 优先中文 (zh-rCN → 任意 zh → 默认)
 fn aapt2_label(apk: &str) -> Option<String> {
     let aapt2 = AAPT2_PATHS.iter().find(|p| std::path::Path::new(p).exists())?;
     let out = std::process::Command::new(aapt2)
@@ -1043,28 +1053,78 @@ fn aapt2_label(apk: &str) -> Option<String> {
         return None;
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    let line = text.lines().find(|l| l.starts_with("application-label:"))?;
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("application-label-zh-rCN:"))
+        .or_else(|| text.lines().find(|l| l.starts_with("application-label-zh")))
+        .or_else(|| text.lines().find(|l| l.starts_with("application-label:")))?;
     let v = line.splitn(2, '\'').nth(1)?.trim_end_matches('\'');
     (!v.is_empty()).then(|| v.to_string())
 }
 
-/// 用户包 → 应用名: 先查 label 缓存, 未缓存再跑 aapt2 并缓存
-fn pkg_label(pkg: &str) -> String {
-    if let Some(l) = crate::rw_read_ignore_poison(&PKG_LABEL_CACHE).get(pkg) {
-        return l.clone();
+/// 从磁盘加载 label 缓存 (仅首次/缓存为空时)
+fn load_label_cache() {
+    let mut m = crate::rw_write_ignore_poison(&PKG_LABEL_CACHE);
+    if !m.is_empty() {
+        return;
     }
-    let label = apk_path_for(pkg)
-        .and_then(|apk| aapt2_label(&apk))
-        .unwrap_or_default();
-    if !label.is_empty() {
-        crate::rw_write_ignore_poison(&PKG_LABEL_CACHE).insert(pkg.to_string(), label.clone());
+    if let Ok(text) = std::fs::read_to_string(LABELS_FILE) {
+        if let Ok(v) = serde_json::from_str::<HashMap<String, String>>(&text) {
+            *m = v;
+        }
     }
-    label
 }
 
-/// 刷新 pkg→(uid, system, label) 缓存 (初始化 / EV_PKG packages.list inotify 时调用)
+/// 落盘 label 缓存 (新增 label 后调用; tmp+rename 原子写)
+fn save_label_cache() {
+    let m = crate::rw_read_ignore_poison(&PKG_LABEL_CACHE);
+    if let Ok(text) = serde_json::to_string(&*m) {
+        let tmp = format!("{}.tmp", LABELS_FILE);
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, LABELS_FILE);
+        }
+    }
+}
+
+/// 单个未缓存用户包 → label (aapt2; 找不到返回空)
+fn pkg_label_from_apk(pkg: &str) -> String {
+    apk_path_for(pkg)
+        .and_then(|apk| aapt2_label(&apk))
+        .unwrap_or_default()
+}
+
+/// 并行解析一批未缓存包的 label (并发跑 aapt2, 上限 4 路)
+fn extract_labels(pkgs: &[String]) -> HashMap<String, String> {
+    use std::sync::atomic::{AtomicUsize, Ordering as AO};
+    use std::sync::Mutex;
+    let out = Mutex::new(HashMap::new());
+    let next = AtomicUsize::new(0);
+    let n = pkgs.len();
+    let workers = n.min(4).max(1);
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, AO::Relaxed);
+                if i >= n {
+                    break;
+                }
+                let label = pkg_label_from_apk(&pkgs[i]);
+                if !label.is_empty() {
+                    out.lock().unwrap_or_else(|e| e.into_inner())
+                        .insert(pkgs[i].clone(), label);
+                }
+            });
+        }
+    });
+    out.into_inner().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 刷新 pkg→(uid, system, label) 缓存 (初始化 / EV_PKG packages.list inotify 时调用):
+/// 1) 载入磁盘 label 缓存 → 2) 收集未缓存用户包 → 3) 并行 aapt2 解析 → 4) 合并落盘
 pub fn refresh_pkg_cache() {
+    load_label_cache();
     let mut m: HashMap<String, (i32, bool, String)> = HashMap::new();
+    let mut pending: Vec<String> = Vec::new();
     if let Ok(content) = std::fs::read_to_string("/data/system/packages.list") {
         for line in content.lines() {
             let mut it = line.split_whitespace();
@@ -1078,10 +1138,28 @@ pub fn refresh_pkg_cache() {
             /* 应用名: 用户应用从 /data/app 的 base.apk 用 aapt2 取 label (系统应用不在 /data/app) */
             let label = if system {
                 String::new()
+            } else if let Some(l) = crate::rw_read_ignore_poison(&PKG_LABEL_CACHE).get(pkg) {
+                l.clone()
             } else {
-                pkg_label(pkg)
+                pending.push(pkg.to_string());
+                String::new()
             };
             m.insert(pkg.to_string(), (uid, system, label));
+        }
+    }
+    /* 并行解析缺失 label, 合并缓存并落盘 */
+    let fresh = extract_labels(&pending);
+    if !fresh.is_empty() {
+        crate::rw_write_ignore_poison(&PKG_LABEL_CACHE).extend(fresh.clone());
+        save_label_cache();
+    }
+    let cache = crate::rw_read_ignore_poison(&PKG_LABEL_CACHE);
+    for (pkg, (_, system, label)) in m.iter_mut() {
+        if *system || !label.is_empty() {
+            continue;
+        }
+        if let Some(l) = cache.get(pkg) {
+            *label = l.clone();
         }
     }
     *crate::rw_write_ignore_poison(&PKG_UID_CACHE) = m;
