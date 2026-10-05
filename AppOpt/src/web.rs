@@ -985,20 +985,86 @@ fn fs_list_api(req: &Request) -> (u16, String) {
 
 // ===== 已安装应用列表 API (隐藏页添加目标应用选择) =====
 
-/// 全量 包名→(uid, system) 缓存 (packages.list; 初始化 / EV_PKG 时刷新)。
+/// 全量 包名→(uid, system, label) 缓存 (packages.list + /data/app 应用名; 初始化 / EV_PKG 时刷新)。
 /// 同时供 waylay 规则表构建 (pkg→uid) 与 /api/apps 应用列表 (应用列表预缓存已移除,
 /// 每次 webui 请求时由本缓存重建)。
-pub static PKG_UID_CACHE: std::sync::LazyLock<RwLock<HashMap<String, (i32, bool)>>> =
+pub static PKG_UID_CACHE: std::sync::LazyLock<RwLock<HashMap<String, (i32, bool, String)>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
-/// 全量 包名→(uid, system) 表读锁 (read guard, deref 到 &HashMap; 替代每次读盘 pkg_to_uid_map)
-pub fn pkg_uid_map() -> std::sync::RwLockReadGuard<'static, HashMap<String, (i32, bool)>> {
+/// 应用 label 缓存 (pkg→可读应用名; 避免每次刷新重复跑 aapt2)
+static PKG_LABEL_CACHE: std::sync::LazyLock<RwLock<HashMap<String, String>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// aapt2 路径 (Magisk 模块部署): bin/ 优先, 回退模块根目录
+const AAPT2_PATHS: &[&str] = &[
+    "/data/adb/modules/AppOpt/bin/aapt2",
+    "/data/adb/modules/AppOpt/aapt2",
+];
+
+/// 全量 包名→(uid, system, label) 表读锁 (read guard, deref 到 &HashMap; 替代每次读盘 pkg_to_uid_map)
+pub fn pkg_uid_map() -> std::sync::RwLockReadGuard<'static, HashMap<String, (i32, bool, String)>> {
     crate::rw_read_ignore_poison(&PKG_UID_CACHE)
 }
 
-/// 刷新 pkg→(uid, system) 缓存 (初始化 / EV_PKG packages.list inotify 时调用)
+/// 在 /data/app 下找 <pkg>-*/base.apk (兼容 ~~/ 二级目录布局)
+fn apk_path_for(pkg: &str) -> Option<String> {
+    for e1 in std::fs::read_dir("/data/app").ok()?.flatten() {
+        let n1 = e1.file_name().to_string_lossy().into_owned();
+        let path1 = e1.path();
+        if n1.starts_with("~~") {
+            for e2 in std::fs::read_dir(&path1).ok()?.flatten() {
+                let n2 = e2.file_name().to_string_lossy().into_owned();
+                if n2.starts_with(pkg) && n2.as_bytes().get(pkg.len()).copied() == Some(b'-') {
+                    let apk = e2.path().join("base.apk");
+                    if apk.exists() {
+                        return Some(apk.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        } else if n1.starts_with(pkg) && n1.as_bytes().get(pkg.len()).copied() == Some(b'-') {
+            let apk = path1.join("base.apk");
+            if apk.exists() {
+                return Some(apk.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
+}
+
+/// aapt2 dump badging 提取应用 label (application-label:'...')
+fn aapt2_label(apk: &str) -> Option<String> {
+    let aapt2 = AAPT2_PATHS.iter().find(|p| std::path::Path::new(p).exists())?;
+    let out = std::process::Command::new(aapt2)
+        .args(["dump", "badging"])
+        .arg(apk)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().find(|l| l.starts_with("application-label:"))?;
+    let v = line.splitn(2, '\'').nth(1)?.trim_end_matches('\'');
+    (!v.is_empty()).then(|| v.to_string())
+}
+
+/// 用户包 → 应用名: 先查 label 缓存, 未缓存再跑 aapt2 并缓存
+fn pkg_label(pkg: &str) -> String {
+    if let Some(l) = crate::rw_read_ignore_poison(&PKG_LABEL_CACHE).get(pkg) {
+        return l.clone();
+    }
+    let label = apk_path_for(pkg)
+        .and_then(|apk| aapt2_label(&apk))
+        .unwrap_or_default();
+    if !label.is_empty() {
+        crate::rw_write_ignore_poison(&PKG_LABEL_CACHE).insert(pkg.to_string(), label.clone());
+    }
+    label
+}
+
+/// 刷新 pkg→(uid, system, label) 缓存 (初始化 / EV_PKG packages.list inotify 时调用)
 pub fn refresh_pkg_cache() {
-    let mut m: HashMap<String, (i32, bool)> = HashMap::new();
+    let mut m: HashMap<String, (i32, bool, String)> = HashMap::new();
     if let Ok(content) = std::fs::read_to_string("/data/system/packages.list") {
         for line in content.lines() {
             let mut it = line.split_whitespace();
@@ -1009,20 +1075,28 @@ pub fn refresh_pkg_cache() {
             }
             /* 应用类别: 条目末尾标记 @system=系统应用, @null=用户应用 */
             let system = line.trim_end().ends_with("@system");
-            m.insert(pkg.to_string(), (uid, system));
+            /* 应用名: 用户应用从 /data/app 的 base.apk 用 aapt2 取 label (系统应用不在 /data/app) */
+            let label = if system {
+                String::new()
+            } else {
+                pkg_label(pkg)
+            };
+            m.insert(pkg.to_string(), (uid, system, label));
         }
     }
     *crate::rw_write_ignore_poison(&PKG_UID_CACHE) = m;
 }
 
-/// GET /api/apps: 每次请求由 pkg→(uid,system) 缓存重建应用列表 (按包名排序)。
+/// GET /api/apps: 每次请求由 pkg→(uid,system,label) 缓存重建应用列表 (按包名排序)。
 fn apps_json() -> String {
     let cache = crate::rw_read_ignore_poison(&PKG_UID_CACHE);
-    let mut entries: Vec<(&String, &(i32, bool))> = cache.iter().collect();
+    let mut entries: Vec<(&String, &(i32, bool, String))> = cache.iter().collect();
     entries.sort_by(|a, b| a.0.cmp(b.0));
     let arr: Vec<serde_json::Value> = entries
         .iter()
-        .map(|(pkg, (uid, sys))| json!({ "pkg": pkg, "uid": uid, "system": *sys }))
+        .map(|(pkg, (uid, sys, label))| {
+            json!({ "pkg": pkg, "uid": uid, "system": *sys, "label": label })
+        })
         .collect();
     json!({ "apps": arr }).to_string()
 }

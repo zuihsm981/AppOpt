@@ -116,7 +116,7 @@ pub(crate) fn pkg_to_uid_map() -> HashMap<String, i32> {
 /// main 下发与 WebUI 保存前校验共用, 避免两套映射漂移。
 pub(crate) fn build_rule_rows(
     all: &[crate::config::WaylayRule],
-    pkguid: &HashMap<String, (i32, bool)>,
+    pkguid: &HashMap<String, (i32, bool, String)>,
 ) -> (
     HashMap<i32, Vec<crate::config::WaylayRule>>,
     Vec<(i32, String, String, String, String)>,
@@ -127,7 +127,7 @@ pub(crate) fn build_rule_rows(
         if r.pkg == "*" {
             continue;   /* 全局规则已移除: 不下发内核 (用户态/内核态均无全局段) */
         }
-        let Some(&(u, _)) = pkguid.get(&r.pkg) else {
+        let Some(&(u, _, _)) = pkguid.get(&r.pkg) else {
             continue;   /* 未安装包 → 跳过 */
         };
         tbl.entry(u).or_default().push(r.clone());
