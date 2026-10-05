@@ -1085,27 +1085,13 @@ fn apk_for<'a>(pkg: &str, apk_dirs: &'a [(String, String)]) -> Option<&'a str> {
     })
 }
 
-/// aapt2 命令构造: rlimit 防护 (CPU/内存/文件数/core)。
-/// 设备实测 SELinux 仅 root 可执行 aapt2 (shell 域对 magisk_file 无 execute),
-/// 故以 daemon 自身身份 (root) 执行; 由 固定模块路径 + 符号链接校验 + 超时 + rlimit 兜底。
+/// aapt2 命令构造: 以 daemon 身份 (root) 运行 (设备 SELinux 仅 root 可 exec aapt2)。
+/// 不加 rlimit (首版能跑的配置; 首版加 rlimit 后才出现被信号杀), 由 5s 看门狗 + 管道并发 drain 兜底。
 fn build_aapt2_cmd(aapt2: &str, apk: &str) -> std::process::Command {
-    use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new(aapt2);
     cmd.args(["dump", "badging"]).arg(apk);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setrlimit(libc::RLIMIT_CPU, &libc::rlimit { rlim_cur: 5u64, rlim_max: 5u64 });
-            libc::setrlimit(
-                libc::RLIMIT_AS,
-                &libc::rlimit { rlim_cur: 512u64 << 20, rlim_max: 512u64 << 20 },
-            );
-            libc::setrlimit(libc::RLIMIT_NOFILE, &libc::rlimit { rlim_cur: 32u64, rlim_max: 32u64 });
-            libc::setrlimit(libc::RLIMIT_CORE, &libc::rlimit { rlim_cur: 0u64, rlim_max: 0u64 });
-            Ok(())
-        });
-    }
     cmd
 }
 
@@ -1167,10 +1153,12 @@ fn aapt2_label(apk: &str) -> Option<String> {
     let err = herr.and_then(|h| h.join().ok()).unwrap_or_default();
     if !ok {
         if AAPT2_FAIL_N.fetch_add(1, Ordering::Relaxed) < 5 {
+            use std::os::unix::process::ExitStatusExt;
             let tail: String = String::from_utf8_lossy(&err).chars().take(200).collect();
             log_err(&format!(
-                "aapt2 退出 {:?} apk={} :: {}",
+                "aapt2 退出 code={:?} sig={:?} apk={} :: {}",
                 status.code(),
+                status.signal(),
                 apk,
                 tail
             ));
