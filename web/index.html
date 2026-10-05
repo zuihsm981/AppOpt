@@ -787,6 +787,9 @@ document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{
 let wlRules=[];
 let wlPropRules=[];
 let rdCrules=[];let rdFrules=[];let rdApps=[];
+/* waylay 规则包 → 应用名 (来自 /api/waylay 的 label; 无则回退包名) */
+let wlLabel={};
+function labelOf(p){return wlLabel[p]||p;}
 /* 规则级应用: 弹窗临时收集, 添加/编辑时写入规则 */
 let rdAddTmp=[];let rdBatchTmp=[];let rdpTmp=[];let rdEditTmp=[];let rdEditFromApp=null;
 let svAddTmp=[];let wpAddTmp=[];
@@ -795,7 +798,7 @@ const grow=(a,i)=>`<div class="grp"><div class="grp-head"><svg class="chev" view
 const appRowsHtml=(list,appAttr,editAttr,delAttr,empty)=>{
   const apps=uniq(list.flatMap(r=>r.apps||[]));
   return apps.length?apps.map((a,i)=>`<div class="grp"><div class="grp-head" style="cursor:pointer;gap:0;align-items:center" data-${appAttr}="${esc(a)}">
-<span style="font-weight:700;font-size:14px;color:#000;padding-left:8px;flex:1">${esc(a)}</span>
+<span style="font-weight:700;font-size:14px;color:#000;padding-left:8px;flex:1">${esc(labelOf(a))}</span>
 <button class="icon-btn" style="flex-shrink:0" data-${editAttr}="${i}" title="编辑">${ICO_EDIT}</button>
 <button class="icon-btn danger" style="flex-shrink:0;margin-right:6px" data-${delAttr}="${i}" title="删除">${ICO_TRASH}</button>
 </div></div>`).join(''):empty;
@@ -1304,6 +1307,7 @@ async function loadWaylay(){
   try{
     const d=await api('/api/waylay');
     const rs=d.rules||[];
+    wlLabel={};(rs||[]).forEach(r=>{if(r.label)wlLabel[r.pkg]=r.label;});
     const uniq=(a)=>[...new Set(a)];
     wlRules=uniq(rs.filter(r=>r.kind==='src').map(r=>r.from+'\u0000'+r.to)).map(k=>{const [f,t]=k.split('\u0000');const same=rs.filter(x=>x.kind==='src'&&x.from===f&&x.to===t);return {from:f,to:t,apps:uniq(same.map(x=>x.pkg))}});
     wlPropRules=uniq(rs.filter(r=>r.kind==='prop').map(r=>r.from+'\u0000'+r.to)).map(k=>{const [f,t]=k.split('\u0000');const same=rs.filter(x=>x.kind==='prop'&&x.from===f&&x.to===t);return {from:f,to:t,apps:uniq(same.map(x=>x.pkg))}});
