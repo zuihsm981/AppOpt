@@ -241,7 +241,7 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="core-chips" id="rf-active-chips"></div></div>
 <div class="row"><span class="label">空闲刷新率</span>
 <div class="core-chips" id="rf-idle-chips"></div></div>
-<div class="row"><span class="label">空闲超时(秒)</span><input id="rf-timeout" type="number" min="1" max="3600" style="width:80px;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:14px;font-family:inherit"></div>
+<div id="rf-timeout-row"><div class="row"><span class="label">空闲超时(秒)</span><input id="rf-timeout" type="number" min="1" max="3600" style="width:80px;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:14px;font-family:inherit"></div></div>
 <div style="margin-top:10px;text-align:right"><button class="btn" id="rf-save">保存配置</button></div>
 </div>
 </div>
@@ -444,8 +444,10 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 <div class="tr-head"><span class="tr-tag">空闲刷新率·可选</span></div>
 <div class="core-chips" id="mr-rf-idle-chips"></div>
 </div>
+<div id="mr-rf-timeout-box">
 <div class="tr-head"><span class="tr-tag">空闲超时(秒)</span></div>
 <div class="field"><input id="mr-rf-timeout" type="number" min="1" max="3600" value="10"></div>
+</div>
 </div>
 <div class="modal-actions">
 <button class="btn-outline" id="mr-cancel">取消</button>
@@ -2014,10 +2016,16 @@ $('mr-seg').addEventListener('click',e=>{
 });
 // 编辑应用弹窗刷新率配置: 0=未设置, 按设备可用刷新率 chips 点选
 let mrRfActive=0, mrRfIdle=0, mrRfOldRefresh=false;
+/* 活跃/空闲刷新率相同 → 无空闲切换, 自动隐藏空闲超时; 不同 → 恢复显示 */
+function renderRfTimeout(){
+  const same=!!mrRfActive&&!!mrRfIdle&&mrRfActive===mrRfIdle;
+  $('mr-rf-timeout-box').hidden=same;
+}
 function renderRfChips(){
   const av=rfAvail&&rfAvail.length?rfAvail:[120,90,60];
   $('mr-rf-active-chips').innerHTML=av.map(r=>`<button data-rf="${r}" class="${mrRfActive===r?'on':''}">${r}Hz</button>`).join('');
   $('mr-rf-idle-chips').innerHTML=av.map(r=>`<button data-rf="${r}" class="${mrRfIdle===r?'on':''}">${r}Hz</button>`).join('');
+  renderRfTimeout();
 }
 function bindRfChips(){
   $('mr-rf-active-chips').addEventListener('click',e=>{
@@ -2325,6 +2333,8 @@ function renderGlobalRfChips(){
   const av=rfAvail&&rfAvail.length?rfAvail:[120,90,60];
   $('rf-active-chips').innerHTML=av.map(r=>`<button data-rf="${r}" class="${rfActive===r?'on':''}">${r}Hz</button>`).join('');
   $('rf-idle-chips').innerHTML=av.map(r=>`<button data-rf="${r}" class="${rfIdle===r?'on':''}">${r}Hz</button>`).join('');
+  /* 活跃==空闲 → 无空闲切换, 自动隐藏空闲超时; 不同 → 恢复显示 */
+  $('rf-timeout-row').hidden=!!rfActive&&rfActive===rfIdle;
 }
 function bindGlobalRfChips(){
   $('rf-active-chips').addEventListener('click',e=>{
