@@ -1004,6 +1004,8 @@ static PKG_LABEL_CACHE: std::sync::LazyLock<RwLock<HashMap<String, String>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 /// label 缓存落盘文件 (与 AppOpt.json 同目录, 模块 CWD)
 const LABELS_FILE: &str = "./AppOpt.labels.json";
+/// 异步 aapt2 提取进行中 (防并发重复跑)
+static LABEL_EXTRACTING: AtomicBool = AtomicBool::new(false);
 
 /// aapt2 路径 (Magisk 模块部署): bin/ 优先, 回退模块根目录
 const AAPT2_PATHS: &[&str] = &[
@@ -1016,50 +1018,112 @@ pub fn pkg_uid_map() -> std::sync::RwLockReadGuard<'static, HashMap<String, (i32
     crate::rw_read_ignore_poison(&PKG_UID_CACHE)
 }
 
-/// 在 /data/app 下找 <pkg>-*/base.apk (兼容 ~~/ 二级目录布局)
-fn apk_path_for(pkg: &str) -> Option<String> {
-    for e1 in std::fs::read_dir("/data/app").ok()?.flatten() {
-        let n1 = e1.file_name().to_string_lossy().into_owned();
-        let path1 = e1.path();
-        if n1.starts_with("~~") {
-            for e2 in std::fs::read_dir(&path1).ok()?.flatten() {
-                let n2 = e2.file_name().to_string_lossy().into_owned();
-                if n2.starts_with(pkg) && n2.as_bytes().get(pkg.len()).copied() == Some(b'-') {
-                    let apk = e2.path().join("base.apk");
-                    if apk.exists() {
-                        return Some(apk.to_string_lossy().into_owned());
+/// 一次性扫描 /data/app (单次 read_dir, 不再每包扫): 返回 (目录名, base.apk 路径)。
+/// 校验目录/文件均为真实条目 (symlink_metadata 不跟随符号链接, 防指向敏感文件)
+fn scan_apk_dirs() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir("/data/app") {
+        for e1 in rd.flatten() {
+            if !e1.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;   /* 符号链接/非目录 → 跳过 */
+            }
+            let n1 = e1.file_name().to_string_lossy().into_owned();
+            let p1 = e1.path();
+            if n1.starts_with("~~") {
+                if let Ok(rd2) = std::fs::read_dir(&p1) {
+                    for e2 in rd2.flatten() {
+                        if !e2.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                            continue;
+                        }
+                        let apk = e2.path().join("base.apk");
+                        if apk.is_file()
+                            && apk.symlink_metadata().map(|m| m.file_type().is_file()).unwrap_or(false)
+                        {
+                            out.push((
+                                e2.file_name().to_string_lossy().into_owned(),
+                                apk.to_string_lossy().into_owned(),
+                            ));
+                        }
                     }
                 }
-            }
-        } else if n1.starts_with(pkg) && n1.as_bytes().get(pkg.len()).copied() == Some(b'-') {
-            let apk = path1.join("base.apk");
-            if apk.exists() {
-                return Some(apk.to_string_lossy().into_owned());
+            } else {
+                let apk = p1.join("base.apk");
+                if apk.is_file()
+                    && apk.symlink_metadata().map(|m| m.file_type().is_file()).unwrap_or(false)
+                {
+                    out.push((n1, apk.to_string_lossy().into_owned()));
+                }
             }
         }
     }
-    None
+    out
 }
 
-/// aapt2 dump badging 提取应用 label: 优先中文 (zh-rCN → 任意 zh → 默认)
+/// 在单次扫描结果中匹配 <pkg>-* 目录 (O(N) 内存匹配, 无重复目录系统调用)
+fn apk_for<'a>(pkg: &str, apk_dirs: &'a [(String, String)]) -> Option<&'a str> {
+    apk_dirs.iter().find_map(|(n, apk)| {
+        (n.starts_with(pkg) && n.as_bytes().get(pkg.len()).copied() == Some(b'-'))
+            .then_some(apk.as_str())
+    })
+}
+
+/// aapt2 dump badging 提取应用 label: 优先中文 (zh-rCN → 任意 zh → 默认)。
+/// 以低权限 (shell 2000) + 超时 (3s) + rlimit (CPU/内存/文件数/core) 运行,
+/// 避免 root 解析不可信 APK 被提权 / 恶意包卡死阻塞。
 fn aapt2_label(apk: &str) -> Option<String> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
     let aapt2 = AAPT2_PATHS.iter().find(|p| std::path::Path::new(p).exists())?;
-    let out = std::process::Command::new(aapt2)
-        .args(["dump", "badging"])
-        .arg(apk)
-        .output()
-        .ok()?;
-    if !out.status.success() {
+    let mut cmd = std::process::Command::new(aapt2);
+    cmd.args(["dump", "badging"]).arg(apk);
+    cmd.uid(2000).gid(2000);   /* shell 用户: /data/app apk 可读, 无法访问 AppOpt 配置/内核态 */
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::null());
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setrlimit(libc::RLIMIT_CPU, &libc::rlimit { rlim_cur: 2u64, rlim_max: 2u64 });
+            libc::setrlimit(
+                libc::RLIMIT_AS,
+                &libc::rlimit { rlim_cur: 512u64 << 20, rlim_max: 512u64 << 20 },
+            );
+            libc::setrlimit(libc::RLIMIT_NOFILE, &libc::rlimit { rlim_cur: 32u64, rlim_max: 32u64 });
+            libc::setrlimit(libc::RLIMIT_CORE, &libc::rlimit { rlim_cur: 0u64, rlim_max: 0u64 });
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().ok()?;
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(15)),
+            Err(_) => return None,
+        }
+    };
+    let ok = status.success();
+    let mut out = Vec::new();
+    if let Some(mut so) = child.stdout.take() {
+        let _ = so.read_to_end(&mut out);
+    }
+    if !ok {
         return None;
     }
-    let text = String::from_utf8_lossy(&out.stdout);
+    let text = String::from_utf8_lossy(&out);
     let line = text
         .lines()
         .find(|l| l.starts_with("application-label-zh-rCN:"))
         .or_else(|| text.lines().find(|l| l.starts_with("application-label-zh")))
         .or_else(|| text.lines().find(|l| l.starts_with("application-label:")))?;
     let v = line.splitn(2, '\'').nth(1)?.trim_end_matches('\'');
-    (!v.is_empty()).then(|| v.to_string())
+    /* 清洗控制字符 (label 来自不可信 APK 资源, 防 UI/日志注入) */
+    let v: String = v.chars().filter(|c| !c.is_control()).collect();
+    (!v.is_empty()).then_some(v)
 }
 
 /// 从磁盘加载 label 缓存 (仅首次/缓存为空时)
@@ -1087,14 +1151,14 @@ fn save_label_cache() {
 }
 
 /// 单个未缓存用户包 → label (aapt2; 找不到返回空)
-fn pkg_label_from_apk(pkg: &str) -> String {
-    apk_path_for(pkg)
-        .and_then(|apk| aapt2_label(&apk))
+fn pkg_label_from_apk(pkg: &str, apk_dirs: &[(String, String)]) -> String {
+    apk_for(pkg, apk_dirs)
+        .and_then(|apk| aapt2_label(apk))
         .unwrap_or_default()
 }
 
-/// 并行解析一批未缓存包的 label (并发跑 aapt2, 上限 4 路)
-fn extract_labels(pkgs: &[String]) -> HashMap<String, String> {
+/// 并行解析一批未缓存包的 label (并发跑 aapt2, 上限 4 路; apk 目录列表复用单次扫描)
+fn extract_labels(pkgs: &[String], apk_dirs: &[(String, String)]) -> HashMap<String, String> {
     use std::sync::atomic::{AtomicUsize, Ordering as AO};
     use std::sync::Mutex;
     let out = Mutex::new(HashMap::new());
@@ -1108,7 +1172,7 @@ fn extract_labels(pkgs: &[String]) -> HashMap<String, String> {
                 if i >= n {
                     break;
                 }
-                let label = pkg_label_from_apk(&pkgs[i]);
+                let label = pkg_label_from_apk(&pkgs[i], apk_dirs);
                 if !label.is_empty() {
                     out.lock().unwrap_or_else(|e| e.into_inner())
                         .insert(pkgs[i].clone(), label);
@@ -1120,7 +1184,9 @@ fn extract_labels(pkgs: &[String]) -> HashMap<String, String> {
 }
 
 /// 刷新 pkg→(uid, system, label) 缓存 (初始化 / EV_PKG packages.list inotify 时调用):
-/// 1) 载入磁盘 label 缓存 → 2) 收集未缓存用户包 → 3) 并行 aapt2 解析 → 4) 合并落盘
+/// 1) 载入磁盘 label 缓存 → 2) 同步重建 (uid,system,已有 label) 表 → 3) label 缺失部分
+///    异步并行 aapt2 解析 (不阻塞主循环/EV_PKG) → 4) 合并回填并落盘;
+/// label 缓存随 packages.list 裁剪 (已卸载包移除陈旧 label)
 pub fn refresh_pkg_cache() {
     load_label_cache();
     let mut m: HashMap<String, (i32, bool, String)> = HashMap::new();
@@ -1147,22 +1213,40 @@ pub fn refresh_pkg_cache() {
             m.insert(pkg.to_string(), (uid, system, label));
         }
     }
-    /* 并行解析缺失 label, 合并缓存并落盘 */
-    let fresh = extract_labels(&pending);
-    if !fresh.is_empty() {
-        crate::rw_write_ignore_poison(&PKG_LABEL_CACHE).extend(fresh.clone());
-        save_label_cache();
-    }
-    let cache = crate::rw_read_ignore_poison(&PKG_LABEL_CACHE);
-    for (pkg, (_, system, label)) in m.iter_mut() {
-        if *system || !label.is_empty() {
-            continue;
-        }
-        if let Some(l) = cache.get(pkg) {
-            *label = l.clone();
+    /* label 缓存跟随 packages.list: 已卸载包的陈旧 label 一并移除并落盘 */
+    {
+        let mut lc = crate::rw_write_ignore_poison(&PKG_LABEL_CACHE);
+        let before = lc.len();
+        lc.retain(|pkg, _| m.contains_key(pkg));
+        if lc.len() != before {
+            drop(lc);
+            save_label_cache();
         }
     }
     *crate::rw_write_ignore_poison(&PKG_UID_CACHE) = m;
+
+    /* 缺失 label: 异步并行解析 (不阻塞主循环; 复用单次 /data/app 扫描; 进行中不重复跑) */
+    if !pending.is_empty() && !LABEL_EXTRACTING.swap(true, Ordering::AcqRel) {
+        let apk_dirs = scan_apk_dirs();
+        std::thread::spawn(move || {
+            let fresh = extract_labels(&pending, &apk_dirs);
+            if !fresh.is_empty() {
+                crate::rw_write_ignore_poison(&PKG_LABEL_CACHE).extend(fresh.clone());
+                save_label_cache();
+                /* 回填 PKG_UID_CACHE label (仅缺失项) */
+                let mut u = crate::rw_write_ignore_poison(&PKG_UID_CACHE);
+                for (pkg, (_, system, label)) in u.iter_mut() {
+                    if *system || !label.is_empty() {
+                        continue;
+                    }
+                    if let Some(l) = fresh.get(pkg) {
+                        *label = l.clone();
+                    }
+                }
+            }
+            LABEL_EXTRACTING.store(false, Ordering::Release);
+        });
+    }
 }
 
 /// GET /api/apps: 每次请求由 pkg→(uid,system,label) 缓存重建应用列表 (按包名排序)。
