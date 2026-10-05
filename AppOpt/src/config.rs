@@ -203,32 +203,40 @@ static WAYLAY_SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn save_waylay_rules(rules: &[WaylayRule]) -> io::Result<()> {
     let _g = WAYLAY_SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut out = String::from("# waylay 新格式: <包名>=<kind>-<from>-<to>\n");
-    out.push_str("# kind: src=服务伪装 prop=属性伪装 red=重定向(内容替换); from/to 等长且不含 '-'\n");
+    /* 规则行先按包名重排 (参考 applist.conf organize_lines): 同包规则连续 */
+    let mut lines: Vec<String> = Vec::new();
     for r in rules {
         if r.pkg.trim() == "*" {
             continue;   /* 全局规则已移除: 不落盘 */
         }
         let prefix = r.kind.tag();
-        if r.kind == WaylayKind::Red {
+        let line = if r.kind == WaylayKind::Red {
             /* 内容替换带目标文件: <目标>-<from>-<to> */
-            out.push_str(&format!(
-                "{}={}-{}-{}-{}\n",
+            format!(
+                "{}={}-{}-{}-{}",
                 r.pkg.trim(),
                 prefix,
                 r.target.trim(),
                 r.from.trim(),
                 r.to.trim()
-            ));
+            )
         } else {
-            out.push_str(&format!(
-                "{}={}-{}-{}\n",
+            format!(
+                "{}={}-{}-{}",
                 r.pkg.trim(),
                 prefix,
                 r.from.trim(),
                 r.to.trim()
-            ));
-        }
+            )
+        };
+        lines.push(line);
+    }
+    let organized = organize_waylay_lines(&lines);
+    let mut out = String::from("# waylay 新格式: <包名>=<kind>-<from>-<to>\n");
+    out.push_str("# kind: src=服务伪装 prop=属性伪装 red=重定向(内容替换); from/to 等长且不含 '-'\n");
+    for l in organized {
+        out.push_str(&l);
+        out.push('\n');
     }
     let tmp = format!("{}.tmp", WAYLAY_FILE);
     fs::write(&tmp, out.as_bytes())?;
@@ -237,6 +245,38 @@ pub fn save_waylay_rules(rules: &[WaylayRule]) -> io::Result<()> {
         rules.iter().filter(|r| r.pkg.trim() != "*").cloned().collect();
     WAYLAY_CHANGED.store(true, Ordering::Release);
     Ok(())
+}
+
+/// waylay.conf 规则行重排: 注释/空行保持原序置顶; 规则行按包名分组
+/// (按首次出现顺序), 包内保持原序 —— 与 applist.conf 的 organize_lines 同思路。
+fn organize_waylay_lines(lines: &[String]) -> Vec<String> {
+    let mut head: Vec<String> = Vec::new();
+    let mut pkgs: Vec<(String, Vec<String>)> = Vec::new();
+    let mut idx: HashMap<String, usize> = HashMap::new();
+    for l in lines {
+        let t = l.trim();
+        if t.is_empty() || t.starts_with('#') || t.starts_with("//") {
+            head.push(l.clone());
+            continue;
+        }
+        let pkg = t.split('=').next().unwrap_or("").trim().to_string();
+        if pkg.is_empty() {
+            head.push(l.clone());
+            continue;
+        }
+        match idx.get(&pkg) {
+            Some(&i) => pkgs[i].1.push(l.clone()),
+            None => {
+                idx.insert(pkg.clone(), pkgs.len());
+                pkgs.push((pkg, vec![l.clone()]));
+            }
+        }
+    }
+    let mut out = head;
+    for (_, ls) in pkgs {
+        out.extend(ls);
+    }
+    out
 }
 
 /// property 区伪装规则列表 (新格式 prop 规则; on_fg 按包 set_prop_rules 维护)
