@@ -1103,6 +1103,11 @@ fn apk_for<'a>(pkg: &str, apk_dirs: &'a [(String, String)]) -> Option<&'a str> {
     })
 }
 
+/// aapt2 是否已部署 (模块目录无 aapt2 时跳过提取线程)
+fn aapt2_available() -> bool {
+    AAPT2_PATHS.iter().any(|p| std::path::Path::new(p).exists())
+}
+
 /// aapt2 命令构造: 以 daemon 身份 (root) 运行 (设备 SELinux 仅 root 可 exec aapt2)。
 /// 不加 rlimit (首版能跑的配置; 首版加 rlimit 后才出现被信号杀), 由 5s 看门狗 + 管道并发 drain 兜底。
 fn build_aapt2_cmd(aapt2: &str, apk: &str) -> std::process::Command {
@@ -1231,6 +1236,7 @@ fn extract_labels(pkgs: &[String], apk_dirs: &[(String, String)]) -> HashMap<Str
 /// label 缓存随 packages.list 裁剪 (已卸载包移除陈旧 label)
 pub fn refresh_pkg_cache() {
     load_label_cache();
+    let have_aapt2 = aapt2_available();
     let mut m: HashMap<String, (i32, bool, String)> = HashMap::new();
     let mut pending: Vec<String> = Vec::new();
     if let Ok(content) = std::fs::read_to_string("/data/system/packages.list") {
@@ -1249,7 +1255,10 @@ pub fn refresh_pkg_cache() {
             } else if let Some(l) = crate::rw_read_ignore_poison(&PKG_LABEL_CACHE).get(pkg) {
                 l.clone()
             } else {
-                pending.push(pkg.to_string());
+                /* 模块目录无 aapt2 时跳过提取 (不启动线程, label 保持空 → 前端回退包名) */
+                if have_aapt2 {
+                    pending.push(pkg.to_string());
+                }
                 String::new()
             };
             m.insert(pkg.to_string(), (uid, system, label));
