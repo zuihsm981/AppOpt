@@ -144,9 +144,8 @@ fn add_touch(epfd: c_int, touch_fd: c_int) -> bool {
 // 事件标记 (ev.u64): pidfd 用 pid 本身 (正整数); 控制/触摸用保留标记
 const TAG_CTRL: u64 = u64::MAX;
 const TAG_TOUCH: u64 = u64::MAX - 1;
-// 触摸节流时长: 通知后摘除触摸 fd 暂停监听, 降低高频触摸唤醒/通知开销
-// (替代原内核 input 1s 节流; refresh handle_input 另有防抖)
-const TOUCH_THROTTLE_MS: u64 = 2000;
+// 触摸 fd 常驻 epoll (不做摘除); 活动通知防抖 2s: 高频触摸只发一次 1B 通知
+const TOUCH_NOTIFY_DEBOUNCE_MS: u64 = 2000;
 
 /// 用户态事件探测线程入口 (单 epoll: 触摸 fd + pidfd 集合 + 控制 fd)。
 /// touch_sock: 触摸活动通知写端 (1B); exit_sock: 主进程退出通知写端 (i32 LE 4B);
@@ -182,34 +181,16 @@ pub fn spawn_event(touch_sock: c_int, ctrl_sock: c_int, exit_sock: c_int) {
 
     let mut events: [libc::epoll_event; 32] = unsafe { std::mem::zeroed() };
     let mut buf = [0u8; 4096];
-    // 触摸节流: Some(到期时刻) 期间触摸 fd 从 epoll 摘除 (事件在队列堆积, 只读丢弃);
-    // 用 epoll_wait 超时恢复, 不阻塞 pidfd/控制事件 (退出清理零延迟)。
-    let mut throttle_until: Option<std::time::Instant> = None;
-
+    // 触摸 fd 常驻 epoll: 摘除只发生在定时器停止 (ctrl 0) 显式暂停时;
+    // 高频触摸时仅对"跨线程活动通知"做 2s 防抖 (本地读空仍每次执行, 微秒级)
+    let mut last_notify: Option<std::time::Instant> = None;
     loop {
-        let timeout = match throttle_until {
-            Some(t) => {
-                let rem = t.saturating_duration_since(std::time::Instant::now());
-                rem.as_millis().min(2000) as i32
-            }
-            None => -1,
-        };
-        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 32, timeout) };
+        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 32, -1) };
         if n < 0 {
             if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
             break;
-        }
-        let now = std::time::Instant::now();
-        if n == 0 {
-            // 节流到期: 恢复触摸监听 (若仍启用且未在监听)
-            throttle_until = None;
-            if touch_fd >= 0 && ENABLED.load(Ordering::Acquire) && !listening {
-                listening = add_touch(epfd, touch_fd);
-                TOUCH_LISTENING.store(listening, Ordering::Relaxed);
-            }
-            continue;
         }
         let mut activity = false;
         for i in 0..n as usize {
@@ -254,18 +235,18 @@ pub fn spawn_event(touch_sock: c_int, ctrl_sock: c_int, exit_sock: c_int) {
             }
         }
         if activity {
-            // 通知主线程: 有输入活动
-            if touch_sock >= 0 {
-                let v: u8 = 1;
-                let _ = unsafe { libc::send(touch_sock, &v as *const u8 as *const _, 1, libc::MSG_DONTWAIT) };
+            // 通知防抖: 2s 内只向主线程发送一次活动通知 (触摸 fd 常驻, 本地仍每次读空)
+            let now = std::time::Instant::now();
+            let due = last_notify
+                .map(|t| now.duration_since(t).as_millis() >= TOUCH_NOTIFY_DEBOUNCE_MS as u128)
+                .unwrap_or(true);
+            if due {
+                last_notify = Some(now);
+                if touch_sock >= 0 {
+                    let v: u8 = 1;
+                    let _ = unsafe { libc::send(touch_sock, &v as *const u8 as *const _, 1, libc::MSG_DONTWAIT) };
+                }
             }
-            // 节流: 摘除触摸 fd 暂停读取 (期间事件在队列堆积, 只读丢弃); 经 epoll timeout 恢复
-            if listening {
-                unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_DEL, touch_fd, std::ptr::null_mut()); }
-                listening = false;
-                TOUCH_LISTENING.store(false, Ordering::Relaxed);
-            }
-            throttle_until = Some(now + std::time::Duration::from_millis(TOUCH_THROTTLE_MS));
         }
     }
 

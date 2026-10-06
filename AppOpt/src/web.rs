@@ -343,10 +343,9 @@ fn rf_stats(cfg: Option<&crate::config::AppConfig>) -> serde_json::Map<String, s
         .unwrap_or_default();
     let rf_rules = rf_apps.len();
     // 刷新率命中不能从 CPU hit_list 派生 (仅刷新率应用不在 CPU 命中里, 恒空);
-    // 取 refresh 状态当前被应用级配置驱动的前台包 (launcher 用全局 → 不计)
-    let cur = crate::refresh::refresh_get_status()
-        .map(|s| s.current_package)
-        .unwrap_or_default();
+    // 取当前生效前台包 (实时读取, 避免状态快照延迟导致恒 0);
+    // launcher 用全局 → 不计
+    let cur = crate::refresh::refresh_current_package();
     let rf_hit_list: Vec<String> = if cur.is_empty()
         || cur == crate::config::DEFAULT_REFRESH_PACKAGE
         || !rf_apps.contains(cur.as_str())
