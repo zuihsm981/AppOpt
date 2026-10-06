@@ -578,7 +578,7 @@ pub fn refresh_set_config(timeout: i32, active: &str, idle: &str) {
         lines.retain(|l| !l.trim().starts_with("refresh_timeout="));
         found_timeout = true;
     }
-    // 缺失字段插头部 (与 write_global_refresh_defaults 一致), 保持分区整齐
+    // 缺失字段插入: 头部注释/空行之后, 紧跟已有 refresh_* 字段 (不插到配置顶部覆盖文件头)
     let missing: Vec<String> = [
         (!found_timeout).then(|| format!("refresh_timeout={}", timeout)),
         (!found_active).then(|| format!("refresh_active={}", active)),
@@ -587,9 +587,36 @@ pub fn refresh_set_config(timeout: i32, active: &str, idle: &str) {
     .into_iter()
     .flatten()
     .collect();
-    let mut new_lines = missing;
-    new_lines.extend(lines);
-    let lines = new_lines;
+    if !missing.is_empty() {
+        let mut at = 0;
+        let mut last_rf: Option<usize> = None;
+        while at < lines.len() {
+            let t = lines[at].trim();
+            if t.is_empty() || t.starts_with('#') {
+                at += 1;
+                continue;
+            }
+            if t.starts_with("refresh_")
+                && t.split_once('=')
+                    .map(|(k, _)| {
+                        matches!(
+                            k.trim(),
+                            "refresh_timeout" | "refresh_active" | "refresh_idle"
+                        )
+                    })
+                    .unwrap_or(false)
+            {
+                last_rf = Some(at);
+                at += 1;
+                continue;
+            }
+            break;   /* 头部区 (注释/空行/刷新率字段) 结束 */
+        }
+        let ins = last_rf.map(|i| i + 1).unwrap_or(at);
+        for (i, l) in missing.into_iter().enumerate() {
+            lines.insert(ins + i, l);
+        }
+    }
 
     // 原子写: 先写临时文件再 rename, 避免中途崩溃留下半写配置
     let tmp = format!("{}.tmp", path);
