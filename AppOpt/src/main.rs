@@ -391,6 +391,8 @@ struct AppState {
     rfr_monitored: HashMap<i32, String>,
     /// waylay 规则应用主 pid 记录表: pid → uid (内核 vfc_fg 下发保护; 主 pid 退出移除)
     waylay_monitored: HashMap<i32, i32>,
+    /// srv 规则应用主 pid 监听表: pid → uid (内核 srv_active 通知门控; 主 pid 退出移除)
+    srv_monitored: HashMap<i32, i32>,
 }
 
 impl AppState {
@@ -416,6 +418,7 @@ impl AppState {
             last_fg_uid: -1,
             rfr_monitored: HashMap::new(),
             waylay_monitored: HashMap::new(),
+            srv_monitored: HashMap::new(),
             rule_cache: Vec::new(),
             vfc_uid_set: std::collections::HashSet::new(),
             uid_rules: std::collections::HashMap::new(),
@@ -452,6 +455,9 @@ impl AppState {
                 es.bpf.vfc_apply();
             } else {
                 es.bpf.disarm();
+                /* 断开: 复位内核 srv 开关 — 探针已摘除但 srv_active 标志残留,
+                 * 否则重连后会在未收到相关前台回调时全局生效 */
+                es.bpf.srv_active(false);
                 // 断开把探针摘除 (srv_remove); 重置激活记录 → 下次前台回调重新下发
                 self.srv_active_cur = false;
             }
@@ -502,7 +508,6 @@ impl AppState {
                         }
                     }
                 }
-                let has_src = !srows.is_empty();
                 es.bpf.srv_clear();
                 for (i, (_u, f, t)) in srows.iter().enumerate() {
                     if let Err(e) = es.bpf.srv_rule(i, f, t) {
@@ -522,7 +527,17 @@ impl AppState {
                     crate::config::set_prop_rules(&prop_rules);
                 }
                 es.bpf.prop_file_apply(prop_any);
-                self.srv_active_cur = has_src;
+                /* srv: 规则表已重发, 开关按最近前台 uid 的 src 规则重新门控 (防止用户态
+                 * 记录与内核 srv_active 脱节 → 未收到相关前台回调也全局生效) */
+                let fg_active = self
+                    .uid_rules
+                    .get(&self.last_fg_uid)
+                    .map(|rs| rs.iter().any(|r| r.kind == crate::config::WaylayKind::Src))
+                    .unwrap_or(false);
+                if fg_active != self.srv_active_cur {
+                    self.srv_active_cur = fg_active;
+                    es.bpf.srv_active(fg_active);
+                }
                 self.prop_active_cur = prop_any;
             }
         }
@@ -607,7 +622,6 @@ impl AppState {
             .get(&uid)
             .cloned()
             .unwrap_or_default();
-        let active = !my.is_empty();
         // ---- 前台 uid 通知内核 (vfc_fg): 规则应用 → 记录主 pid 后下发 uid
         //      (已记录直接下发, 不检查 cpuset); 非规则应用 → 已记录主 pid 有
         //      top-app 则不下发 uid (内核保持当前前台 uid 段), 否则下发 -1 (仅全局) ----
@@ -620,13 +634,13 @@ impl AppState {
             Some(uid)
         } else {
             // 非规则应用回调: 先检查是否有记录; 空 → 不做任何动作 (不再下发 -1);
-            // 有记录 → 检查 top-app: 有 top → 不下发 (保持); 无 top → 下发 -1 (停止)
+            // 有记录 → 检查 top-app: 有 top → 不下发 (保持); 无 top → 下发 0 (停止)
             if self.waylay_monitored.is_empty() {
                 None
             } else {
-                match self.waylay_top_uid() {
+                match Self::monitored_top_uid(&mut self.waylay_monitored) {
                     Some(_) => None,  // 有 top → 不下发
-                    None => Some(-1), // 有记录但无 top → 停止
+                    None => Some(0),  // 有记录但无 top → 通知停止 (vfc_fg 0)
                 }
             }
         };
@@ -635,12 +649,31 @@ impl AppState {
                 es.bpf.vfc_fg(u);
             }
         }
-        // ---- src (系统服务伪装): 该包 src 规则 + 开关 ----
-        if active != self.srv_active_cur {
-            self.srv_active_cur = active;
-            if let Some(es) = self.ebpf_state.as_ref() {
-                /* 规则已由 sync_vfc_rules 全量下发 (带 uid); on_fg 只做 listServices 前台门控 */
-                es.bpf.srv_active(active);
+        // ---- src (系统服务伪装): 与 vfc 同款快照门控, 但内核侧用 srv_active 通知 (0/1) ----
+        //      规则应用 → 记录主 pid + 下发激活通知; 非规则应用 → 已监听 srv 应用
+        //      主 pid 有 top-app → 应用其规则 (保持激活); 无 top-app → 通知停止
+        let in_srv = my
+            .iter()
+            .any(|r| r.kind == crate::config::WaylayKind::Src);
+        let srv_on: Option<bool> = if in_srv {
+            if !self.srv_monitored.contains_key(&pid) {
+                self.srv_monitored.insert(pid, uid);
+                crate::event_probe::watch(pid);
+            }
+            Some(true)
+        } else {
+            if self.srv_monitored.is_empty() {
+                None
+            } else {
+                match Self::monitored_top_uid(&mut self.srv_monitored) {
+                    Some(_) => None,        // 有 top → 不下发 (保持激活)
+                    None => Some(false),    // 无 top → 通知停止
+                }
+            }
+        };
+        if let Some(es) = self.ebpf_state.as_ref() {
+            if let Some(on) = srv_on {
+                es.bpf.srv_active(on);
             }
         }
         // prop (系统属性伪装): 该包 prop 规则前台激活, 切走恢复 (用户态 tmpfs 写替换)
@@ -730,11 +763,12 @@ impl AppState {
         }
     }
 
-    /// 非规则应用前台回调: 检查已记录 waylay 主 pid 的 cpuset, 返回其中 top-app 的 uid
-    /// (有 → 不下发 uid, 内核保持当前前台 uid 段); 顺带移除已退出主 pid 的记录。
-    fn waylay_top_uid(&mut self) -> Option<i32> {
+    /// 通用 top 保护: 扫描已监听主 pid 表 (pid→uid), 返回其中处于 top-app 的 uid
+    /// (有 → 调用方不下发, 内核保持); 顺带移除已退出 (cpuset 文件消失) 的记录。
+    /// vfc(waylay_monitored) 与 srv(srv_monitored) 共用。
+    fn monitored_top_uid(monitored: &mut HashMap<i32, i32>) -> Option<i32> {
         let mut top: Option<i32> = None;
-        self.waylay_monitored.retain(|p, u| {
+        monitored.retain(|p, u| {
             if Self::pid_in_top_app(*p) {
                 if top.is_none() {
                     top = Some(*u);
@@ -1143,10 +1177,16 @@ fn main() {
                             }
                             // 刷新率: 主 pid 退出 → 移除监听
                             state.rfr_monitored.remove(&pid);
-                            // waylay: 主 pid 退出 → 移除记录 + 下发 -1 停止内核规则
+                            // waylay: 主 pid 退出 → 移除记录 + 下发 vfc_fg 0 停止内核 vfc 规则
                             if state.waylay_monitored.remove(&pid).is_some() {
                                 if let Some(es) = state.ebpf_state.as_ref() {
-                                    es.bpf.vfc_fg(-1);
+                                    es.bpf.vfc_fg(0);
+                                }
+                            }
+                            // srv: 主 pid 退出 → 移除记录 + 通知停止 srv (srv_active 0)
+                            if state.srv_monitored.remove(&pid).is_some() {
+                                if let Some(es) = state.ebpf_state.as_ref() {
+                                    es.bpf.srv_active(false);
                                 }
                             }
                         }
