@@ -40,6 +40,8 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 .chip.h{background:rgba(175,82,222,.15);color:#8944ab}
 .chip.c{background:rgba(142,142,147,.16);color:#636366}
 .tabbar,.navbar{background:rgba(255,255,255,.85);backdrop-filter:blur(20px) saturate(1.6);-webkit-backdrop-filter:blur(20px) saturate(1.6)}
+/* 输入法弹出期间关闭毛玻璃 (键盘动画期间视口持续 resize, blur 重绘昂贵) */
+body.kb .tabbar,body.kb .navbar{backdrop-filter:none;-webkit-backdrop-filter:none}
 .tabbar{display:flex;height:56px;border-top:1px solid var(--border);flex-shrink:0;padding-bottom:env(safe-area-inset-bottom)}
 .tab{flex:1;color:var(--sub);font-size:11px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;transition:color .15s}
 .tab svg{width:24px;height:24px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;transition:transform .15s}
@@ -758,6 +760,12 @@ button{cursor:pointer;border:none;font-family:inherit;background:none;color:inhe
 const uniq=(a)=>[...new Set(a)];
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+function debounce(fn,ms){let t=null;return(...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),ms);};}
+/* 输入法键盘弹出 (任意输入框聚焦) 时暂停轮询并关闭毛玻璃, 键盘收合后恢复 —
+   减少键盘动画期间的重排/重绘导致的卡顿 */
+let uiFocus=0;
+document.addEventListener('focusin',()=>{uiFocus++;document.body.classList.add('kb');});
+document.addEventListener('focusout',()=>{uiFocus=Math.max(0,uiFocus-1);if(!uiFocus){document.body.classList.remove('kb');resumePolling();}});
 function fmtUp(s){s=+s||0;const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d>0?d+'天'+h+'小时':h>0?h+'小时'+m+'分':m>0?m+'分':'刚刚'}
 // 工作模式显示: KPM 为叠加增强 → 连接后 用户态+KPM; 未连接 用户态
 const modeLabel=m=>m==='kpm'?'用户态+KPM':'用户态';
@@ -1396,7 +1404,7 @@ function showRfHitList(){
 $('s-rf-hit-card').onclick=showRfHitList;
 $('s-rf-hit-card').addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();showRfHitList()}});
 async function refreshStat(){
-  if(document.hidden)return;
+  if(document.hidden||uiFocus)return;
   try{
     const d=await api('/api/status');
     const mb=$('s-mode');
@@ -1795,7 +1803,7 @@ function renderRules(){
     tip.innerHTML=f?'无匹配应用':'暂无规则<br>点击右上角「添加」创建第一条规则';
   }else tip?.remove();
 }
-$('r-filter').addEventListener('input',renderRules);
+$('r-filter').addEventListener('input',debounce(renderRules,120));
 $('r-list').addEventListener('click',e=>{
   const ea=e.target.closest('[data-editapp]');
   if(ea){openRuleModal('edit-app',+ea.dataset.editapp);return}
@@ -2290,6 +2298,7 @@ async function loadRefresh(){
     renderDeviceRates(cfg);
     applyGlobalRfChips(cfg.active,cfg.idle);
     rfTimer=setInterval(async()=>{
+      if(document.hidden||uiFocus)return;   /* 键盘弹出/页面隐藏时暂停刷新率轮询 */
       try{
         const[s,st0]=await Promise.all([api('/api/refresh/status'),api('/api/status')]);
         statusDrive=st0.mode; statusConn=!!st0.connected; statusTouch=!!st0.touch_listening;
@@ -2397,7 +2406,7 @@ $('fs-up').onclick=()=>{
   const i=p.lastIndexOf('/');
   fsOpen(i<=0?'/':p.slice(0,i));
 };
-$('fs-q').addEventListener('input',e=>{fsQ=e.target.value;fsRender({path:fsCur,entries:fsEntries});});
+$('fs-q').addEventListener('input',debounce(e=>{fsQ=e.target.value;fsRender({path:fsCur,entries:fsEntries});},120));
 $('fs-list').addEventListener('click',e=>{
   const el=e.target.closest('[data-path]');
   if(!el)return;
@@ -2438,7 +2447,7 @@ $('ap-seg').addEventListener('click',e=>{
   $('ap-seg').querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));
   apRender();
 });
-$('ap-q').addEventListener('input',apRender);
+$('ap-q').addEventListener('input',debounce(apRender,120));
 $('ap-cancel').onclick=()=>{$('app-pick-modal').hidden=true;};
 $('app-pick-modal').addEventListener('click',e=>{if(e.target.id==='app-pick-modal')$('app-pick-modal').hidden=true;});
 $('ap-list').addEventListener('click',e=>{
