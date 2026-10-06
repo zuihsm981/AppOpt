@@ -2181,7 +2181,7 @@ function suggest_bind(input, box, opts = {}) {
   const hide = () => { seq++; box.dataset.closed = '1'; box.hidden = true; hl = -1; };
   const render = () => {
     if (!items.length) { hide(); return; }
-    box.innerHTML = items.map((it, i) => `<div class="sg-item${i === hl ? ' hl' : ''}" data-i="${i}">${esc(it)}</div>`).join('');
+    box.innerHTML = items.map((it, i) => `<div class="sg-item${i === hl ? ' hl' : ''}" data-i="${i}">${esc(labelOf(it))}</div>`).join('');
     box.hidden = false;
     if (hl >= 0) box.children[hl]?.scrollIntoView({ block: 'nearest' });
   };
