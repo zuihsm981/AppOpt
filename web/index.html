@@ -2422,7 +2422,12 @@ $('fs-list').addEventListener('click',e=>{
 // ===== 应用列表选择 (隐藏页四个功能添加目标应用; 默认仅用户应用) =====
 let apPick=null, apData=[], apMode='user';
 async function apLoad(){
-  try{apData=(await api('/api/apps')).apps||[];apRender();}catch(e){toast(e.message)}
+  try{
+    apData=(await api('/api/apps')).apps||[];
+    /* 同步应用名到 wlLabel: 供目标应用/生效应用列表 labelOf 使用 (覆盖未在规则中的包) */
+    apData.forEach(a=>{if(a.label)wlLabel[a.pkg]=a.label;});
+    apRender();
+  }catch(e){toast(e.message)}
 }
 function apRender(){
   const q=$('ap-q').value.trim().toLowerCase();
@@ -2485,6 +2490,11 @@ document.addEventListener('click',e=>{
   e.preventDefault();
   openRdContent(t.id,t.dataset.contentTitle);
 });
+/* 页面加载即同步全部应用名到 wlLabel (目标应用/生效应用列表 labelOf 全覆盖) */
+api('/api/apps').then(d=>{
+  apData=d.apps||[];
+  apData.forEach(a=>{if(a.label)wlLabel[a.pkg]=a.label;});
+}).catch(()=>{});
 startStat();
 </script>
 </body>
