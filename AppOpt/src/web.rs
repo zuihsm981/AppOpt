@@ -324,6 +324,11 @@ fn cpu_stats(cfg: Option<&crate::config::AppConfig>) -> serde_json::Map<String, 
     m.insert("pkgs".into(), json!(pkgs));
     m.insert("parse_fail".into(), json!(PARSE_FAILS.load(Ordering::Relaxed)));
     m.insert("hit_pkgs".into(), json!(hit_pkgs));
+    /* 命中列表带应用名 (前端弹窗显示 label||pkg) */
+    let hit_list: Vec<serde_json::Value> = hit_list
+        .iter()
+        .map(|p| json!({ "pkg": p, "label": app_label_of(p) }))
+        .collect();
     m.insert("hit_list".into(), json!(hit_list));
     m.insert("threads".into(), json!(threads));
     m.insert("total_procs".into(), json!(sys_procs()));
@@ -353,6 +358,11 @@ fn rf_stats(cfg: Option<&crate::config::AppConfig>) -> serde_json::Map<String, s
     let mut m = serde_json::Map::new();
     m.insert("rf_rules".into(), json!(rf_rules));
     m.insert("rf_hit_pkgs".into(), json!(rf_hit_list.len()));
+    /* 命中列表带应用名 (前端弹窗显示 label||pkg) */
+    let rf_hit_list: Vec<serde_json::Value> = rf_hit_list
+        .iter()
+        .map(|p| json!({ "pkg": p, "label": app_label_of(p) }))
+        .collect();
     m.insert("rf_hit_list".into(), json!(rf_hit_list));
     m
 }
@@ -556,17 +566,6 @@ fn suggest_api(req: &Request) -> (u16, String) {
     (200, json!({ "ok": true, "list": list }).to_string())
 }
 
-/// 枚举包名 (读 pkg→(uid,system) 缓存, 不再扫 /data/data; 缓存为空时先补一次)
-fn installed_pkgs() -> Vec<String> {
-    if crate::rw_read_ignore_poison(&PKG_UID_CACHE).is_empty() {
-        refresh_pkg_cache();
-    }
-    crate::rw_read_ignore_poison(&PKG_UID_CACHE)
-        .keys()
-        .cloned()
-        .collect()
-}
-
 /// 排序键
 fn rank_top(counts: BTreeMap<String, usize>, lq: &str) -> Vec<(String, usize)> {
     let mut ranked: Vec<(u8, Reverse<usize>, String)> = counts
@@ -583,14 +582,42 @@ fn rank_top(counts: BTreeMap<String, usize>, lq: &str) -> Vec<(String, usize)> {
 }
 
 fn suggest_pkgs(q: &str) -> Vec<(String, usize)> {
-    let mut counts: BTreeMap<String, usize> =
-        installed_pkgs().into_iter().map(|p| (p, 0)).collect();
+    let cache = crate::rw_read_ignore_poison(&PKG_UID_CACHE);
+    if cache.is_empty() {
+        drop(cache);
+        refresh_pkg_cache();
+    }
+    let cache = crate::rw_read_ignore_poison(&PKG_UID_CACHE);
+    let lq = q.trim().to_ascii_lowercase();
+    if lq.is_empty() {
+        return Vec::new();
+    }
+    let label_of = |p: &str| cache.get(p).map(|x| &x.2).cloned().unwrap_or_default();
+    let mut hits: Vec<(u8, usize, String)> = Vec::new();   /* (rank, 运行计数, 包名) */
+    /* 同时匹配包名与应用名 (如 douyu / 斗鱼) */
+    for (p, (_, _, label)) in cache.iter() {
+        let hay = format!("{} {}", p, label).to_ascii_lowercase();
+        if hay.contains(&lq) {
+            let r = if p.to_ascii_lowercase().starts_with(&lq) { 0 } else { 1 };
+            hits.push((r, 0usize, p.clone()));
+        }
+    }
     crate::for_each_proc_pid(|pid| {
         if let Some(name) = read_cmdline(pid).filter(|n| n.contains('.')) {
-            *counts.entry(name).or_insert(0) += 1;
+            let hay = format!("{} {}", name, label_of(&name)).to_ascii_lowercase();
+            if hay.contains(&lq) {
+                if let Some(e) = hits.iter_mut().find(|e| e.2 == name) {
+                    e.1 += 1;
+                } else {
+                    let r = if name.to_ascii_lowercase().starts_with(&lq) { 0 } else { 1 };
+                    hits.push((r, 1usize, name));
+                }
+            }
         }
     });
-    rank_top(counts, &q.to_ascii_lowercase())
+    hits.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)).then_with(|| a.2.cmp(&b.2)));
+    hits.truncate(20);
+    hits.into_iter().map(|(_, c, p)| (p, c)).collect()
 }
 
 fn thread_comm(pid: i32, tid: i32) -> Option<String> {
