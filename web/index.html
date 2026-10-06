@@ -2336,7 +2336,9 @@ function renderDeviceRates(cfg){
 }
 // 全局刷新率 chips: 按设备可用刷新率 (rfAvail) 渲染; 单选强制 (点选切换, 不允许取消)
 let rfActive=120, rfIdle=60;
+let rfTouched=false;   /* 用户已手动点选 chips: 后台刷新/轮询不再覆盖当前选择 */
 function applyGlobalRfChips(active,idle){
+  if(rfTouched)return;
   const av=rfAvail&&rfAvail.length?rfAvail:[120,90,60];
   rfActive=av.includes(+active)?+active:av[0];
   rfIdle=av.includes(+idle)?+idle:av[0];
@@ -2353,11 +2355,13 @@ function bindGlobalRfChips(){
   $('rf-active-chips').addEventListener('click',e=>{
     const b=e.target.closest('[data-rf]');if(!b)return;
     const r=+b.dataset.rf;
+    rfTouched=true;
     if(rfActive!==r){rfActive=r;renderGlobalRfChips();}
   });
   $('rf-idle-chips').addEventListener('click',e=>{
     const b=e.target.closest('[data-rf]');if(!b)return;
     const r=+b.dataset.rf;
+    rfTouched=true;
     if(rfIdle!==r){rfIdle=r;renderGlobalRfChips();}
   });
 }
