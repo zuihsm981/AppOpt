@@ -2033,17 +2033,13 @@ function renderRfTimeout(){
   const same=!!mrRfActive&&!!mrRfIdle&&mrRfActive===mrRfIdle;
   $('mr-rf-timeout-box').hidden=same;
 }
-let mrRfChipsBound=false;
 function renderRfChips(){
   const av=rfAvail&&rfAvail.length?rfAvail:[120,90,60];
-  $('mr-rf-active-chips').innerHTML=av.map(r=>`<button data-rf="${r}" class="${mrRfActive===+r?'on':''}">${r}Hz</button>`).join('');
-  $('mr-rf-idle-chips').innerHTML=av.map(r=>`<button data-rf="${r}" class="${mrRfIdle===+r?'on':''}">${r}Hz</button>`).join('');
+  $('mr-rf-active-chips').innerHTML=av.map(r=>`<button data-rf="${r}" class="${mrRfActive===r?'on':''}">${r}Hz</button>`).join('');
+  $('mr-rf-idle-chips').innerHTML=av.map(r=>`<button data-rf="${r}" class="${mrRfIdle===r?'on':''}">${r}Hz</button>`).join('');
   renderRfTimeout();
-  bindRfChips();   /* 幂等重绑: 任何早期失败/重建后首次渲染即恢复监听 */
 }
 function bindRfChips(){
-  if(mrRfChipsBound)return;
-  mrRfChipsBound=true;
   $('mr-rf-active-chips').addEventListener('click',e=>{
     const b=e.target.closest('[data-rf]');if(!b)return;
     const r=+b.dataset.rf;
@@ -2348,16 +2344,12 @@ function applyGlobalRfChips(active,idle){
 }
 function renderGlobalRfChips(){
   const av=rfAvail&&rfAvail.length?rfAvail:[120,90,60];
-  $('rf-active-chips').innerHTML=av.map(r=>`<button data-rf="${r}" class="${rfActive===+r?'on':''}">${r}Hz</button>`).join('');
-  $('rf-idle-chips').innerHTML=av.map(r=>`<button data-rf="${r}" class="${rfIdle===+r?'on':''}">${r}Hz</button>`).join('');
+  $('rf-active-chips').innerHTML=av.map(r=>`<button data-rf="${r}" class="${rfActive===r?'on':''}">${r}Hz</button>`).join('');
+  $('rf-idle-chips').innerHTML=av.map(r=>`<button data-rf="${r}" class="${rfIdle===r?'on':''}">${r}Hz</button>`).join('');
   /* 活跃==空闲 → 无空闲切换, 自动隐藏空闲超时; 不同 → 恢复显示 */
   $('rf-timeout-row').hidden=!!rfActive&&rfActive===rfIdle;
-  bindGlobalRfChips();   /* 幂等重绑: 任何早期失败/重建后首次渲染即恢复监听 */
 }
-let rfChipsBound=false;
 function bindGlobalRfChips(){
-  if(rfChipsBound)return;
-  rfChipsBound=true;
   $('rf-active-chips').addEventListener('click',e=>{
     const b=e.target.closest('[data-rf]');if(!b)return;
     const r=+b.dataset.rf;
