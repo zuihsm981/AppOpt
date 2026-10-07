@@ -233,7 +233,7 @@ body.kb .tabbar,body.kb .navbar{backdrop-filter:none;-webkit-backdrop-filter:non
 <div class="card">
 <div class="card-title">规则</div>
 <div class="grid2">
-<div class="stat clickable" id="s-rf-hit-card" role="button" tabindex="0" title="点击查看命中的具体应用包名"><div class="num" id="s-rf-hit">0</div><div class="lbl">命中应用</div></div>
+<div class="stat clickable" id="s-rf-cover-card" role="button" tabindex="0" title="点击查看全部有刷新率规则的应用"><div class="num" id="s-rf-cover">0</div><div class="lbl">覆盖应用</div></div>
 <div class="stat"><div class="num" id="s-rf-rules">0</div><div class="lbl">规则数量</div></div>
 </div>
 </div>
@@ -471,7 +471,7 @@ body.kb .tabbar,body.kb .navbar{backdrop-filter:none;-webkit-backdrop-filter:non
 
 <div id="modal-hit" class="modal-bg" hidden>
 <div class="modal">
-<h3>命中应用</h3>
+<h3 id="mhit-title">命中应用</h3>
 <div class="hint" id="mhit-summary" style="margin-bottom:10px"></div>
 <div id="mhit-list" style="max-height:52vh;overflow:auto"></div>
 <div class="modal-actions">
@@ -1385,24 +1385,25 @@ window.addEventListener('blur',()=>pausePolling());
 window.addEventListener('focus',()=>resumePolling());
 window.addEventListener('pagehide',()=>pausePolling());
 let hitList=[];
-let rfHitList=[];
+let rfCoverList=[];
 let statusDrive='auto',statusTouch=false,statusConn=false;
-// 刷新率状态页规则卡: 规则数量/命中应用 (不含只有线程规则且无刷新率配置的应用)
+// 刷新率状态页规则卡: 规则数量/覆盖应用 (全部有刷新率规则的应用)
 function fillRfRules(d){
   $('s-rf-rules').textContent=d.rf_rules??0;
-  rfHitList=Array.isArray(d.rf_hit_list)?d.rf_hit_list:[];
-  $('s-rf-hit').textContent=d.rf_hit_pkgs??0;
+  rfCoverList=Array.isArray(d.rf_cover_list)?d.rf_cover_list:[];
+  $('s-rf-cover').textContent=d.rf_cover_pkgs??0;
 }
-// 刷新率状态命中应用弹窗 (复用 modal-hit)
-function showRfHitList(){
-  $('mhit-summary').textContent='共 '+rfHitList.length+' 个命中应用';
+// 覆盖应用弹窗 (复用 modal-hit): 展示全部有刷新率规则的应用
+function showRfCoverList(){
+  $('mhit-title').textContent='覆盖应用';
+  $('mhit-summary').textContent='共 '+rfCoverList.length+' 个覆盖应用';
   const box=$('mhit-list');
-  if(!rfHitList.length){box.innerHTML='<div class="empty">暂无命中应用</div>';}
-  else{box.innerHTML=rfHitList.map(p=>`<div class="rule-row"><span class="rule-name mono">${esc(typeof p==='string'?p:(p.label||p.pkg))}</span></div>`).join('');}
+  if(!rfCoverList.length){box.innerHTML='<div class="empty">暂无覆盖应用</div>';}
+  else{box.innerHTML=rfCoverList.map(p=>`<div class="rule-row"><span class="rule-name">${esc(p.label||p.pkg)}</span></div>`).join('');}
   $('modal-hit').hidden=false;
 }
-$('s-rf-hit-card').onclick=showRfHitList;
-$('s-rf-hit-card').addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();showRfHitList()}});
+$('s-rf-cover-card').onclick=showRfCoverList;
+$('s-rf-cover-card').addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();showRfCoverList()}});
 async function refreshStat(){
   if(document.hidden||uiFocus)return;
   try{
@@ -1443,6 +1444,7 @@ async function refreshStat(){
 
 // 命中应用列表弹窗: 点击"命中应用"统计块展示具体包名
 function showHitList(){
+  $('mhit-title').textContent='命中应用';
   $('mhit-summary').textContent='共 '+hitList.length+' 个命中应用';
   const box=$('mhit-list');
   if(!hitList.length){box.innerHTML='<div class="empty">暂无命中应用</div>';}
@@ -2320,10 +2322,9 @@ function renderRfInput(st){
   $('rf-input-label').textContent=rfTouchEvent?(rfTouchEvent+' 状态'):'触摸监听状态';
   $('rf-input').textContent=fmtInput(st);
 }
-function fmtInput(st){
-  const last=(st.last_input_secs||0)>=0?(' · 上次输入 '+(st.last_input_secs||0)+'s前'):'';
+function fmtInput(){
   // input 检测统一走用户态 eventX (无内核 input hook): 一律显示监听状态
-  return (statusTouch?'已监听':'未监听')+last;
+  return (statusTouch?'已监听':'未监听');
 }
 // 设备刷新率: 默认只显示刷新率 (120Hz / 90Hz / 60Hz), 点击后展开完整模式 (id|WxH Hz)
 function renderDeviceRates(cfg){
