@@ -807,7 +807,6 @@ const appRowsHtml=(list,appAttr,editAttr,delAttr,empty)=>{
   const apps=uniq(list.flatMap(r=>r.apps||[]));
   return apps.length?apps.map((a,i)=>`<div class="grp"><div class="grp-head" style="cursor:pointer;gap:0;align-items:center" data-${appAttr}="${esc(a)}">
 <span style="font-weight:700;font-size:14px;color:#000;padding-left:8px;flex:1">${esc(labelOf(a))}</span>
-<button class="icon-btn" style="flex-shrink:0" data-${editAttr}="${i}" title="编辑">${ICO_EDIT}</button>
 <button class="icon-btn danger" style="flex-shrink:0;margin-right:6px" data-${delAttr}="${i}" title="删除">${ICO_TRASH}</button>
 </div></div>`).join(''):empty;
 };
@@ -846,11 +845,12 @@ function renderRdNameRuleList(){
 /* 组弹层: 该组规则 (图标 + from/to + 编辑/删除) */
 let rdFGroupRoot='';
 let frGroupsApp='';
-function openFGroupsLayer(app){
+let frGroupsName=false;   /* true=文件名伪装入口, false=路径重定向入口 (分组/组规则按此过滤) */
+function openFGroupsLayer(app, nameMode){
   if(!app)return;
-  frGroupsApp=app;
+  frGroupsApp=app; frGroupsName=!!nameMode;
   $('fr-groups-title').textContent=app+' 的分组';
-  const rs=rdFrules.filter(r=>(r.apps||[]).includes(app));
+  const rs=rdFrules.filter(r=>(r.apps||[]).includes(app)&&(frGroupsName?isNameRule(r):!isNameRule(r)));
   const groups={};
   rs.forEach(r=>{const root=dirName(r.from)||'/'; (groups[root]=groups[root]||[]).push(r)});
   $('fr-groups-body').innerHTML=Object.keys(groups).map(root=>
@@ -868,8 +868,8 @@ $('fr-groups-body').addEventListener('click',e=>{
 });
 function openFGroup(root){
   rdFGroupRoot=root;
-  $('rd-fgroup-title').textContent=root + ' 下的重定向';
-  const rs=rdFrules.filter(r=>(r.apps||[]).includes(frGroupsApp)&&dirName(r.from)===root);
+  $('rd-fgroup-title').textContent=root + ' 下的' + (frGroupsName?'文件名伪装':'路径重定向');
+  const rs=rdFrules.filter(r=>(r.apps||[]).includes(frGroupsApp)&&dirName(r.from)===root&&(frGroupsName?isNameRule(r):!isNameRule(r)));
 
   $('rd-fgroup-body').innerHTML=rs.map((r,i)=>{
     const gidx=rdFrules.indexOf(r);
@@ -896,7 +896,7 @@ $('rd-fgroup-body').addEventListener('click',e=>{
     if(!((r.apps||[]).length) && !r.global) rdFrules.splice(rdFrules.indexOf(r),1);
   }
   renderRdFrules(); wlSaveNow();
-  const left=rdFrules.some(r=>(r.apps||[]).includes(frGroupsApp)&&dirName(r.from)===rdFGroupRoot);
+  const left=rdFrules.some(r=>(r.apps||[]).includes(frGroupsApp)&&dirName(r.from)===rdFGroupRoot&&(frGroupsName?isNameRule(r):!isNameRule(r)));
   if(left)openFGroup(rdFGroupRoot); else closeFGroup();
 });
 function renderRdApps(){
@@ -1023,7 +1023,7 @@ $('rd-frules').addEventListener('click',e=>{
   const ad=e.target.closest('button[data-fadel]');
   if(ad){const app=uniq(rdFrules.flatMap(r=>r.apps||[]))[+ad.dataset.fadel];if(!app)return;rdFrules.forEach(r=>{if(r.apps)r.apps=r.apps.filter(x=>x!==app)});rdFrules=rdFrules.filter(r=>!(r.apps&&!r.apps.length&&!r.global));renderRdFrules();wlSaveNow();return}
   const h=e.target.closest('[data-fapp]');
-  if(h)openFGroupsLayer(h.dataset.fapp);
+  if(h)openFGroupsLayer(h.dataset.fapp,false);   /* 路径重定向入口: 仅同名规则 */
 });
 $('rd-name-rules').addEventListener('click',e=>{
   const ae=e.target.closest('button[data-faedit]');
@@ -1031,7 +1031,7 @@ $('rd-name-rules').addEventListener('click',e=>{
   const ad=e.target.closest('button[data-fadel]');
   if(ad){const app=uniq(rdFrules.filter(isNameRule).flatMap(r=>r.apps||[]))[+ad.dataset.fadel];if(!app)return;rdFrules.forEach(r=>{if(r.apps)r.apps=r.apps.filter(x=>x!==app)});rdFrules=rdFrules.filter(r=>!(r.apps&&!r.apps.length&&!r.global));renderRdFrules();wlSaveNow();return}
   const h=e.target.closest('[data-fapp]');
-  if(h)openFGroupsLayer(h.dataset.fapp);
+  if(h)openFGroupsLayer(h.dataset.fapp,true);    /* 文件名伪装入口: 仅不同名规则 */
 });
 $('rd-add-apps').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(b){rdAddTmp.splice(+b.dataset.i,1);renderRdApps();return}const h=e.target.closest('.grp-head');if(h)h.parentElement.classList.toggle('open');});
 $('rd-field-apps').addEventListener('click',e=>{
@@ -1105,7 +1105,7 @@ function closeRdField(){
   $('rd-field-modal').hidden=true;
   $('rd-ffrom').value='';$('rd-fto').value='';  /* 关闭即清新/旧规则名 — 避免残留 */
   $('rd-field-err').hidden=true;
-  if(!$('fr-groups-modal').hidden&&frGroupsApp)openFGroupsLayer(frGroupsApp);
+  if(!$('fr-groups-modal').hidden&&frGroupsApp)openFGroupsLayer(frGroupsApp,frGroupsName);
   if(!$('rd-fgroup-modal').hidden&&rdFGroupRoot)openFGroup(rdFGroupRoot);
 }
 $('rd-field-modal').addEventListener('click',e=>{if(e.target.id==='rd-field-modal')closeRdField();});
@@ -1226,6 +1226,15 @@ $('w-red-rules').addEventListener('click',e=>{
   renderRdCrules();wlSaveNow();
 });
 $('w-redpath-rules').addEventListener('click',e=>{
+  const ed=e.target.closest('button[data-rdfruleedit]');
+  if(ed){rdEditFromApp=null;openRdEdit('f',+ed.dataset.rdfruleedit,true);return}
+  const b=e.target.closest('button[data-rdfruledel]');
+  if(!b)return;
+  rdFrules.splice(+b.dataset.rdfruledel,1);
+  renderRdFrules();wlSaveNow();
+});
+/* 文件名伪装规则列表: 与路径重定向规则列表同款 (编辑/删除), 只作用于不同名规则 */
+$('w-name-rules').addEventListener('click',e=>{
   const ed=e.target.closest('button[data-rdfruleedit]');
   if(ed){rdEditFromApp=null;openRdEdit('f',+ed.dataset.rdfruleedit,true);return}
   const b=e.target.closest('button[data-rdfruledel]');
