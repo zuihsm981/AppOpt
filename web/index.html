@@ -840,7 +840,7 @@ function renderRdNameRules(){
 }
 function renderRdNameRuleList(){
   const box=$('w-name-rules');if(!box)return;
-  box.innerHTML=rdFrules.filter(isNameRule).map((r,i)=>wlRuleRow(r,i,'rdfrule')).join('')||'<div class="hint">暂无规则</div>';
+  box.innerHTML=rdFrules.filter(isNameRule).map(r=>wlRuleRow(r,rdFrules.indexOf(r),'rdfrule')).join('')||'<div class="hint">暂无规则</div>';
 }
 /* 组弹层: 该组规则 (图标 + from/to + 编辑/删除) */
 let rdFGroupRoot='';
@@ -1216,7 +1216,7 @@ function renderRdCRuleList(){
 function renderRdFRuleList(){
   const box=$('w-redpath-rules');if(!box)return;
   rdFrules=mergeWlRules(rdFrules,false);
-  box.innerHTML=rdFrules.filter(r=>!isNameRule(r)).map((r,i)=>wlRuleRow(r,i,'rdfrule')).join('')||'<div class="hint">暂无规则</div>';
+  box.innerHTML=rdFrules.filter(r=>!isNameRule(r)).map(r=>wlRuleRow(r,rdFrules.indexOf(r),'rdfrule')).join('')||'<div class="hint">暂无规则</div>';
 }
 [['w-srv-tabs','w-srv-apps','w-srv-rules'],['w-prop-tabs','w-prop-apps','w-prop-rules'],['w-red-tabs','w-red-apps','w-red-rules'],['w-redpath-tabs','w-redpath-apps','w-redpath-rules'],['w-name-tabs','w-name-apps','w-name-rules']].forEach(([segId,appsId,rulesId])=>{
   const seg=$(segId),apps=$(appsId),rules=$(rulesId);
