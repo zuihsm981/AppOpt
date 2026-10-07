@@ -342,27 +342,15 @@ fn rf_stats(cfg: Option<&crate::config::AppConfig>) -> serde_json::Map<String, s
         .map(|c| c.app_refresh_configs.keys().map(String::as_str).collect())
         .unwrap_or_default();
     let rf_rules = rf_apps.len();
-    // 刷新率命中不能从 CPU hit_list 派生 (仅刷新率应用不在 CPU 命中里, 恒空);
-    // 取当前生效前台包 (实时读取, 避免状态快照延迟导致恒 0);
-    // launcher 用全局 → 不计
-    let cur = crate::refresh::refresh_current_package();
-    let rf_hit_list: Vec<String> = if cur.is_empty()
-        || cur == crate::config::DEFAULT_REFRESH_PACKAGE
-        || !rf_apps.contains(cur.as_str())
-    {
-        Vec::new()
-    } else {
-        vec![cur]
-    };
     let mut m = serde_json::Map::new();
     m.insert("rf_rules".into(), json!(rf_rules));
-    m.insert("rf_hit_pkgs".into(), json!(rf_hit_list.len()));
-    /* 命中列表带应用名 (前端弹窗显示 label||pkg) */
-    let rf_hit_list: Vec<serde_json::Value> = rf_hit_list
+    /* 覆盖应用 = 全部有刷新率规则的应用 (带应用名; 前端弹窗显示 label||pkg) */
+    m.insert("rf_cover_pkgs".into(), json!(rf_rules));
+    let cover_list: Vec<serde_json::Value> = rf_apps
         .iter()
         .map(|p| json!({ "pkg": p, "label": app_label_of(p) }))
         .collect();
-    m.insert("rf_hit_list".into(), json!(rf_hit_list));
+    m.insert("rf_cover_list".into(), json!(cover_list));
     m
 }
 

@@ -109,8 +109,6 @@ static WAKE_FD: AtomicI32 = AtomicI32::new(-1);
 static STATUS_REQ: AtomicBool = AtomicBool::new(false);
 static REFRESH_STATUS: Mutex<Option<RefreshStatus>> = Mutex::new(None);
 static REFRESH_TX: Mutex<Option<mpsc::Sender<RefreshEvent>>> = Mutex::new(None);
-/// 当前生效前台包名 (try_apply_fg_pkg 同步写入; 供 /api/status 命中统计实时读取, 不依赖快照)
-static CURRENT_RF_PKG: Mutex<String> = Mutex::new(String::new());
 
 
 #[derive(Clone)]
@@ -310,7 +308,6 @@ fn try_apply_fg_pkg(state: &mut RefreshState, pkg: &str) -> bool {
         return false;
     }
     state.current_package = pkg.to_string();
-    *crate::lock_ignore_poison(&CURRENT_RF_PKG) = pkg.to_string();
     apply_app_config(state, pkg);
     set_refresh_rate(state, state.effective.active);
     reset_timer(state, true);
@@ -730,11 +727,6 @@ pub fn refresh_get_status() -> Option<RefreshStatus> {
     STATUS_REQ.store(true, Ordering::Release);
     wake();
     crate::lock_ignore_poison(&REFRESH_STATUS).clone()
-}
-
-/// 当前生效前台包名 (实时, 由 try_apply_fg_pkg 同步写入; 不依赖状态快照)
-pub fn refresh_current_package() -> String {
-    crate::lock_ignore_poison(&CURRENT_RF_PKG).clone()
 }
 
 /// 解析 `dumpsys display` 的显示模式 (模仿命令行):
