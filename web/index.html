@@ -1112,6 +1112,7 @@ $('rd-field-modal').addEventListener('click',e=>{if(e.target.id==='rd-field-moda
 $('rd-field-ok').onclick=()=>{
   const f=$('rd-ffrom').value.trim(),t=$('rd-fto').value.trim();
   if(!f.length||!t.length){$('rd-field-err').textContent='原/新路径不能为空';$('rd-field-err').hidden=false;return}else{$('rd-field-err').hidden=true}
+  if(baseName(f)!==baseName(t)){$('rd-field-err').textContent='原/新文件名不同属「文件名伪装」, 请使用文件名伪装功能添加';$('rd-field-err').hidden=false;return}else{$('rd-field-err').hidden=true}
   if(!rdpTmp.length){$('rd-field-err').textContent='无法保存: 需要添加目标应用';$('rd-field-err').hidden=false;return}else{$('rd-field-err').hidden=true}
   rdFrules.push({from:f,to:t,apps:rdpTmp.slice()});
   $('rd-ffrom').value='';$('rd-fto').value='';
@@ -1670,6 +1671,7 @@ $('rd-edit-save').onclick=()=>{
   }else{
     const nf=$('rd-edit-from-input').value.trim(),nt=$('rd-edit-to-input').value.trim();
     if(!nf.length||!nt.length){toast('原/新路径不能为空');return}
+    if(baseName(nf)!==baseName(nt)){toast('原/新文件名不同属「文件名伪装」, 请用文件名伪装功能编辑');return}
     rdFrules[rdEditIdx].from=nf;
     rdFrules[rdEditIdx].to=nt;
     if(!rdEditTmp.length){toast('无法保存: 需要添加目标应用');return}
