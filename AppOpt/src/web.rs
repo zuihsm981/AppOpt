@@ -890,6 +890,10 @@ fn waylay_set_api(req: &Request) -> (u16, String) {
             KPM_ARMED.store(false, std::sync::atomic::Ordering::Relaxed);
         }
     }
+    // 挂机黑屏 (scr 字段): 1=开启(内核 hwc_off 关屏), 0=恢复(hwc_on); 由主循环消费 SCR_REQ
+    if v.get("scr").is_some() && v["scr"].is_boolean() {
+        crate::config::set_scr_req(v["scr"].as_bool().unwrap_or(false));
+    }
     let mut rules: Vec<crate::config::WaylayRule> = Vec::new();
     if let Some(arr) = v["rules"].as_array() {
         for r in arr {

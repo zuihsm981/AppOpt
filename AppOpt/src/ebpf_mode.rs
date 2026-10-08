@@ -313,6 +313,17 @@ impl KpmHandle {
         Ok(())
     }
 
+    /// 屏幕挂机黑屏: 内核关屏 (HWC setPowerMode OFF 内核实现, 仅 6.6; 面板物理关闭,
+    /// Android 状态机不干预 → 游戏前台不暂停; 亮屏状态由持锁保持)
+    pub(crate) fn scr_off(&self) {
+        self.cmd("hwc_off");
+    }
+
+    /// 屏幕挂机黑屏: 恢复亮屏 (双击恢复入口; 内核放行下一帧合成重亮)
+    pub(crate) fn scr_on(&self) {
+        self.cmd("hwc_on");
+    }
+
     /// property 区用户态文件写替换 (root 读写 /dev/__properties__/<ctx> 文件,
     /// 等长替换 → tmpfs page cache 更新 → 全进程共享映射见新名)。
     /// on=true from→to, false 反向恢复。完全用户态, 无内核内存操作。

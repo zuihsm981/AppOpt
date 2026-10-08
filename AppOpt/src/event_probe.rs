@@ -146,6 +146,21 @@ const TAG_CTRL: u64 = u64::MAX;
 const TAG_TOUCH: u64 = u64::MAX - 1;
 // 触摸 fd 常驻 epoll (不做摘除); 活动通知防抖 2s: 高频触摸只发一次 1B 通知
 const TOUCH_NOTIFY_DEBOUNCE_MS: u64 = 2000;
+// input_event 解析 (24B, aarch64: timeval 16B + type/code/value 8B): 双击检测
+const EV_ABS: u16 = 0x03;
+const ABS_MT_TRACKING_ID: u16 = 0x39;   // 57: 触点会话 id, >=0 按下 / -1 抬起
+// 双击判定: 两次按下间隔 ≤ 300ms (中间有抬起)
+const DOUBLE_TAP_MS: u128 = 300;
+const INPUT_EVENT_SIZE: usize = 24;
+
+#[repr(C)]
+struct InputEvent {
+    sec: i64,
+    usec: i64,
+    type_: u16,
+    code: u16,
+    value: i32,
+}
 
 /// 用户态事件探测线程入口 (单 epoll: 触摸 fd + pidfd 集合 + 控制 fd)。
 /// touch_sock: 触摸活动通知写端 (1B); exit_sock: 主进程退出通知写端 (i32 LE 4B);
@@ -181,6 +196,9 @@ pub fn spawn_event(touch_sock: c_int, ctrl_sock: c_int, exit_sock: c_int) {
 
     let mut events: [libc::epoll_event; 32] = unsafe { std::mem::zeroed() };
     let mut buf = [0u8; 4096];
+    // 双击状态机: last_down=上次按下时刻, armed=已抬起等待第二次按下
+    let mut last_down: Option<std::time::Instant> = None;
+    let mut armed = false;
     // 触摸 fd 常驻 epoll: 摘除只发生在定时器停止 (ctrl 0) 显式暂停时;
     // 高频触摸时仅对"跨线程活动通知"做 2s 防抖 (本地读空仍每次执行, 微秒级)
     let mut last_notify: Option<std::time::Instant> = None;
@@ -193,6 +211,7 @@ pub fn spawn_event(touch_sock: c_int, ctrl_sock: c_int, exit_sock: c_int) {
             break;
         }
         let mut activity = false;
+        let mut double_tap = false;
         for i in 0..n as usize {
             let tag = events[i].u64;
             if tag == TAG_CTRL {
@@ -209,11 +228,34 @@ pub fn spawn_event(touch_sock: c_int, ctrl_sock: c_int, exit_sock: c_int) {
                     TOUCH_LISTENING.store(false, Ordering::Relaxed); // 暂停 → UI 未监听
                 }
             } else if tag == TAG_TOUCH {
-                // touch event: 清空事件 (只读丢弃)
+                // 触摸事件: 解析触点按下/抬起 → 双击检测 (只读丢弃, 不影响系统输入)
                 loop {
                     let r = unsafe { libc::read(touch_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
                     if r <= 0 {
                         break;
+                    }
+                    let mut off = 0usize;
+                    while off + INPUT_EVENT_SIZE <= r as usize {
+                        let ev = unsafe { &*(buf.as_ptr().add(off) as *const InputEvent) };
+                        if ev.type_ == EV_ABS && ev.code == ABS_MT_TRACKING_ID {
+                            if ev.value >= 0 {
+                                // 触点按下 (新 touch 会话)
+                                let now = std::time::Instant::now();
+                                if armed {
+                                    if let Some(t0) = last_down {
+                                        if now.duration_since(t0).as_millis() <= DOUBLE_TAP_MS {
+                                            double_tap = true;
+                                        }
+                                    }
+                                }
+                                last_down = Some(now);
+                                armed = false;
+                            } else {
+                                // 触点抬起 → 等待第二次按下
+                                armed = true;
+                            }
+                        }
+                        off += INPUT_EVENT_SIZE;
                     }
                 }
                 activity = true;
@@ -234,7 +276,13 @@ pub fn spawn_event(touch_sock: c_int, ctrl_sock: c_int, exit_sock: c_int) {
                 }
             }
         }
-        if activity {
+        if double_tap {
+            // 双击: 绕过防抖立即通知 (value=2 → 主循环恢复挂机黑屏亮屏)
+            if touch_sock >= 0 {
+                let v: u8 = 2;
+                let _ = unsafe { libc::send(touch_sock, &v as *const u8 as *const _, 1, libc::MSG_DONTWAIT) };
+            }
+        } else if activity {
             // 通知防抖: 2s 内只向主线程发送一次活动通知 (触摸 fd 常驻, 本地仍每次读空)
             let now = std::time::Instant::now();
             let due = last_notify

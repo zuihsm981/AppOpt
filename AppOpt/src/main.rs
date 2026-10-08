@@ -552,6 +552,20 @@ impl AppState {
             -1 => self.set_kpm_arm(false),
             _ => {}
         }
+        // 挂机黑屏: 开启/恢复 (内核 hwc_off / hwc_on; 双击屏幕也可恢复)
+        match crate::config::take_scr_req() {
+            1 => {
+                if let Some(es) = self.ebpf_state.as_ref() {
+                    es.bpf.scr_off();
+                }
+            }
+            -1 => {
+                if let Some(es) = self.ebpf_state.as_ref() {
+                    es.bpf.scr_on();
+                }
+            }
+            _ => {}
+        }
         // waylay 配置保存 (web /api/waylay): 同步替换字符到内核 (目标 uid 集合已由
         // save_waylay 更新静态, 下一次前台回调差量生效)
         if crate::config::take_waylay_changed() {
@@ -1144,10 +1158,9 @@ fn main() {
                     }
                 }
                 EV_TOUCH => {
-                    // 用户态触摸/输入活动: 读走 1 字节通知 (只关心"有活动") → 重置刷新率空闲
+                    // 用户态触摸/输入活动: 读走 1 字节通知; 1=活动, 2=双击
+                    let mut tb = [0u8; 1];
                     if touch_ok && touch_sv[0] > 0 {
-                        // event_probe 每次活动通知 1 字节; 读走即可 (只关心"有活动")
-                        let mut tb = [0u8; 1];
                         let _ = unsafe {
                             libc::recv(
                                 touch_sv[0],
@@ -1156,6 +1169,12 @@ fn main() {
                                 0,
                             )
                         };
+                    }
+                    if tb[0] == 2 {
+                        // 双击 → 恢复挂机黑屏亮屏 (内核 hwc_on 放行下一帧合成重亮)
+                        if let Some(es) = state.ebpf_state.as_ref() {
+                            es.bpf.scr_on();
+                        }
                     }
                     crate::refresh::refresh_on_event(crate::refresh::EVENT_INPUT, 0);
                 }

@@ -300,6 +300,18 @@ pub fn take_kpm_arm_req() -> i8 {
     KPM_ARM_REQ.swap(0, Ordering::AcqRel)
 }
 
+/// 挂机黑屏请求 (隐藏页按钮 → 主循环): 1=开启(内核 hwc_off 关屏), -1=恢复(hwc_on), 0=无
+pub static SCR_REQ: AtomicI8 = AtomicI8::new(0);
+
+pub fn set_scr_req(on: bool) {
+    SCR_REQ.store(if on { 1 } else { -1 }, Ordering::Release);
+    request_config_reload();
+}
+
+pub fn take_scr_req() -> i8 {
+    SCR_REQ.swap(0, Ordering::AcqRel)
+}
+
 
 /// 目标应用 → uid 集合 (查 packages.list; 未安装跳过)
 
