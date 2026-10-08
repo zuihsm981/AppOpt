@@ -558,11 +558,13 @@ impl AppState {
                 if let Some(es) = self.ebpf_state.as_ref() {
                     es.bpf.scr_off();
                 }
+                crate::config::set_scr_off_state(true);
             }
             -1 => {
                 if let Some(es) = self.ebpf_state.as_ref() {
                     es.bpf.scr_on();
                 }
+                crate::config::set_scr_off_state(false);
             }
             _ => {}
         }
@@ -1170,8 +1172,9 @@ fn main() {
                             )
                         };
                     }
-                    if tb[0] == 2 {
-                        // 双击 → 恢复挂机黑屏亮屏 (内核 hwc_on 放行下一帧合成重亮)
+                    if tb[0] == 2 && crate::config::scr_off_state() {
+                        // 双击 → 恢复挂机黑屏亮屏 (仅关屏态响应, 防普通触摸误触发)
+                        crate::config::set_scr_off_state(false);
                         if let Some(es) = state.ebpf_state.as_ref() {
                             es.bpf.scr_on();
                         }

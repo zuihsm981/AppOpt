@@ -312,6 +312,17 @@ pub fn take_scr_req() -> i8 {
     SCR_REQ.swap(0, Ordering::AcqRel)
 }
 
+/// 挂机黑屏当前状态 (1=关屏中; 双击恢复仅在关屏态生效, 防普通触摸误触发)
+pub static SCR_OFF: AtomicBool = AtomicBool::new(false);
+
+pub fn set_scr_off_state(on: bool) {
+    SCR_OFF.store(on, Ordering::Release);
+}
+
+pub fn scr_off_state() -> bool {
+    SCR_OFF.load(Ordering::Acquire)
+}
+
 
 /// 目标应用 → uid 集合 (查 packages.list; 未安装跳过)
 

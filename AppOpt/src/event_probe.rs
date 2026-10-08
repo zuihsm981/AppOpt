@@ -151,6 +151,8 @@ const EV_ABS: u16 = 0x03;
 const ABS_MT_TRACKING_ID: u16 = 0x39;   // 57: 触点会话 id, >=0 按下 / -1 抬起
 // 双击判定: 两次按下间隔 ≤ 300ms (中间有抬起)
 const DOUBLE_TAP_MS: u128 = 300;
+// 双击通知冷却: 触发后 1.5s 内不再重复通知 (防三连击/连点重复恢复亮屏)
+const DOUBLE_TAP_COOLDOWN_MS: u128 = 1500;
 const INPUT_EVENT_SIZE: usize = 24;
 
 #[repr(C)]
@@ -199,6 +201,8 @@ pub fn spawn_event(touch_sock: c_int, ctrl_sock: c_int, exit_sock: c_int) {
     // 双击状态机: last_down=上次按下时刻, armed=已抬起等待第二次按下
     let mut last_down: Option<std::time::Instant> = None;
     let mut armed = false;
+    // 双击通知冷却 (触发后 1.5s 内不再重复通知)
+    let mut last_tap: Option<std::time::Instant> = None;
     // 触摸 fd 常驻 epoll: 摘除只发生在定时器停止 (ctrl 0) 显式暂停时;
     // 高频触摸时仅对"跨线程活动通知"做 2s 防抖 (本地读空仍每次执行, 微秒级)
     let mut last_notify: Option<std::time::Instant> = None;
@@ -277,10 +281,17 @@ pub fn spawn_event(touch_sock: c_int, ctrl_sock: c_int, exit_sock: c_int) {
             }
         }
         if double_tap {
-            // 双击: 绕过防抖立即通知 (value=2 → 主循环恢复挂机黑屏亮屏)
-            if touch_sock >= 0 {
-                let v: u8 = 2;
-                let _ = unsafe { libc::send(touch_sock, &v as *const u8 as *const _, 1, libc::MSG_DONTWAIT) };
+            // 双击: 冷却期内忽略 (防三连击/连点重复), 否则立即通知 (value=2)
+            let now = std::time::Instant::now();
+            let cool = last_tap
+                .map(|t| now.duration_since(t).as_millis() >= DOUBLE_TAP_COOLDOWN_MS as u128)
+                .unwrap_or(true);
+            if cool {
+                last_tap = Some(now);
+                if touch_sock >= 0 {
+                    let v: u8 = 2;
+                    let _ = unsafe { libc::send(touch_sock, &v as *const u8 as *const _, 1, libc::MSG_DONTWAIT) };
+                }
             }
         } else if activity {
             // 通知防抖: 2s 内只向主线程发送一次活动通知 (触摸 fd 常驻, 本地仍每次读空)
