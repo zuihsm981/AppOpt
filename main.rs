@@ -3,16 +3,15 @@
 compile_error!("AppOpt requires 64-bit target due to cpu_set_t binary layout assumptions");
 
 mod apply_affinity;
-mod cache;
 mod cpu_affinity;
 mod config;
 mod cpuset;
 mod ebpf_mode;
-mod proc_mode;
 mod process_observer;
 mod refresh;
 mod rule_edit;
 mod rule_match;
+mod event_probe;
 mod web;
 
 use std::collections::{HashMap, HashSet};
@@ -21,21 +20,18 @@ use std::ffi::CString;
 use std::fs;
 use std::process;
 use std::sync::atomic::Ordering;
-use std::sync::{mpsc, Arc, Mutex};
-use std::time::Instant;
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::config::{
     init_inotify, load_config, AppConfig,
-    CHECK_INTERVAL, CONFIG_FILE, CONFIG_WAKE_FD, CURRENT_CONFIG,
+    CONFIG_FILE, CONFIG_WAKE_FD, CURRENT_CONFIG,
 };
 use crate::cpuset::{init_cpu_topo, set_base_cpuset};
 use crate::ebpf_mode::{
-    full_scan, event_dispatch, ebpf_init, EbpfState,
+    ebpf_init, EbpfState,
 };
-use crate::proc_mode::{cache_sync, ProcScanState};
 use crate::web::{
-    cache_stats, settings_load, settings_save, web_start, WebStats,
-    WEB_ENABLED, WEB_STATS, MODE_FORCE, MODE_SWITCH_FD, SETTINGS_FILE,
+    settings_load, settings_save, web_start, SETTINGS_FILE,
 };
 
 pub const MAX_PKG_LEN: usize = 128;
@@ -45,32 +41,147 @@ pub(crate) fn lock_ignore_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 从 packages.list 构建两张 uid→包名 静态表 (主线程持有):
-///   cpu: 有 CPU 规则的应用; rfr: com.android.launcher3 + 有刷新率规则的应用。
-/// 前台回调只查这两张表, 不查 cmdline、不管 pid。
-fn build_uid_tables(cfg: &AppConfig) -> (HashMap<i32, String>, HashMap<i32, String>) {
+/// 高频只读数据的读锁 (RwLock): 多线程并发读不互斥, 写方独占
+pub(crate) fn rw_read_ignore_poison<T>(rw: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    rw.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 高频只读数据的写锁 (RwLock): 独占写
+pub(crate) fn rw_write_ignore_poison<T>(rw: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    rw.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// uid 表条目: 一个 uid → 包名 + 用途标志 (CPU 规则 / 刷新率)
+struct UidEntry {
+    pkg: String,
+    cpu: bool,
+    rfr: bool,
+}
+
+/// 从 packages.list 构建 uid→条目 静态表 (主线程持有):
+///   cpu = 有 CPU 规则的应用; rfr = com.android.launcher3 + 有刷新率规则的应用。
+/// 一个应用可同时 CPU + 刷新率 (合表后用标志位表达)。前台回调只查本表。
+fn build_uid_tables(cfg: &AppConfig) -> (HashMap<i32, UidEntry>, HashMap<String, i32>) {
     let mut cpu_pkgs: HashSet<&str> = HashSet::new();
     for r in &cfg.rules {
         cpu_pkgs.insert(r.pkg.as_str());
     }
-    let mut cpu: HashMap<i32, String> = HashMap::new();
-    let mut rfr: HashMap<i32, String> = HashMap::new();
+    let mut fwd: HashMap<i32, UidEntry> = HashMap::new();
+    let mut rev: HashMap<String, i32> = HashMap::new();
+    /* 与 pkg_to_uid_map 共用 packages.list 读取 (当前用户 uid<100000) */
+    for (pkg, uid) in pkg_to_uid_map() {
+        let cpu = cpu_pkgs.contains(pkg.as_str());
+        let rfr = pkg == crate::config::DEFAULT_REFRESH_PACKAGE
+            || cfg.app_refresh_configs.contains_key(&pkg);
+        if cpu || rfr {
+            fwd.entry(uid).or_insert_with(|| UidEntry { pkg: pkg.clone(), cpu, rfr });
+            rev.entry(pkg.clone()).or_insert(uid);
+        }
+    }
+    (fwd, rev)
+}
+
+/// 遍历 /proc 全部数字 pid (>0); 供 web 枚举应用进程 (cpu_affinity 已改 cgroup 取 pid, 不经过)
+pub(crate) fn for_each_proc_pid(mut f: impl FnMut(i32)) {
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for e in entries.flatten() {
+            if let Ok(p) = e.file_name().to_string_lossy().parse::<i32>()
+                && p > 0
+            {
+                f(p);
+            }
+        }
+    }
+}
+
+/// vfc 规则表构建: 读 packages.list 建 包名→uid (应用 uid)
+pub(crate) fn pkg_to_uid_map() -> HashMap<String, i32> {
+    let mut m: HashMap<String, i32> = HashMap::new();
     if let Ok(content) = std::fs::read_to_string("/data/system/packages.list") {
         for line in content.lines() {
             let mut it = line.split_whitespace();
             let (Some(pkg), Some(uid_s)) = (it.next(), it.next()) else { continue };
-            let Ok(uid) = uid_s.parse::<i32>() else { continue };
-            if cpu_pkgs.contains(pkg) {
-                cpu.entry(uid).or_insert_with(|| pkg.to_string());
-            }
-            if pkg == crate::config::DEFAULT_REFRESH_PACKAGE
-                || cfg.app_refresh_configs.contains_key(pkg)
-            {
-                rfr.entry(uid).or_insert_with(|| pkg.to_string());
+            if let Ok(uid) = uid_s.parse::<i32>() {
+                if uid > 0 && uid < 100000 {   /* 当前用户 (Android 多用户 uid 偏移, 与 cpu 一致) */
+                    m.insert(pkg.to_string(), uid);
+                }
             }
         }
     }
-    (cpu, rfr)
+    m
+}
+
+/// 统一 waylay 规则 → 内核下行映射 (与 sync_vfc_rules 完全一致):
+/// 返回 (uid→规则表, vfc rows, srv list); rows/srows 的索引即内核下发 idx。
+/// main 下发与 WebUI 保存前校验共用, 避免两套映射漂移。
+pub(crate) fn build_rule_rows(
+    all: &[crate::config::WaylayRule],
+    pkguid: &HashMap<String, (i32, bool, String)>,
+) -> (
+    HashMap<i32, Vec<crate::config::WaylayRule>>,
+    Vec<(i32, String, String, String, String)>,
+    Vec<(i32, String, String)>,
+) {
+    let mut tbl: HashMap<i32, Vec<crate::config::WaylayRule>> = HashMap::new();
+    for r in all.iter() {
+        if r.pkg == "*" {
+            continue;   /* 全局规则已移除: 不下发内核 (用户态/内核态均无全局段) */
+        }
+        let Some(&(u, _, _)) = pkguid.get(&r.pkg) else {
+            continue;   /* 未安装包 → 跳过 */
+        };
+        tbl.entry(u).or_default().push(r.clone());
+    }
+    /* vfc 指纹 (red/redpath) — 稳定排序 (同 uid 内按 kind 序) */
+    let mut rows: Vec<(i32, String, String, String, String)> = Vec::new();
+    for (uid, rules) in tbl.iter() {
+        for r in rules.iter() {
+            if r.kind != crate::config::WaylayKind::Red
+                && r.kind != crate::config::WaylayKind::RedPath
+            {
+                continue;
+            }
+            let (k, tg) = if r.kind == crate::config::WaylayKind::Red {
+                ("c", r.target.clone())
+            } else {
+                ("p", "-".to_string())   /* 占位: 内核 sscanf 需 target 段非空 */
+            };
+            rows.push((*uid, k.to_string(), tg, r.from.clone(), r.to.clone()));
+        }
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    /* srv list — 同 uid 内按 from 序, 保证内核 idx 稳定 */
+    let mut srows: Vec<(i32, String, String)> = Vec::new();
+    for (u, rules) in tbl.iter() {
+        for r in rules.iter() {
+            if r.kind == crate::config::WaylayKind::Src {
+                srows.push((*u, r.from.clone(), r.to.clone()));
+            }
+        }
+    }
+    srows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    (tbl, rows, srows)
+}
+
+/// CPU 规则包 → uid: 从 main 维护的反向表过滤 (不直接读 packages.list)
+fn cpu_pkg_uids(cfg: &crate::config::AppConfig, pkg_uid: &HashMap<String, i32>) -> HashMap<String, i32> {
+    cfg.pkgs
+        .iter()
+        .filter_map(|p| pkg_uid.get(p).map(|u| (p.clone(), *u)))
+        .collect()
+}
+
+/// 按包名在 packages.list 查 uid (单个; 供增量维护在交叉提取失败时回退)
+fn lookup_uid_in_packages_list(pkg: &str) -> Option<i32> {
+    let content = std::fs::read_to_string("/data/system/packages.list").ok()?;
+    for line in content.lines() {
+        let mut it = line.split_whitespace();
+        let (Some(p), Some(u)) = (it.next(), it.next()) else { continue };
+        if p == pkg {
+            return u.parse::<i32>().ok();
+        }
+    }
+    None
 }
 
 /// 规则应用集合 (cpu/rfr): 主线程检测“新增/删除规则应用”, 集合未变则跳过重建
@@ -85,15 +196,14 @@ fn cfg_pkg_sets(cfg: &AppConfig) -> (HashSet<String>, HashSet<String>) {
 fn print_help(prog_name: &str) {
     println!("Usage: {} [OPTIONS]", prog_name);
     println!("Options:");
-    println!("  -c <config_file>   指定统一配置文件 (默认: ./appopt.conf)");
-    println!("  -s <interval>      设置检查间隔(秒) (必须>=1, 默认: 2)");
+    println!("  -c <config_file>   指定统一配置文件 (默认: ./applist.conf)");
     println!("  -b <cpuset_name>   指定 BASE_CPUSET 目录名 (默认: AppOpt)");
     println!("  -w                 启用网页前端 (仅本机 127.0.0.1:8889)");
     println!("  -v                 显示程序版本");
     println!("  -h                 显示帮助信息");
     println!();
     println!("示例:");
-    println!("  {} -c /data/appopt.conf -s 3", prog_name);
+    println!("  {} -c /data/applist.conf", prog_name);
     println!("  {} -b MyAppOpt", prog_name);
     println!();
     println!("应用设置保存于 ./AppOpt.json，首次运行自动创建；");
@@ -118,7 +228,563 @@ fn print_help(prog_name: &str) {
     println!("  refresh_timeout=30");
     println!("  refresh_active=120");
     println!("  refresh_idle=60");
-    println!("  refresh_app,com.example.game,30,120,60");
+    println!("  com.example.game=refresh-30-120-60");
+}
+
+// ================= 模块级辅助 (不捕获环境; 原 main 内嵌 fn 提取) =================
+
+fn spawn_probe_pipe(sv: &mut [libc::c_int; 2]) -> bool {
+    let ok = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+            sv.as_mut_ptr(),
+        )
+    };
+    ok == 0
+}
+
+fn epoll_add(epfd: i32, fd: i32, tag: u64) {
+    if fd < 0 {
+        return;
+    }
+    let mut ev: libc::epoll_event = unsafe { std::mem::zeroed() };
+    ev.events = libc::EPOLLIN as u32;
+    ev.u64 = tag;
+    unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fd, &mut ev) };
+}
+
+fn read_eventfd(fd: i32) {
+    if fd < 0 {
+        return;
+    }
+    let mut buf = [0u8; 8];
+    let _ = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, 8) };
+}
+
+/// 用户态事件探测线程 (合并触摸+退出): 单 epoll 统一监听 触摸 fd (/dev/input eventX,
+/// abs 能力探测设备) + pidfd 集合 (进程退出) + 控制 fd (触摸启停); 全模式统一
+/// (KPM 不再消费内核 EXIT 事件)。返回 (touch_ok, exit_ok); 触摸通道失败不拖垮退出监听。
+fn spawn_event_probe(touch_sv: &mut [libc::c_int; 2], exit_sv: &mut [libc::c_int; 2]) -> (bool, bool) {
+    let touch_ok = spawn_probe_pipe(touch_sv); // 触摸活动通知通道
+    let exit_ok = spawn_probe_pipe(exit_sv);   // 主进程退出通知通道 (必需)
+    if !exit_ok {
+        crate::event_probe::set_ctrl_fd(-1);
+        return (touch_ok, false);
+    }
+    // 触摸监听控制 socket: refresh 线程按 timer_enabled 暂停/恢复监听
+    let mut ctrl: [libc::c_int; 2] = [-1, -1];
+    let ctrl_ok = spawn_probe_pipe(&mut ctrl);
+    crate::event_probe::set_ctrl_fd(if ctrl_ok { ctrl[1] } else { -1 }); // 写端供 set_enabled 使用
+    let tw = if touch_ok { touch_sv[1] } else { -1 };
+    let cr = if ctrl_ok { ctrl[0] } else { -1 };
+    let ew = exit_sv[1];
+    std::thread::spawn(move || crate::event_probe::spawn_event(tw, cr, ew));
+    (touch_ok, true)
+}
+
+/// 亲和性重放 (配置变更共用): 按最近变更包单包 ApplyPkgByUid/ApplyThreadByUid,
+/// 无变更包 → 全量。用户态与 KPM 模式一致生效。
+fn kpm_full_apply(cfg: &crate::config::AppConfig, pkg_uid: &HashMap<String, i32>) {
+    // 规则编辑保存路径: 只对最近变更包单包重放亲和性 (避免改一个应用 →
+    // apply_all_now 全量重放所有规则应用); 启动/整体重载等无变更包 → 全量。
+    // 主线程反查 uid (pkg_uid) 后消息携带 uid 下发; 未安装/未运行的包不反查到 uid
+    // → 不发消息 (规则只对未来启动的应用生效)。
+    match crate::web::last_rule_take() {
+        Some((pkg, Some(thread))) => {
+            if let Some(uid) = pkg_uid.get(&pkg) {
+                if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
+                    let _ = tx.send(crate::cpu_affinity::CpuMsg::ApplyThreadByUid(
+                        *uid, pkg, thread,
+                    ));
+                }
+            }
+        }
+        Some((pkg, None)) => {
+            if let Some(uid) = pkg_uid.get(&pkg) {
+                if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
+                    let _ = tx.send(crate::cpu_affinity::CpuMsg::ApplyPkgByUid(*uid, pkg));
+                }
+            }
+        }
+        None => crate::cpu_affinity::apply_all_now(cpu_pkg_uids(cfg, pkg_uid)),
+    }
+}
+
+/// 配置变更后应用: 全量扫描 + uid 表重建(规则包集合门控; 两模式统一)
+fn apply_config(cpu_changed: bool, cfg: Option<&crate::config::AppConfig>, pkg_uid: &HashMap<String, i32>) {
+    let Some(cfg) = cfg else { return };
+    // CPU 规则未变 (仅刷新率/数值调整): 无需全量扫描, 亲和性/uid 表不需重放
+    if !cpu_changed {
+        return;
+    }
+    // 两模式统一重放 (用户态亦生效; 不再按 KPM 存在与否门控)
+    kpm_full_apply(cfg, pkg_uid);
+}
+
+/// uid 表重建: 按 cpu_changed/包集合变化决定 (reload_config 共用)
+fn rebuild_uid_if_needed(
+    cpu_changed: bool,
+    cfg: &crate::config::AppConfig,
+    uid_map: &mut HashMap<i32, UidEntry>,
+    pkg_uid: &mut HashMap<String, i32>,
+    cpu_pkgs_set: &mut HashSet<String>,
+    rfr_pkgs_set: &mut HashSet<String>,
+) {
+    let (nc, nr) = cfg_pkg_sets(cfg);
+    let cpu_set_changed = cpu_changed && nc != *cpu_pkgs_set;
+    let rfr_set_changed = nr != *rfr_pkgs_set;
+    if !cpu_set_changed && !rfr_set_changed {
+        return;
+    }
+    // 合表增量维护 (不再整表重扫 packages.list):
+    // - 已有条目: 按新集合刷新 cpu/rfr 标志, 两者皆无则移除;
+    // - 新增: 该包已存在 (如先有 CPU 规则后加刷新率) 时标志位自然覆盖,
+    //         仅"全新包名"才按包名查 packages.list 取 uid。
+    uid_map.retain(|_, e| {
+        e.cpu = nc.contains(&e.pkg);
+        e.rfr = nr.contains(&e.pkg);
+        e.cpu || e.rfr
+    });
+    let known: HashSet<String> = uid_map.values().map(|e| e.pkg.clone()).collect();
+    for pkg in nc.union(&nr) {
+        if known.contains(pkg.as_str()) {
+            continue;
+        }
+        if let Some(uid) = lookup_uid_in_packages_list(pkg) {
+            uid_map.insert(uid, UidEntry {
+                pkg: pkg.clone(),
+                cpu: nc.contains(pkg),
+                rfr: nr.contains(pkg),
+            });
+        }
+    }
+    // 就地更新反向表 (pkg → uid): 移除已删除包, 再按最新 uid_map 刷新
+    pkg_uid.retain(|pkg, _| nc.contains(pkg) || nr.contains(pkg));
+    for (&u, e) in uid_map.iter() {
+        pkg_uid.insert(e.pkg.clone(), u);
+    }
+    *cpu_pkgs_set = nc;
+    *rfr_pkgs_set = nr;
+}
+
+/// 主循环跨事件共享状态 (打包原 6 个局部 mut, 消除长参数传递)
+struct AppState {
+    ebpf_state: Option<EbpfState>,
+    cfg: Option<Arc<AppConfig>>,
+    uid_map: HashMap<i32, UidEntry>,
+    pkg_uid: HashMap<String, i32>,
+    cpu_pkgs_set: HashSet<String>,
+    rfr_pkgs_set: HashSet<String>,
+    /// 已下发给内核的 service list 伪装开关 (差量下发, 仅应用切换时调整)
+    srv_active_cur: bool,
+    last_fg_uid: i32,
+    /* vfc 规则下发指纹缓存: (uid, kind, target, from, to) — 无变化不重发; vfc_uid_set=表内 uid */
+    rule_cache: Vec<(i32, String, String, String, String)>,
+    vfc_uid_set: std::collections::HashSet<i32>,
+    /* 四功能统一 uid 规则表 (sync_vfc_rules 构建; on_fg/reload 按前台 uid 取 src/prop/red) */
+    uid_rules: std::collections::HashMap<i32, Vec<crate::config::WaylayRule>>,
+    /// 已下发给内核的 property 区伪装开关 (独立目标应用集)
+    prop_active_cur: bool,
+    /// 刷新率规则应用主 pid 监听表: pid → 包名 (top-app cpuset 保持; 主 pid 退出移除)
+    rfr_monitored: HashMap<i32, String>,
+    /// waylay 规则应用主 pid 记录表: pid → uid (内核 vfc_fg 下发保护; 主 pid 退出移除)
+    waylay_monitored: HashMap<i32, i32>,
+    /// srv 规则应用主 pid 监听表: pid → uid (内核 srv_active 通知门控; 主 pid 退出移除)
+    srv_monitored: HashMap<i32, i32>,
+}
+
+impl AppState {
+    /// 从 CURRENT_CONFIG 构建 (初始 uid 表 + 规则包集合)
+    fn new() -> Self {
+        let cfg = rw_read_ignore_poison(&CURRENT_CONFIG).clone();
+        let (uid_map, pkg_uid) = cfg
+            .as_ref()
+            .map(|c| build_uid_tables(c))
+            .unwrap_or_default();
+        let (cpu_pkgs_set, rfr_pkgs_set) = cfg
+            .as_ref()
+            .map(|c| cfg_pkg_sets(c))
+            .unwrap_or_default();
+        Self {
+            ebpf_state: None,
+            cfg,
+            uid_map,
+            pkg_uid,
+            cpu_pkgs_set,
+            rfr_pkgs_set,
+            srv_active_cur: false,
+            last_fg_uid: -1,
+            rfr_monitored: HashMap::new(),
+            waylay_monitored: HashMap::new(),
+            srv_monitored: HashMap::new(),
+            rule_cache: Vec::new(),
+            vfc_uid_set: std::collections::HashSet::new(),
+            uid_rules: std::collections::HashMap::new(),
+            prop_active_cur: false,
+        }
+    }
+
+    /// 配置重载 (EV_INOTIFY / EV_CONFIG 共用): 重载配置 → 应用到当前模式 →
+    /// 仅"规则应用集合"变更时重建 uid 表 (调整数值不重建)
+    /// KPM 武装/解除 (拦截页连接/断开): start=武装全功能, stop=解除;
+    /// 武装后立即同步 waylay 规则 (清理后的合法规则)
+    fn set_kpm_arm(&mut self, arm: bool) {
+        // 连接且 KPM 未就绪: 模块可能后加载 (AppOpt 先启动) —— 重试初始化
+        if arm && self.ebpf_state.is_none() {
+            if let Some(es) = crate::ebpf_mode::ebpf_init(String::new()) {
+                self.ebpf_state = Some(es);
+                /* KPM_ACTIVE 只在启动时置位; 模块后加载 (连接时重试初始化成功) 需同步,
+                   否则 /api/status connected=false + mode=kpm → 线程状态 UI 误显示"未连接" */
+                crate::web::KPM_ACTIVE.store(true, Ordering::Relaxed);
+            }
+        }
+        if arm {
+            /* 连接: 强制全量下发 — 模块可能重载/内核表已空, 旧 rule_cache 会使 changed=false 导致规则失效 */
+            self.rule_cache = Vec::new();
+            self.sync_vfc_rules();
+        }
+        if let Some(es) = self.ebpf_state.as_ref() {
+            if arm {
+                es.bpf.arm();
+                // red-path 副本权限/上下文同步 (连接时校准)
+                crate::config::sync_redpath_perm(&crate::rw_read_ignore_poison(
+                    &crate::config::WAYLAY_RULES_NEW,
+                ));
+                es.bpf.vfc_apply();
+            } else {
+                es.bpf.disarm();
+                /* 断开: 复位内核 srv 开关 — 探针已摘除但 srv_active 标志残留,
+                 * 否则重连后会在未收到相关前台回调时全局生效 */
+                es.bpf.srv_active(false);
+                // 断开把探针摘除 (srv_remove); 重置激活记录 → 下次前台回调重新下发
+                self.srv_active_cur = false;
+            }
+            crate::web::KPM_ARMED.store(arm, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// 用户态配置驱动: uid 规则表下发。构建指纹 (uid, kind, target, from, to) 对比缓存,
+    /// 有新增/删除才 clear + 重发 (无变化零动作); 全局(pkg="*")已移除, 仅按包下发。
+    fn sync_vfc_rules(&mut self) {
+        /* 四功能统一 uid 规则表 + 内核行映射 (与 WebUI 校验共用 build_rule_rows) */
+        let all = crate::rw_read_ignore_poison(&crate::config::WAYLAY_RULES_NEW);
+        let pkguid = crate::web::pkg_uid_map();   /* 全量缓存, 不再每次读 packages.list */
+        let (tbl, rows, srows) = build_rule_rows(&all, &pkguid);
+        self.uid_rules = tbl;
+        self.vfc_uid_set = rows.iter().filter(|x| x.0 >= 0).map(|x| x.0).collect();
+        let changed = rows != self.rule_cache;
+        if let Some(es) = self.ebpf_state.as_ref() {
+            /* L1 全量预检: 任何非法规则 → 整组不下发 (静默: WebUI 保存时已反馈) */
+            let all_errs = crate::ebpf_mode::validate_rule_set(&rows, &srows);
+            if !all_errs.is_empty() {
+                let _ = all_errs;
+                return;
+            }
+            if changed {
+                es.bpf.vfc_rule_clear();
+                let mut i = 0usize;
+                for (uid, kind, tg, from, to) in rows.iter() {
+                    if i >= 512 {
+                        break;
+                    }
+                    if let Err(e) = es.bpf.vfc_rule(i, *uid, kind, tg, from, to) {
+                        let _ = e;   /* 静默: 失败即停, 缓存不更新 → 下次重发 */
+                        break;
+                    }
+                    i += 1;
+                }
+                es.bpf.vfc_fg(self.last_fg_uid);   /* 表重建后定位当前前台 uid 段 */
+                self.rule_cache = rows;   /* 全部成功后才更新缓存 */
+            }
+            /* src/prop: 全量下发 — getService 由内核按 current uid 匹配 (不依赖前台回调) */
+            {
+                let mut prop_any = false;
+                for (_u, rules) in self.uid_rules.iter() {
+                    for r in rules {
+                        if r.kind == crate::config::WaylayKind::Prop {
+                            prop_any = true;
+                        }
+                    }
+                }
+                es.bpf.srv_clear();
+                for (i, (_u, f, t)) in srows.iter().enumerate() {
+                    if let Err(e) = es.bpf.srv_rule(i, f, t) {
+                        let _ = e;   /* 静默 */
+                        break;
+                    }
+                }
+                if prop_any {
+                    let mut prop_rules: Vec<(String, String)> = Vec::new();
+                    for (_u2, r2) in self.uid_rules.iter() {
+                        for r in r2 {
+                            if r.kind == crate::config::WaylayKind::Prop {
+                                prop_rules.push((r.from.clone(), r.to.clone()));
+                            }
+                        }
+                    }
+                    crate::config::set_prop_rules(&prop_rules);
+                }
+                es.bpf.prop_file_apply(prop_any);
+                /* srv: 规则表已重发, 开关按最近前台 uid 的 src 规则重新门控 (防止用户态
+                 * 记录与内核 srv_active 脱节 → 未收到相关前台回调也全局生效) */
+                let fg_active = self
+                    .uid_rules
+                    .get(&self.last_fg_uid)
+                    .map(|rs| rs.iter().any(|r| r.kind == crate::config::WaylayKind::Src))
+                    .unwrap_or(false);
+                if fg_active != self.srv_active_cur {
+                    self.srv_active_cur = fg_active;
+                    es.bpf.srv_active(fg_active);
+                }
+                self.prop_active_cur = prop_any;
+            }
+        }
+    }
+
+    fn reload(&mut self) {
+        // waylay.conf 启动/重载直接加载 (WAYLAY_RULES_NEW)
+        crate::config::load_waylay_rules();
+        // 拦截页连接/断开: 武装请求 (在模块加载/激活前提下执行)
+        match crate::config::take_kpm_arm_req() {
+            1 => self.set_kpm_arm(true),
+            -1 => self.set_kpm_arm(false),
+            _ => {}
+        }
+        // 挂机黑屏: 开启 (延迟 10s 执行, 防误触; 10s 窗口内重复点击全部抛弃)
+        if crate::config::take_scr_req() > 0 {
+            crate::ebpf_mode::schedule_hang_black();
+        }
+        // waylay 配置保存 (web /api/waylay): 同步替换字符到内核 (目标 uid 集合已由
+        // save_waylay 更新静态, 下一次前台回调差量生效)
+        if crate::config::take_waylay_changed() {
+            // 任何配置变化 → sync_vfc_rules 统一处理:
+            // 内部 vfc 指纹对比 (red/redpath 无变化则零动作) + src/prop 当前前台无条件重发
+            self.sync_vfc_rules();
+            crate::config::sync_redpath_perm(&crate::rw_read_ignore_poison(
+                &crate::config::WAYLAY_RULES_NEW,
+            ));
+            crate::ebpf_mode::ensure_prop_maps();
+            /* 四功能下发统一入口: sync_vfc_rules (vfc 内核 + 当前前台 src/prop) */
+        }
+        let cpu_changed = crate::config::take_cpu_rules_changed();
+        self.cfg = rw_read_ignore_poison(&CURRENT_CONFIG).clone();
+        // 先重建 uid 表 (新加规则包的 uid 进 pkg_uid), 再重放/全量 ——
+        // 顺序反了会把新规则包从 cpu_pkg_uids 过滤掉 (apply_config 不生效)
+        if let Some(cfg) = self.cfg.as_ref() {
+            rebuild_uid_if_needed(
+                cpu_changed,
+                cfg,
+                &mut self.uid_map,
+                &mut self.pkg_uid,
+                &mut self.cpu_pkgs_set,
+                &mut self.rfr_pkgs_set,
+            );
+        }
+        apply_config(cpu_changed, self.cfg.as_deref(), &self.pkg_uid);
+    }
+
+    /// packages.list 变化 (安装/卸载/替换) → 整表重建 cpu uid 表 + 刷新已安装应用缓存。
+    /// waylay 四功能统一包名 (规则不依赖 packages.list; on_fg 实时查包名) → 无需重建。
+    fn rebuild_uid_tables(&mut self) {
+        /* 已安装应用列表缓存: packages.list 变化 → 同步刷新 */
+        crate::web::refresh_pkg_cache();
+        if let Some(cfg) = self.cfg.as_ref() {
+            (self.uid_map, self.pkg_uid) = build_uid_tables(cfg);
+        }
+        /* 与 cpu 共用 packages.list 构建时机: uid→包名缓存 + vfc 规则表 (自建 uid) 重建 */
+        self.sync_vfc_rules();
+    }
+
+    /// 全量重放 (初始 / KPM 重连后): 对当前规则应用整表 apply_all_now
+    fn apply_all(&self) {
+        if let Some(cfg) = self.cfg.as_ref() {
+            crate::cpu_affinity::apply_all_now(cpu_pkg_uids(cfg, &self.pkg_uid));
+        }
+    }
+
+    /// 读 /proc/<pid>/cpuset: 判断该 pid 是否处于 top-app cpuset (Android cpuset 分层)。
+    /// 前台回调变化时若当前驱动刷新率的主 pid 仍为 top-app → 保持刷新率规则不变;
+    /// pid 已退出/读取失败 → 视为非 top-app (放行切换)。
+    fn pid_in_top_app(pid: i32) -> bool {
+        if pid <= 0 {
+            return false;
+        }
+        std::fs::read_to_string(format!("/proc/{}/cpuset", pid))
+            .map(|s| s.contains("top-app"))
+            .unwrap_or(false)
+    }
+
+    /// binder 前台回调 (pid+uid): 查 uid 表分发 CPU (冷启动 ApplyPkg + pidfd watch)
+    /// 与刷新率 (包名) —— 原 EV_FG 分支主体
+    fn on_fg(&mut self, pid: i32, uid: i32) {
+        /* 四功能统一 uid: 直接查 uid 规则表 (uid 在该表 = 有规则) */
+        self.last_fg_uid = uid;
+        let my: Vec<crate::config::WaylayRule> = self
+            .uid_rules
+            .get(&uid)
+            .cloned()
+            .unwrap_or_default();
+        // ---- 前台 uid 通知内核 (vfc_fg): 规则应用 → 记录主 pid 后下发 uid
+        //      (已记录直接下发, 不检查 cpuset); 非规则应用 → 已记录主 pid 有
+        //      top-app 则不下发 uid (内核保持当前前台 uid 段), 否则下发 -1 (仅全局) ----
+        let in_vfc = self.vfc_uid_set.contains(&uid);
+        let fg_uid: Option<i32> = if in_vfc {
+            if !self.waylay_monitored.contains_key(&pid) {
+                self.waylay_monitored.insert(pid, uid);
+                crate::event_probe::watch(pid);
+            }
+            Some(uid)
+        } else {
+            // 非规则应用回调: 先检查是否有记录; 空 → 不做任何动作 (不再下发 -1);
+            // 有记录 → 检查 top-app: 有 top → 不下发 (保持); 无 top → 下发 0 (停止)
+            if self.waylay_monitored.is_empty() {
+                None
+            } else {
+                match Self::monitored_top_uid(&mut self.waylay_monitored) {
+                    Some(_) => None,  // 有 top → 不下发
+                    None => Some(0),  // 有记录但无 top → 通知停止 (vfc_fg 0)
+                }
+            }
+        };
+        if let Some(es) = self.ebpf_state.as_ref() {
+            if let Some(u) = fg_uid {
+                es.bpf.vfc_fg(u);
+            }
+        }
+        // ---- src (系统服务伪装): 与 vfc 同款快照门控, 但内核侧用 srv_active 通知 (0/1) ----
+        //      规则应用 → 记录主 pid + 下发激活通知; 非规则应用 → 已监听 srv 应用
+        //      主 pid 有 top-app → 应用其规则 (保持激活); 无 top-app → 通知停止
+        let in_srv = my
+            .iter()
+            .any(|r| r.kind == crate::config::WaylayKind::Src);
+        let srv_on: Option<bool> = if in_srv {
+            if !self.srv_monitored.contains_key(&pid) {
+                self.srv_monitored.insert(pid, uid);
+                crate::event_probe::watch(pid);
+            }
+            Some(true)
+        } else {
+            if self.srv_monitored.is_empty() {
+                None
+            } else {
+                match Self::monitored_top_uid(&mut self.srv_monitored) {
+                    Some(_) => None,        // 有 top → 不下发 (保持激活)
+                    None => Some(false),    // 无 top → 通知停止
+                }
+            }
+        };
+        if let Some(es) = self.ebpf_state.as_ref() {
+            if let Some(on) = srv_on {
+                es.bpf.srv_active(on);
+            }
+        }
+        // prop (系统属性伪装): 该包 prop 规则前台激活, 切走恢复 (用户态 tmpfs 写替换)
+        let prop_rules: Vec<(String, String)> = my
+            .iter()
+            .filter(|r| r.kind == crate::config::WaylayKind::Prop)
+            .map(|r| (r.from.clone(), r.to.clone()))
+            .collect();
+        let want_prop = !prop_rules.is_empty();
+        if want_prop != self.prop_active_cur {
+            self.prop_active_cur = want_prop;
+            if let Some(es) = self.ebpf_state.as_ref() {
+                if want_prop {
+                    crate::config::set_prop_rules(&prop_rules);
+                }
+                es.bpf.prop_file_apply(want_prop);
+            }
+        }
+        // 提前取出 uid 表条目 (克隆), 避免持有 self 借用时再 &mut self
+        let entry = self.uid_map.get(&uid).map(|e| (e.cpu, e.rfr, e.pkg.clone()));
+        match entry {
+            Some((cpu, rfr, pkg)) => {
+                // CPU 规则: 冷热判断 (cpu_known 中 uid+pid 一致=热);
+                // 冷时注册 pidfd 监听 (退出清理由 EV_EXIT_PID 驱动)
+                if cpu && !crate::cpu_affinity::cpu_known_is_hot(uid, pid) {
+                    crate::event_probe::watch(pid);
+                    if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
+                        let _ = tx.send(crate::cpu_affinity::CpuMsg::ApplyPkg(
+                            pid, uid, pkg.clone(),
+                        ));
+                    }
+                }
+                // 刷新率: 桌面 (非规则) → 检查已监听主 pid 是否有 top-app;
+                // 规则应用 → 应用规则并监听主 pid (已监听则不检查 cpuset 直接应用)
+                if rfr {
+                    if pkg == crate::config::DEFAULT_REFRESH_PACKAGE {
+                        self.refresh_keep_top();
+                    } else {
+                        self.refresh_fg_rule_app(pid, &pkg);
+                    }
+                }
+            }
+            None => {
+                // 非规则应用回调 (不在 uid 表): 刷新率保持 top-app 主 pid 规则;
+                // 无 top-app 时回落全局默认
+                self.refresh_keep_top();
+            }
+        }
+    }
+
+    /// 刷新率应用规则: 主线程命中后下发包名给刷新率线程
+    fn refresh_apply(&mut self, pkg: String) {
+        crate::refresh::refresh_send_fg_pkg(pkg);
+    }
+
+    /// 规则应用前台回调: 未监听 → 应用规则并开始监听主 pid (cpuset + 退出);
+    /// 已监听 → 不检查 cpuset 直接应用规则。
+    fn refresh_fg_rule_app(&mut self, pid: i32, pkg: &str) {
+        if self.rfr_monitored.contains_key(&pid) {
+            self.refresh_apply(pkg.to_string());
+            return;
+        }
+        // 首次回调: 应用规则 + 入监听表 (主 pid 退出时 EV_EXIT_PID 移除)
+        self.rfr_monitored.insert(pid, pkg.to_string());
+        crate::event_probe::watch(pid);
+        self.refresh_apply(pkg.to_string());
+    }
+
+    /// 非规则应用前台回调: 扫描已监听主 pid, 有仍处于 top-app 的 → 应用其规则 (保持);
+    /// 无 top-app → 回落全局默认 (桌面配置); 顺带移除已退出主 pid 的监听。
+    fn refresh_keep_top(&mut self) {
+        let mut top: Option<String> = None;
+        self.rfr_monitored.retain(|p, pkg| {
+            if Self::pid_in_top_app(*p) {
+                if top.is_none() {
+                    top = Some(pkg.clone());
+                }
+                true
+            } else {
+                // 已退出 (cpuset 文件消失) → 移除监听; 仍存活但不在 top → 保留
+                std::path::Path::new(&format!("/proc/{}/cpuset", p)).exists()
+            }
+        });
+        match top {
+            Some(pkg) => self.refresh_apply(pkg),
+            None => self.refresh_apply(crate::config::DEFAULT_REFRESH_PACKAGE.to_string()),
+        }
+    }
+
+    /// 通用 top 保护: 扫描已监听主 pid 表 (pid→uid), 返回其中处于 top-app 的 uid
+    /// (有 → 调用方不下发, 内核保持); 顺带移除已退出 (cpuset 文件消失) 的记录。
+    /// vfc(waylay_monitored) 与 srv(srv_monitored) 共用。
+    fn monitored_top_uid(monitored: &mut HashMap<i32, i32>) -> Option<i32> {
+        let mut top: Option<i32> = None;
+        monitored.retain(|p, u| {
+            if Self::pid_in_top_app(*p) {
+                if top.is_none() {
+                    top = Some(*u);
+                }
+                true
+            } else {
+                // 已退出 (cpuset 文件消失) → 移除记录; 仍存活但不在 top → 保留
+                std::path::Path::new(&format!("/proc/{}/cpuset", p)).exists()
+            }
+        });
+        top
+    }
 }
 
 fn main() {
@@ -126,8 +792,7 @@ fn main() {
     let prog_name = &args[0];
 
     // 参数解析先行，-v/-h/错误用法在设置加载前退出，不产生文件副作用
-    let (mut cli_cfg, mut cli_interval, mut cli_cpuset, mut cli_web) =
-        (None, None, None, false);
+    let (mut cli_cfg, mut cli_cpuset, mut cli_web) = (None, None, false);
 
     let mut i = 1;
     while i < args.len() {
@@ -138,23 +803,6 @@ fn main() {
                     cli_cfg = Some(args[i].clone());
                 } else {
                     eprintln!("错误: -c 需要指定配置文件路径");
-                    process::exit(1);
-                }
-            }
-            "-s" => {
-                i += 1;
-                if i < args.len() {
-                    let val: u64 = match args[i].parse() {
-                        Ok(v) if v >= 1 => v,
-                        _ => {
-                            eprintln!("无效的时间间隔: {}", args[i]);
-                            eprintln!("间隔必须是 >=1 的整数");
-                            process::exit(1);
-                        }
-                    };
-                    cli_interval = Some(val);
-                } else {
-                    eprintln!("错误: -s 需要指定时间间隔");
                     process::exit(1);
                 }
             }
@@ -196,16 +844,57 @@ fn main() {
         i += 1;
     }
 
-    // 应用设置持久化于 AppOpt.json，命令行参数优先覆盖
+    // 应用设置 (AppOpt.json) 提前读取: 驱动模式需在 L1 ebpf_init spawn 前决定
     let st = settings_load(SETTINGS_FILE);
-    let config_file = match cli_cfg {
-        Some(path) => path,
-        None if st.config_file == "./applist.conf" => "./appopt.conf".to_string(),
-        None => st.config_file,
-    };
-    // 默认配置升级：applist.conf -> appopt.conf；-c 显式指定的路径不受影响。
-    crate::config::migrate_legacy_main_config(&config_file);
-    let sleep_interval = cli_interval.unwrap_or(st.check_interval);
+    let drive_mode = st.mode;
+    crate::web::set_drive_mode(&drive_mode);
+    // uclamp 支持探测 (webui 据此隐藏/显示 uclamp 配置)
+    crate::web::init_uclamp_support();
+
+    // ================= 初始化并发: 独立无依赖项并行 =================
+    // 提前创建 fd (不依赖 settings; 供各独立线程使用)
+    let mut fg_sv: [libc::c_int; 2] = [0, 0];
+    let socket_ok = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+            fg_sv.as_mut_ptr(),
+        )
+    } == 0;
+    if socket_ok {
+        let rcvbuf: libc::c_int = 256 * 1024;
+        unsafe {
+            libc::setsockopt(
+                fg_sv[0],
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &rcvbuf as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+
+    // T2: ebpf_init (按驱动模式尝试 KPM: userspace 直退 / auto 快速回退 / kpm 等待)
+    let dm = drive_mode.clone();
+    let ebpf_thread = std::thread::spawn(move || ebpf_init(dm));
+
+    // T3: process_observer (binder 回调注册; 完成后线程退出)
+    let obs_fd = fg_sv[1];
+    let observer_thread = std::thread::spawn(move || {
+        if socket_ok {
+            crate::process_observer::init_observer(obs_fd);
+        }
+    });
+
+    // T4: packages.list inotify (返回 fd; 完成后线程退出)
+    let pkg_inotify_thread = std::thread::spawn(crate::config::init_pkg_inotify);
+
+    // T5: dumpsys display 显示模式解析 (供 refresh_init; 完成后线程退出)
+    let display_modes_thread = std::thread::spawn(crate::refresh::parse_display_modes);
+
+    // 命令行参数优先覆盖设置 (settings_load 已在 L1 前完成)
+    let config_file = cli_cfg.unwrap_or(st.config_file);
     let cpuset_name = cli_cpuset.unwrap_or(st.cpuset_name);
     let web_enable = cli_web || st.web_enable;
 
@@ -214,19 +903,15 @@ fn main() {
     let topo = init_cpu_topo();
 
     if fs::metadata(&config_file).is_err() {
-        let initial_content = "# 规则编写与使用说明请参考 http://AppOpt.suto.top\n# 刷新率字段与 CPU 规则共用此文件\nrefresh_timeout=30\nrefresh_active=120\nrefresh_idle=60\n\n";
+        // 头注释两行; refresh_* 由设备可用刷新率解析后写入这两行下面
+        let initial_content = "# 规则编写与使用说明请参考 http://AppOpt.suto.top\n# 刷新率字段与 CPU 规则共用此文件\n";
         let _ = fs::write(&config_file, initial_content);
     }
-    // 兼容旧版本：将 refresh_config.conf 内容一次性并入当前主配置文件。
-    // 迁移完成后刷新率模块不再依赖该独立文件。
-    crate::config::migrate_legacy_refresh_config(&config_file);
-
     {
+
         let mut guard = lock_ignore_poison(&CONFIG_FILE);
         *guard = config_file.clone();
     }
-    CHECK_INTERVAL.store(sleep_interval, Ordering::Release);
-    MODE_FORCE.store(st.mode, Ordering::Release);
 
     let mut tmp_mtime: i64 = -1;
     let initial_config = match load_config(&config_file, &topo, &mut tmp_mtime) {
@@ -238,134 +923,64 @@ fn main() {
     };
 
     {
-        let mut guard = lock_ignore_poison(&CURRENT_CONFIG);
+        let mut guard = rw_write_ignore_poison(&CURRENT_CONFIG);
         *guard = Some(Arc::new(initial_config));
     }
 
     init_inotify(&config_file);
 
+    // waylay 规则: 启动/重载由 reload() 的 load_waylay_rules 加载 (WAYLAY_RULES_NEW)
+    crate::ebpf_mode::ensure_prop_maps();
+
     if web_enable {
         web_start();
-        // -w 或设置恢复启用后落盘，重启保持开启
-        settings_save();
+    }
+    // 落盘当前设置 (含旧默认配置名迁移后的 config_file)，重启后保持一致
+    settings_save();
+
+    // ===== join 各独立线程 (事件循环/使用点前就绪) =====
+    // 主循环共享状态: uid 表 / 规则包集合 / 当前配置 (ebpf_state 稍后 join 填入)
+    let mut state = AppState::new();
+    // ebpf_init 线程: KPM 加载+激活已并行完成, join 拿 EbpfState
+    state.ebpf_state = ebpf_thread.join().ok().flatten();
+    if state.ebpf_state.is_some() {
+        crate::web::KPM_ACTIVE.store(true, Ordering::Relaxed);
     }
 
-    // CPU 亲和性投递通道必须先于刷新率 observer 建立, 否则注册瞬间(或首个)
-    // 前台回调会被丢弃, 导致首次打开应用不生效。
-    let cpu_ready = crate::cpu_affinity::start();
-
-    // 刷新率控制模块，独立线程运行 (binder 回调经主线程 uid 表 → FgPkg 消息驱动)
-    refresh::refresh_init();
-
-    // ===== 三线程: 主线程持有 IProcessObserver 回调 socket, 分发 cpuset/刷新率线程 =====
-    let mut fg_sv: [libc::c_int; 2] = [0, 0];
-    if unsafe {
-        libc::socketpair(
-            libc::AF_UNIX,
-            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-            0,
-            fg_sv.as_mut_ptr(),
-        )
-    } == 0
-    {
-        let rcvbuf: libc::c_int = 256 * 1024;
-        unsafe {
-            libc::setsockopt(
-                fg_sv[0],
-                libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
-                &rcvbuf as *const libc::c_int as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
-        crate::process_observer::init_observer(fg_sv[1]);
-    }
+    // 用户态事件探测线程 (模块级 spawn_event_probe): 触摸活动 → EV_TOUCH, 主进程退出 → EV_EXIT_PID
+    let mut touch_sv: [libc::c_int; 2] = [-1, -1];
+    let mut exit_sv: [libc::c_int; 2] = [-1, -1];
+    let (touch_ok, exit_ok) = spawn_event_probe(&mut touch_sv, &mut exit_sv);
+    // T4: packages.list inotify fd
+    let pkg_inotify_fd = pkg_inotify_thread.join().unwrap_or(-1);
+    // T3: observer 注册完成
+    let _ = observer_thread.join();
     let fg_recv_fd = fg_sv[0];
     let mut fg_buf = [0u8; 8];
-    // uid 静态表 (主线程): CPU 表 = 有 CPU 规则应用; 刷新率表 = launcher + 规则应用
-    let mut cpu_uid: HashMap<i32, String> = HashMap::new();
-    let mut rfr_uid: HashMap<i32, String> = HashMap::new();
-    let mut cpu_known: HashMap<i32, i32> = HashMap::new(); // uid → pid (CPU 冷热)
-    // 规则应用集合 (主线程对比用): 仅集合变化才重建 uid 表 (数值调整不重建)
-    let mut cpu_pkgs_set: HashSet<String> = HashSet::new();
-    let mut rfr_pkgs_set: HashSet<String> = HashSet::new();
-    if let Some(cfg) = lock_ignore_poison(&CURRENT_CONFIG).clone() {
-        (cpu_uid, rfr_uid) = build_uid_tables(&cfg);
-        (cpu_pkgs_set, rfr_pkgs_set) = cfg_pkg_sets(&cfg);
-    }
 
-    let prog_start = Instant::now();
-    let mut proc_state: Option<ProcScanState> = None;
-    let mut ebpf_state: Option<EbpfState> = None;
+    crate::cpu_affinity::start();
+
+    // 刷新率控制模块，独立线程运行 (binder 回调经主线程 uid 表 → FgPkg 消息驱动)
+    refresh::refresh_init(display_modes_thread);
+    let _ = crate::web::START.get_or_init(|| std::time::Instant::now());
 
     // ================= 纯事件驱动主循环 =================
-    // 事件源: KPM 事件唤醒 eventfd / inotify / 模式切换 eventfd / 配置重载 eventfd
-    //          /proc 回退模式的周期 timerfd (仅 KPM 不可用时启用)
-    const EV_KPM: u64 = 1;
+    // 事件源: KPM 事件唤醒 eventfd / inotify / 配置重载 eventfd / binder 前台回调
+    //         / packages.list inotify (全模式)
     const EV_INOTIFY: u64 = 2;
-    const EV_MODE: u64 = 3;
     const EV_CONFIG: u64 = 4;
-    const EV_PROC: u64 = 5;
     const EV_FG: u64 = 6; // binder 前台回调 (pid+uid), 主线程分发
     const EV_PKG: u64 = 7; // packages.list inotify (安装/卸载/替换)
+    const EV_TOUCH: u64 = 8; // 用户态 /dev/input 触摸/输入活动 (替代 4.19 内核 input hook)
+    const EV_EXIT_PID: u64 = 9; // pidfd 进程退出监听 (全模式统一退出来源)
+    const EV_WAYLAY: u64 = 10; // waylay.conf inotify (外部编辑/原子替换 → 重读校验全量下发)
 
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epfd < 0 {
         eprintln!("初始化 epoll 失败");
         process::exit(1);
     }
-    fn epoll_add(epfd: i32, fd: i32, tag: u64) {
-        if fd < 0 {
-            return;
-        }
-        let mut ev: libc::epoll_event = unsafe { std::mem::zeroed() };
-        ev.events = libc::EPOLLIN as u32;
-        ev.u64 = tag;
-        unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fd, &mut ev) };
-    }
-    fn read_eventfd(fd: i32) {
-        if fd < 0 {
-            return;
-        }
-        let mut buf = [0u8; 8];
-        let _ = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, 8) };
-    }
-    fn arm_periodic(tfd: i32, secs: i64) {
-        let ts = libc::timespec { tv_sec: secs, tv_nsec: 0 };
-        let it = libc::itimerspec { it_interval: ts, it_value: ts };
-        unsafe { libc::timerfd_settime(tfd, 0, &it, std::ptr::null_mut()) };
-    }
-    fn disarm_timerfd(tfd: i32) {
-        let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-        let it = libc::itimerspec { it_interval: zero, it_value: zero };
-        unsafe { libc::timerfd_settime(tfd, 0, &it, std::ptr::null_mut()) };
-    }
-    // 配置变更后应用到当前模式: KPM 全量扫描 + uid 表重建(规则包集合门控); /proc 标记全量重扫
-    fn apply_config(
-        ebpf_state: &mut Option<EbpfState>,
-        proc_state: &mut Option<ProcScanState>,
-        cfg: Option<&crate::config::AppConfig>,
-    ) {
-        let Some(cfg) = cfg else { return };
-        if let Some(es) = ebpf_state.as_mut() {
-            full_scan(cfg, es);
-        } else {
-            let ps = proc_state.get_or_insert_with(ProcScanState::new);
-            ps.scan_all_proc = true;
-            ps.last_proc_count = 0;
-            ps.force_affinity = true;
-        }
-        // CPU 亲和性: 配置变更后全量应用一次
-        crate::cpu_affinity::apply_all_now();
-    }
-
     // KPM 事件唤醒 eventfd: reader 收到事件后写入, 主循环 epoll 唤醒
-    let kpm_wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-    epoll_add(epfd, kpm_wake_fd, EV_KPM);
-    // 模式切换 eventfd: web 端修改 MODE_FORCE 后写入
-    let mode_switch_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-    MODE_SWITCH_FD.store(mode_switch_fd, Ordering::Relaxed);
-    epoll_add(epfd, mode_switch_fd, EV_MODE);
     // 配置重载 eventfd: web 端写配置/规则后由 config_reload_now 写入
     let config_wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     CONFIG_WAKE_FD.store(config_wake_fd, Ordering::Relaxed);
@@ -373,60 +988,32 @@ fn main() {
     // inotify fd: 配置文件修改
     let inotify_fd = crate::config::INOTIFY_FD.load(Ordering::Acquire);
     epoll_add(epfd, inotify_fd, EV_INOTIFY);
-    // /proc 回退模式周期 timerfd
-    let proc_timer_fd = unsafe {
-        libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC | libc::TFD_NONBLOCK)
-    };
-    epoll_add(epfd, proc_timer_fd, EV_PROC);
     if fg_recv_fd > 0 {
         epoll_add(epfd, fg_recv_fd, EV_FG);
     }
+    if touch_ok {
+        epoll_add(epfd, touch_sv[0], EV_TOUCH);
+    }
+    if exit_ok {
+        epoll_add(epfd, exit_sv[0], EV_EXIT_PID);
+    }
 
-    // 监听 /data/system/packages.list: 应用安装/卸载/替换 → 重建 uid 表
-    // 用 inotify 而非 mtime (用户要求); 日志确认监听是否成功 (SELinux/权限可见)
-    let mut pkg_inotify_fd: i32 = -1;
+    // packages.list inotify: 应用安装/卸载/替换 → 重建 uid 表 (fd 由并发 T4 线程建立;
+    // pkglist_path 保留供 EV_PKG 重挂 watch 用)
     let pkglist_path = CString::new("/data/system/packages.list").unwrap_or_default();
-    unsafe {
-        let ifd = libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK);
-        if ifd < 0 {
-            // inotify 不可用 (如 SELinux 拦截), 放弃监听 packages.list
-        } else {
-            let wd = libc::inotify_add_watch(
-                ifd,
-                pkglist_path.as_ptr(),
-                libc::IN_CLOSE_WRITE
-                    | libc::IN_MOVED_TO
-                    | libc::IN_MOVE_SELF
-                    | libc::IN_DELETE_SELF,
-            );
-            if wd < 0 {
-                libc::close(ifd);
-            } else {
-                epoll_add(epfd, ifd, EV_PKG);
-                pkg_inotify_fd = ifd;
-            }
-        }
+    epoll_add(epfd, pkg_inotify_fd, EV_PKG);
+    // waylay.conf inotify: 外部编辑 (WebUI 之外) 修改规则文件 → 重读+校验+全量下发
+    let waylay_fd = crate::config::init_waylay_inotify();
+    if waylay_fd > 0 {
+        epoll_add(epfd, waylay_fd, EV_WAYLAY);
     }
 
-    // 初始 eBPF 初始化 (强制 /proc 模式不尝试)
-    if MODE_FORCE.load(Ordering::Relaxed) != 2 {
-        if let Some(mut es) = ebpf_init(kpm_wake_fd) {
-            let cfg = lock_ignore_poison(&CURRENT_CONFIG).clone();
-            if let Some(cfg) = cfg {
-                full_scan(&cfg, &mut es);
-            }
-            ebpf_state = Some(es);
-            // CPU 亲和性: binder 前台回调驱动 (cpu_affinity.rs), 启动即全量应用一次
-            if cpu_ready {
-                crate::cpu_affinity::apply_all_now();
-            }
-        }
-    }
-    // /proc 模式: 周期 timerfd 立即启动; KPM 模式: 保持 disarm
-    if ebpf_state.is_none() {
-        let interval = CHECK_INTERVAL.load(Ordering::Relaxed).max(1);
-        arm_periodic(proc_timer_fd, interval as i64);
-    }
+    // 初始全量应用 (两种驱动模式都执行: KPM 事件驱动 / 纯用户态)
+    state.apply_all();
+    // 预缓存 pkg→(uid,system) 表 (packages.list; 之后 EV_PKG 变化时由 rebuild_uid_tables 刷新)
+    crate::web::refresh_pkg_cache();
+    // 初始加载 waylay 配置 (WAYLAY_RULES_NEW + uid→包名缓存 + src/prop 规则; on_fg 直接查缓存)
+    state.reload();
 
     let mut events = [unsafe { std::mem::zeroed::<libc::epoll_event>() }; 8];
 
@@ -443,36 +1030,9 @@ fn main() {
             continue;
         }
 
-        let mut cfg = lock_ignore_poison(&CURRENT_CONFIG).clone();
-        let mut kpm_died = false;
-
         for i in 0..n as usize {
             let ev = events[i];
             match ev.u64 {
-                EV_KPM => {
-                    read_eventfd(kpm_wake_fd);
-                    if let Some(es) = ebpf_state.as_mut() {
-                        // CPU 亲和性已由 binder 触发的 CpuAffinity 模块负责;
-                        // 事件流仅消费 input (刷新率活动检测)。
-                        loop {
-                            match es.event_rx.try_recv() {
-                                Ok(event) => {
-                                    let Some(cfg) =
-                                        lock_ignore_poison(&CURRENT_CONFIG).clone()
-                                    else {
-                                        continue;
-                                    };
-                                    event_dispatch(&event, &cfg, es);
-                                }
-                                Err(mpsc::TryRecvError::Empty) => break,
-                                Err(mpsc::TryRecvError::Disconnected) => {
-                                    kpm_died = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
                 EV_PKG => {
                     // packages.list 变化 (安装/卸载/替换) → 重建 uid 表
                     if pkg_inotify_fd > 0 {
@@ -517,8 +1077,55 @@ fn main() {
                                 /* rewatch 失败: 下次事件再尝试 */
                             }
                         }
-                        if let Some(cfg) = cfg.as_ref() {
-                            (cpu_uid, rfr_uid) = build_uid_tables(cfg);
+                        state.rebuild_uid_tables();
+                    }
+                }
+                EV_WAYLAY => {
+                    // waylay.conf 变化 (外部编辑/原子 rename) → 重读+校验+全量下发
+                    if waylay_fd > 0 {
+                        let mut buf = [0u8; 4096];
+                        let mut dirty = false;
+                        loop {
+                            let len = unsafe {
+                                libc::read(
+                                    waylay_fd,
+                                    buf.as_mut_ptr() as *mut libc::c_void,
+                                    buf.len(),
+                                )
+                            };
+                            if len <= 0 {
+                                break;
+                            }
+                            let hdr = std::mem::size_of::<libc::inotify_event>();
+                            let mut off = 0usize;
+                            while off + hdr <= len as usize {
+                                let ev = unsafe {
+                                    &*(buf.as_ptr().add(off) as *const libc::inotify_event)
+                                };
+                                if ev.len > 0 {
+                                    let name = unsafe {
+                                        std::ffi::CStr::from_ptr(
+                                            buf.as_ptr().add(off + hdr) as *const u8,
+                                        )
+                                    }
+                                    .to_string_lossy()
+                                    .into_owned();
+                                    if name == crate::config::WAYLAY_FILE
+                                        && ev.mask
+                                            & (libc::IN_CLOSE_WRITE
+                                                | libc::IN_MOVED_TO
+                                                | libc::IN_CREATE)
+                                                != 0
+                                    {
+                                        dirty = true;
+                                    }
+                                }
+                                off += hdr + ev.len as usize;
+                            }
+                        }
+                        if dirty {
+                            /* reload(): load_waylay_rules + L1 全量校验 + 全量下发 */
+                            state.reload();
                         }
                     }
                 }
@@ -536,140 +1143,70 @@ fn main() {
                         if nrecv == 8 {
                             let pid = i32::from_ne_bytes([fg_buf[0], fg_buf[1], fg_buf[2], fg_buf[3]]);
                             let uid = i32::from_ne_bytes([fg_buf[4], fg_buf[5], fg_buf[6], fg_buf[7]]);
-                            // CPU: 表命中 且 冷(新 pid) → 发包名给 cpuset 线程; 热跳过
-                            if let Some(pkg) = cpu_uid.get(&uid) {
-                                let cold = cpu_known.get(&uid).map_or(true, |&p| p != pid);
-                                cpu_known.insert(uid, pid);
-                                if cold {
-                                    if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
-                                        let _ = tx.send(crate::cpu_affinity::CpuMsg::ApplyPkg(
-                                            uid,
-                                            pkg.clone(),
-                                        ));
-                                    }
+                            state.on_fg(pid, uid);
+                        }
+                    }
+                }
+                EV_TOUCH => {
+                    // 用户态触摸/输入活动: 读走 1 字节通知 (只关心"有活动") → 重置刷新率空闲
+                    if touch_ok && touch_sv[0] > 0 {
+                        let mut tb = [0u8; 1];
+                        let _ = unsafe {
+                            libc::recv(
+                                touch_sv[0],
+                                tb.as_mut_ptr() as *mut libc::c_void,
+                                1,
+                                0,
+                            )
+                        };
+                    }
+                    crate::refresh::refresh_on_event(crate::refresh::EVENT_INPUT, 0);
+                }
+                EV_EXIT_PID => {
+                    // 用户态进程退出: recv pid → 清理该 uid 身份
+                    if exit_ok && exit_sv[0] > 0 {
+                        let mut pb = [0u8; 4];
+                        let n = unsafe {
+                            libc::recv(exit_sv[0], pb.as_mut_ptr() as *mut libc::c_void, 4, 0)
+                        };
+                        if n == 4 {
+                            let pid = i32::from_ne_bytes([pb[0], pb[1], pb[2], pb[3]]);
+                            // 清身份 + 通知 CPU worker 清该 uid managed → 发布统计
+                            // CPU 身份清理 (EvictUid → evict_uid 移除条目)
+                            if let Some(uid) = crate::cpu_affinity::cpu_known_pid_to_uid(pid) {
+                                if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
+                                    let _ = tx.send(crate::cpu_affinity::CpuMsg::EvictUid(uid));
                                 }
                             }
-                            // 刷新率: 表命中 → 发包名给刷新率线程
-                            if let Some(pkg) = rfr_uid.get(&uid) {
-                                crate::refresh::refresh_send_fg_pkg(pkg.clone());
+                            // 刷新率: 主 pid 退出 → 移除监听
+                            state.rfr_monitored.remove(&pid);
+                            // waylay: 主 pid 退出 → 移除记录 + 下发 vfc_fg 0 停止内核 vfc 规则
+                            if state.waylay_monitored.remove(&pid).is_some() {
+                                if let Some(es) = state.ebpf_state.as_ref() {
+                                    es.bpf.vfc_fg(0);
+                                }
+                            }
+                            // srv: 主 pid 退出 → 移除记录 + 通知停止 srv (srv_active 0)
+                            if state.srv_monitored.remove(&pid).is_some() {
+                                if let Some(es) = state.ebpf_state.as_ref() {
+                                    es.bpf.srv_active(false);
+                                }
                             }
                         }
                     }
                 }
                 EV_INOTIFY => {
+                    // 配置变更 (inotify): 与 EV_CONFIG 共用 reload_config
                     if crate::config::inotify_drain() {
-                        // 配置已重载: 应用到当前模式
-                        cfg = lock_ignore_poison(&CURRENT_CONFIG).clone();
-                        apply_config(&mut ebpf_state, &mut proc_state, cfg.as_deref());
-                        if let Some(cfg) = cfg.as_ref() {
-                            let (nc, nr) = cfg_pkg_sets(cfg);
-                            if nc != cpu_pkgs_set || nr != rfr_pkgs_set {
-                                (cpu_uid, rfr_uid) = build_uid_tables(cfg);
-                                cpu_pkgs_set = nc;
-                                rfr_pkgs_set = nr;
-                            }
-                        }
-                    }
-                }
-                EV_MODE => {
-                    read_eventfd(mode_switch_fd);
-                    let mode = MODE_FORCE.load(Ordering::Relaxed);
-                    if mode == 2 {
-                        // 强制 /proc: 卸载 eBPF
-                        if ebpf_state.take().is_some() {
-                            let ps = proc_state.get_or_insert_with(ProcScanState::new);
-                            ps.scan_all_proc = true;
-                            ps.last_proc_count = 0;
-                            ps.force_affinity = true;
-                        }
-                    } else if ebpf_state.is_none() {
-                        // 自动/强制 KPM: 尝试初始化
-                        if let Some(mut es) = ebpf_init(kpm_wake_fd) {
-                            if let Some(cfg) = cfg.as_ref() {
-                                full_scan(cfg, &mut es);
-                            }
-                            ebpf_state = Some(es);
-                            if cpu_ready {
-                                crate::cpu_affinity::apply_all_now();
-                            }
-                        }
-                    } else {
-                        // 已在 KPM 模式: 重新应用配置 (规则应用集合可能变化)
-                        apply_config(&mut ebpf_state, &mut proc_state, cfg.as_deref());
-                        if let Some(cfg) = cfg.as_ref() {
-                            let (nc, nr) = cfg_pkg_sets(cfg);
-                            if nc != cpu_pkgs_set || nr != rfr_pkgs_set {
-                                (cpu_uid, rfr_uid) = build_uid_tables(cfg);
-                                cpu_pkgs_set = nc;
-                                rfr_pkgs_set = nr;
-                            }
-                        }
+                        state.reload();
                     }
                 }
                 EV_CONFIG => {
                     read_eventfd(config_wake_fd);
-                    cfg = lock_ignore_poison(&CURRENT_CONFIG).clone();
-                    apply_config(&mut ebpf_state, &mut proc_state, cfg.as_deref());
-                        if let Some(cfg) = cfg.as_ref() {
-                            let (nc, nr) = cfg_pkg_sets(cfg);
-                            if nc != cpu_pkgs_set || nr != rfr_pkgs_set {
-                                (cpu_uid, rfr_uid) = build_uid_tables(cfg);
-                                cpu_pkgs_set = nc;
-                                rfr_pkgs_set = nr;
-                            }
-                        }
-                }
-                EV_PROC => {
-                    read_eventfd(proc_timer_fd);
-                    // /proc 回退模式周期同步
-                    if ebpf_state.is_none() {
-                        let Some(cfg) = cfg.as_ref() else { continue };
-                        let ps = proc_state.get_or_insert_with(ProcScanState::new);
-                        cache_sync(ps, cfg);
-                        if ps.force_affinity {
-                            ps.cache.affinity_sync(&cfg.topo);
-                            ps.force_affinity = false;
-                        }
-                    }
+                    // 配置变更 (eventfd 主动唤醒): 与 EV_INOTIFY 共用 state.reload()
+                    state.reload();
                 }
                 _ => {}
-            }
-        }
-
-        // KPM 通道断开: 回退 /proc 并启动周期 timerfd
-        if kpm_died {
-            ebpf_state = None;
-            let ps = proc_state.get_or_insert_with(ProcScanState::new);
-            ps.scan_all_proc = true;
-            ps.last_proc_count = 0;
-            ps.force_affinity = true;
-        }
-
-        // 周期 timerfd 与模式联动: /proc 模式启动, KPM 模式停止
-        let interval = CHECK_INTERVAL.load(Ordering::Relaxed).max(1);
-        if ebpf_state.is_none() {
-            arm_periodic(proc_timer_fd, interval as i64);
-        } else {
-            disarm_timerfd(proc_timer_fd);
-        }
-
-        // web 状态统计: 事件驱动更新 (收到事件时刷新, 不再定时轮询)
-        if WEB_ENABLED.load(Ordering::Relaxed) && crate::web::web_active() {
-            let (threads, hit_pkgs, hit_list) = match (&ebpf_state, &proc_state) {
-                (Some(es), _) => cache_stats(&es.cache),
-                (None, Some(ps)) => cache_stats(&ps.cache),
-                _ => (0, 0, Vec::new()),
-            };
-            if let Some(cfg) = cfg.as_ref() {
-                *lock_ignore_poison(&WEB_STATS) = Some(WebStats {
-                    rules: cfg.rules.len(),
-                    pkgs: cfg.pkgs.len(),
-                    hit_pkgs,
-                    hit_list,
-                    threads,
-                    kpm: ebpf_state.is_some(),
-                    uptime: prog_start.elapsed().as_secs(),
-                });
             }
         }
     }

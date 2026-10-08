@@ -1,0 +1,1432 @@
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock, RwLock};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Value};
+
+use crate::apply_affinity::{read_cmdline, task_tids};
+use crate::config::{
+    config_reload_now, spec_like,
+    CONFIG_FILE, PARSE_FAILS,
+};
+use crate::cpuset::{base_cpuset, create_cpuset_dir, parse_cpu_spec, CpuSet, CpuTopology, DEFAULT_CPUSET_NAME};
+use crate::ebpf_mode::kpm_probe;
+use crate::rule_edit::{rule_delete, rule_delete_pkg, rule_rename, rule_upsert, RuleEdit};
+use crate::{lock_ignore_poison, MAX_PKG_LEN, MAX_THREAD_LEN};
+
+pub const WEB_PORT: u16 = 8889;
+const INDEX_HTML: &str = include_str!("../web/index.html");
+
+/// BASE_CPUSET 目录名 (末段, 供设置项显示/持久化)
+fn cpuset_leaf() -> String {
+    base_cpuset().rsplit('/').next().unwrap_or_default().to_string()
+}
+
+/// web 是否启用 (--no-web 时 false)
+pub static WEB_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// uclamp (sched_setattr util clamp) 是否可用: /proc/sys/kernel/sched_util_clamp_max 存在
+/// 表示内核支持 uclamp; 启动时检查一次, webui 据此决定是否显示 uclamp 配置 UI。
+pub static UCLAMP_SUPPORTED: AtomicBool = AtomicBool::new(false);
+pub fn init_uclamp_support() {
+    UCLAMP_SUPPORTED.store(
+        std::path::Path::new("/proc/sys/kernel/sched_util_clamp_max").exists(),
+        Ordering::Relaxed,
+    );
+}
+
+/// KPM 模式是否活跃 (main 在 ebpf_state 置位/卸载时更新)
+pub static KPM_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// KPM 模块是否已武装 (拦截页 连接/断开 控制; start/stop)
+pub static KPM_ARMED: AtomicBool = AtomicBool::new(false);
+
+/// 线程放置延迟 (ms): 冷启动 ApplyPkg 后延迟取该 uid 全部 pid (cgroup) 设亲和的时间
+/// (默认 2000 = 原 ENUM_DELAY 2s), web 设置项可调, 持久化于 AppOpt.json
+pub static AFFINITY_DELAY_MS: AtomicU64 = AtomicU64::new(2000);
+
+/// 进程启动时间 (/api/status 实时计算 uptime)
+pub static START: OnceLock<Instant> = OnceLock::new();
+
+/// 启动 web 前端
+pub fn web_start() {
+    let listener = match TcpListener::bind(("127.0.0.1", WEB_PORT)) {
+        Ok(l) => l,
+        Err(_) => {
+            return;
+        }
+    };
+    WEB_ENABLED.store(true, Ordering::Release);
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            thread::spawn(move || conn_handle(stream));
+        }
+    });
+}
+
+struct Request {
+    method: String,
+    path: String,
+    host: String,
+    origin: String,
+    fetch_site: String,
+    content_type: String,
+    body: Vec<u8>,
+    keep_alive: bool,
+}
+
+fn conn_handle(stream: TcpStream) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_nodelay(true);
+    let mut writer = match stream.try_clone() {
+        Ok(w) => w,
+        Err(_) => return,
+    };
+    let mut reader = BufReader::new(stream);
+    while let Some(req) = request_read(&mut reader) {
+        dispatch(&mut writer, &req);
+        if !req.keep_alive {
+            return;
+        }
+    }
+}
+
+fn request_read(reader: &mut BufReader<TcpStream>) -> Option<Request> {
+    let mut head = Vec::with_capacity(512);
+    let mut line = Vec::with_capacity(128);
+    loop {
+        line.clear();
+        reader.read_until(b'\n', &mut line).ok()?;
+        if line.is_empty() {
+            return None;
+        }
+        if line == b"\r\n" || line == b"\n" {
+            break;
+        }
+        head.extend_from_slice(&line);
+        if head.len() > 8192 {
+            return None;
+        }
+    }
+
+    let head_str = String::from_utf8_lossy(&head);
+    let mut lines = head_str.lines();
+    let mut parts = lines.next()?.split_whitespace();
+    let method = parts.next()?.to_string();
+    let path = parts.next()?.split('?').next().unwrap_or("").to_string();
+    let version = parts.next().unwrap_or("HTTP/1.1").to_string();
+
+    let (mut host, mut origin, mut site, mut ctype, mut len) =
+        (String::new(), String::new(), String::new(), String::new(), 0usize);
+    let mut conn = String::new();
+    for h in lines {
+        let Some((k, v)) = h.split_once(':') else { continue };
+        let v = v.trim();
+        match k.trim().to_ascii_lowercase().as_str() {
+            "host" => host = v.to_ascii_lowercase(),
+            "origin" => origin = v.to_ascii_lowercase(),
+            "sec-fetch-site" => site = v.to_ascii_lowercase(),
+            "content-type" => ctype = v.to_ascii_lowercase(),
+            "content-length" => len = v.parse().unwrap_or(usize::MAX),
+            "connection" => conn = v.to_ascii_lowercase(),
+            "transfer-encoding" => return None, // 拒绝 chunked
+            _ => {}
+        }
+    }
+    if len > 16384 {
+        return None;
+    }
+
+    let mut body = vec![0u8; len];
+    if len > 0 {
+        reader.read_exact(&mut body).ok()?;
+    }
+    let keep_alive = if version == "HTTP/1.0" {
+        conn.contains("keep-alive")
+    } else {
+        !conn.contains("close")
+    };
+    Some(Request {
+        method,
+        path,
+        host,
+        origin,
+        fetch_site: site,
+        content_type: ctype,
+        body,
+        keep_alive,
+    })
+}
+
+fn resp_send(out: &mut TcpStream, status: u16, ctype: &str, body: &[u8], close: bool) {
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        403 => "Forbidden",
+        404 => "Not Found",
+        _ => "Error",
+    };
+    let head = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: {}\r\n\r\n",
+        status,
+        reason,
+        ctype,
+        body.len(),
+        if close { "close" } else { "keep-alive" }
+    );
+    let _ = out.write_all(head.as_bytes());
+    let _ = out.write_all(body);
+    let _ = out.flush();
+}
+
+fn dispatch(out: &mut TcpStream, req: &Request) {
+    let port_str = format!(":{}", WEB_PORT);
+    let host = req.host.strip_suffix(&port_str).unwrap_or(req.host.as_str());
+    let origin_ok = matches!(host, "127.0.0.1" | "localhost")
+        && (req.origin.is_empty()
+            || req.origin == "null"
+            || matches!(req.fetch_site.as_str(), "" | "none" | "same-origin"))
+        && (req.method != "POST" || req.content_type.starts_with("application/json"));
+    if !origin_ok {
+        resp_send(out, 403, "application/json", b"{\"ok\":false,\"err\":\"forbidden\"}", true);
+        return;
+    }
+
+    if req.method == "GET" && matches!(req.path.as_str(), "/" | "/index.html") {
+        resp_send(out, 200, "text/html; charset=utf-8", INDEX_HTML.as_bytes(), !req.keep_alive);
+        return;
+    }
+
+    let (status, body) = match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/api/status") => {
+                (200, status_json())
+            },
+        ("GET", "/api/rules") => (200, rules_json()),
+        ("GET", "/api/config") => (200, config_json()),
+        ("POST", "/api/rule") => rule_api(req),
+        ("POST", "/api/rule/del") => rule_del_api(req),
+        ("POST", "/api/rule/rename") => rule_rename_api(req),
+        ("POST", "/api/config") => config_set_api(req),
+        ("POST", "/api/suggest") => suggest_api(req),
+        ("GET", "/api/refresh/status") => (200, refresh_status_json()),
+        ("GET", "/api/refresh/config") => (200, refresh_config_json()),
+        ("POST", "/api/refresh/config") => refresh_config_set_api(req),
+        ("GET", "/api/waylay") => (200, waylay_json()),
+        // webui 不可见 (visibilitychange hidden) 时前端触发: 提前映射 prop 目标文件
+        ("GET", "/api/propmap") | ("POST", "/api/propmap") => {
+            crate::ebpf_mode::ensure_prop_maps();
+            (200, "{\"ok\":true}".to_string())
+        },
+        ("POST", "/api/waylay") => waylay_set_api(req),
+        ("GET", "/api/refresh/apps") => (200, refresh_apps_json()),
+        ("POST", "/api/refresh/app") => refresh_app_add_api(req),
+        ("POST", "/api/refresh/app/del") => refresh_app_del_api(req),
+        ("POST", "/api/fs/list") => fs_list_api(req),
+        ("GET", "/api/apps") => (200, apps_json()),
+        _ => err_json(404, "not found"),
+    };
+    resp_send(out, status, "application/json", body.as_bytes(), !req.keep_alive);
+}
+
+/// 解析 JSON 请求体 (各写接口共用样板); 失败返回标准错误响应
+fn parse_json(req: &Request) -> Result<serde_json::Value, (u16, String)> {
+    serde_json::from_slice::<serde_json::Value>(&req.body)
+        .map_err(|_| err_json(400, "请求体不是合法 JSON"))
+}
+
+fn err_json(code: u16, msg: &str) -> (u16, String) {
+    (code, json!({ "ok": false, "err": msg }).to_string())
+}
+
+fn sys_procs() -> u16 {
+    let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
+    if unsafe { libc::sysinfo(&mut info) } == 0 {
+        info.procs
+    } else {
+        0
+    }
+}
+
+/// CPU 集合转语义名
+fn spec_name(cpus: &CpuSet, topo: &CpuTopology) -> String {
+    if cpus.count() > 0 {
+        if *cpus == topo.e_core {
+            return "e-core".into();
+        }
+        if *cpus == topo.p_core {
+            return "p-core".into();
+        }
+        if *cpus == topo.hp_core {
+            return "hp-core".into();
+        }
+        if *cpus == topo.present_cpus {
+            return "all-core".into();
+        }
+    }
+    cpus.to_range_string()
+}
+
+/// /api/status 快照: 设备信息 / CPU 统计 / 刷新率统计 三段拼装
+fn status_json() -> String {
+    let cfg = crate::config::current_cfg();
+    let topo = cfg.as_ref().map(|c| &c.topo);
+    let mut j = serde_json::Map::new();
+    j.extend(device_info(topo));
+    j.extend(cpu_stats(cfg.as_deref()));
+    j.extend(rf_stats(cfg.as_deref()));
+    serde_json::Value::Object(j).to_string()
+}
+
+/// 段 1: 设备/连接信息 (mode / 触摸监听 / 拓扑 / uclamp 支持)
+fn device_info(topo: Option<&crate::cpuset::CpuTopology>) -> serde_json::Map<String, serde_json::Value> {
+    let connected = KPM_ACTIVE.load(Ordering::Relaxed);
+    let uptime = START.get().map(|t| t.elapsed().as_secs()).unwrap_or(0);
+    let mut m = serde_json::Map::new();
+    m.insert("version".into(), json!(env!("CARGO_PKG_VERSION")));
+    // 工作模式 = 实际武装状态 (设置项模式已移除): KPM 已武装 → kpm, 否则用户态
+    m.insert(
+        "mode".into(),
+        json!(if KPM_ARMED.load(Ordering::Relaxed) { "kpm" } else { "userspace" }),
+    );
+    m.insert("connected".into(), json!(connected));
+    m.insert("touch_listening".into(), json!(crate::event_probe::TOUCH_LISTENING.load(Ordering::Relaxed)));
+    m.insert("touch_event".into(), json!(crate::event_probe::touch_event_name()));
+    // 直接读原子量 (与 refresh::update_status 的 input_hooked 同源),
+    // 避免 /api/status 第二次触发 refresh_get_status (STATUS_REQ+wake)
+    m.insert("input_hooked".into(), json!(crate::event_probe::TOUCH_LISTENING.load(Ordering::Relaxed)));
+    m.insert("uptime".into(), json!(uptime));
+    m.insert("e_core".into(), json!(topo.map(|t| t.e_core.to_range_string()).unwrap_or_default()));
+    m.insert("p_core".into(), json!(topo.map(|t| t.p_core.to_range_string()).unwrap_or_default()));
+    m.insert("hp_core".into(), json!(topo.map(|t| t.hp_core.to_range_string()).unwrap_or_default()));
+    m.insert("all_core".into(), json!(topo.map(|t| t.present_str.clone()).unwrap_or_default()));
+    m.insert("uclamp_supported".into(), json!(UCLAMP_SUPPORTED.load(Ordering::Relaxed)));
+    m.insert("cores".into(), json!(topo.map(|t| t.present_cpus.count()).unwrap_or(0)));
+    m.insert("cpuset_enabled".into(), json!(topo.is_some_and(|t| t.cpuset_enabled)));
+    m
+}
+
+/// 段 2: CPU 运行统计 (规则数 / 命中应用 / 绑定线程 / parse_fail)
+fn cpu_stats(cfg: Option<&crate::config::AppConfig>) -> serde_json::Map<String, serde_json::Value> {
+    // 仅 KPM 模式: 前端轮询即实时读 CPU worker 发布的 CPU_STATS
+    let (threads, hit_pkgs, hit_list) = crate::cpu_affinity::cpu_stats();
+    let (rules, pkgs) = match cfg {
+        Some(c) => (c.rules.len(), c.pkgs.len()),
+        None => (0, 0),
+    };
+    let mut m = serde_json::Map::new();
+    m.insert("rules".into(), json!(rules));
+    m.insert("pkgs".into(), json!(pkgs));
+    m.insert("parse_fail".into(), json!(PARSE_FAILS.load(Ordering::Relaxed)));
+    m.insert("hit_pkgs".into(), json!(hit_pkgs));
+    /* 命中列表带应用名 (前端弹窗显示 label||pkg) */
+    let hit_list: Vec<serde_json::Value> = hit_list
+        .iter()
+        .map(|p| json!({ "pkg": p, "label": app_label_of(p) }))
+        .collect();
+    m.insert("hit_list".into(), json!(hit_list));
+    m.insert("threads".into(), json!(threads));
+    m.insert("total_procs".into(), json!(sys_procs()));
+    m
+}
+
+/// 段 3: 刷新率统计 (只统计有刷新率配置的应用; 只有线程规则且无刷新率
+/// 配置的应用不影响刷新率, 不计入)
+fn rf_stats(cfg: Option<&crate::config::AppConfig>) -> serde_json::Map<String, serde_json::Value> {
+    let rf_apps: HashSet<&str> = cfg
+        .map(|c| c.app_refresh_configs.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    let rf_rules = rf_apps.len();
+    let mut m = serde_json::Map::new();
+    m.insert("rf_rules".into(), json!(rf_rules));
+    /* 覆盖应用 = 全部有刷新率规则的应用 (带应用名; 前端弹窗显示 label||pkg) */
+    m.insert("rf_cover_pkgs".into(), json!(rf_rules));
+    let cover_list: Vec<serde_json::Value> = rf_apps
+        .iter()
+        .map(|p| json!({ "pkg": p, "label": app_label_of(p) }))
+        .collect();
+    m.insert("rf_cover_list".into(), json!(cover_list));
+    m
+}
+
+/// 包名 → 应用名 (PKG_UID_CACHE; 无则空串, 前端回退显示包名)
+fn app_label_of(pkg: &str) -> String {
+    crate::rw_read_ignore_poison(&PKG_UID_CACHE)
+        .get(pkg)
+        .map(|(_, _, l)| l.clone())
+        .unwrap_or_default()
+}
+
+fn rules_json() -> String {
+    let Some(cfg) = crate::config::current_cfg() else {
+        return json!({ "rules": [] }).to_string();
+    };
+    let mut groups: Vec<serde_json::Value> = Vec::new();
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    for r in &cfg.rules {
+        let gi = *index.entry(r.pkg.as_str()).or_insert_with(|| {
+            groups.push(json!({ "pkg": r.pkg, "label": app_label_of(r.pkg.as_str()), "items": [] }));
+            groups.len() - 1
+        });
+        // spec 携带 util token (util_min=/util_max=): 前端 parseSpec 提取回填 chips;
+        // 前端显示时再剥离 util 只显示 CPU 名。
+        let mut spec = spec_name(&r.cpus, &cfg.topo);
+        if r.util_min >= 0 || r.util_max >= 0 {
+            // util 段成对: 单侧缺省补默认 (min=0 / max=1024, 语义等价未设)
+            let mn = if r.util_min >= 0 { r.util_min } else { 0 };
+            let mx = if r.util_max >= 0 { r.util_max } else { 1024 };
+            spec.push_str(&format!("-{}-{}", mn, mx));
+        }
+        groups[gi]["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "thread": r.thread, "spec": spec }));
+    }
+    // 仅刷新率配置 (无 CPU 规则) 的应用也必须列出, 否则 web 规则项看不到它们
+    for pkg in cfg.app_refresh_configs.keys() {
+        if !index.contains_key(pkg.as_str()) {
+            groups.push(json!({ "pkg": pkg, "label": app_label_of(pkg.as_str()), "items": [] }));
+        }
+    }
+    json!({ "rules": groups }).to_string()
+}
+
+fn token_ok(s: &str, max: usize) -> bool {
+    let t = s.trim();
+    !t.is_empty()
+        && t.len() < max
+        && !t.bytes().any(|b| b < 0x20 || b == 0x7f)
+        && !t.contains('#')
+        && !t.contains("//")
+}
+
+fn pkg_shape_ok(pkg: &str) -> bool {
+    !(pkg.contains('{') && pkg.ends_with('}'))
+}
+
+fn rule_api(req: &Request) -> (u16, String) {
+    let v = match parse_json(req) { Ok(v) => v, Err(e) => return e };
+    let (Some(pkg), Some(cpus)) = (
+        v["pkg"].as_str().map(str::trim),
+        v["cpus"].as_str().map(str::trim),
+    ) else {
+        return err_json(400, "缺少 pkg 或 cpus 字段");
+    };
+    let thread = v["thread"].as_str().map(str::trim).unwrap_or("");
+    let Some(cfg) = crate::config::current_cfg() else {
+        return err_json(500, "配置未就绪");
+    };
+    if !token_ok(pkg, MAX_PKG_LEN) || (!thread.is_empty() && !token_ok(thread, MAX_THREAD_LEN)) {
+        return err_json(400, "名称含有非法字符");
+    }
+    if thread.is_empty() && !pkg_shape_ok(pkg) {
+        return err_json(400, "包名含 { 且以 } 结尾时不支持包级规则，可改用线程规则");
+    }
+    // 剥离 uclamp token (util_min=/util_max=) 后再校验 CPU 规格; 原始 cpus 原样写文件。
+    // CPU 集合可空 (只有 uclamp): 允许; 空且无 util 才算无效。
+    let (cpu_spec, umin, umax) = crate::config::parse_rule_spec(cpus);
+    let has_util = umin >= 0 || umax >= 0;
+    if cpu_spec.len() >= 64 || (cpu_spec.is_empty() && !has_util)
+        || (!cpu_spec.is_empty()
+            && (!spec_like(&cpu_spec) || parse_cpu_spec(&cpu_spec, &cfg.topo).count() == 0))
+    {
+        return err_json(400, "无效的 CPU 规格");
+    }
+
+    let file = lock_ignore_poison(&CONFIG_FILE).clone();
+    // only_thread=true (前端单线程规则编辑): 只重放该线程; 否则整包重放
+    let only_thread = v["only_thread"].as_bool().unwrap_or(false);
+    let last_thread = if only_thread { Some(thread) } else { None };
+    match rule_upsert(&file, pkg, thread, cpus) {
+        RuleEdit::Ok => {
+            set_last_rule(pkg, last_thread);
+            config_reload_now();
+            (200, json!({ "ok": true }).to_string())
+        }
+        RuleEdit::Malformed => err_json(409, "配置文件存在未闭合块，请修复后重试"),
+        _ => err_json(500, "配置文件写入失败"),
+    }
+}
+
+fn rule_del_api(req: &Request) -> (u16, String) {
+    let v = match parse_json(req) { Ok(v) => v, Err(e) => return e };
+    let Some(pkg) = v["pkg"].as_str().map(str::trim) else {
+        return err_json(400, "缺少 pkg 字段");
+    };
+    let thread = v["thread"].as_str().map(str::trim).unwrap_or("");
+
+    let file = lock_ignore_poison(&CONFIG_FILE).clone();
+    let result = if v["all"].as_bool().unwrap_or(false) {
+        // 删除应用全部规则: 应用可能只有刷新率配置 (无 CPU 规则) → 视为完成 (幂等)
+        match rule_delete_pkg(&file, pkg) {
+            RuleEdit::NotFound => RuleEdit::Ok,
+            r => r,
+        }
+    } else {
+        rule_delete(&file, pkg, thread)
+    };
+    match result {
+        RuleEdit::Ok => {
+            set_last_rule(pkg, None);
+            config_reload_now();
+            (200, json!({ "ok": true }).to_string())
+        }
+        RuleEdit::NotFound => err_json(404, "规则不存在"),
+        RuleEdit::Conflict => err_json(409, "状态冲突"),
+        RuleEdit::Malformed => err_json(409, "配置文件存在未闭合块，请修复后重试"),
+        RuleEdit::IoErr => err_json(500, "配置文件写入失败"),
+    }
+}
+
+fn rule_rename_api(req: &Request) -> (u16, String) {
+    let v = match parse_json(req) { Ok(v) => v, Err(e) => return e };
+    let (Some(old), Some(new)) =
+        (v["old"].as_str().map(str::trim), v["new"].as_str().map(str::trim))
+    else {
+        return err_json(400, "缺少 old 或 new 字段");
+    };
+    if !token_ok(old, MAX_PKG_LEN) || !token_ok(new, MAX_PKG_LEN) {
+        return err_json(400, "名称含有非法字符");
+    }
+    if !pkg_shape_ok(new) {
+        return err_json(400, "包名含 { 且以 } 结尾时不可作为重命名目标");
+    }
+    if old == new {
+        return (200, json!({ "ok": true }).to_string());
+    }
+
+    let file = lock_ignore_poison(&CONFIG_FILE).clone();
+    match rule_rename(&file, old, new) {
+        RuleEdit::Ok => {
+            // 联动: 同一配置文件内的刷新率配置行 old=refresh-* → new=refresh-*
+            // (刷新率与规则同文件, 规则改名后刷新率行必须同步, 否则残留旧包名)
+            let content = fs::read_to_string(&file).unwrap_or_default();
+            let mut changed = false;
+            let new_lines: Vec<String> = content
+                .lines()
+                .map(|l| {
+                    let t = l.trim();
+                    if let Some((k, v)) = t.split_once('=') {
+                        if k.trim() == old && v.trim_start().starts_with("refresh-") {
+                            changed = true;
+                            return format!("{}={}", new, v.trim());
+                        }
+                    }
+                    l.to_string()
+                })
+                .collect();
+            if changed {
+                let _ = crate::config::save_config_lines(&file, &new_lines);
+            }
+            set_last_rule(new, None);
+            config_reload_now();
+            (200, json!({ "ok": true }).to_string())
+        }
+        RuleEdit::NotFound => err_json(404, "原包名不存在"),
+        RuleEdit::Conflict => err_json(409, "目标包名已存在规则"),
+        RuleEdit::Malformed => err_json(409, "配置文件存在未闭合块，请修复后重试"),
+        RuleEdit::IoErr => err_json(500, "配置文件写入失败"),
+    }
+}
+
+/// 输入建议
+fn suggest_api(req: &Request) -> (u16, String) {
+    let v = match parse_json(req) { Ok(v) => v, Err(e) => return e };
+    let q = v["q"].as_str().map(str::trim).unwrap_or("");
+    if q.len() > 64 {
+        return err_json(400, "q 过长");
+    }
+    let list: Vec<String> = match v["pkg"].as_str().map(str::trim).filter(|p| !p.is_empty()) {
+        None => suggest_pkgs(q).into_iter().map(|(n, _)| n).collect(),
+        Some(pkg) => {
+            if !token_ok(pkg, MAX_PKG_LEN) {
+                return err_json(400, "名称含有非法字符");
+            }
+            suggest_threads(pkg, q).into_iter().map(|(n, _)| n).collect()
+        }
+    };
+    (200, json!({ "ok": true, "list": list }).to_string())
+}
+
+/// 排序键
+fn rank_top(counts: BTreeMap<String, usize>, lq: &str) -> Vec<(String, usize)> {
+    let mut ranked: Vec<(u8, Reverse<usize>, String)> = counts
+        .into_iter()
+        .filter_map(|(n, c)| {
+            let ln = n.to_ascii_lowercase();
+            let r = if ln.starts_with(lq) { 0 } else if ln.contains(lq) { 1 } else { 2 };
+            (r < 2).then_some((r, Reverse(c), n))
+        })
+        .collect();
+    ranked.sort_unstable();
+    ranked.truncate(20);
+    ranked.into_iter().map(|(_, Reverse(c), n)| (n, c)).collect()
+}
+
+fn suggest_pkgs(q: &str) -> Vec<(String, usize)> {
+    let cache = crate::rw_read_ignore_poison(&PKG_UID_CACHE);
+    if cache.is_empty() {
+        drop(cache);
+        refresh_pkg_cache();
+    }
+    let cache = crate::rw_read_ignore_poison(&PKG_UID_CACHE);
+    let lq = q.trim().to_ascii_lowercase();
+    if lq.is_empty() {
+        return Vec::new();
+    }
+    let label_of = |p: &str| cache.get(p).map(|x| &x.2).cloned().unwrap_or_default();
+    let mut hits: Vec<(u8, usize, String)> = Vec::new();   /* (rank, 运行计数, 包名) */
+    /* 同时匹配包名与应用名 (如 douyu / 斗鱼) */
+    for (p, (_, _, label)) in cache.iter() {
+        let hay = format!("{} {}", p, label).to_ascii_lowercase();
+        if hay.contains(&lq) {
+            let r = if p.to_ascii_lowercase().starts_with(&lq) { 0 } else { 1 };
+            hits.push((r, 0usize, p.clone()));
+        }
+    }
+    crate::for_each_proc_pid(|pid| {
+        if let Some(name) = read_cmdline(pid).filter(|n| n.contains('.')) {
+            let hay = format!("{} {}", name, label_of(&name)).to_ascii_lowercase();
+            if hay.contains(&lq) {
+                if let Some(e) = hits.iter_mut().find(|e| e.2 == name) {
+                    e.1 += 1;
+                } else {
+                    let r = if name.to_ascii_lowercase().starts_with(&lq) { 0 } else { 1 };
+                    hits.push((r, 1usize, name));
+                }
+            }
+        }
+    });
+    hits.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)).then_with(|| a.2.cmp(&b.2)));
+    hits.truncate(20);
+    hits.into_iter().map(|(_, c, p)| (p, c)).collect()
+}
+
+fn thread_comm(pid: i32, tid: i32) -> Option<String> {
+    let s = fs::read_to_string(format!("/proc/{}/task/{}/comm", pid, tid)).ok()?;
+    let name = s.trim_end_matches(['\0', '\n']).trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn suggest_threads(pkg: &str, q: &str) -> Vec<(String, usize)> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    crate::for_each_proc_pid(|pid| {
+        if read_cmdline(pid).as_deref() == Some(pkg) {
+            for tid in task_tids(pid).unwrap_or_default() {
+                if let Some(comm) = thread_comm(pid, tid) {
+                    *counts.entry(comm).or_insert(0) += 1;
+                }
+            }
+        }
+    });
+    rank_top(counts, &q.to_ascii_lowercase())
+}
+
+fn config_json() -> String {
+    let cfg = crate::config::current_cfg();
+    let dm = drive_mode();
+    let mode_num = match dm.as_str() { "kpm" => 1, "userspace" => 2, _ => 0 };
+    // 当前生效: userspace 显式或未连上 KPM → 用户态; 否则 KPM
+    let active = if dm == "userspace" || !KPM_ACTIVE.load(Ordering::Relaxed) {
+        "userspace"
+    } else {
+        "kpm"
+    };
+    json!({
+        "mode": mode_num,
+        "mode_active": active,
+        "kpm_available": kpm_probe(),
+        "cpuset_name": cpuset_leaf(),
+        "config_file": lock_ignore_poison(&CONFIG_FILE).clone(),
+        "cpuset_enabled": cfg.is_some_and(|c| c.topo.cpuset_enabled),
+        "affinity_delay_ms": AFFINITY_DELAY_MS.load(Ordering::Relaxed),
+    })
+    .to_string()
+}
+
+fn config_set_api(req: &Request) -> (u16, String) {
+    let v = match parse_json(req) { Ok(v) => v, Err(e) => return e };
+    let name = v["cpuset_name"].as_str();
+    let path = v["config_file"].as_str();
+
+    if name.is_some_and(|n| !valid_name(n)) {
+        return err_json(400, "无效的 cpuset 目录名");
+    }
+    if path.is_some_and(|p| !valid_path(p)) {
+        return err_json(400, "无效的配置文件路径");
+    }
+
+    if let Some(n) = name {
+        crate::cpuset::set_base_cpuset(n);
+        if let Some(cfg) = crate::config::current_cfg()
+            && cfg.topo.cpuset_enabled {
+                create_cpuset_dir(&base_cpuset(), &cfg.topo.present_str, &cfg.topo.mems_str);
+            }
+        crate::config::request_config_reload();
+    }
+    if let Some(p) = path {
+        if std::fs::metadata(p).is_err() {
+            let _ = std::fs::write(p, "# 规则编写与使用说明请参考 http://AppOpt.suto.top\n\n");
+            // 新配置文件也写入设备档位的全局默认刷新率 (文件开头)
+            let (a, i) = crate::refresh::refresh_device_default_rates();
+            crate::refresh::write_global_refresh_defaults(p, a, i);
+        }
+        *lock_ignore_poison(&CONFIG_FILE) = p.to_string();
+        crate::config::request_config_reload();
+    }
+
+    // 驱动模式: 支持数字 (0=auto,1=kpm,2=userspace) 或字符串 ("auto"/"kpm"/"userspace")
+    let mode_str = v["mode"].as_str().map(|s| s.to_string()).or_else(|| {
+        v["mode"].as_i64().map(|n| match n {
+            1 => "kpm".to_string(),
+            2 => "userspace".to_string(),
+            _ => "auto".to_string(),
+        })
+    });
+    if let Some(m) = mode_str {
+        if valid_mode(&m) {
+            set_drive_mode(&m);
+        }
+    }
+
+    // 线程放置延迟 (ms): 数字, 0~60000
+    if let Some(n) = v["affinity_delay_ms"].as_u64() {
+        if n <= 60000 {
+            AFFINITY_DELAY_MS.store(n, Ordering::Relaxed);
+        } else {
+            return err_json(400, "延迟超出范围 (0~60000ms)");
+        }
+    }
+
+    settings_save();
+    (200, json!({ "ok": true }).to_string())
+}
+
+pub const SETTINGS_FILE: &str = "./AppOpt.json";
+
+static SAVE_LOCK: Mutex<()> = Mutex::new(());
+
+/// 最近一次规则编辑的 (包名, 线程名?): 规则保存后 reload 时主线程按粒度重放 —
+/// Some(thread) → 只重放该线程; None → 整包重放; 无记录 → 全量。
+/// 避免"改一个应用 → apply_all_now 全量重放所有规则应用"的放大。
+static LAST_RULE: Mutex<Option<(String, Option<String>)>> = Mutex::new(None);
+
+pub fn last_rule_take() -> Option<(String, Option<String>)> {
+    lock_ignore_poison(&LAST_RULE).take()
+}
+
+fn set_last_rule(pkg: &str, thread: Option<&str>) {
+    *lock_ignore_poison(&LAST_RULE) = Some((pkg.to_string(), thread.map(str::to_string)));
+}
+
+/// 驱动模式全局: "auto"(默认) / "kpm" / "userspace"
+static DRIVE_MODE: Mutex<String> = Mutex::new(String::new());
+
+fn valid_mode(m: &str) -> bool {
+    m == "auto" || m == "kpm" || m == "userspace"
+}
+
+pub fn drive_mode() -> String {
+    let v = lock_ignore_poison(&DRIVE_MODE).clone();
+    if v.is_empty() { "auto".to_string() } else { v }
+}
+
+pub fn set_drive_mode(m: &str) {
+    let m = if valid_mode(m) { m.to_string() } else { "auto".to_string() };
+    *lock_ignore_poison(&DRIVE_MODE) = m;
+}
+
+#[derive(Clone)]
+pub struct Settings {
+    pub web_enable: bool,
+    pub cpuset_name: String,
+    pub config_file: String,
+    pub mode: String,
+    pub affinity_delay_ms: u64,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            web_enable: false,
+            cpuset_name: DEFAULT_CPUSET_NAME.to_string(),
+            config_file: "./applist.conf".to_string(),
+            mode: "auto".to_string(),
+            affinity_delay_ms: 2000,
+        }
+    }
+}
+
+fn valid_name(s: &str) -> bool {
+    !s.is_empty() && s.len() < 64 && !s.contains('/') && !s.bytes().any(|b| b <= b' ')
+}
+
+fn valid_path(s: &str) -> bool {
+    !s.is_empty() && s.len() < 256 && !s.bytes().any(|b| b < 0x20 || b == 0x7f)
+}
+
+impl Settings {
+    fn from_json(v: &Value) -> Self {
+        let d = Settings::default();
+        Self {
+            web_enable: v["web_enable"].as_bool().unwrap_or(d.web_enable),
+            cpuset_name: v["cpuset_name"]
+                .as_str()
+                .filter(|s| valid_name(s))
+                .unwrap_or(&d.cpuset_name)
+                .to_string(),
+            config_file: v["config_file"]
+                .as_str()
+                .filter(|s| valid_path(s))
+                .unwrap_or(&d.config_file)
+                .to_string(),
+            mode: v["mode"]
+                .as_str()
+                .filter(|s| valid_mode(s))
+                .unwrap_or("auto")
+                .to_string(),
+            affinity_delay_ms: v["affinity_delay_ms"]
+                .as_u64()
+                .filter(|n| *n <= 60000)
+                .unwrap_or(2000),
+        }
+    }
+
+    fn to_value(&self) -> Value {
+        json!({
+            "web_enable": self.web_enable,
+            "cpuset_name": self.cpuset_name,
+            "config_file": self.config_file,
+            "mode": self.mode,
+            "affinity_delay_ms": self.affinity_delay_ms,
+        })
+    }
+
+    fn save(&self, path: &str) {
+        let _guard = lock_ignore_poison(&SAVE_LOCK);
+        let json = serde_json::to_string_pretty(&self.to_value()).unwrap_or_default();
+        let tmp = format!("{}.tmp", path);
+        let res = fs::File::create(&tmp)
+            .and_then(|mut f| {
+                f.write_all(format!("{}\n", json).as_bytes())?;
+                f.sync_all()
+            })
+            .and_then(|_| fs::rename(&tmp, path));
+        let _ = res;
+    }
+}
+
+pub fn settings_load(path: &str) -> Settings {
+    let s = match fs::read_to_string(path) {
+        Ok(text) => match serde_json::from_str::<Value>(&text) {
+            Ok(v) => Settings::from_json(&v),
+            Err(_) => Settings::default(),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let d = Settings::default();
+            d.save(path);
+            d
+        }
+        Err(_) => Settings::default(),
+    };
+    AFFINITY_DELAY_MS.store(s.affinity_delay_ms, Ordering::Relaxed);
+    s
+}
+
+pub fn settings_save() {
+    Settings {
+        web_enable: WEB_ENABLED.load(Ordering::Relaxed),
+        cpuset_name: cpuset_leaf(),
+        config_file: lock_ignore_poison(&CONFIG_FILE).clone(),
+        mode: drive_mode(),
+        affinity_delay_ms: AFFINITY_DELAY_MS.load(Ordering::Relaxed),
+    }
+    .save(SETTINGS_FILE);
+}
+
+// ===== waylay (service list 拦截伪装) Web API =====
+
+/// GET /api/waylay: 当前配置 (多组规则) + KPM 连接状态
+fn waylay_json() -> String {
+    let rules = crate::config::waylay_rules_snapshot();
+    json!({
+        // 已连接 = KPM 模块已武装 (拦截功能随 start/stop)
+        "connected": KPM_ARMED.load(Ordering::Relaxed),
+        "rules": rules
+            .iter()
+            .map(|r| {
+                json!({
+                    "pkg": r.pkg,
+                    "label": app_label_of(&r.pkg),
+                    "kind": r.kind.tag(),
+                    "target": r.target,
+                    "from": r.from,
+                    "to": r.to
+                })
+            })
+            .collect::<Vec<_>>(),
+    })
+    .to_string()
+}
+
+/// POST /api/waylay: 保存配置 (拦截字符/替换字符各 7 ASCII + 目标应用列表)
+/// POST /api/waylay: 保存新格式配置 [{pkg, kind, from, to}] (kind: src/prop/red)
+fn waylay_set_api(req: &Request) -> (u16, String) {
+    let v: serde_json::Value = match serde_json::from_slice(&req.body) {
+        Ok(v) => v,
+        Err(_) => return err_json(400, "invalid json"),
+    };
+    // 连接/断开 (arm 字段非 null 时执行; 独立于配置校验, 由主循环消费 KPM_ARM_REQ)
+    if v.get("arm").is_some() && v["arm"].is_boolean() {
+        let arm_req = v["arm"].as_bool().unwrap_or(false);
+        crate::config::set_kpm_arm_req(arm_req);
+        if !arm_req {
+            /* 断开: 同步反映 (前端 loadWaylay 立即读到未连接; 主循环 set_kpm_arm(false) 幂等) */
+            KPM_ARMED.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    // 挂机黑屏 (scr 字段): true=开启(用户态关屏+双击监控线程); 恢复仅由双击触发
+    if v.get("scr").is_some() && v["scr"].is_boolean() {
+        crate::config::set_scr_req(v["scr"].as_bool().unwrap_or(false));
+    }
+    let mut rules: Vec<crate::config::WaylayRule> = Vec::new();
+    if let Some(arr) = v["rules"].as_array() {
+        for r in arr {
+            let pkg = r["pkg"].as_str().unwrap_or("").trim().to_string();
+            let kind_t = r["kind"].as_str().unwrap_or("").to_string();
+            let f = r["from"].as_str().unwrap_or("").to_string();
+            let t = r["to"].as_str().unwrap_or("").to_string();
+            let mut target = r["target"].as_str().unwrap_or("").trim().to_string();
+            let Some(kind) = crate::config::WaylayKind::parse(&kind_t) else {
+                return err_json(400, "未知类型 (src/prop/red)");
+            };
+            if pkg.is_empty() || pkg.len() > 256 {
+                return err_json(400, "包名非法");
+            }
+            if pkg == "*" {
+                continue;   /* 全局规则已移除: 保存时丢弃 */
+            }
+            let max = match kind_t.as_str() {
+                "src" => 64usize,
+                "prop" => 92usize,
+                "red" => 64usize,
+                _ => 64usize,
+            };
+            if f.is_empty() {
+                return err_json(400, "规则 from 不能为空");
+            }
+            /* red: 内容替换 (red-<目标>-<from>-<to>); red-path: 文件重定向 (from 必为 '/' 路径) */
+            let is_path = kind_t == "red-path" && f.starts_with('/');
+            if kind_t == "red" {
+                if target.is_empty() || !target.starts_with('/') || target.len() > 127 {
+                    return err_json(400, "内容替换需目标文件路径 (以 / 开头, ≤127)");
+                }
+                if f.len() != t.len() || f.len() > max || !f.is_ascii() || !t.is_ascii() {
+                    return err_json(400, "red 内容替换需等长 ASCII (≤64)");
+                }
+            } else if kind_t == "red-path" && is_path {
+                if t.is_empty() || f.len() > 127 || t.len() > 255 {
+                    return err_json(400, "red-path 路径超限 (≤127/255)");
+                }
+            } else if kind_t == "red-path" {
+                /* 文件重定向 (含兼容格式): 无等长限制 — 原/新路径文件名、长度可任意不同;
+                 * 仅校验路径语义与长度上限 (不同名规则不受等长检查约束) */
+                if !f.starts_with('/') || !t.starts_with('/') {
+                    return err_json(400, "red-path 原/新路径必须以 / 开头");
+                }
+                if f.len() > 127 || t.len() > 255 {
+                    return err_json(400, "red-path 路径超限 (≤127/255)");
+                }
+            } else if f.len() != t.len() || f.len() > max || !f.is_ascii() || !t.is_ascii() {
+                return err_json(
+                    400,
+                    &format!("{} 规则需等长 ASCII (≤{}), 且不含 '-'", kind_t, max),
+                );
+            }
+            if kind == crate::config::WaylayKind::Red && target.is_empty() {
+                target = "/vendor/etc/selinux/vendor_file_contexts".to_string();
+            }
+            rules.push(crate::config::WaylayRule {
+                pkg,
+                kind,
+                target,
+                from: f,
+                to: t,
+            });
+        }
+    }
+    /* L1: 复用主循环同一套映射+校验, 保存前即时反馈全部错误 (编号与内核下发一致) */
+    let pkguid = pkg_uid_map();   /* 全量缓存, 不再每次读 packages.list */
+    let (_tbl, vrows, srows) = crate::build_rule_rows(&rules, &pkguid);
+    let errs = crate::ebpf_mode::validate_rule_set(&vrows, &srows);
+    if !errs.is_empty() {
+        return (400, json!({ "error": "规则校验失败", "items": errs }).to_string());
+    }
+    if let Err(e) = crate::config::save_waylay_rules(&rules) {
+        return err_json(500, &format!("保存失败: {}", e));
+    }
+    crate::config::request_config_reload();
+    (200, json!({"ok": true}).to_string())
+}
+
+// ===== 文件浏览器 API (重定向/内容替换路径选择) =====
+
+/// POST /api/fs/list: 列出目录 {path} 下的条目 (dirs 在前, 再按名称排序)。
+/// 仅本机 webui 使用; 校验绝对路径 / 禁 ".." / 禁控制字符。
+fn fs_list_api(req: &Request) -> (u16, String) {
+    let v = match parse_json(req) { Ok(v) => v, Err(e) => return e };
+    let Some(p) = v["path"].as_str() else {
+        return err_json(400, "缺少 path 字段");
+    };
+    let p = p.trim();
+    let ok = !p.is_empty()
+        && p.starts_with('/')
+        && !p.contains("..")
+        && !p.bytes().any(|b| b < 0x20 || b == 0x7f);
+    if !ok {
+        return err_json(400, "路径非法");
+    }
+    let mut entries: Vec<(bool, String)> = Vec::new();
+    match std::fs::read_dir(p) {
+        Ok(rd) => {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                entries.push((dir, name));
+            }
+        }
+        Err(_) => return err_json(500, "无法读取目录"),
+    }
+    entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let arr: Vec<serde_json::Value> = entries
+        .into_iter()
+        .map(|(dir, name)| json!({ "name": name, "dir": dir }))
+        .collect();
+    (200, json!({ "ok": true, "path": p, "entries": arr }).to_string())
+}
+
+// ===== 已安装应用列表 API (隐藏页添加目标应用选择) =====
+
+/// 全量 包名→(uid, system, label) 缓存 (packages.list + /data/app 应用名; 初始化 / EV_PKG 时刷新)。
+/// 同时供 waylay 规则表构建 (pkg→uid) 与 /api/apps 应用列表 (应用列表预缓存已移除,
+/// 每次 webui 请求时由本缓存重建)。
+pub static PKG_UID_CACHE: std::sync::LazyLock<RwLock<HashMap<String, (i32, bool, String)>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// 应用 label 缓存 (pkg→可读应用名; 内存 + 磁盘持久化, 避免重启/刷新重复跑 aapt2)
+static PKG_LABEL_CACHE: std::sync::LazyLock<RwLock<HashMap<String, String>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+/// label 缓存落盘文件 (与 AppOpt.json 同目录, 模块 CWD)
+const LABELS_FILE: &str = "./AppOpt.labels.json";
+/// 异步 aapt2 提取进行中 (防并发重复跑)
+static LABEL_EXTRACTING: AtomicBool = AtomicBool::new(false);
+/// 异步提取期间自动释放 LABEL_EXTRACTING (线程 panic/提前返回兜底, 防止门卡死)
+struct LabelExtractGuard;
+impl Drop for LabelExtractGuard {
+    fn drop(&mut self) {
+        LABEL_EXTRACTING.store(false, Ordering::Release);
+    }
+}
+
+/// aapt2 路径 (Magisk 模块部署): bin/ 优先, 回退模块根目录
+const AAPT2_PATHS: &[&str] = &[
+    "/data/adb/modules/AppOpt/bin/aapt2",
+    "/data/adb/modules/AppOpt/aapt2",
+];
+
+/// 全量 包名→(uid, system, label) 表读锁 (read guard, deref 到 &HashMap; 替代每次读盘 pkg_to_uid_map)
+pub fn pkg_uid_map() -> std::sync::RwLockReadGuard<'static, HashMap<String, (i32, bool, String)>> {
+    crate::rw_read_ignore_poison(&PKG_UID_CACHE)
+}
+
+/// 一次性扫描 /data/app (单次 read_dir, 不再每包扫): 返回 (目录名, base.apk 路径)。
+/// 校验目录/文件均为真实条目 (symlink_metadata 不跟随符号链接, 防指向敏感文件)
+fn scan_apk_dirs() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir("/data/app") {
+        for e1 in rd.flatten() {
+            if !e1.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;   /* 符号链接/非目录 → 跳过 */
+            }
+            let n1 = e1.file_name().to_string_lossy().into_owned();
+            let p1 = e1.path();
+            if n1.starts_with("~~") {
+                if let Ok(rd2) = std::fs::read_dir(&p1) {
+                    for e2 in rd2.flatten() {
+                        if !e2.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                            continue;
+                        }
+                        let apk = e2.path().join("base.apk");
+                        if apk.is_file()
+                            && apk.symlink_metadata().map(|m| m.file_type().is_file()).unwrap_or(false)
+                        {
+                            out.push((
+                                e2.file_name().to_string_lossy().into_owned(),
+                                apk.to_string_lossy().into_owned(),
+                            ));
+                        }
+                    }
+                }
+            } else {
+                let apk = p1.join("base.apk");
+                if apk.is_file()
+                    && apk.symlink_metadata().map(|m| m.file_type().is_file()).unwrap_or(false)
+                {
+                    out.push((n1, apk.to_string_lossy().into_owned()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 在单次扫描结果中匹配 <pkg> 或 <pkg>-* 目录 (兼容带/不带 hash 后缀两种 /data/app 布局)
+fn apk_for<'a>(pkg: &str, apk_dirs: &'a [(String, String)]) -> Option<&'a str> {
+    apk_dirs.iter().find_map(|(n, apk)| {
+        let hit = n == pkg
+            || (n.starts_with(pkg) && n.as_bytes().get(pkg.len()).copied() == Some(b'-'));
+        hit.then_some(apk.as_str())
+    })
+}
+
+/// aapt2 是否已部署 (模块目录无 aapt2 时跳过提取线程)
+fn aapt2_available() -> bool {
+    AAPT2_PATHS.iter().any(|p| std::path::Path::new(p).exists())
+}
+
+/// aapt2 命令构造: 以 daemon 身份 (root) 运行 (设备 SELinux 仅 root 可 exec aapt2)。
+/// 不加 rlimit (首版能跑的配置; 首版加 rlimit 后才出现被信号杀), 由 5s 看门狗 + 管道并发 drain 兜底。
+fn build_aapt2_cmd(aapt2: &str, apk: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(aapt2);
+    cmd.args(["dump", "badging"]).arg(apk);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd
+}
+
+/// aapt2 dump badging 提取应用 label: 优先中文 (zh-rCN → 任意 zh → 默认)。
+/// 以 daemon 身份 (root) + 超时 (5s) + rlimit 运行。
+fn aapt2_label(apk: &str) -> Option<String> {
+    use std::io::Read;
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+    let aapt2 = AAPT2_PATHS.iter().find(|p| std::path::Path::new(p).exists())?;
+    let mut child = build_aapt2_cmd(aapt2, apk).spawn().ok()?;
+    /* 等待期间并发 drain stdout/stderr (防管道满 64KB 死锁被超时误杀 — 大应用 badging 输出可超 64KB) */
+    let mut so = child.stdout.take();
+    let mut se = child.stderr.take();
+    let hout = so
+        .take()
+        .map(|mut s| std::thread::spawn(move || {
+            let mut v = Vec::new();
+            let _ = s.read_to_end(&mut v);
+            v
+        }));
+    let herr = se
+        .take()
+        .map(|mut s| std::thread::spawn(move || {
+            let mut v = Vec::new();
+            let _ = s.read_to_end(&mut v);
+            v
+        }));
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(15)),
+            Err(_) => return None,
+        }
+    };
+    let ok = status.success();
+    let out = hout.and_then(|h| h.join().ok()).unwrap_or_default();
+    let _ = herr.and_then(|h| h.join().ok());   /* 排空 stderr 防死锁, 内容丢弃 */
+    if !ok {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out);
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("application-label-zh-rCN:"))
+        .or_else(|| text.lines().find(|l| l.starts_with("application-label-zh")))
+        .or_else(|| text.lines().find(|l| l.starts_with("application-label:")))?;
+    let v = line.splitn(2, '\'').nth(1)?.trim_end_matches('\'');
+    /* 清洗控制字符 (label 来自不可信 APK 资源, 防 UI/日志注入) */
+    let v: String = v.chars().filter(|c| !c.is_control()).collect();
+    (!v.is_empty()).then_some(v)
+}
+
+/// 从磁盘加载 label 缓存 (仅首次/缓存为空时)
+fn load_label_cache() {
+    let mut m = crate::rw_write_ignore_poison(&PKG_LABEL_CACHE);
+    if !m.is_empty() {
+        return;
+    }
+    if let Ok(text) = std::fs::read_to_string(LABELS_FILE) {
+        if let Ok(v) = serde_json::from_str::<HashMap<String, String>>(&text) {
+            *m = v;
+        }
+    }
+}
+
+/// 落盘 label 缓存 (新增 label 后调用; tmp+rename 原子写)
+fn save_label_cache() {
+    let m = crate::rw_read_ignore_poison(&PKG_LABEL_CACHE);
+    if let Ok(text) = serde_json::to_string(&*m) {
+        let tmp = format!("{}.tmp", LABELS_FILE);
+        if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, LABELS_FILE).is_ok() {
+            return;
+        }
+    }
+}
+
+/// 单个未缓存用户包 → label (aapt2; 找不到返回空)
+fn pkg_label_from_apk(pkg: &str, apk_dirs: &[(String, String)]) -> String {
+    apk_for(pkg, apk_dirs)
+        .and_then(|apk| aapt2_label(apk))
+        .unwrap_or_default()
+}
+
+/// 并行解析一批未缓存包的 label (并发跑 aapt2, 上限 4 路; apk 目录列表复用单次扫描)
+fn extract_labels(pkgs: &[String], apk_dirs: &[(String, String)]) -> HashMap<String, String> {
+    use std::sync::atomic::{AtomicUsize, Ordering as AO};
+    use std::sync::Mutex;
+    let out = Mutex::new(HashMap::new());
+    let next = AtomicUsize::new(0);
+    let n = pkgs.len();
+    let workers = n.min(4).max(1);
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, AO::Relaxed);
+                if i >= n {
+                    break;
+                }
+                let label = pkg_label_from_apk(&pkgs[i], apk_dirs);
+                if !label.is_empty() {
+                    out.lock().unwrap_or_else(|e| e.into_inner())
+                        .insert(pkgs[i].clone(), label);
+                }
+            });
+        }
+    });
+    out.into_inner().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 刷新 pkg→(uid, system, label) 缓存 (初始化 / EV_PKG packages.list inotify 时调用):
+/// 1) 载入磁盘 label 缓存 → 2) 同步重建 (uid,system,已有 label) 表 → 3) label 缺失部分
+///    异步并行 aapt2 解析 (不阻塞主循环/EV_PKG) → 4) 合并回填并落盘;
+/// label 缓存随 packages.list 裁剪 (已卸载包移除陈旧 label)
+pub fn refresh_pkg_cache() {
+    load_label_cache();
+    let have_aapt2 = aapt2_available();
+    let mut m: HashMap<String, (i32, bool, String)> = HashMap::new();
+    let mut pending: Vec<String> = Vec::new();
+    if let Ok(content) = std::fs::read_to_string("/data/system/packages.list") {
+        for line in content.lines() {
+            let mut it = line.split_whitespace();
+            let Some(pkg) = it.next() else { continue };
+            let Some(uid) = it.next().and_then(|s| s.parse::<i32>().ok()) else { continue };
+            if uid <= 0 || uid >= 100000 {
+                continue;   /* 仅当前用户 (与 cpu/waylay uid 表一致) */
+            }
+            /* 应用类别: 条目末尾标记 @system=系统应用, @null=用户应用 */
+            let system = line.trim_end().ends_with("@system");
+            /* 应用名: 用户应用从 /data/app 的 base.apk 用 aapt2 取 label (系统应用不在 /data/app) */
+            let label = if system {
+                String::new()
+            } else if let Some(l) = crate::rw_read_ignore_poison(&PKG_LABEL_CACHE).get(pkg) {
+                l.clone()
+            } else {
+                /* 模块目录无 aapt2 时跳过提取 (不启动线程, label 保持空 → 前端回退包名) */
+                if have_aapt2 {
+                    pending.push(pkg.to_string());
+                }
+                String::new()
+            };
+            m.insert(pkg.to_string(), (uid, system, label));
+        }
+    }
+    /* label 缓存跟随 packages.list: 已卸载包的陈旧 label 一并移除并落盘 */
+    {
+        let mut lc = crate::rw_write_ignore_poison(&PKG_LABEL_CACHE);
+        let before = lc.len();
+        lc.retain(|pkg, _| m.contains_key(pkg));
+        if lc.len() != before {
+            drop(lc);
+            save_label_cache();
+        }
+    }
+    *crate::rw_write_ignore_poison(&PKG_UID_CACHE) = m;
+
+    /* 缺失 label: 异步并行解析 (不阻塞主循环; 复用单次 /data/app 扫描; 进行中不重复跑) */
+    if !pending.is_empty() && !LABEL_EXTRACTING.swap(true, Ordering::AcqRel) {
+        let apk_dirs = scan_apk_dirs();
+        std::thread::spawn(move || {
+            let _g = LabelExtractGuard;   /* 线程退出/panic 自动释放门 */
+            let fresh = extract_labels(&pending, &apk_dirs);
+            if fresh.is_empty() {
+                return;
+            }
+            crate::rw_write_ignore_poison(&PKG_LABEL_CACHE).extend(fresh.clone());
+            save_label_cache();
+            /* 回填 PKG_UID_CACHE label (仅缺失项) */
+            let mut u = crate::rw_write_ignore_poison(&PKG_UID_CACHE);
+            for (pkg, (_, system, label)) in u.iter_mut() {
+                if *system || !label.is_empty() {
+                    continue;
+                }
+                if let Some(l) = fresh.get(pkg) {
+                    *label = l.clone();
+                }
+            }
+        });
+    }
+}
+
+/// GET /api/apps: 每次请求由 pkg→(uid,system,label) 缓存重建应用列表 (按包名排序)。
+fn apps_json() -> String {
+    let cache = crate::rw_read_ignore_poison(&PKG_UID_CACHE);
+    let mut entries: Vec<(&String, &(i32, bool, String))> = cache.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    let arr: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|(pkg, (uid, sys, label))| {
+            json!({ "pkg": pkg, "uid": uid, "system": *sys, "label": label })
+        })
+        .collect();
+    json!({ "apps": arr }).to_string()
+}
+
+// ===== 刷新率 Web API =====
+
+fn refresh_status_json() -> String {
+    match crate::refresh::refresh_get_status() {
+        Some(s) => json!({
+            "current_mode": s.current_mode,
+            "mode_str": match s.current_mode {
+                0 => "120Hz", 1 => "60Hz", 2 => "90Hz", _ => "未知"
+            },
+            "timer_running": s.timer_running,
+            "is_paused": s.is_paused,
+            "timer_enabled": s.timer_enabled,
+            "current_package": s.current_package,
+            "timeout": s.timeout,
+            "active_mode": s.active_mode,
+            "active_str": match s.active_mode {
+                0 => "120Hz", 1 => "60Hz", 2 => "90Hz", _ => "60Hz"
+            },
+            "idle_mode": s.idle_mode,
+            "idle_str": match s.idle_mode {
+                0 => "120Hz", 1 => "60Hz", 2 => "90Hz", _ => "60Hz"
+            },
+            "input_hooked": s.input_hooked,
+            "last_input_secs": s.last_input_secs,
+        }).to_string(),
+        None => json!({"error": "refresh module not initialized"}).to_string(),
+    }
+}
+
+fn refresh_config_json() -> String {
+    let (timeout, active, idle) = crate::refresh::refresh_get_config();
+    // 设备可用刷新率 (Hz), 前端据此过滤 120/90/60 选项
+    let (available, device_modes) = match crate::refresh::refresh_get_status() {
+        Some(s) => (s.available, s.device_modes),
+        None => (vec![120, 90, 60], std::sync::Arc::new(Vec::new())),
+    };
+    json!({
+        "timeout": timeout,
+        "active": active,
+        "idle": idle,
+        "available": available,
+        "device_modes": device_modes,
+    }).to_string()
+}
+
+fn refresh_config_set_api(req: &Request) -> (u16, String) {
+    let v = match parse_json(req) { Ok(v) => v, Err(e) => return e };
+    let timeout = v["timeout"].as_u64().unwrap_or(30) as i32;
+    let active = v["active"].as_str().unwrap_or("120");
+    let idle = v["idle"].as_str().unwrap_or("60");
+    if timeout < 1 || timeout > 3600 {
+        return err_json(400, "超时时间需在 1-3600 秒之间");
+    }
+    if !matches!(active, "120" | "90" | "60") || !matches!(idle, "120" | "90" | "60") {
+        return err_json(400, "刷新率仅支持 120/90/60");
+    }
+    crate::refresh::refresh_set_config(timeout, active, idle);
+    (200, json!({"ok": true}).to_string())
+}
+
+fn refresh_apps_json() -> String {
+    let apps = crate::refresh::refresh_get_apps();
+    let arr: Vec<_> = apps.iter().map(|(pkg, timeout, active, idle)| {
+        json!({"pkg": pkg, "timeout": timeout, "active": active, "idle": idle})
+    }).collect();
+    json!({"apps": arr}).to_string()
+}
+
+fn refresh_app_add_api(req: &Request) -> (u16, String) {
+    let v = match parse_json(req) { Ok(v) => v, Err(e) => return e };
+    let Some(pkg) = v["pkg"].as_str().map(str::trim) else {
+        return err_json(400, "缺少 pkg 字段");
+    };
+    if pkg.is_empty() || pkg.len() >= 128 || !pkg.bytes().all(|b| b >= 0x20 && b != 0x7f) {
+        return err_json(400, "无效的包名");
+    }
+    let timeout = v["timeout"].as_u64().unwrap_or(30) as i32;
+    // active/idle 兼容字符串 ("120") 与数字 (120): 前端可能传数字
+    let sv = |k: &str| -> String {
+        v[k].as_str()
+            .map(str::to_string)
+            .or_else(|| v[k].as_i64().map(|n| n.to_string()))
+            .unwrap_or_default()
+    };
+    let active = sv("active");
+    let idle = sv("idle");
+    if timeout < 1 || timeout > 3600 {
+        return err_json(400, "超时时间需在 1-3600 秒之间");
+    }
+    // 按设备可用档位校正 (防止默认/旧值 120 写入仅支持 90/60 的设备)
+    let avail = crate::refresh::refresh_get_status()
+        .map(|s| s.available)
+        .unwrap_or_default();
+    let fix = |r: String| -> String {
+        let r = if r.is_empty() { "120".to_string() } else { r };
+        if avail.is_empty() || avail.iter().any(|a| a.to_string() == r) {
+            r
+        } else {
+            avail[0].to_string()
+        }
+    };
+    let active = fix(active);
+    let idle = fix(idle);
+    if !matches!(active.as_str(), "120" | "90" | "60") || !matches!(idle.as_str(), "120" | "90" | "60") {
+        return err_json(400, "刷新率仅支持 120/90/60");
+    }
+    crate::refresh::refresh_add_app(pkg, timeout, &active, &idle);
+    (200, json!({"ok": true}).to_string())
+}
+
+fn refresh_app_del_api(req: &Request) -> (u16, String) {
+    let v = match parse_json(req) { Ok(v) => v, Err(e) => return e };
+    let Some(pkg) = v["pkg"].as_str().map(str::trim) else {
+        return err_json(400, "缺少 pkg 字段");
+    };
+    if pkg.is_empty() {
+        return err_json(400, "包名不能为空");
+    }
+    if crate::refresh::refresh_del_app(pkg) {
+        (200, json!({"ok": true}).to_string())
+    } else {
+        err_json(500, "删除失败")
+    }
+}
