@@ -267,6 +267,9 @@ body.kb .tabbar,body.kb .navbar{backdrop-filter:none;-webkit-backdrop-filter:non
 <div class="uclamp-chips" id="w-seg" style="margin-bottom:8px">
 <button data-v="srv" class="on">系统服务伪装</button><button data-v="prop">系统属性伪装</button><button data-v="red">文件内容替换</button><button data-v="name">文件名伪装</button><button data-v="redpath">路径重定向</button>
 </div>
+<div class="uclamp-chips" id="w-scr" style="margin-bottom:8px">
+<button data-v="1">挂机黑屏</button><button data-v="0">恢复亮屏</button>
+</div>
 </section>
 
 <section id="tab-settings" class="panel" hidden>
@@ -1372,6 +1375,16 @@ $('w-conn-chips').addEventListener('click',async e=>{
     const conn=await loadWaylay();
     if(on) toast(conn?'已连接 (模块已武装)':'未连接: KPM 未就绪');
     else toast('已断开 (模块已解除)');
+  }catch(e){toast(e.message)}
+});
+
+// 挂机黑屏: 开启 → 内核关屏 (游戏前台挂机), 恢复 → 亮屏 (或双击屏幕恢复)
+$('w-scr').addEventListener('click',async e=>{
+  const b=e.target.closest('button');if(!b)return;
+  const on=b.dataset.v==='1';
+  try{
+    await api('/api/waylay',{scr:on,rules:buildRules()});
+    toast(on?'已开启挂机黑屏 (双击屏幕恢复亮屏)':'已恢复亮屏');
   }catch(e){toast(e.message)}
 });
 
