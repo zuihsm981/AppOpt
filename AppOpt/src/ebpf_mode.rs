@@ -313,15 +313,21 @@ impl KpmHandle {
         Ok(())
     }
 
-    /// 屏幕挂机黑屏: 内核关屏 (HWC setPowerMode OFF 内核实现, 仅 6.6; 面板物理关闭,
-    /// Android 状态机不干预 → 游戏前台不暂停; 亮屏状态由持锁保持)
+    /// 屏幕挂机黑屏: 关屏 (用户态直写 sysfs bl_power=4, 面板电源下电黑屏;
+    /// 该面板驱动只认 bl_power, 不响应 brightness 写入)
     pub(crate) fn scr_off(&self) {
-        self.cmd("hwc_off");
+        let _ = std::fs::write(
+            "/sys/class/backlight/panel0-backlight/bl_power",
+            "4\n",
+        );
     }
 
-    /// 屏幕挂机黑屏: 恢复亮屏 (双击恢复入口; 内核放行下一帧合成重亮)
+    /// 屏幕挂机黑屏: 恢复亮屏 (双击恢复入口; 用户态直写 sysfs bl_power=0 上电)
     pub(crate) fn scr_on(&self) {
-        self.cmd("hwc_on");
+        let _ = std::fs::write(
+            "/sys/class/backlight/panel0-backlight/bl_power",
+            "0\n",
+        );
     }
 
     /// property 区用户态文件写替换 (root 读写 /dev/__properties__/<ctx> 文件,
