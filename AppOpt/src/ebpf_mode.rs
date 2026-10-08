@@ -212,52 +212,50 @@ fn kp_ready(key: &CString) -> bool {
 }
 
 /// KPM 传输句柄 (占用原 EbpfState.bpf 字段, 保持 main.rs 接口不变)
-/// 屏幕挂机黑屏: 关屏 (直写 sysfs brightness=0, 保存原亮度; 系统只在亮度变化时写
-/// brightness, 自动亮度关闭时不会覆盖, 避免 bl_power 被显示管理重置自动亮屏)
-pub fn scr_off_fs() {
-    // 先记录原亮度; 读取失败 → 不写 0 (否则恢复时无亮度可写回, 永久黑屏)
-    let cur = std::fs::read_to_string(
-        "/sys/class/backlight/panel0-backlight/brightness",
-    )
-    .ok()
-    .and_then(|s| s.trim().parse::<i32>().ok());
-    let Some(v) = cur else { return };
-    *SCR_BRIGHTNESS.lock().unwrap() = Some(v);
+/// 屏幕挂机黑屏: 读当前亮度 (brightness 文件)
+pub fn scr_read_brightness() -> Option<i32> {
+    std::fs::read_to_string("/sys/class/backlight/panel0-backlight/brightness")
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+}
+
+/// 屏幕挂机黑屏: 写亮度
+pub fn scr_set_brightness(v: i32) {
     let _ = std::fs::write(
         "/sys/class/backlight/panel0-backlight/brightness",
-        "0\n",
+        format!("{}\n", v),
     );
 }
 
-/// 屏幕挂机黑屏: 恢复亮屏 (写回关屏前亮度; brightness=0 下必须写回才亮)
-pub fn scr_on_fs() {
-    let v = *SCR_BRIGHTNESS.lock().unwrap();
-    if let Some(v) = v {
-        let _ = std::fs::write(
-            "/sys/class/backlight/panel0-backlight/brightness",
-            format!("{}\n", v),
-        );
+/// 保存关屏前亮度 (双击① 黑屏前记录; 记录成功才允许写 0)
+pub fn scr_store_saved(v: i32) {
+    *SCR_BRIGHTNESS.lock().unwrap() = Some(v);
+}
+
+/// 取出关屏前亮度 (双击② 渐亮恢复用)
+pub fn scr_take_saved() -> Option<i32> {
+    SCR_BRIGHTNESS.lock().unwrap().take()
+}
+
+/// 渐亮: 从 0 分 20 步 (每步 50ms) 恢复到 target, 模拟亮度慢慢提高
+pub fn scr_fade_in(target: i32) {
+    if target <= 0 {
+        return;
+    }
+    let step = (target / 20).max(1);
+    let mut cur = 0;
+    while cur < target {
+        cur += step;
+        if cur > target {
+            cur = target;
+        }
+        scr_set_brightness(cur);
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 
-/// 挂机黑屏调度标志: 已计划 (10s 窗口内) 时重复点击全部抛弃
-static SCR_SCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// 关屏前亮度 (brightness 方案恢复必须写回)
+/// 关屏前亮度 (双击① 黑屏时记录; 读取失败则不写 0, 避免永久黑屏)
 static SCR_BRIGHTNESS: std::sync::Mutex<Option<i32>> = std::sync::Mutex::new(None);
-
-/// 挂机黑屏调度: 点击后延迟 10s 执行 (关屏 + 启动双击监控), 防误触;
-/// 10s 窗口内再次点击 → 全部抛弃 (不重置、不重复执行)
-pub fn schedule_hang_black() {
-    if SCR_SCHED.swap(true, std::sync::atomic::Ordering::AcqRel) {
-        return;   // 10s 内重复点击 → 抛弃
-    }
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_secs(10));
-        SCR_SCHED.store(false, std::sync::atomic::Ordering::Release);
-        scr_off_fs();
-        crate::event_probe::spawn_double_tap();
-    });
-}
 
 pub struct KpmHandle {
     key: CString,

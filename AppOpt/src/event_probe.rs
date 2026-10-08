@@ -151,6 +151,8 @@ const EV_ABS: u16 = 0x03;
 const ABS_MT_TRACKING_ID: u16 = 0x39;   // 57: 触点会话 id, >=0 按下 / -1 抬起
 // 双击判定: 两次按下间隔 ≤ 300ms (中间有抬起)
 const DOUBLE_TAP_MS: u128 = 300;
+// 挂机黑屏切换防抖: 双击触发黑屏/渐亮后 2s 内不再响应 (防连续误触快速切换)
+const HANG_TAP_COOLDOWN_MS: u128 = 2000;
 const INPUT_EVENT_SIZE: usize = 24;
 
 #[repr(C)]
@@ -272,43 +274,69 @@ pub fn spawn_event(touch_sock: c_int, ctrl_sock: c_int, exit_sock: c_int) {
 }
 
 /// 挂机黑屏双击监控线程: 「挂机黑屏」开启后启动, 打开触摸设备阻塞读事件,
-/// 检测双击 (两次按下 ≤300ms, 中间有抬起) → 恢复亮屏 (直写 bl_power=0) → 退出。
+/// 检测双击 (两次按下 ≤300ms, 中间有抬起) → 恢复亮屏 (写回关屏前亮度) → 退出。
 /// 恢复亮屏后前端按钮再次触发挂机时重建线程 (专用线程, 不影响主触摸监听)。
-pub fn spawn_double_tap() {
-    std::thread::spawn(move || {
-        let name = std::ffi::CString::new("DoubleTap").unwrap();
-        unsafe { libc::pthread_setname_np(libc::pthread_self(), name.as_ptr()); }
-        let Some((_, p)) = event_for_touch() else { return };
-        let Ok(c) = std::ffi::CString::new(p.as_str()) else { return };
-        let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY) };   // 阻塞读
-        if fd < 0 {
-            return;
+/// 挂机黑屏监听线程运行标志 (开关关闭/重启时置 false 停止)
+pub static HANG_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 启动挂机黑屏监听 (开关打开): 双击① 记录亮度成功 → 写 brightness=0 黑屏;
+/// 双击② → 渐亮恢复; 循环切换, 直到 stop_hang_monitor 停止
+pub fn start_hang_monitor() {
+    HANG_RUNNING.store(true, std::sync::atomic::Ordering::Release);
+    std::thread::spawn(move || hang_monitor_loop());
+}
+
+/// 停止监听线程 (开关关闭, 还原系统双击唤醒设置后调用)
+pub fn stop_hang_monitor() {
+    HANG_RUNNING.store(false, std::sync::atomic::Ordering::Release);
+}
+
+fn hang_monitor_loop() {
+    let name = std::ffi::CString::new("HangMonitor").unwrap();
+    unsafe { libc::pthread_setname_np(libc::pthread_self(), name.as_ptr()); }
+    let Some((_, p)) = event_for_touch() else { return };
+    let Ok(c) = std::ffi::CString::new(p.as_str()) else { return };
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+    if fd < 0 {
+        return;
+    }
+    let mut buf = [0u8; 4096];
+    let mut last_down: Option<std::time::Instant> = None;
+    let mut armed = false;
+    let mut hung = false;   /* 当前是否黑屏态 */
+    let mut last_tap: Option<std::time::Instant> = None;   /* 切换防抖 2s */
+    loop {
+        if !HANG_RUNNING.load(std::sync::atomic::Ordering::Acquire) {
+            break;
         }
-        let mut buf = [0u8; 4096];
-        let mut last_down: Option<std::time::Instant> = None;
-        let mut armed = false;
+        /* poll 200ms: 可响应 stop, 又不漏触摸 */
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN as i16,
+            revents: 0,
+        };
+        let pr = unsafe { libc::poll(&mut pfd, 1, 200) };
+        if pr <= 0 {
+            continue;   /* 超时/信号 → 回循环检查停止标志 */
+        }
+        let mut tap = false;
         loop {
             let r = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
             if r <= 0 {
-                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                    continue;
-                }
-                break;   // 设备异常 → 退出
+                break;
             }
             let mut off = 0usize;
             while off + INPUT_EVENT_SIZE <= r as usize {
                 let ev = unsafe { &*(buf.as_ptr().add(off) as *const InputEvent) };
                 if ev.type_ == EV_ABS && ev.code == ABS_MT_TRACKING_ID {
                     if ev.value >= 0 {
-                        // 触点按下 (新 touch 会话)
+                        /* 触点按下 (新 touch 会话) */
                         let now = std::time::Instant::now();
                         if armed {
                             if let Some(t0) = last_down {
                                 if now.duration_since(t0).as_millis() <= DOUBLE_TAP_MS {
-                                    /* 双击 → 恢复亮屏 → 线程退出 */
-                                    crate::ebpf_mode::scr_on_fs();
-                                    unsafe { libc::close(fd); }
-                                    return;
+                                    tap = true;
                                 }
                             }
                         }
@@ -321,6 +349,31 @@ pub fn spawn_double_tap() {
                 off += INPUT_EVENT_SIZE;
             }
         }
-        unsafe { libc::close(fd); }
-    });
+        if tap {
+            /* 切换防抖: 2s 内不响应新的双击 */
+            let now = std::time::Instant::now();
+            let cool = last_tap
+                .map(|t| now.duration_since(t).as_millis() >= HANG_TAP_COOLDOWN_MS as u128)
+                .unwrap_or(true);
+            if !cool {
+                continue;
+            }
+            last_tap = Some(now);
+            if !hung {
+                /* 双击①: 先记录亮度, 成功才写 0 (黑屏) */
+                if let Some(v) = crate::ebpf_mode::scr_read_brightness() {
+                    crate::ebpf_mode::scr_store_saved(v);
+                    crate::ebpf_mode::scr_set_brightness(0);
+                    hung = true;
+                }
+            } else {
+                /* 双击②: 渐亮恢复 */
+                if let Some(t) = crate::ebpf_mode::scr_take_saved() {
+                    crate::ebpf_mode::scr_fade_in(t);
+                }
+                hung = false;
+            }
+        }
+    }
+    unsafe { libc::close(fd); }
 }

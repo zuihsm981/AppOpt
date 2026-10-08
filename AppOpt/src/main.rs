@@ -552,9 +552,22 @@ impl AppState {
             -1 => self.set_kpm_arm(false),
             _ => {}
         }
-        // 挂机黑屏: 开启 (延迟 10s 执行, 防误触; 10s 窗口内重复点击全部抛弃)
-        if crate::config::take_scr_req() > 0 {
-            crate::ebpf_mode::schedule_hang_black();
+        // 挂机黑屏持久开关: 开 → 禁用系统双击唤醒 + 启动双击监听线程
+        // (双击① 记录亮度→写0黑屏, 双击② 渐亮恢复); 关 → 还原双击唤醒 + 停止线程
+        match crate::config::take_scr_req() {
+            1 => {
+                let _ = std::process::Command::new("settings")
+                    .args(["put", "secure", "double_tap_to_wake", "0"])
+                    .status();
+                crate::event_probe::start_hang_monitor();
+            }
+            -1 => {
+                let _ = std::process::Command::new("settings")
+                    .args(["put", "secure", "double_tap_to_wake", "1"])
+                    .status();
+                crate::event_probe::stop_hang_monitor();
+            }
+            _ => {}
         }
         // waylay 配置保存 (web /api/waylay): 同步替换字符到内核 (目标 uid 集合已由
         // save_waylay 更新静态, 下一次前台回调差量生效)
