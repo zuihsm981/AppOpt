@@ -267,9 +267,6 @@ body.kb .tabbar,body.kb .navbar{backdrop-filter:none;-webkit-backdrop-filter:non
 <div class="uclamp-chips" id="w-seg" style="margin-bottom:8px">
 <button data-v="srv" class="on">系统服务伪装</button><button data-v="prop">系统属性伪装</button><button data-v="red">文件内容替换</button><button data-v="name">文件名伪装</button><button data-v="redpath">路径重定向</button>
 </div>
-<div class="uclamp-chips" id="w-scr" style="margin-bottom:8px">
-<button data-v="1">挂机黑屏</button>
-</div>
 </section>
 
 <section id="tab-settings" class="panel" hidden>
@@ -287,6 +284,13 @@ body.kb .tabbar,body.kb .navbar{backdrop-filter:none;-webkit-backdrop-filter:non
 <div class="card-title">线程延迟放置</div>
 <div class="field"><input id="c-delay" type="number" min="0" max="60000" step="100" placeholder="2000"><button class="btn" id="c-delay-save">保存</button></div>
 <div class="hint">如果出现部分线程没有正确设置时尝试调整<br>默认：2000ms</div>
+</div>
+<div class="card">
+<div class="card-title">挂机黑屏</div>
+<div class="uclamp-chips" id="w-scr">
+<button data-v="1">开启挂机</button><button data-v="0">关闭挂机</button>
+</div>
+<div class="hint">开启后禁用系统双击唤醒并监听双击：第 1 次双击黑屏（不锁屏，游戏前台挂机），第 2 次双击渐亮恢复；关闭时还原双击唤醒并停止监听</div>
 </div>
 <div class="card">
 <div class="card-title">关于</div>
@@ -1378,12 +1382,13 @@ $('w-conn-chips').addEventListener('click',async e=>{
   }catch(e){toast(e.message)}
 });
 
-// 挂机黑屏: 点击 → 关屏 (游戏前台挂机), 双击屏幕恢复亮屏
+// 挂机黑屏持久开关: 开启 → 禁用系统双击唤醒, 双击① 黑屏 双击② 渐亮恢复; 关闭 → 还原
 $('w-scr').addEventListener('click',async e=>{
   const b=e.target.closest('button');if(!b)return;
+  const on=b.dataset.v==='1';
   try{
-    await api('/api/waylay',{scr:true,rules:buildRules()});
-    toast('已开启挂机黑屏 (双击屏幕恢复亮屏)');
+    await api('/api/waylay',{scr:on,rules:buildRules()});
+    toast(on?'已开启挂机 (双击屏幕: 黑屏/渐亮恢复)':'已关闭挂机 (还原双击唤醒)');
   }catch(e){toast(e.message)}
 });
 
