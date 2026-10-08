@@ -1382,15 +1382,22 @@ $('w-conn-chips').addEventListener('click',async e=>{
   }catch(e){toast(e.message)}
 });
 
-// 挂机黑屏持久开关: 开启 → 禁用系统双击唤醒, 双击① 黑屏 双击② 渐亮恢复; 关闭 → 还原
+// 挂机黑屏持久开关: 开启 → 立马禁用系统双击唤醒, 亮屏双击黑屏 / 黑屏单击渐亮恢复; 关闭 → 还原
+let scrOn=false;
+function renderScr(on){
+  scrOn=on;
+  $('w-scr').querySelectorAll('button').forEach(b=>b.classList.toggle('on',(b.dataset.v==='1')===on));
+}
 $('w-scr').addEventListener('click',async e=>{
   const b=e.target.closest('button');if(!b)return;
   const on=b.dataset.v==='1';
+  renderScr(on);
   try{
     await api('/api/waylay',{scr:on,rules:buildRules()});
-    toast(on?'已开启挂机 (双击屏幕: 黑屏/渐亮恢复)':'已关闭挂机 (还原双击唤醒)');
+    toast(on?'已开启挂机 (双击屏幕黑屏, 单击渐亮恢复)':'已关闭挂机 (还原双击唤醒)');
   }catch(e){toast(e.message)}
 });
+renderScr(false);
 
 // webui 不可见 (切后台/关闭) 时: 提前映射 prop 目标 tmpfs 文件 (配置已保存则生效)
 document.addEventListener('visibilitychange',()=>{
