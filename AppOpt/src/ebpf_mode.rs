@@ -212,19 +212,38 @@ fn kp_ready(key: &CString) -> bool {
 }
 
 /// KPM 传输句柄 (占用原 EbpfState.bpf 字段, 保持 main.rs 接口不变)
-/// 屏幕挂机黑屏: 关屏 (直写 sysfs bl_power=4, 面板电源下电黑屏; 该面板驱动只认
-/// bl_power, 不响应 brightness 写入)。前端按钮 / 双击监控线程共用。
+/// 屏幕挂机黑屏: 关屏 (直写 sysfs brightness=0, 保存原亮度; 系统只在亮度变化时写
+/// brightness, 自动亮度关闭时不会覆盖, 避免 bl_power 被显示管理重置自动亮屏)
 pub fn scr_off_fs() {
-    let _ = std::fs::write("/sys/class/backlight/panel0-backlight/bl_power", "4\n");
+    // 先记录原亮度; 读取失败 → 不写 0 (否则恢复时无亮度可写回, 永久黑屏)
+    let cur = std::fs::read_to_string(
+        "/sys/class/backlight/panel0-backlight/brightness",
+    )
+    .ok()
+    .and_then(|s| s.trim().parse::<i32>().ok());
+    let Some(v) = cur else { return };
+    *SCR_BRIGHTNESS.lock().unwrap() = Some(v);
+    let _ = std::fs::write(
+        "/sys/class/backlight/panel0-backlight/brightness",
+        "0\n",
+    );
 }
 
-/// 屏幕挂机黑屏: 恢复亮屏 (直写 sysfs bl_power=0 上电; 不恢复亮度)
+/// 屏幕挂机黑屏: 恢复亮屏 (写回关屏前亮度; brightness=0 下必须写回才亮)
 pub fn scr_on_fs() {
-    let _ = std::fs::write("/sys/class/backlight/panel0-backlight/bl_power", "0\n");
+    let v = *SCR_BRIGHTNESS.lock().unwrap();
+    if let Some(v) = v {
+        let _ = std::fs::write(
+            "/sys/class/backlight/panel0-backlight/brightness",
+            format!("{}\n", v),
+        );
+    }
 }
 
 /// 挂机黑屏调度标志: 已计划 (10s 窗口内) 时重复点击全部抛弃
 static SCR_SCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 关屏前亮度 (brightness 方案恢复必须写回)
+static SCR_BRIGHTNESS: std::sync::Mutex<Option<i32>> = std::sync::Mutex::new(None);
 
 /// 挂机黑屏调度: 点击后延迟 10s 执行 (关屏 + 启动双击监控), 防误触;
 /// 10s 窗口内再次点击 → 全部抛弃 (不重置、不重复执行)
