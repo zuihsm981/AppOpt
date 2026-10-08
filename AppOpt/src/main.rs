@@ -552,21 +552,9 @@ impl AppState {
             -1 => self.set_kpm_arm(false),
             _ => {}
         }
-        // 挂机黑屏: 开启/恢复 (内核 hwc_off / hwc_on; 双击屏幕也可恢复)
-        match crate::config::take_scr_req() {
-            1 => {
-                if let Some(es) = self.ebpf_state.as_ref() {
-                    es.bpf.scr_off();
-                }
-                crate::config::set_scr_off_state(true);
-            }
-            -1 => {
-                if let Some(es) = self.ebpf_state.as_ref() {
-                    es.bpf.scr_on();
-                }
-                crate::config::set_scr_off_state(false);
-            }
-            _ => {}
+        // 挂机黑屏: 开启 (延迟 10s 执行, 防误触; 10s 窗口内重复点击全部抛弃)
+        if crate::config::take_scr_req() > 0 {
+            crate::ebpf_mode::schedule_hang_black();
         }
         // waylay 配置保存 (web /api/waylay): 同步替换字符到内核 (目标 uid 集合已由
         // save_waylay 更新静态, 下一次前台回调差量生效)
@@ -1160,9 +1148,9 @@ fn main() {
                     }
                 }
                 EV_TOUCH => {
-                    // 用户态触摸/输入活动: 读走 1 字节通知; 1=活动, 2=双击
-                    let mut tb = [0u8; 1];
+                    // 用户态触摸/输入活动: 读走 1 字节通知 (只关心"有活动") → 重置刷新率空闲
                     if touch_ok && touch_sv[0] > 0 {
+                        let mut tb = [0u8; 1];
                         let _ = unsafe {
                             libc::recv(
                                 touch_sv[0],
@@ -1171,13 +1159,6 @@ fn main() {
                                 0,
                             )
                         };
-                    }
-                    if tb[0] == 2 && crate::config::scr_off_state() {
-                        // 双击 → 恢复挂机黑屏亮屏 (仅关屏态响应, 防普通触摸误触发)
-                        crate::config::set_scr_off_state(false);
-                        if let Some(es) = state.ebpf_state.as_ref() {
-                            es.bpf.scr_on();
-                        }
                     }
                     crate::refresh::refresh_on_event(crate::refresh::EVENT_INPUT, 0);
                 }

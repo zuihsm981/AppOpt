@@ -212,6 +212,34 @@ fn kp_ready(key: &CString) -> bool {
 }
 
 /// KPM 传输句柄 (占用原 EbpfState.bpf 字段, 保持 main.rs 接口不变)
+/// 屏幕挂机黑屏: 关屏 (直写 sysfs bl_power=4, 面板电源下电黑屏; 该面板驱动只认
+/// bl_power, 不响应 brightness 写入)。前端按钮 / 双击监控线程共用。
+pub fn scr_off_fs() {
+    let _ = std::fs::write("/sys/class/backlight/panel0-backlight/bl_power", "4\n");
+}
+
+/// 屏幕挂机黑屏: 恢复亮屏 (直写 sysfs bl_power=0 上电; 不恢复亮度)
+pub fn scr_on_fs() {
+    let _ = std::fs::write("/sys/class/backlight/panel0-backlight/bl_power", "0\n");
+}
+
+/// 挂机黑屏调度标志: 已计划 (10s 窗口内) 时重复点击全部抛弃
+static SCR_SCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 挂机黑屏调度: 点击后延迟 10s 执行 (关屏 + 启动双击监控), 防误触;
+/// 10s 窗口内再次点击 → 全部抛弃 (不重置、不重复执行)
+pub fn schedule_hang_black() {
+    if SCR_SCHED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;   // 10s 内重复点击 → 抛弃
+    }
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        SCR_SCHED.store(false, std::sync::atomic::Ordering::Release);
+        scr_off_fs();
+        crate::event_probe::spawn_double_tap();
+    });
+}
+
 pub struct KpmHandle {
     key: CString,
 }
@@ -311,23 +339,6 @@ impl KpmHandle {
             return Err(format!("内核拒绝 vfc_rule #{}: 返回 {}", idx, r));
         }
         Ok(())
-    }
-
-    /// 屏幕挂机黑屏: 关屏 (用户态直写 sysfs bl_power=4, 面板电源下电黑屏;
-    /// 该面板驱动只认 bl_power, 不响应 brightness 写入)
-    pub(crate) fn scr_off(&self) {
-        let _ = std::fs::write(
-            "/sys/class/backlight/panel0-backlight/bl_power",
-            "4\n",
-        );
-    }
-
-    /// 屏幕挂机黑屏: 恢复亮屏 (双击恢复入口; 用户态直写 sysfs bl_power=0 上电)
-    pub(crate) fn scr_on(&self) {
-        let _ = std::fs::write(
-            "/sys/class/backlight/panel0-backlight/bl_power",
-            "0\n",
-        );
     }
 
     /// property 区用户态文件写替换 (root 读写 /dev/__properties__/<ctx> 文件,

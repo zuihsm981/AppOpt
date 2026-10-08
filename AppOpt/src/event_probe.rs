@@ -151,8 +151,6 @@ const EV_ABS: u16 = 0x03;
 const ABS_MT_TRACKING_ID: u16 = 0x39;   // 57: 触点会话 id, >=0 按下 / -1 抬起
 // 双击判定: 两次按下间隔 ≤ 300ms (中间有抬起)
 const DOUBLE_TAP_MS: u128 = 300;
-// 双击通知冷却: 触发后 1.5s 内不再重复通知 (防三连击/连点重复恢复亮屏)
-const DOUBLE_TAP_COOLDOWN_MS: u128 = 1500;
 const INPUT_EVENT_SIZE: usize = 24;
 
 #[repr(C)]
@@ -198,11 +196,6 @@ pub fn spawn_event(touch_sock: c_int, ctrl_sock: c_int, exit_sock: c_int) {
 
     let mut events: [libc::epoll_event; 32] = unsafe { std::mem::zeroed() };
     let mut buf = [0u8; 4096];
-    // 双击状态机: last_down=上次按下时刻, armed=已抬起等待第二次按下
-    let mut last_down: Option<std::time::Instant> = None;
-    let mut armed = false;
-    // 双击通知冷却 (触发后 1.5s 内不再重复通知)
-    let mut last_tap: Option<std::time::Instant> = None;
     // 触摸 fd 常驻 epoll: 摘除只发生在定时器停止 (ctrl 0) 显式暂停时;
     // 高频触摸时仅对"跨线程活动通知"做 2s 防抖 (本地读空仍每次执行, 微秒级)
     let mut last_notify: Option<std::time::Instant> = None;
@@ -215,7 +208,6 @@ pub fn spawn_event(touch_sock: c_int, ctrl_sock: c_int, exit_sock: c_int) {
             break;
         }
         let mut activity = false;
-        let mut double_tap = false;
         for i in 0..n as usize {
             let tag = events[i].u64;
             if tag == TAG_CTRL {
@@ -232,34 +224,11 @@ pub fn spawn_event(touch_sock: c_int, ctrl_sock: c_int, exit_sock: c_int) {
                     TOUCH_LISTENING.store(false, Ordering::Relaxed); // 暂停 → UI 未监听
                 }
             } else if tag == TAG_TOUCH {
-                // 触摸事件: 解析触点按下/抬起 → 双击检测 (只读丢弃, 不影响系统输入)
+                // 触摸事件: 清空事件 (只读丢弃; 双击恢复由挂机专用线程负责)
                 loop {
                     let r = unsafe { libc::read(touch_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
                     if r <= 0 {
                         break;
-                    }
-                    let mut off = 0usize;
-                    while off + INPUT_EVENT_SIZE <= r as usize {
-                        let ev = unsafe { &*(buf.as_ptr().add(off) as *const InputEvent) };
-                        if ev.type_ == EV_ABS && ev.code == ABS_MT_TRACKING_ID {
-                            if ev.value >= 0 {
-                                // 触点按下 (新 touch 会话)
-                                let now = std::time::Instant::now();
-                                if armed {
-                                    if let Some(t0) = last_down {
-                                        if now.duration_since(t0).as_millis() <= DOUBLE_TAP_MS {
-                                            double_tap = true;
-                                        }
-                                    }
-                                }
-                                last_down = Some(now);
-                                armed = false;
-                            } else {
-                                // 触点抬起 → 等待第二次按下
-                                armed = true;
-                            }
-                        }
-                        off += INPUT_EVENT_SIZE;
                     }
                 }
                 activity = true;
@@ -280,20 +249,7 @@ pub fn spawn_event(touch_sock: c_int, ctrl_sock: c_int, exit_sock: c_int) {
                 }
             }
         }
-        if double_tap {
-            // 双击: 冷却期内忽略 (防三连击/连点重复), 否则立即通知 (value=2)
-            let now = std::time::Instant::now();
-            let cool = last_tap
-                .map(|t| now.duration_since(t).as_millis() >= DOUBLE_TAP_COOLDOWN_MS as u128)
-                .unwrap_or(true);
-            if cool {
-                last_tap = Some(now);
-                if touch_sock >= 0 {
-                    let v: u8 = 2;
-                    let _ = unsafe { libc::send(touch_sock, &v as *const u8 as *const _, 1, libc::MSG_DONTWAIT) };
-                }
-            }
-        } else if activity {
+        if activity {
             // 通知防抖: 2s 内只向主线程发送一次活动通知 (触摸 fd 常驻, 本地仍每次读空)
             let now = std::time::Instant::now();
             let due = last_notify
@@ -313,4 +269,58 @@ pub fn spawn_event(touch_sock: c_int, ctrl_sock: c_int, exit_sock: c_int) {
         unsafe { libc::close(touch_fd); }
     }
     unsafe { libc::close(epfd); }
+}
+
+/// 挂机黑屏双击监控线程: 「挂机黑屏」开启后启动, 打开触摸设备阻塞读事件,
+/// 检测双击 (两次按下 ≤300ms, 中间有抬起) → 恢复亮屏 (直写 bl_power=0) → 退出。
+/// 恢复亮屏后前端按钮再次触发挂机时重建线程 (专用线程, 不影响主触摸监听)。
+pub fn spawn_double_tap() {
+    std::thread::spawn(move || {
+        let name = std::ffi::CString::new("DoubleTap").unwrap();
+        unsafe { libc::pthread_setname_np(libc::pthread_self(), name.as_ptr()); }
+        let Some((_, p)) = event_for_touch() else { return };
+        let Ok(c) = std::ffi::CString::new(p.as_str()) else { return };
+        let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY) };   // 阻塞读
+        if fd < 0 {
+            return;
+        }
+        let mut buf = [0u8; 4096];
+        let mut last_down: Option<std::time::Instant> = None;
+        let mut armed = false;
+        loop {
+            let r = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+            if r <= 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break;   // 设备异常 → 退出
+            }
+            let mut off = 0usize;
+            while off + INPUT_EVENT_SIZE <= r as usize {
+                let ev = unsafe { &*(buf.as_ptr().add(off) as *const InputEvent) };
+                if ev.type_ == EV_ABS && ev.code == ABS_MT_TRACKING_ID {
+                    if ev.value >= 0 {
+                        // 触点按下 (新 touch 会话)
+                        let now = std::time::Instant::now();
+                        if armed {
+                            if let Some(t0) = last_down {
+                                if now.duration_since(t0).as_millis() <= DOUBLE_TAP_MS {
+                                    /* 双击 → 恢复亮屏 → 线程退出 */
+                                    crate::ebpf_mode::scr_on_fs();
+                                    unsafe { libc::close(fd); }
+                                    return;
+                                }
+                            }
+                        }
+                        last_down = Some(now);
+                        armed = false;
+                    } else {
+                        armed = true;   /* 触点抬起 → 等待第二次按下 */
+                    }
+                }
+                off += INPUT_EVENT_SIZE;
+            }
+        }
+        unsafe { libc::close(fd); }
+    });
 }
