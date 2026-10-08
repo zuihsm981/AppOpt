@@ -320,7 +320,6 @@ fn hang_monitor_loop() {
         if pr <= 0 {
             continue;   /* 超时/信号 → 回循环检查停止标志 */
         }
-        let mut tap = false;
         loop {
             let r = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
             if r <= 0 {
@@ -333,45 +332,43 @@ fn hang_monitor_loop() {
                     if ev.value >= 0 {
                         /* 触点按下 (新 touch 会话) */
                         let now = std::time::Instant::now();
-                        if armed {
+                        let cool = last_tap
+                            .map(|t| now.duration_since(t).as_millis() >= HANG_TAP_COOLDOWN_MS as u128)
+                            .unwrap_or(true);
+                        if hung {
+                            /* 黑屏态: 单击 (任意新按下) → 渐亮恢复 (防抖 2s) */
+                            if cool {
+                                last_tap = Some(now);
+                                if let Some(t) = crate::ebpf_mode::scr_take_saved() {
+                                    crate::ebpf_mode::scr_fade_in(t);
+                                }
+                                hung = false;
+                            }
+                        } else if armed {
+                            /* 亮屏态: 双击 (两次按下 ≤300ms, 中间抬起) → 黑屏 */
                             if let Some(t0) = last_down {
-                                if now.duration_since(t0).as_millis() <= DOUBLE_TAP_MS {
-                                    tap = true;
+                                if now.duration_since(t0).as_millis() <= DOUBLE_TAP_MS
+                                    && cool
+                                {
+                                    last_tap = Some(now);
+                                    if let Some(v) = crate::ebpf_mode::scr_read_brightness() {
+                                        crate::ebpf_mode::scr_store_saved(v);
+                                        crate::ebpf_mode::scr_set_brightness(0);
+                                        hung = true;
+                                    }
                                 }
                             }
+                            last_down = Some(now);
+                            armed = false;
+                        } else {
+                            last_down = Some(now);
+                            armed = false;
                         }
-                        last_down = Some(now);
-                        armed = false;
                     } else {
                         armed = true;   /* 触点抬起 → 等待第二次按下 */
                     }
                 }
                 off += INPUT_EVENT_SIZE;
-            }
-        }
-        if tap {
-            /* 切换防抖: 2s 内不响应新的双击 */
-            let now = std::time::Instant::now();
-            let cool = last_tap
-                .map(|t| now.duration_since(t).as_millis() >= HANG_TAP_COOLDOWN_MS as u128)
-                .unwrap_or(true);
-            if !cool {
-                continue;
-            }
-            last_tap = Some(now);
-            if !hung {
-                /* 双击①: 先记录亮度, 成功才写 0 (黑屏) */
-                if let Some(v) = crate::ebpf_mode::scr_read_brightness() {
-                    crate::ebpf_mode::scr_store_saved(v);
-                    crate::ebpf_mode::scr_set_brightness(0);
-                    hung = true;
-                }
-            } else {
-                /* 双击②: 渐亮恢复 */
-                if let Some(t) = crate::ebpf_mode::scr_take_saved() {
-                    crate::ebpf_mode::scr_fade_in(t);
-                }
-                hung = false;
             }
         }
     }

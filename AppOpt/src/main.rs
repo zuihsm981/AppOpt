@@ -552,21 +552,11 @@ impl AppState {
             -1 => self.set_kpm_arm(false),
             _ => {}
         }
-        // 挂机黑屏持久开关: 开 → 禁用系统双击唤醒 + 启动双击监听线程
-        // (双击① 记录亮度→写0黑屏, 双击② 渐亮恢复); 关 → 还原双击唤醒 + 停止线程
+        // 挂机黑屏持久开关: 系统双击唤醒已由 web 层立马设置; 这里只启停监听线程
+        // (亮屏态双击 → 黑屏; 黑屏态单击 → 渐亮恢复)
         match crate::config::take_scr_req() {
-            1 => {
-                let _ = std::process::Command::new("settings")
-                    .args(["put", "secure", "double_tap_to_wake", "0"])
-                    .status();
-                crate::event_probe::start_hang_monitor();
-            }
-            -1 => {
-                let _ = std::process::Command::new("settings")
-                    .args(["put", "secure", "double_tap_to_wake", "1"])
-                    .status();
-                crate::event_probe::stop_hang_monitor();
-            }
+            1 => crate::event_probe::start_hang_monitor(),
+            -1 => crate::event_probe::stop_hang_monitor(),
             _ => {}
         }
         // waylay 配置保存 (web /api/waylay): 同步替换字符到内核 (目标 uid 集合已由

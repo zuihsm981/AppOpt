@@ -890,9 +890,19 @@ fn waylay_set_api(req: &Request) -> (u16, String) {
             KPM_ARMED.store(false, std::sync::atomic::Ordering::Relaxed);
         }
     }
-    // 挂机黑屏 (scr 字段): true=开启(用户态关屏+双击监控线程); 恢复仅由双击触发
+    // 挂机黑屏 (scr 字段): 开关点击时**立马**设置系统双击唤醒 (不依赖主循环异步),
+    // 再置 SCR_REQ 由主循环启停监听线程
     if v.get("scr").is_some() && v["scr"].is_boolean() {
-        crate::config::set_scr_req(v["scr"].as_bool().unwrap_or(false));
+        let on = v["scr"].as_bool().unwrap_or(false);
+        let _ = std::process::Command::new("settings")
+            .args([
+                "put",
+                "secure",
+                "double_tap_to_wake",
+                if on { "0" } else { "1" },
+            ])
+            .status();
+        crate::config::set_scr_req(on);
     }
     let mut rules: Vec<crate::config::WaylayRule> = Vec::new();
     if let Some(arr) = v["rules"].as_array() {
