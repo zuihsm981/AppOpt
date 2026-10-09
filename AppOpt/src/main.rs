@@ -395,6 +395,34 @@ struct AppState {
     srv_monitored: HashMap<i32, i32>,
 }
 
+/// 挂机黑屏 8890 长按 HOME 事件监听运行标志 (仅开关打开时监听, 与 WebUI 无关)
+static HANG_EV_RUNNING: std::sync::LazyLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+
+/// 常驻监听 127.0.0.1:8890: 红果清屏 hook 到长按 HOME 后 POST 过来 →
+/// hang_toggle() (亮屏 → 黑屏 / 黑屏 → 亮屏); 开关关闭时停止
+fn hang_ev_server(running: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use std::io::Read;
+    let listener = match std::net::TcpListener::bind(("127.0.0.1", 8890)) {
+        Ok(l) => l,
+        Err(_) => return,
+    };
+    listener.set_nonblocking(true).ok();
+    let mut buf = [0u8; 128];
+    while running.load(std::sync::atomic::Ordering::Acquire) {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let _ = stream.read(&mut buf);
+                crate::ebpf_mode::hang_toggle();
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(_) => break,
+        }
+    }
+}
+
 impl AppState {
     /// 从 CURRENT_CONFIG 构建 (初始 uid 表 + 规则包集合)
     fn new() -> Self {
@@ -552,11 +580,20 @@ impl AppState {
             -1 => self.set_kpm_arm(false),
             _ => {}
         }
-        // 挂机黑屏持久开关: 系统双击唤醒已由 web 层立马设置; 这里只启停监听线程
-        // (亮屏态双击 → 黑屏; 黑屏态单击 → 渐亮恢复)
+        // 挂机黑屏持久开关: 系统双击唤醒由 web 层立马设置; 这里:
+        // 开 → 触摸监听(黑屏态单击亮屏) + 8890 长按 HOME 监听(黑屏触发);
+        // 关 → 全部停止
         match crate::config::take_scr_req() {
-            1 => crate::event_probe::start_hang_monitor(),
-            -1 => crate::event_probe::stop_hang_monitor(),
+            1 => {
+                crate::event_probe::start_hang_monitor();
+                HANG_EV_RUNNING.store(true, Ordering::Release);
+                let running = HANG_EV_RUNNING.clone();
+                std::thread::spawn(move || hang_ev_server(running));
+            }
+            -1 => {
+                crate::event_probe::stop_hang_monitor();
+                HANG_EV_RUNNING.store(false, Ordering::Release);
+            }
             _ => {}
         }
         // waylay 配置保存 (web /api/waylay): 同步替换字符到内核 (目标 uid 集合已由

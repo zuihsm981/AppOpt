@@ -257,6 +257,67 @@ pub fn scr_fade_in(target: i32) {
 /// 关屏前亮度 (双击① 黑屏时记录; 读取失败则不写 0, 避免永久黑屏)
 static SCR_BRIGHTNESS: std::sync::Mutex<Option<i32>> = std::sync::Mutex::new(None);
 
+/// 挂机黑屏当前状态 (true=黑屏态; 黑屏由长按 HOME 触发, 单击屏幕亮屏)
+static HANG_HUNG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 切换防抖 (黑屏/亮屏切换后 2s 内忽略新触发)
+static HANG_LAST_TOGGLE: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+pub fn hang_hung() -> bool {
+    HANG_HUNG.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// 黑屏: 记录亮度成功 → 写 0 + 置黑屏态 (读取失败则不黑, 避免永久黑屏)
+pub fn hang_off() {
+    if let Some(v) = scr_read_brightness() {
+        scr_store_saved(v);
+        scr_set_brightness(0);
+        HANG_HUNG.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// 亮屏: 渐亮恢复 + 清黑屏态
+pub fn hang_on() {
+    if let Some(t) = scr_take_saved() {
+        scr_fade_in(t);
+    }
+    HANG_HUNG.store(false, std::sync::atomic::Ordering::Release);
+}
+
+/// 长按 HOME 切换 (8890 事件): 黑屏 ↔ 亮屏, 2s 防抖
+pub fn hang_toggle() {
+    let now = std::time::Instant::now();
+    let cool = HANG_LAST_TOGGLE
+        .lock()
+        .unwrap()
+        .map(|t| now.duration_since(t).as_millis() >= 2000)
+        .unwrap_or(true);
+    if !cool {
+        return;
+    }
+    *HANG_LAST_TOGGLE.lock().unwrap() = Some(now);
+    if hang_hung() {
+        hang_on();
+    } else {
+        hang_off();
+    }
+}
+
+/// 黑屏态单击亮屏 (监听线程): 共用 2s 防抖, 返回是否已执行
+pub fn hang_tap_on() -> bool {
+    let now = std::time::Instant::now();
+    let mut g = HANG_LAST_TOGGLE.lock().unwrap();
+    if let Some(t) = *g {
+        if now.duration_since(t).as_millis() < 2000 {
+            return false;
+        }
+    }
+    *g = Some(now);
+    drop(g);
+    hang_on();
+    true
+}
+
 pub struct KpmHandle {
     key: CString,
 }

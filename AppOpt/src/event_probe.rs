@@ -149,10 +149,6 @@ const TOUCH_NOTIFY_DEBOUNCE_MS: u64 = 2000;
 // input_event 解析 (24B, aarch64: timeval 16B + type/code/value 8B): 双击检测
 const EV_ABS: u16 = 0x03;
 const ABS_MT_TRACKING_ID: u16 = 0x39;   // 57: 触点会话 id, >=0 按下 / -1 抬起
-// 双击判定: 两次按下间隔 ≤ 300ms (中间有抬起)
-const DOUBLE_TAP_MS: u128 = 300;
-// 挂机黑屏切换防抖: 双击触发黑屏/渐亮后 2s 内不再响应 (防连续误触快速切换)
-const HANG_TAP_COOLDOWN_MS: u128 = 2000;
 const INPUT_EVENT_SIZE: usize = 24;
 
 #[repr(C)]
@@ -280,8 +276,8 @@ pub fn spawn_event(touch_sock: c_int, ctrl_sock: c_int, exit_sock: c_int) {
 pub static HANG_RUNNING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// 启动挂机黑屏监听 (开关打开): 双击① 记录亮度成功 → 写 brightness=0 黑屏;
-/// 双击② → 渐亮恢复; 循环切换, 直到 stop_hang_monitor 停止
+/// 启动挂机黑屏监听 (开关打开): 常驻读触摸事件, **黑屏态单击 → 亮屏**;
+/// 黑屏触发由长按 HOME (红果 hook → 8890 → hang_off) 完成
 pub fn start_hang_monitor() {
     HANG_RUNNING.store(true, std::sync::atomic::Ordering::Release);
     std::thread::spawn(move || hang_monitor_loop());
@@ -302,10 +298,6 @@ fn hang_monitor_loop() {
         return;
     }
     let mut buf = [0u8; 4096];
-    let mut last_down: Option<std::time::Instant> = None;
-    let mut armed = false;
-    let mut hung = false;   /* 当前是否黑屏态 */
-    let mut last_tap: Option<std::time::Instant> = None;   /* 切换防抖 2s */
     loop {
         if !HANG_RUNNING.load(std::sync::atomic::Ordering::Acquire) {
             break;
@@ -328,45 +320,14 @@ fn hang_monitor_loop() {
             let mut off = 0usize;
             while off + INPUT_EVENT_SIZE <= r as usize {
                 let ev = unsafe { &*(buf.as_ptr().add(off) as *const InputEvent) };
-                if ev.type_ == EV_ABS && ev.code == ABS_MT_TRACKING_ID {
-                    if ev.value >= 0 {
-                        /* 触点按下 (新 touch 会话) */
-                        let now = std::time::Instant::now();
-                        let cool = last_tap
-                            .map(|t| now.duration_since(t).as_millis() >= HANG_TAP_COOLDOWN_MS as u128)
-                            .unwrap_or(true);
-                        if hung {
-                            /* 黑屏态: 单击 (任意新按下) → 渐亮恢复 (防抖 2s) */
-                            if cool {
-                                last_tap = Some(now);
-                                if let Some(t) = crate::ebpf_mode::scr_take_saved() {
-                                    crate::ebpf_mode::scr_fade_in(t);
-                                }
-                                hung = false;
-                            }
-                        } else if armed {
-                            /* 亮屏态: 双击 (两次按下 ≤300ms, 中间抬起) → 黑屏 */
-                            if let Some(t0) = last_down {
-                                if now.duration_since(t0).as_millis() <= DOUBLE_TAP_MS
-                                    && cool
-                                {
-                                    last_tap = Some(now);
-                                    if let Some(v) = crate::ebpf_mode::scr_read_brightness() {
-                                        crate::ebpf_mode::scr_store_saved(v);
-                                        crate::ebpf_mode::scr_set_brightness(0);
-                                        hung = true;
-                                    }
-                                }
-                            }
-                            last_down = Some(now);
-                            armed = false;
-                        } else {
-                            last_down = Some(now);
-                            armed = false;
-                        }
-                    } else {
-                        armed = true;   /* 触点抬起 → 等待第二次按下 */
+                if ev.type_ == EV_ABS && ev.code == ABS_MT_TRACKING_ID
+                    && ev.value >= 0
+                {
+                    /* 黑屏态: 单击 (任意新按下) → 亮屏 (防抖在 hang_tap_on 内) */
+                    if crate::ebpf_mode::hang_hung() {
+                        crate::ebpf_mode::hang_tap_on();
                     }
+                    /* 亮屏态: 忽略触摸 (黑屏由长按 HOME 触发) */
                 }
                 off += INPUT_EVENT_SIZE;
             }
