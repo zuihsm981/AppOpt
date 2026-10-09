@@ -328,16 +328,16 @@ fn cpu_rule_info(
     (app_cpu, threads)
 }
 
-/// 刷新率规则串: 活跃==静止 → "90HZ"; 否则 → "120HZ-90HZ-30s"
+/// 刷新率规则串: 活跃==静止 → "90Hz"; 否则 → "120Hz-90Hz-30s"
 fn rf_rule_str(cfg: Option<&crate::config::AppConfig>, pkg: &str) -> String {
     cfg.and_then(|c| c.app_refresh_configs.get(pkg))
         .map(|(t, a, i)| {
             let a_s = crate::config::refresh_mode_str(*a);
             let i_s = crate::config::refresh_mode_str(*i);
             if a_s == i_s {
-                format!("{}HZ", a_s)
+                format!("{}Hz", a_s)
             } else {
-                format!("{}HZ-{}HZ-{}s", a_s, i_s, t)
+                format!("{}Hz-{}Hz-{}s", a_s, i_s, t)
             }
         })
         .unwrap_or_default()
