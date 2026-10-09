@@ -368,18 +368,24 @@ fn cpu_stats(cfg: Option<&crate::config::AppConfig>) -> serde_json::Map<String, 
         })
         .collect();
     m.insert("hit_list".into(), json!(hit_list));
-    /* 全部 CPU 规则应用 (规则数量点击弹窗) */
+    /* 全部 CPU 规则应用 (规则数量点击弹窗; 按应用级 CPU 范围排序) */
     let rule_apps: Vec<serde_json::Value> = match cfg {
         Some(c) => {
             let mut ps: Vec<&String> = c.rules.iter().map(|r| &r.pkg).collect();
             ps.sort();
             ps.dedup();
-            ps.iter()
+            let mut items: Vec<(String, serde_json::Value)> = ps
+                .iter()
                 .map(|p| {
                     let (cpu, ths) = cpu_rule_info(&c.rules, p);
-                    json!({ "pkg": p, "label": app_label_of(p), "cpu": cpu, "threads": ths })
+                    (
+                        cpu.clone(),
+                        json!({ "pkg": p, "label": app_label_of(p), "cpu": cpu, "threads": ths }),
+                    )
                 })
-                .collect()
+                .collect();
+            items.sort_by(|a, b| a.0.cmp(&b.0));
+            items.into_iter().map(|(_, v)| v).collect()
         }
         None => Vec::new(),
     };
@@ -407,11 +413,20 @@ fn rf_stats(cfg: Option<&crate::config::AppConfig>) -> serde_json::Map<String, s
         })
         .collect();
     m.insert("rf_hit_list".into(), json!(hit_list));
-    /* 全部刷新率规则应用 (规则数量点击弹窗) */
-    let rf_rule_apps: Vec<serde_json::Value> = rf_apps
+    /* 全部刷新率规则应用 (规则数量点击弹窗; 按规则串排序) */
+    let mut rf_rule_apps: Vec<(String, serde_json::Value)> = rf_apps
         .iter()
-        .map(|p| json!({ "pkg": p, "label": app_label_of(p), "rule": rf_rule_str(cfg, p) }))
+        .map(|p| {
+            let rule = rf_rule_str(cfg, p);
+            (
+                rule.clone(),
+                json!({ "pkg": p, "label": app_label_of(p), "rule": rule }),
+            )
+        })
         .collect();
+    rf_rule_apps.sort_by(|a, b| a.0.cmp(&b.0));
+    let rf_rule_apps: Vec<serde_json::Value> =
+        rf_rule_apps.into_iter().map(|(_, v)| v).collect();
     m.insert("rf_rule_apps".into(), json!(rf_rule_apps));
     m
 }
