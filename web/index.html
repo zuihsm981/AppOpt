@@ -290,7 +290,7 @@ body.kb .tabbar,body.kb .navbar{backdrop-filter:none;-webkit-backdrop-filter:non
 <div class="uclamp-chips" id="w-scr">
 <button data-v="1">开启挂机</button><button data-v="0">关闭挂机</button>
 </div>
-<div class="hint">开启后禁用系统双击唤醒并监听双击：第 1 次双击黑屏（不锁屏，游戏前台挂机），第 2 次双击渐亮恢复；关闭时还原双击唤醒并停止监听</div>
+<div class="hint">开启后监听长按 HOME 触发黑屏（不锁屏，游戏前台挂机），黑屏态单击屏幕渐亮恢复；关闭时停止监听</div>
 </div>
 <div class="card">
 <div class="card-title">关于</div>
@@ -1367,6 +1367,7 @@ async function loadWaylay(){
     rdFrules=uniq(rs.filter(r=>r.kind==='red-path'&&r.from.startsWith('/')).map(r=>r.from+'\u0000'+r.to)).map(k=>{const [f,t]=k.split('\u0000');const same=rs.filter(x=>x.kind==='red-path'&&x.from===f&&x.to===t);return {from:f,to:t,global:same.some(x=>x.pkg==='*'),apps:uniq(same.filter(x=>x.pkg!=='*').map(x=>x.pkg))}});
     rdApps=uniq(rdCrules.flatMap(r=>r.apps||[]));
     renderWaylayConn(!!d.connected);
+    renderScr(!!d.scr_on);   // 恢复挂机黑屏开关状态
     renderWaylayRules();renderWaylayApps();renderWpRules();renderWpApps();renderRdCrules();renderRdFrules();renderRdApps();renderRdpApps();
     return !!d.connected;
   }catch(e){toast(e.message);return false}
@@ -1382,7 +1383,7 @@ $('w-conn-chips').addEventListener('click',async e=>{
   }catch(e){toast(e.message)}
 });
 
-// 挂机黑屏持久开关: 开启 → 立马禁用系统双击唤醒, 亮屏双击黑屏 / 黑屏单击渐亮恢复; 关闭 → 还原
+// 挂机黑屏持久开关: 开启 → 监听长按 HOME (黑屏触发) + 黑屏态单击渐亮恢复; 关闭 → 停止
 let scrOn=false;
 function renderScr(on){
   scrOn=on;
@@ -1394,7 +1395,7 @@ $('w-scr').addEventListener('click',async e=>{
   renderScr(on);
   try{
     await api('/api/waylay',{scr:on,rules:buildRules()});
-    toast(on?'已开启挂机 (双击屏幕黑屏, 单击渐亮恢复)':'已关闭挂机 (还原双击唤醒)');
+    toast(on?'已开启挂机 (长按HOME黑屏, 单击屏幕渐亮恢复)':'已关闭挂机 (停止监听)');
   }catch(e){toast(e.message)}
 });
 renderScr(false);
