@@ -743,9 +743,11 @@ impl AppState {
             self.refresh_apply(pkg.to_string());
             return;
         }
-        // 首次回调: 应用规则 + 入监听表 (主 pid 退出时 EV_EXIT_PID 移除)
+        // 首次回调: 应用规则 + 入监听表 (主 pid 退出时 EV_EXIT_PID 移除);
+        // pidfd 监听主进程 → webui 命中应用 (经表查 pkg/label)
         self.rfr_monitored.insert(pid, pkg.to_string());
         crate::event_probe::watch(pid);
+        RFR_MON.lock().unwrap().insert(pid, pkg.to_string());
         self.refresh_apply(pkg.to_string());
     }
 
@@ -788,6 +790,18 @@ impl AppState {
         });
         top
     }
+}
+
+/// pidfd 监听的刷新率规则应用主进程表 (pid→pkg; 可多个正在运行的规则应用)。
+/// pidfd 退出时清除对应条目。
+static RFR_MON: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i32, String>>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Mutex::new(std::collections::HashMap::new())
+    });
+
+/// webui 轮询: 全部 pidfd 监听的刷新率主进程 (pid, pkg) 快照
+pub fn rfr_hit_list() -> Vec<(i32, String)> {
+    RFR_MON.lock().unwrap().iter().map(|(p, k)| (*p, k.clone())).collect()
 }
 
 fn main() {
@@ -853,11 +867,8 @@ fn main() {
     crate::web::set_drive_mode(&drive_mode);
     // uclamp 支持探测 (webui 据此隐藏/显示 uclamp 配置)
     crate::web::init_uclamp_support();
-    // 挂机黑屏持久状态: 上次开启 → 自动恢复 (禁用系统双击唤醒 + 启动监听线程)
+    // 挂机黑屏持久状态: 上次开启 → 自动恢复 (启动监听线程)
     if crate::web::hang_black_active() {
-        let _ = std::process::Command::new("settings")
-            .args(["put", "secure", "double_tap_to_wake", "0"])
-            .status();
         crate::event_probe::start_hang_monitor();
     }
 
@@ -1188,8 +1199,10 @@ fn main() {
                                     let _ = tx.send(crate::cpu_affinity::CpuMsg::EvictUid(uid));
                                 }
                             }
-                            // 刷新率: 主 pid 退出 → 移除监听
-                            state.rfr_monitored.remove(&pid);
+                            // 刷新率: 主 pid 退出 → 移除监听 + 清 webui 命中
+                            if state.rfr_monitored.remove(&pid).is_some() {
+                                RFR_MON.lock().unwrap().remove(&pid);
+                            }
                             // waylay: 主 pid 退出 → 移除记录 + 下发 vfc_fg 0 停止内核 vfc 规则
                             if state.waylay_monitored.remove(&pid).is_some() {
                                 if let Some(es) = state.ebpf_state.as_ref() {

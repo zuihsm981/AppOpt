@@ -311,6 +311,38 @@ fn device_info(topo: Option<&crate::cpuset::CpuTopology>) -> serde_json::Map<Str
     m
 }
 
+/// CPU 规则信息: (应用级 CPU 范围, 线程规则列表 [{name,cpus}])
+fn cpu_rule_info(
+    rules: &[crate::config::AffinityRule],
+    pkg: &str,
+) -> (String, Vec<serde_json::Value>) {
+    let mut app_cpu = String::new();
+    let mut threads = Vec::new();
+    for r in rules.iter().filter(|r| r.pkg == pkg) {
+        if r.thread.is_empty() {
+            app_cpu = r.cpus.to_range_string();
+        } else {
+            threads.push(json!({ "name": r.thread, "cpus": r.cpus.to_range_string() }));
+        }
+    }
+    (app_cpu, threads)
+}
+
+/// 刷新率规则串: 活跃==静止 → "90HZ"; 否则 → "120HZ-90HZ-30s"
+fn rf_rule_str(cfg: Option<&crate::config::AppConfig>, pkg: &str) -> String {
+    cfg.and_then(|c| c.app_refresh_configs.get(pkg))
+        .map(|(t, a, i)| {
+            let a_s = crate::config::refresh_mode_str(*a);
+            let i_s = crate::config::refresh_mode_str(*i);
+            if a_s == i_s {
+                format!("{}HZ", a_s)
+            } else {
+                format!("{}HZ-{}HZ-{}s", a_s, i_s, t)
+            }
+        })
+        .unwrap_or_default()
+}
+
 /// 段 2: CPU 运行统计 (规则数 / 命中应用 / 绑定线程 / parse_fail)
 fn cpu_stats(cfg: Option<&crate::config::AppConfig>) -> serde_json::Map<String, serde_json::Value> {
     // 仅 KPM 模式: 前端轮询即实时读 CPU worker 发布的 CPU_STATS
@@ -324,19 +356,40 @@ fn cpu_stats(cfg: Option<&crate::config::AppConfig>) -> serde_json::Map<String, 
     m.insert("pkgs".into(), json!(pkgs));
     m.insert("parse_fail".into(), json!(PARSE_FAILS.load(Ordering::Relaxed)));
     m.insert("hit_pkgs".into(), json!(hit_pkgs));
-    /* 命中列表带应用名 (前端弹窗显示 label||pkg) */
+    /* 命中列表: 应用名 + 应用级 CPU 范围 + 线程规则 (前端灰色小字显示线程) */
     let hit_list: Vec<serde_json::Value> = hit_list
         .iter()
-        .map(|p| json!({ "pkg": p, "label": app_label_of(p) }))
+        .map(|p| {
+            let (cpu, ths) = match cfg {
+                Some(c) => cpu_rule_info(&c.rules, p),
+                None => (String::new(), Vec::new()),
+            };
+            json!({ "pkg": p, "label": app_label_of(p), "cpu": cpu, "threads": ths })
+        })
         .collect();
     m.insert("hit_list".into(), json!(hit_list));
+    /* 全部 CPU 规则应用 (规则数量点击弹窗) */
+    let rule_apps: Vec<serde_json::Value> = match cfg {
+        Some(c) => {
+            let mut ps: Vec<&String> = c.rules.iter().map(|r| &r.pkg).collect();
+            ps.sort();
+            ps.dedup();
+            ps.iter()
+                .map(|p| {
+                    let (cpu, ths) = cpu_rule_info(&c.rules, p);
+                    json!({ "pkg": p, "label": app_label_of(p), "cpu": cpu, "threads": ths })
+                })
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    m.insert("rule_apps".into(), json!(rule_apps));
     m.insert("threads".into(), json!(threads));
     m.insert("total_procs".into(), json!(sys_procs()));
     m
 }
 
-/// 段 3: 刷新率统计 (只统计有刷新率配置的应用; 只有线程规则且无刷新率
-/// 配置的应用不影响刷新率, 不计入)
+/// 段 3: 刷新率统计 (规则数 / 最新命中应用)
 fn rf_stats(cfg: Option<&crate::config::AppConfig>) -> serde_json::Map<String, serde_json::Value> {
     let rf_apps: HashSet<&str> = cfg
         .map(|c| c.app_refresh_configs.keys().map(String::as_str).collect())
@@ -344,13 +397,22 @@ fn rf_stats(cfg: Option<&crate::config::AppConfig>) -> serde_json::Map<String, s
     let rf_rules = rf_apps.len();
     let mut m = serde_json::Map::new();
     m.insert("rf_rules".into(), json!(rf_rules));
-    /* 覆盖应用 = 全部有刷新率规则的应用 (带应用名; 前端弹窗显示 label||pkg) */
-    m.insert("rf_cover_pkgs".into(), json!(rf_rules));
-    let cover_list: Vec<serde_json::Value> = rf_apps
+    /* 命中应用 = 全部 pidfd 监听的刷新率规则主进程 (经表查应用名 + 规则) */
+    let hits = crate::rfr_hit_list();
+    m.insert("rf_hit_count".into(), json!(hits.len()));
+    let hit_list: Vec<serde_json::Value> = hits
         .iter()
-        .map(|p| json!({ "pkg": p, "label": app_label_of(p) }))
+        .map(|(_, pkg)| {
+            json!({ "pkg": pkg, "label": app_label_of(pkg), "rule": rf_rule_str(cfg, pkg) })
+        })
         .collect();
-    m.insert("rf_cover_list".into(), json!(cover_list));
+    m.insert("rf_hit_list".into(), json!(hit_list));
+    /* 全部刷新率规则应用 (规则数量点击弹窗) */
+    let rf_rule_apps: Vec<serde_json::Value> = rf_apps
+        .iter()
+        .map(|p| json!({ "pkg": p, "label": app_label_of(p), "rule": rf_rule_str(cfg, p) }))
+        .collect();
+    m.insert("rf_rule_apps".into(), json!(rf_rule_apps));
     m
 }
 
@@ -874,6 +936,8 @@ fn waylay_json() -> String {
     json!({
         // 已连接 = KPM 模块已武装 (拦截功能随 start/stop)
         "connected": KPM_ARMED.load(Ordering::Relaxed),
+        // 挂机黑屏持久开关状态 (AppOpt.json 持久化; webui 打开时恢复显示)
+        "hang_black": hang_black_active(),
         "rules": rules
             .iter()
             .map(|r| {
@@ -907,18 +971,9 @@ fn waylay_set_api(req: &Request) -> (u16, String) {
             KPM_ARMED.store(false, std::sync::atomic::Ordering::Relaxed);
         }
     }
-    // 挂机黑屏 (scr 字段): 开关点击时**立马**设置系统双击唤醒 (不依赖主循环异步),
-    // 持久化到 AppOpt.json, 再置 SCR_REQ 由主循环启停监听线程
+    // 挂机黑屏 (scr 字段): 持久化到 AppOpt.json + 置 SCR_REQ 由主循环启停监听线程
     if v.get("scr").is_some() && v["scr"].is_boolean() {
         let on = v["scr"].as_bool().unwrap_or(false);
-        let _ = std::process::Command::new("settings")
-            .args([
-                "put",
-                "secure",
-                "double_tap_to_wake",
-                if on { "0" } else { "1" },
-            ])
-            .status();
         set_hang_black(on);
         settings_save();
         crate::config::set_scr_req(on);
