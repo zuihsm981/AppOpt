@@ -405,9 +405,12 @@ fn hang_ev_server(running: std::sync::Arc<std::sync::atomic::AtomicBool>) {
     use std::io::Read;
     let listener = match std::net::TcpListener::bind(("127.0.0.1", 8890)) {
         Ok(l) => l,
-        Err(_) => return,
+        Err(e) => {
+            eprintln!("[hang] bind 8890 失败: {e}");
+            return;
+        }
     };
-    listener.set_nonblocking(true).ok();
+    let _ = listener.set_nonblocking(true);
     let mut buf = [0u8; 128];
     while running.load(std::sync::atomic::Ordering::Acquire) {
         match listener.accept() {
@@ -585,6 +588,7 @@ impl AppState {
         // 关 → 全部停止
         match crate::config::take_scr_req() {
             1 => {
+                crate::config::set_scr_on_state(true);
                 crate::ebpf_mode::hang_reset();   // 清残留黑屏态, 防误触发
                 crate::event_probe::start_hang_monitor();
                 HANG_EV_RUNNING.store(true, Ordering::Release);
@@ -592,6 +596,7 @@ impl AppState {
                 std::thread::spawn(move || hang_ev_server(running));
             }
             -1 => {
+                crate::config::set_scr_on_state(false);
                 crate::event_probe::stop_hang_monitor();
                 HANG_EV_RUNNING.store(false, Ordering::Release);
             }

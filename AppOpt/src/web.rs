@@ -857,6 +857,8 @@ fn waylay_json() -> String {
     json!({
         // 已连接 = KPM 模块已武装 (拦截功能随 start/stop)
         "connected": KPM_ARMED.load(Ordering::Relaxed),
+        // 挂机黑屏开关状态 (web 重开时恢复渲染)
+        "scr_on": crate::config::scr_on_state(),
         "rules": rules
             .iter()
             .map(|r| {
