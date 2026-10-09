@@ -227,12 +227,12 @@ pub fn scr_set_brightness(v: i32) {
     );
 }
 
-/// 保存关屏前亮度 (双击① 黑屏前记录; 记录成功才允许写 0)
+/// 保存关屏前亮度 (长按黑屏前记录; 记录成功才允许写 0)
 pub fn scr_store_saved(v: i32) {
     *SCR_BRIGHTNESS.lock().unwrap() = Some(v);
 }
 
-/// 取出关屏前亮度 (双击② 渐亮恢复用)
+/// 取出关屏前亮度 (单击渐亮恢复用)
 pub fn scr_take_saved() -> Option<i32> {
     SCR_BRIGHTNESS.lock().unwrap().take()
 }
@@ -254,7 +254,7 @@ pub fn scr_fade_in(target: i32) {
     }
 }
 
-/// 关屏前亮度 (双击① 黑屏时记录; 读取失败则不写 0, 避免永久黑屏)
+/// 关屏前亮度 (长按黑屏时记录; 读取失败则不写 0, 避免永久黑屏)
 static SCR_BRIGHTNESS: std::sync::Mutex<Option<i32>> = std::sync::Mutex::new(None);
 
 pub struct KpmHandle {

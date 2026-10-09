@@ -226,7 +226,7 @@ pub fn spawn_event(touch_sock: c_int, ctrl_sock: c_int, exit_sock: c_int) {
                     TOUCH_LISTENING.store(false, Ordering::Relaxed); // 暂停 → UI 未监听
                 }
             } else if tag == TAG_TOUCH {
-                // 触摸事件: 清空事件 (只读丢弃; 双击恢复由挂机专用线程负责)
+                // 触摸事件: 清空事件 (只读丢弃; 挂机黑屏由专用监听线程负责)
                 loop {
                     let r = unsafe { libc::read(touch_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
                     if r <= 0 {
@@ -273,21 +273,21 @@ pub fn spawn_event(touch_sock: c_int, ctrl_sock: c_int, exit_sock: c_int) {
     unsafe { libc::close(epfd); }
 }
 
-/// 挂机黑屏双击监控线程: 「挂机黑屏」开启后启动, 打开触摸设备阻塞读事件,
-/// 检测双击 (两次按下 ≤300ms, 中间有抬起) → 恢复亮屏 (写回关屏前亮度) → 退出。
-/// 恢复亮屏后前端按钮再次触发挂机时重建线程 (专用线程, 不影响主触摸监听)。
+/// 挂机黑屏监听线程: 「挂机黑屏」开启后启动, 打开触摸设备读事件,
+/// 亮屏态长按 3s → 记录亮度 + 写 brightness=0 黑屏; 黑屏态单击 → 渐亮恢复;
+/// 循环切换, 直到 stop_hang_monitor 停止。
 /// 挂机黑屏监听线程运行标志 (开关关闭/重启时置 false 停止)
 pub static HANG_RUNNING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// 启动挂机黑屏监听 (开关打开): 双击① 记录亮度成功 → 写 brightness=0 黑屏;
-/// 双击② → 渐亮恢复; 循环切换, 直到 stop_hang_monitor 停止
+/// 启动挂机黑屏监听 (开关打开): 亮屏态长按 3s → 记录亮度成功 → 写 brightness=0
+/// 黑屏; 黑屏态单击 → 渐亮恢复; 循环切换, 直到 stop_hang_monitor 停止
 pub fn start_hang_monitor() {
     HANG_RUNNING.store(true, std::sync::atomic::Ordering::Release);
     std::thread::spawn(move || hang_monitor_loop());
 }
 
-/// 停止监听线程 (开关关闭, 还原系统双击唤醒设置后调用)
+/// 停止监听线程 (开关关闭时调用)
 pub fn stop_hang_monitor() {
     HANG_RUNNING.store(false, std::sync::atomic::Ordering::Release);
 }

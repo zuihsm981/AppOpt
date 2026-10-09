@@ -552,8 +552,8 @@ impl AppState {
             -1 => self.set_kpm_arm(false),
             _ => {}
         }
-        // 挂机黑屏持久开关: 系统双击唤醒已由 web 层立马设置; 这里只启停监听线程
-        // (亮屏态双击 → 黑屏; 黑屏态单击 → 渐亮恢复)
+        // 挂机黑屏持久开关: 只启停监听线程
+        // (亮屏态长按 3s → 黑屏; 黑屏态单击 → 渐亮恢复)
         match crate::config::take_scr_req() {
             1 => crate::event_probe::start_hang_monitor(),
             -1 => crate::event_probe::stop_hang_monitor(),
