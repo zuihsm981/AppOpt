@@ -1516,9 +1516,9 @@ function showHitList(){
   if(!hitList.length){box.innerHTML='<div class="empty">暂无命中应用</div>';}
   else{box.innerHTML=hitList.map(p=>{
     const name=esc(typeof p==='string'?p:(p.label||p.pkg));
-    const cpuLine=p.cpu?`<span class="rule-sub">${esc(p.cpu)}</span>`:'';
+    const cpuLine=p.cpu?`<span class="rule-sub"> ${esc(p.cpu)}</span>`:'';
     const ths=(p.threads||[]).map(t=>`<div class="rule-sub" style="color:#8e8e93;font-size:11px">${esc(t.name)}：${esc(t.cpus)}</div>`).join('');
-    return `<div class="rule-row"><span class="rule-name mono">${name}</span>${cpuLine}${ths}</div>`;
+    return `<div class="rule-row"><span class="rule-name mono">${name}</span>${cpuLine}</div>${ths}`;
   }).join('');}
   $('modal-hit').hidden=false;
 }
@@ -1531,9 +1531,9 @@ function showCpuRuleApps(){
   const box=$('mhit-list');
   if(!cpuRuleApps.length){box.innerHTML='<div class="empty">暂无规则</div>';}
   else{box.innerHTML=cpuRuleApps.map(p=>{
-    const cpuLine=p.cpu?`<span class="rule-sub">${esc(p.cpu)}</span>`:'';
+    const cpuLine=p.cpu?`<span class="rule-sub"> ${esc(p.cpu)}</span>`:'';
     const ths=(p.threads||[]).map(t=>`<div class="rule-sub" style="color:#8e8e93;font-size:11px">${esc(t.name)}：${esc(t.cpus)}</div>`).join('');
-    return `<div class="rule-row"><span class="rule-name">${esc(p.label||p.pkg)}</span>${cpuLine}${ths}</div>`;
+    return `<div class="rule-row"><span class="rule-name">${esc(p.label||p.pkg)}</span>${cpuLine}</div>${ths}`;
   }).join('');}
   $('modal-hit').hidden=false;
 }
