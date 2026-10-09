@@ -585,6 +585,7 @@ impl AppState {
         // 关 → 全部停止
         match crate::config::take_scr_req() {
             1 => {
+                crate::ebpf_mode::hang_reset();   // 清残留黑屏态, 防误触发
                 crate::event_probe::start_hang_monitor();
                 HANG_EV_RUNNING.store(true, Ordering::Release);
                 let running = HANG_EV_RUNNING.clone();

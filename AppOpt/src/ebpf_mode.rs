@@ -318,6 +318,13 @@ pub fn hang_tap_on() -> bool {
     true
 }
 
+/// 重置挂机状态 (开关开启时调用, 防残留黑屏态/旧亮度导致误触发)
+pub fn hang_reset() {
+    HANG_HUNG.store(false, std::sync::atomic::Ordering::Release);
+    *SCR_BRIGHTNESS.lock().unwrap() = None;
+    *HANG_LAST_TOGGLE.lock().unwrap() = None;
+}
+
 pub struct KpmHandle {
     key: CString,
 }
