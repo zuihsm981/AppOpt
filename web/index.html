@@ -74,6 +74,8 @@ body.kb .tabbar,body.kb .navbar{backdrop-filter:none;-webkit-backdrop-filter:non
 .grp.open .grp-body{grid-template-rows:1fr}
 .grp-inner{overflow:hidden}
 .rule-row{display:flex;align-items:center;gap:8px;padding:10px 14px;border-top:1px solid var(--border)}
+/* 命中/规则应用弹窗: 移除行间横线 */
+#mhit-list .rule-row{border-top:none}
 .rule-name{flex:1;min-width:0;word-break:break-all;font-size:13px}
 .rule-sub{color:var(--sub);font-size:12px}
 .rule-add{display:flex;align-items:center;justify-content:center;gap:4px;margin:10px 14px;padding:9px 0;border:1px dashed var(--border);border-radius:10px;color:var(--sub);font-size:13px;width:calc(100% - 28px)}
@@ -1422,22 +1424,6 @@ function stopRf(){if(rfTimer){clearInterval(rfTimer);rfTimer=null}}
 // 状态页: 刷新率轮询**可见即启动** (不依赖切到刷新率段), 线程状态轮询仅 thread 段
 function pauseStatus(){stopStat();stopRf()}
 function resumeStatus(){loadRefresh();if(statusSeg==='thread')startStat()}
-// 切到线程状态时同步拉一次刷新率数据 (供切回即时显示), 不启动 rfTimer
-async function loadRefreshOnce(){
-  try{
-    const[st,cfg,st0]=await Promise.all([api('/api/refresh/status'),api('/api/refresh/config'),api('/api/status')]);
-    rfTouchEvent=st0.touch_event||'';
-    renderRfInput(st);
-    fillRfRules(st0);
-    $('rf-mode').textContent=st.mode_str||'-';
-    $('rf-timer').textContent=st.timer_enabled?(st.is_paused?'空闲中':(st.timer_running?'计时中':'未运行')):'未启用';
-    $('rf-timeout').value=cfg.timeout;
-    rfAvail=cfg.available&&cfg.available.length?cfg.available:[120,90,60];
-    lastRefreshCfg=cfg;
-    renderDeviceRates(cfg);
-    applyGlobalRfChips(cfg.active,cfg.idle);
-  }catch(e){}
-}
 // 轮询可见性管理: 仅前端打开/可见时轮询; 隐藏/失焦/关闭页面即停止
 function pausePolling(){pauseStatus()}
 function resumePolling(){resumeStatus()}
@@ -1517,7 +1503,7 @@ function showHitList(){
   else{box.innerHTML=hitList.map(p=>{
     const name=esc(typeof p==='string'?p:(p.label||p.pkg));
     const appRow=`<div class="rule-row" style="display:flex;justify-content:space-between;align-items:baseline"><span class="rule-name mono">${name}</span>${p.cpu?`<span class="rule-sub">${esc(p.cpu)}</span>`:''}</div>`;
-    const ths=(p.threads||[]).map(t=>`<div style="display:flex;justify-content:space-between;align-items:baseline;color:#8e8e93;font-size:11px"><span>${esc(t.name)}</span><span>${esc(t.cpus)}</span></div>`).join('');
+    const ths=(p.threads||[]).map(t=>`<div class="rule-row" style="justify-content:space-between;color:#8e8e93;font-size:11px"><span style="flex:1;word-break:break-all">${esc(t.name)}</span><span>${esc(t.cpus)}</span></div>`).join('');
     return appRow+ths;
   }).join('');}
   $('modal-hit').hidden=false;
@@ -1532,7 +1518,7 @@ function showCpuRuleApps(){
   if(!cpuRuleApps.length){box.innerHTML='<div class="empty">暂无规则</div>';}
   else{box.innerHTML=cpuRuleApps.map(p=>{
     const appRow=`<div class="rule-row" style="display:flex;justify-content:space-between;align-items:baseline"><span class="rule-name">${esc(p.label||p.pkg)}</span>${p.cpu?`<span class="rule-sub">${esc(p.cpu)}</span>`:''}</div>`;
-    const ths=(p.threads||[]).map(t=>`<div style="display:flex;justify-content:space-between;align-items:baseline;color:#8e8e93;font-size:11px"><span>${esc(t.name)}</span><span>${esc(t.cpus)}</span></div>`).join('');
+    const ths=(p.threads||[]).map(t=>`<div class="rule-row" style="justify-content:space-between;color:#8e8e93;font-size:11px"><span style="flex:1;word-break:break-all">${esc(t.name)}</span><span>${esc(t.cpus)}</span></div>`).join('');
     return appRow+ths;
   }).join('');}
   $('modal-hit').hidden=false;
