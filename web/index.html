@@ -233,7 +233,7 @@ body.kb .tabbar,body.kb .navbar{backdrop-filter:none;-webkit-backdrop-filter:non
 <div class="card">
 <div class="card-title">规则</div>
 <div class="grid2">
-<div class="stat clickable" id="s-rf-cover-card" role="button" tabindex="0" title="点击查看最新命中刷新率规则的应用"><div class="num" id="s-rf-cover">0</div><div class="lbl">命中应用</div></div>
+<div class="stat clickable" id="s-rf-cover-card" role="button" tabindex="0" title="点击查看当前命中刷新率规则的应用"><div class="num" id="s-rf-cover">0</div><div class="lbl">命中应用</div></div>
 <div class="stat clickable" id="s-rf-rules-card" role="button" tabindex="0" title="点击查看全部刷新率规则应用"><div class="num" id="s-rf-rules">0</div><div class="lbl">规则数量</div></div>
 </div>
 </div>
@@ -1450,7 +1450,6 @@ let rfCoverList=[];
 let cpuRuleApps=[];
 let rfRuleApps=[];
 let statusDrive='auto',statusTouch=false,statusConn=false;
-// 刷新率状态页规则卡: 规则数量/命中应用 (刷新率线程每次应用规则记录最新一条)
 function fillRfRules(d){
   $('s-rf-rules').textContent=d.rf_rules??0;
   // 命中应用: 全部 pidfd 监听的刷新率规则主进程 (包名+应用名+规则, 可多个)
@@ -1459,10 +1458,10 @@ function fillRfRules(d){
   // 全部刷新率规则应用 (规则数量点击弹窗)
   rfRuleApps=Array.isArray(d.rf_rule_apps)?d.rf_rule_apps:[];
 }
-// 命中应用弹窗 (复用 modal-hit): 展示最新命中的刷新率规则应用
+// 命中应用弹窗 (复用 modal-hit): 展示当前命中的刷新率规则应用
 function showRfCoverList(){
   $('mhit-title').textContent='命中应用';
-  $('mhit-summary').textContent=rfCoverList.length?'最新命中的刷新率规则应用':'暂无命中应用';
+  $('mhit-summary').textContent=rfCoverList.length?'当前命中的刷新率规则应用':'暂无命中应用';
   const box=$('mhit-list');
   if(!rfCoverList.length){box.innerHTML='<div class="empty">暂无命中应用</div>';}
   else{box.innerHTML=rfCoverList.map(p=>`<div class="rule-row"><span class="rule-name">${esc(p.label||p.pkg)}</span><span class="rule-sub">${esc(p.rule||p.pkg)}</span></div>`).join('');}
