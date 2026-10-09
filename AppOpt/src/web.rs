@@ -748,6 +748,7 @@ pub struct Settings {
     pub config_file: String,
     pub mode: String,
     pub affinity_delay_ms: u64,
+    pub hang_black: bool,
 }
 
 impl Default for Settings {
@@ -758,6 +759,7 @@ impl Default for Settings {
             config_file: "./applist.conf".to_string(),
             mode: "auto".to_string(),
             affinity_delay_ms: 2000,
+            hang_black: false,
         }
     }
 }
@@ -794,6 +796,7 @@ impl Settings {
                 .as_u64()
                 .filter(|n| *n <= 60000)
                 .unwrap_or(2000),
+            hang_black: v["hang_black"].as_bool().unwrap_or(false),
         }
     }
 
@@ -804,6 +807,7 @@ impl Settings {
             "config_file": self.config_file,
             "mode": self.mode,
             "affinity_delay_ms": self.affinity_delay_ms,
+            "hang_black": self.hang_black,
         })
     }
 
@@ -821,6 +825,17 @@ impl Settings {
     }
 }
 
+/// 挂机黑屏持久开关状态 (AppOpt.json 持久化; 重启自动恢复)
+static HANG_BLACK: AtomicBool = AtomicBool::new(false);
+
+pub fn hang_black_active() -> bool {
+    HANG_BLACK.load(Ordering::Relaxed)
+}
+
+pub fn set_hang_black(on: bool) {
+    HANG_BLACK.store(on, Ordering::Relaxed);
+}
+
 pub fn settings_load(path: &str) -> Settings {
     let s = match fs::read_to_string(path) {
         Ok(text) => match serde_json::from_str::<Value>(&text) {
@@ -835,6 +850,7 @@ pub fn settings_load(path: &str) -> Settings {
         Err(_) => Settings::default(),
     };
     AFFINITY_DELAY_MS.store(s.affinity_delay_ms, Ordering::Relaxed);
+    HANG_BLACK.store(s.hang_black, Ordering::Relaxed);
     s
 }
 
@@ -845,6 +861,7 @@ pub fn settings_save() {
         config_file: lock_ignore_poison(&CONFIG_FILE).clone(),
         mode: drive_mode(),
         affinity_delay_ms: AFFINITY_DELAY_MS.load(Ordering::Relaxed),
+        hang_black: HANG_BLACK.load(Ordering::Relaxed),
     }
     .save(SETTINGS_FILE);
 }
@@ -857,8 +874,6 @@ fn waylay_json() -> String {
     json!({
         // 已连接 = KPM 模块已武装 (拦截功能随 start/stop)
         "connected": KPM_ARMED.load(Ordering::Relaxed),
-        // 挂机黑屏开关状态 (web 重开时恢复渲染)
-        "scr_on": crate::config::scr_on_state(),
         "rules": rules
             .iter()
             .map(|r| {
@@ -892,10 +907,21 @@ fn waylay_set_api(req: &Request) -> (u16, String) {
             KPM_ARMED.store(false, std::sync::atomic::Ordering::Relaxed);
         }
     }
-    // 挂机黑屏 (scr 字段): 开关由主循环消费启停挂机监听 (长按 HOME 触发黑屏,
-    // 不再改系统双击唤醒设置)
+    // 挂机黑屏 (scr 字段): 开关点击时**立马**设置系统双击唤醒 (不依赖主循环异步),
+    // 持久化到 AppOpt.json, 再置 SCR_REQ 由主循环启停监听线程
     if v.get("scr").is_some() && v["scr"].is_boolean() {
-        crate::config::set_scr_req(v["scr"].as_bool().unwrap_or(false));
+        let on = v["scr"].as_bool().unwrap_or(false);
+        let _ = std::process::Command::new("settings")
+            .args([
+                "put",
+                "secure",
+                "double_tap_to_wake",
+                if on { "0" } else { "1" },
+            ])
+            .status();
+        set_hang_black(on);
+        settings_save();
+        crate::config::set_scr_req(on);
     }
     let mut rules: Vec<crate::config::WaylayRule> = Vec::new();
     if let Some(arr) = v["rules"].as_array() {

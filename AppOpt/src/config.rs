@@ -312,17 +312,6 @@ pub fn take_scr_req() -> i8 {
     SCR_REQ.swap(0, Ordering::AcqRel)
 }
 
-/// 挂机黑屏当前开关状态 (web 端读取恢复渲染; App 进程内内存态)
-pub static SCR_ON: AtomicBool = AtomicBool::new(false);
-
-pub fn set_scr_on_state(on: bool) {
-    SCR_ON.store(on, Ordering::Release);
-}
-
-pub fn scr_on_state() -> bool {
-    SCR_ON.load(Ordering::Acquire)
-}
-
 
 /// 目标应用 → uid 集合 (查 packages.list; 未安装跳过)
 
