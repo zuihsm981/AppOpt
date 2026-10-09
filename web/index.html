@@ -199,7 +199,7 @@ body.kb .tabbar,body.kb .navbar{backdrop-filter:none;-webkit-backdrop-filter:non
 <div class="card">
 <div class="card-title">规则</div>
 <div class="grid2">
-<div class="stat"><div class="num" id="s-rules">0</div><div class="lbl">规则数量</div></div>
+<div class="stat clickable" id="s-rules-card" role="button" tabindex="0" title="点击查看全部 CPU 规则应用"><div class="num" id="s-rules">0</div><div class="lbl">规则数量</div></div>
 <div class="stat"><div class="num" id="s-pkgs">0</div><div class="lbl">覆盖应用</div></div>
 </div>
 <div class="hint" id="s-pf" hidden style="color:var(--orange)"></div>
@@ -233,8 +233,8 @@ body.kb .tabbar,body.kb .navbar{backdrop-filter:none;-webkit-backdrop-filter:non
 <div class="card">
 <div class="card-title">规则</div>
 <div class="grid2">
-<div class="stat clickable" id="s-rf-cover-card" role="button" tabindex="0" title="点击查看全部有刷新率规则的应用"><div class="num" id="s-rf-cover">0</div><div class="lbl">覆盖应用</div></div>
-<div class="stat"><div class="num" id="s-rf-rules">0</div><div class="lbl">规则数量</div></div>
+<div class="stat clickable" id="s-rf-cover-card" role="button" tabindex="0" title="点击查看最新命中刷新率规则的应用"><div class="num" id="s-rf-cover">0</div><div class="lbl">命中应用</div></div>
+<div class="stat clickable" id="s-rf-rules-card" role="button" tabindex="0" title="点击查看全部刷新率规则应用"><div class="num" id="s-rf-rules">0</div><div class="lbl">规则数量</div></div>
 </div>
 </div>
 <div class="card">
@@ -290,7 +290,7 @@ body.kb .tabbar,body.kb .navbar{backdrop-filter:none;-webkit-backdrop-filter:non
 <div class="uclamp-chips" id="w-scr">
 <button data-v="1">开启挂机</button><button data-v="0">关闭挂机</button>
 </div>
-<div class="hint">开启后禁用系统双击唤醒并监听触摸：长按屏幕 3 秒黑屏（不锁屏，游戏前台挂机），单击渐亮恢复；开关状态持久化于 AppOpt.json，重启自动恢复；关闭时还原双击唤醒并停止监听</div>
+<div class="hint">开启后监听触摸：长按屏幕 3 秒黑屏（不锁屏，游戏前台挂机），单击渐亮恢复；开关状态持久化于 AppOpt.json，重启自动恢复</div>
 </div>
 <div class="card">
 <div class="card-title">关于</div>
@@ -1367,6 +1367,7 @@ async function loadWaylay(){
     rdFrules=uniq(rs.filter(r=>r.kind==='red-path'&&r.from.startsWith('/')).map(r=>r.from+'\u0000'+r.to)).map(k=>{const [f,t]=k.split('\u0000');const same=rs.filter(x=>x.kind==='red-path'&&x.from===f&&x.to===t);return {from:f,to:t,global:same.some(x=>x.pkg==='*'),apps:uniq(same.filter(x=>x.pkg!=='*').map(x=>x.pkg))}});
     rdApps=uniq(rdCrules.flatMap(r=>r.apps||[]));
     renderWaylayConn(!!d.connected);
+    renderScr(!!d.hang_black);
     renderWaylayRules();renderWaylayApps();renderWpRules();renderWpApps();renderRdCrules();renderRdFrules();renderRdApps();renderRdpApps();
     return !!d.connected;
   }catch(e){toast(e.message);return false}
@@ -1382,7 +1383,7 @@ $('w-conn-chips').addEventListener('click',async e=>{
   }catch(e){toast(e.message)}
 });
 
-// 挂机黑屏持久开关: 开启 → 立马禁用系统双击唤醒, 长按 3s 黑屏 / 单击渐亮恢复; 关闭 → 还原
+// 挂机黑屏持久开关: 长按 3s 黑屏 / 单击渐亮恢复; 状态持久化于 AppOpt.json
 let scrOn=false;
 function renderScr(on){
   scrOn=on;
@@ -1394,10 +1395,11 @@ $('w-scr').addEventListener('click',async e=>{
   renderScr(on);
   try{
     await api('/api/waylay',{scr:on,rules:buildRules()});
-    toast(on?'已开启挂机 (长按 3 秒黑屏, 单击渐亮恢复)':'已关闭挂机 (还原双击唤醒)');
+    toast(on?'已开启挂机 (长按 3 秒黑屏, 单击渐亮恢复)':'已关闭挂机');
   }catch(e){toast(e.message)}
 });
-renderScr(false);
+// 页面打开: 从后端 (AppOpt.json) 读取持久状态恢复显示, 失败才默认关闭
+api('/api/waylay').then(d=>renderScr(!!d.hang_black)).catch(()=>renderScr(false));
 
 // webui 不可见 (切后台/关闭) 时: 提前映射 prop 目标 tmpfs 文件 (配置已保存则生效)
 document.addEventListener('visibilitychange',()=>{
@@ -1410,17 +1412,16 @@ function switchStatusSeg(st){
   document.querySelectorAll('#st-seg button').forEach(x=>x.classList.toggle('on',x.dataset.st===st));
   $('st-thread').hidden=st!=='thread';
   $('st-refresh').hidden=st!=='refresh';
-  if(st==='thread'){loadRefreshOnce();}
-  resumeStatus();   // 按当前段启动轮询 (thread→startStat / refresh→loadRefresh)
+  resumeStatus();   // 刷新率轮询常驻 (可见即轮询), 线程状态轮询仅 thread 段
 }
 document.querySelectorAll('#st-seg button').forEach(b=>b.onclick=()=>switchStatusSeg(b.dataset.st));
 
 function startStat(){stopStat();refreshStat();statTimer=setInterval(refreshStat,1000)}
 function stopStat(){if(statTimer){clearInterval(statTimer);statTimer=null}}
 function stopRf(){if(rfTimer){clearInterval(rfTimer);rfTimer=null}}
-// 状态页: 按当前 seg 段轮询 (线程状态→statTimer / 刷新率状态→rfTimer)
+// 状态页: 刷新率轮询**可见即启动** (不依赖切到刷新率段), 线程状态轮询仅 thread 段
 function pauseStatus(){stopStat();stopRf()}
-function resumeStatus(){if(statusSeg==='thread')startStat();else loadRefresh()}
+function resumeStatus(){loadRefresh();if(statusSeg==='thread')startStat()}
 // 切到线程状态时同步拉一次刷新率数据 (供切回即时显示), 不启动 rfTimer
 async function loadRefreshOnce(){
   try{
@@ -1446,20 +1447,25 @@ window.addEventListener('focus',()=>resumePolling());
 window.addEventListener('pagehide',()=>pausePolling());
 let hitList=[];
 let rfCoverList=[];
+let cpuRuleApps=[];
+let rfRuleApps=[];
 let statusDrive='auto',statusTouch=false,statusConn=false;
-// 刷新率状态页规则卡: 规则数量/覆盖应用 (全部有刷新率规则的应用)
+// 刷新率状态页规则卡: 规则数量/命中应用 (刷新率线程每次应用规则记录最新一条)
 function fillRfRules(d){
   $('s-rf-rules').textContent=d.rf_rules??0;
-  rfCoverList=Array.isArray(d.rf_cover_list)?d.rf_cover_list:[];
-  $('s-rf-cover').textContent=d.rf_cover_pkgs??0;
+  // 命中应用: 全部 pidfd 监听的刷新率规则主进程 (包名+应用名+规则, 可多个)
+  rfCoverList=Array.isArray(d.rf_hit_list)?d.rf_hit_list:[];
+  $('s-rf-cover').textContent=rfCoverList.length;
+  // 全部刷新率规则应用 (规则数量点击弹窗)
+  rfRuleApps=Array.isArray(d.rf_rule_apps)?d.rf_rule_apps:[];
 }
-// 覆盖应用弹窗 (复用 modal-hit): 展示全部有刷新率规则的应用
+// 命中应用弹窗 (复用 modal-hit): 展示最新命中的刷新率规则应用
 function showRfCoverList(){
-  $('mhit-title').textContent='覆盖应用';
-  $('mhit-summary').textContent='共 '+rfCoverList.length+' 个覆盖应用';
+  $('mhit-title').textContent='命中应用';
+  $('mhit-summary').textContent=rfCoverList.length?'最新命中的刷新率规则应用':'暂无命中应用';
   const box=$('mhit-list');
-  if(!rfCoverList.length){box.innerHTML='<div class="empty">暂无覆盖应用</div>';}
-  else{box.innerHTML=rfCoverList.map(p=>`<div class="rule-row"><span class="rule-name">${esc(p.label||p.pkg)}</span></div>`).join('');}
+  if(!rfCoverList.length){box.innerHTML='<div class="empty">暂无命中应用</div>';}
+  else{box.innerHTML=rfCoverList.map(p=>`<div class="rule-row"><span class="rule-name">${esc(p.label||p.pkg)}</span><span class="rule-sub">${esc(p.rule||p.pkg)}</span></div>`).join('');}
   $('modal-hit').hidden=false;
 }
 $('s-rf-cover-card').onclick=showRfCoverList;
@@ -1487,6 +1493,7 @@ async function refreshStat(){
     $('s-pf').textContent=pf?pf+' 行规则因格式无效被跳过，请检查配置文件':'';
     $('s-hit').textContent=d.hit_pkgs;
     hitList=Array.isArray(d.hit_list)?d.hit_list:[];
+    cpuRuleApps=Array.isArray(d.rule_apps)?d.rule_apps:[];
     $('s-threads').textContent=d.threads;
     $('s-procs').textContent=d.total_procs;
     $('s-cores').textContent=d.cores;
@@ -1502,17 +1509,48 @@ async function refreshStat(){
   }catch(e){}
 }
 
-// 命中应用列表弹窗: 点击"命中应用"统计块展示具体包名
+// 命中应用弹窗: 应用名 + 应用级 CPU 范围 + 线程规则 (灰色小字)
 function showHitList(){
   $('mhit-title').textContent='命中应用';
-  $('mhit-summary').textContent='共 '+hitList.length+' 个命中应用';
+  $('mhit-summary').textContent=hitList.length?'当前命中的 CPU 规则应用':'暂无命中应用';
   const box=$('mhit-list');
   if(!hitList.length){box.innerHTML='<div class="empty">暂无命中应用</div>';}
-  else{box.innerHTML=hitList.map(p=>`<div class="rule-row"><span class="rule-name mono">${esc(typeof p==='string'?p:(p.label||p.pkg))}</span></div>`).join('');}
+  else{box.innerHTML=hitList.map(p=>{
+    const name=esc(typeof p==='string'?p:(p.label||p.pkg));
+    const cpuLine=p.cpu?`<span class="rule-sub">${esc(p.cpu)}</span>`:'';
+    const ths=(p.threads||[]).map(t=>`<div class="rule-sub" style="color:#8e8e93;font-size:11px">${esc(t.name)}：${esc(t.cpus)}</div>`).join('');
+    return `<div class="rule-row"><span class="rule-name mono">${name}</span>${cpuLine}${ths}</div>`;
+  }).join('');}
   $('modal-hit').hidden=false;
 }
 $('s-hit-card').onclick=showHitList;
 $('s-hit-card').addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();showHitList()}});
+// 全部 CPU 规则应用弹窗 (规则数量点击)
+function showCpuRuleApps(){
+  $('mhit-title').textContent='CPU 规则应用';
+  $('mhit-summary').textContent=cpuRuleApps.length?'全部 CPU 规则应用':'暂无规则';
+  const box=$('mhit-list');
+  if(!cpuRuleApps.length){box.innerHTML='<div class="empty">暂无规则</div>';}
+  else{box.innerHTML=cpuRuleApps.map(p=>{
+    const cpuLine=p.cpu?`<span class="rule-sub">${esc(p.cpu)}</span>`:'';
+    const ths=(p.threads||[]).map(t=>`<div class="rule-sub" style="color:#8e8e93;font-size:11px">${esc(t.name)}：${esc(t.cpus)}</div>`).join('');
+    return `<div class="rule-row"><span class="rule-name">${esc(p.label||p.pkg)}</span>${cpuLine}${ths}</div>`;
+  }).join('');}
+  $('modal-hit').hidden=false;
+}
+// 全部刷新率规则应用弹窗 (规则数量点击)
+function showRfRuleApps(){
+  $('mhit-title').textContent='刷新率规则应用';
+  $('mhit-summary').textContent=rfRuleApps.length?'全部刷新率规则应用':'暂无规则';
+  const box=$('mhit-list');
+  if(!rfRuleApps.length){box.innerHTML='<div class="empty">暂无规则</div>';}
+  else{box.innerHTML=rfRuleApps.map(p=>`<div class="rule-row"><span class="rule-name">${esc(p.label||p.pkg)}</span><span class="rule-sub">${esc(p.rule||p.pkg)}</span></div>`).join('');}
+  $('modal-hit').hidden=false;
+}
+$('s-rules-card').onclick=showCpuRuleApps;
+$('s-rf-rules-card').onclick=showRfRuleApps;
+$('s-rules-card').addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();showCpuRuleApps()}});
+$('s-rf-rules-card').addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();showRfRuleApps()}});
 $('mhit-close').onclick=()=>$('modal-hit').hidden=true;
 $('modal-hit').addEventListener('click',e=>{if(e.target===$('modal-hit'))$('modal-hit').hidden=true});
 
