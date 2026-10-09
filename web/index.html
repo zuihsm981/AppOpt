@@ -1503,7 +1503,7 @@ function showHitList(){
   else{box.innerHTML=hitList.map(p=>{
     const name=esc(typeof p==='string'?p:(p.label||p.pkg));
     const appRow=`<div class="rule-row" style="display:flex;justify-content:space-between;align-items:baseline"><span class="rule-name mono">${name}</span>${p.cpu?`<span class="rule-sub">${esc(p.cpu)}</span>`:''}</div>`;
-    const ths=(p.threads||[]).map(t=>`<div class="rule-row" style="justify-content:space-between;color:#8e8e93;font-size:11px"><span style="flex:1;word-break:break-all">${esc(t.name)}</span><span>${esc(t.cpus)}</span></div>`).join('');
+    const ths=(p.threads||[]).map(t=>`<div class="rule-row" style="justify-content:space-between;padding:2px 14px"><span style="flex:1;word-break:break-all;color:#8e8e93;font-size:11px">${esc(t.name)}</span><span>${esc(t.cpus)}</span></div>`).join('');
     return appRow+ths;
   }).join('');}
   $('modal-hit').hidden=false;
@@ -1518,7 +1518,7 @@ function showCpuRuleApps(){
   if(!cpuRuleApps.length){box.innerHTML='<div class="empty">暂无规则</div>';}
   else{box.innerHTML=cpuRuleApps.map(p=>{
     const appRow=`<div class="rule-row" style="display:flex;justify-content:space-between;align-items:baseline"><span class="rule-name">${esc(p.label||p.pkg)}</span>${p.cpu?`<span class="rule-sub">${esc(p.cpu)}</span>`:''}</div>`;
-    const ths=(p.threads||[]).map(t=>`<div class="rule-row" style="justify-content:space-between;color:#8e8e93;font-size:11px"><span style="flex:1;word-break:break-all">${esc(t.name)}</span><span>${esc(t.cpus)}</span></div>`).join('');
+    const ths=(p.threads||[]).map(t=>`<div class="rule-row" style="justify-content:space-between;padding:2px 14px"><span style="flex:1;word-break:break-all;color:#8e8e93;font-size:11px">${esc(t.name)}</span><span>${esc(t.cpus)}</span></div>`).join('');
     return appRow+ths;
   }).join('');}
   $('modal-hit').hidden=false;
