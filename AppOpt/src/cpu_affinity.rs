@@ -78,11 +78,12 @@ pub fn cpu_known_pid_to_uid(pid: i32) -> Option<i32> {
         .find_map(|(u, (mp, _))| (*mp == pid).then_some(*u))
 }
 
-/// KPM 模式 web 统计: (绑定线程数, 命中包名列表); 由 worker 在每次应用后发布
-static CPU_STATS: RwLock<(usize, Vec<String>)> = RwLock::new((0, Vec::new()));
+/// KPM 模式 web 统计: (绑定线程数, 命中包名列表 [(pkg, 线程规则名→ok; 应用级 ok 派生)])
+static CPU_STATS: RwLock<(usize, Vec<(String, HashMap<String, bool>)>)> =
+    RwLock::new((0, Vec::new()));
 
-/// 读取 KPM 模式统计: (线程数, 命中包名数, 命中包名列表)
-pub fn cpu_stats() -> (usize, usize, Vec<String>) {
+/// 读取 KPM 模式统计: (线程数, 命中包名数, 命中包名列表 [(pkg, 线程名→ok)])
+pub fn cpu_stats() -> (usize, usize, Vec<(String, HashMap<String, bool>)>) {
     // 请求 worker 发布最新统计快照 (web 轮询触发; 返回当前快照, 下一次轮询读到最新)
     if let Some(tx) = cpu_fg_tx() {
         let _ = tx.send(CpuMsg::PublishStats);
@@ -124,6 +125,8 @@ pub struct CpuAffinity {
     /// 已管理线程 tid → 包名 (用于清理已退出线程)
     /// 已应用包 → 绑定 tid 集合 (退出按 uid 反查 pkg 后 O(1) 整清)
     managed: HashMap<String, HashSet<i32>>,
+    /// 回读校验结果 (pkg → 线程名 → 该线程全部 tid 核对通过); 应用级 ok 由此派生
+    managed_tok: HashMap<String, HashMap<String, bool>>,
     /// 已应用应用的 uid → 包名 (退出时按 uid 反查 pkg 清 managed)
     uid_pkg: HashMap<i32, String>,
     /// 合并 CPU 集合 bits → cpuset 目录名 缓存 (相同集合只 ensure 一次, 避免每线程重复建目录)
@@ -137,6 +140,7 @@ impl CpuAffinity {
     pub fn new() -> Self {
         Self {
             managed: HashMap::new(),
+            managed_tok: HashMap::new(),
             uid_pkg: HashMap::new(),
             cpuset_cache: HashMap::new(),
             pending: Vec::new(),
@@ -150,13 +154,19 @@ impl CpuAffinity {
         let pkg = self.uid_pkg.remove(&uid);
         if let Some(pkg) = pkg {
             self.managed.remove(&pkg); // pkg→tids, O(1) 整清 (替代 retain 全表扫)
+            self.managed_tok.remove(&pkg);
         }
     }
 
-    /// 发布当前 managed 统计到 CPU_STATS (web 命中应用/绑定线程在 KPM 模式显示用)
+    /// 发布当前 managed 统计到 CPU_STATS (web 命中应用/绑定线程在 KPM 模式显示用;
+    /// 应用级 ok = 全部线程 ok, 由调用方从 managed_tok 派生)
     fn publish_stats(&self) {
-        let mut pkgs: Vec<String> = self.managed.keys().cloned().collect();
-        pkgs.sort_unstable();
+        let mut pkgs: Vec<(String, HashMap<String, bool>)> = self
+            .managed
+            .keys()
+            .map(|p| (p.clone(), self.managed_tok.get(p).cloned().unwrap_or_default()))
+            .collect();
+        pkgs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         let thread_count: usize = self.managed.values().map(|s| s.len()).sum();
         *crate::rw_write_ignore_poison(&CPU_STATS) = (thread_count, pkgs);
     }
@@ -216,8 +226,17 @@ impl CpuAffinity {
     /// 对给定进程集合的全部线程套用规则并应用 (解析 → 亲和 → uclamp 三段)
     fn apply_tids(&mut self, pids: &[i32], pkg: &str, cfg: &AppConfig) {
         let (aff, uclamps) = self.resolve_threads(pids, pkg, cfg);
-        self.apply_affinity_batch(aff, cfg);
+        self.apply_affinity_batch(aff.clone(), cfg);
         self.apply_uclamp_batch(uclamps);
+        /* 应用级 + 线程规则同一遍回读校验 (tok 一次遍历得出; 应用 ok 从 tok 派生) */
+        let mut tok: HashMap<String, bool> = HashMap::new();
+        for (tid, cpus, _) in &aff {
+            let name = crate::apply_affinity::tid_comm(*tid).unwrap_or_default();
+            let ok = CpuSet::get_affinity(*tid).is_some_and(|a| a == *cpus);
+            let e = tok.entry(name).or_insert(true);
+            *e = *e && ok;
+        }
+        self.managed_tok.insert(pkg.to_string(), tok);
     }
 
     /// 1) 解析: 遍历 pids × tids 套用规则, 收集 (亲和任务, uclamp 任务),

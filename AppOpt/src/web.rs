@@ -356,15 +356,25 @@ fn cpu_stats(cfg: Option<&crate::config::AppConfig>) -> serde_json::Map<String, 
     m.insert("pkgs".into(), json!(pkgs));
     m.insert("parse_fail".into(), json!(PARSE_FAILS.load(Ordering::Relaxed)));
     m.insert("hit_pkgs".into(), json!(hit_pkgs));
-    /* 命中列表: 应用名 + 应用级 CPU 范围 + 线程规则 (前端灰色小字显示线程) */
+    /* 命中列表: 应用名 + 应用级 CPU 范围 + 线程规则(逐线程 ok) + 应用级 ok(派生) */
     let hit_list: Vec<serde_json::Value> = hit_list
         .iter()
-        .map(|p| {
+        .map(|(p, tok)| {
             let (cpu, ths) = match cfg {
                 Some(c) => cpu_rule_info(&c.rules, p),
                 None => (String::new(), Vec::new()),
             };
-            json!({ "pkg": p, "label": app_label_of(p), "cpu": cpu, "threads": ths })
+            let ths: Vec<serde_json::Value> = ths
+                .into_iter()
+                .map(|t| {
+                    let nm = t.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                    let tok = tok.get(nm).copied();
+                    json!({ "name": t["name"], "cpus": t["cpus"], "ok": tok })
+                })
+                .collect();
+            /* 应用级 ok: 全部线程核对通过 (无线程则按 tok 非空且全 true) */
+            let ok = !tok.is_empty() && tok.values().all(|v| *v);
+            json!({ "pkg": p, "label": app_label_of(p), "cpu": cpu, "threads": ths, "ok": ok })
         })
         .collect();
     m.insert("hit_list".into(), json!(hit_list));
