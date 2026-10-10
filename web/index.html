@@ -1417,16 +1417,16 @@ function switchStatusSeg(st){
   document.querySelectorAll('#st-seg button').forEach(x=>x.classList.toggle('on',x.dataset.st===st));
   $('st-thread').hidden=st!=='thread';
   $('st-refresh').hidden=st!=='refresh';
-  resumeStatus();   // 刷新率轮询常驻 (可见即轮询), 线程状态轮询仅 thread 段
+  resumeStatus();   // 线程状态 + 刷新率轮询常驻 (可见即双轮询), 段切换只影响显示
 }
 document.querySelectorAll('#st-seg button').forEach(b=>b.onclick=()=>switchStatusSeg(b.dataset.st));
 
 function startStat(){stopStat();refreshStat();statTimer=setInterval(refreshStat,1000)}
 function stopStat(){if(statTimer){clearInterval(statTimer);statTimer=null}}
 function stopRf(){if(rfTimer){clearInterval(rfTimer);rfTimer=null}}
-// 状态页: 刷新率轮询**可见即启动** (不依赖切到刷新率段), 线程状态轮询仅 thread 段
+// 状态页: 线程状态 + 刷新率**可见即启动** (不依赖当前段), 切换段不影响轮询
 function pauseStatus(){stopStat();stopRf()}
-function resumeStatus(){loadRefresh();if(statusSeg==='thread')startStat()}
+function resumeStatus(){loadRefresh();startStat()}
 // 轮询可见性管理: 仅前端打开/可见时轮询; 隐藏/失焦/关闭页面即停止
 function pausePolling(){pauseStatus()}
 function resumePolling(){resumeStatus()}
