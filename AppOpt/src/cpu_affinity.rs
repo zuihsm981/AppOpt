@@ -91,6 +91,11 @@ pub fn cpu_stats() -> (usize, usize, Vec<String>) {
     (g.0, g.1.len(), g.1.clone())
 }
 
+/// 初始化: 清空命中应用/绑定线程统计快照 (web 线程状态页命中应用显示)
+pub fn cpu_stats_clear() {
+    *crate::rw_write_ignore_poison(&CPU_STATS) = (0, Vec::new());
+}
+
 
 pub fn cpu_fg_tx() -> Option<mpsc::Sender<CpuMsg>> {
     CPU_FG_TX
