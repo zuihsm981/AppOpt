@@ -287,7 +287,7 @@ body.kb .tabbar,body.kb .navbar{backdrop-filter:none;-webkit-backdrop-filter:non
 <div class="field"><input id="c-delay" type="number" min="0" max="60000" step="100" placeholder="2000"><button class="btn" id="c-delay-save">保存</button></div>
 <div class="hint">如果出现部分线程没有正确设置时尝试调整<br>默认：2000ms</div>
 </div>
-<div class="card">
+<div class="card" id="scr-card">
 <div class="card-title">挂机黑屏</div>
 <div class="uclamp-chips" id="w-scr">
 <button data-v="1">开启挂机</button><button data-v="0">关闭挂机</button>
@@ -1400,8 +1400,11 @@ $('w-scr').addEventListener('click',async e=>{
     toast(on?'已开启挂机 (长按 3 秒黑屏, 单击渐亮恢复)':'已关闭挂机');
   }catch(e){toast(e.message)}
 });
-// 页面打开: 从后端 (AppOpt.json) 读取持久状态恢复显示, 失败才默认关闭
-api('/api/waylay').then(d=>renderScr(!!d.hang_black)).catch(()=>renderScr(false));
+// 页面打开: 从后端 (AppOpt.json) 读取持久状态恢复显示; 无背光设备则隐藏挂机功能
+api('/api/waylay').then(d=>{
+  if($('scr-card')&&!d.hang_black_supported)$('scr-card').hidden=true;
+  renderScr(!!d.hang_black);
+}).catch(()=>renderScr(false));
 
 // webui 不可见 (切后台/关闭) 时: 提前映射 prop 目标 tmpfs 文件 (配置已保存则生效)
 document.addEventListener('visibilitychange',()=>{
