@@ -972,6 +972,7 @@ fn main() {
     let mut touch_sv: [libc::c_int; 2] = [-1, -1];
     let mut exit_sv: [libc::c_int; 2] = [-1, -1];
     let (touch_ok, exit_ok) = spawn_event_probe(&mut touch_sv, &mut exit_sv);
+    RFR_MON.lock().unwrap().clear();   /* 初始化: 清空 pidfd 监听刷新率命中记录 */
     // T4: packages.list inotify fd
     let pkg_inotify_fd = pkg_inotify_thread.join().unwrap_or(-1);
     // T3: observer 注册完成

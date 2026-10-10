@@ -177,6 +177,7 @@ pub fn spawn_event(touch_sock: c_int, ctrl_sock: c_int, exit_sock: c_int) {
         return;
     }
     set_epfd(epfd);
+    reg_lock().clear();   /* 初始化: 清空 pidfd 监听记录 (旧 epoll/fd 残留) */
 
     // 触摸设备: 探测并打开 (失败不致命: 仅触摸活动检测退化)
     let (touch_fd, _) = open_touch();
