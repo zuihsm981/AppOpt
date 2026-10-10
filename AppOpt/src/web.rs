@@ -953,6 +953,8 @@ fn waylay_json() -> String {
         "connected": KPM_ARMED.load(Ordering::Relaxed),
         // 挂机黑屏持久开关状态 (AppOpt.json 持久化; webui 打开时恢复显示)
         "hang_black": hang_black_active(),
+        // 挂机黑屏是否可用 (无背光设备 → 前端隐藏该功能)
+        "hang_black_supported": crate::ebpf_mode::backlight_ready(),
         "rules": rules
             .iter()
             .map(|r| {

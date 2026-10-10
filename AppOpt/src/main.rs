@@ -867,6 +867,8 @@ fn main() {
     crate::web::set_drive_mode(&drive_mode);
     // uclamp 支持探测 (webui 据此隐藏/显示 uclamp 配置)
     crate::web::init_uclamp_support();
+    // 挂机黑屏: 初始化扫描背光设备 (动态路径)
+    crate::ebpf_mode::backlight_init();
     // 挂机黑屏持久状态: 上次开启 → 自动恢复 (启动监听线程)
     if crate::web::hang_black_active() {
         crate::event_probe::start_hang_monitor();
@@ -973,6 +975,7 @@ fn main() {
     let mut exit_sv: [libc::c_int; 2] = [-1, -1];
     let (touch_ok, exit_ok) = spawn_event_probe(&mut touch_sv, &mut exit_sv);
     RFR_MON.lock().unwrap().clear();   /* 初始化: 清空 pidfd 监听刷新率命中记录 */
+    crate::cpu_affinity::cpu_stats_clear();   /* 初始化: 清空线程状态页命中应用 */
     // T4: packages.list inotify fd
     let pkg_inotify_fd = pkg_inotify_thread.join().unwrap_or(-1);
     // T3: observer 注册完成

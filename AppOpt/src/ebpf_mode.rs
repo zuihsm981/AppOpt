@@ -212,19 +212,62 @@ fn kp_ready(key: &CString) -> bool {
 }
 
 /// KPM 传输句柄 (占用原 EbpfState.bpf 字段, 保持 main.rs 接口不变)
+/// 挂机黑屏背光目录 (初始化扫描 /sys/class/backlight/*, 保存到内存)
+static BACKLIGHT_DIR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// 初始化: 扫描 /sys/class/backlight/*/brightness, 选主显示背光目录
+/// (type=raw 优先, 其次 max_brightness 大者); 无背光设备则挂机功能禁用
+pub fn backlight_init() {
+    let mut best: Option<(String, i32)> = None;
+    if let Ok(entries) = std::fs::read_dir("/sys/class/backlight") {
+        for e in entries.flatten() {
+            let dir = e.path();
+            if !dir.join("brightness").exists() {
+                continue;
+            }
+            let p = dir.to_string_lossy().into_owned();
+            let mut score = 0i32;
+            if let Ok(t) = std::fs::read_to_string(dir.join("type")) {
+                if t.trim() == "raw" {
+                    score += 1000;
+                }
+            }
+            if let Ok(m) = std::fs::read_to_string(dir.join("max_brightness")) {
+                if let Ok(mv) = m.trim().parse::<i32>() {
+                    score += mv;
+                }
+            }
+            if best.as_ref().map_or(true, |(_, s)| score > *s) {
+                best = Some((p, score));
+            }
+        }
+    }
+    *BACKLIGHT_DIR.lock().unwrap() = best.map(|(p, _)| p);
+}
+
+/// 是否有可用背光设备 (无则前端隐藏挂机黑屏功能)
+pub fn backlight_ready() -> bool {
+    BACKLIGHT_DIR.lock().unwrap().is_some()
+}
+
+/// 当前背光目录 (内存保存; None = 无设备)
+fn backlight_dir() -> Option<String> {
+    BACKLIGHT_DIR.lock().unwrap().clone()
+}
+
 /// 屏幕挂机黑屏: 读当前亮度 (brightness 文件)
 pub fn scr_read_brightness() -> Option<i32> {
-    std::fs::read_to_string("/sys/class/backlight/panel0-backlight/brightness")
+    let d = backlight_dir()?;
+    std::fs::read_to_string(format!("{}/brightness", d))
         .ok()
         .and_then(|s| s.trim().parse::<i32>().ok())
 }
 
 /// 屏幕挂机黑屏: 写亮度
 pub fn scr_set_brightness(v: i32) {
-    let _ = std::fs::write(
-        "/sys/class/backlight/panel0-backlight/brightness",
-        format!("{}\n", v),
-    );
+    if let Some(d) = backlight_dir() {
+        let _ = std::fs::write(format!("{}/brightness", d), format!("{}\n", v));
+    }
 }
 
 /// 保存关屏前亮度 (长按黑屏前记录; 记录成功才允许写 0)
