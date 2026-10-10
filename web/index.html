@@ -1505,8 +1505,9 @@ function showHitList(){
   if(!hitList.length){box.innerHTML='<div class="empty">暂无命中应用</div>';}
   else{box.innerHTML=hitList.map(p=>{
     const name=esc(typeof p==='string'?p:(p.label||p.pkg));
-    const appRow=`<div class="rule-row" style="display:flex;justify-content:space-between;align-items:baseline"><span class="rule-name mono">${name}</span>${p.cpu?`<span class="rule-sub">${esc(p.cpu)}</span>`:''}</div>`;
-    const ths=(p.threads||[]).map(t=>`<div class="rule-row" style="justify-content:space-between;padding:3px 14px;margin-top:-6px"><span style="flex:1;word-break:break-all;color:#8e8e93;font-size:11px;margin-left:14px">${esc(t.name)}</span><span class="rule-sub">${esc(t.cpus)}</span></div>`).join('');
+    const okMark=p.ok===undefined?'':(p.ok?'<span style="color:#34c759">✓</span>':'<span style="color:#ff3b30">×</span>');
+    const appRow=`<div class="rule-row" style="display:flex;justify-content:space-between;align-items:baseline"><span class="rule-name mono">${name}</span>${p.cpu?`<span class="rule-sub">${esc(p.cpu)}</span>`:''}${okMark}</div>`;
+    const ths=(p.threads||[]).map(t=>`<div class="rule-row" style="justify-content:space-between;padding:3px 14px;margin-top:-6px"><span style="flex:1;word-break:break-all;color:#8e8e93;font-size:11px;margin-left:14px">${esc(t.name)}</span><span class="rule-sub">${esc(t.cpus)}</span>${t.ok===undefined?'':(t.ok?'<span style="color:#34c759">✓</span>':'<span style="color:#ff3b30">×</span>')}</div>`).join('');
     return appRow+ths;
   }).join('');}
   $('modal-hit').hidden=false;
