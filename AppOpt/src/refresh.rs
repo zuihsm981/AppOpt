@@ -689,8 +689,10 @@ pub fn refresh_add_app(pkg: &str, timeout: i32, active: &str, idle: &str) {
     if !crate::config::save_config_lines(&path, &lines) {
         return;
     }
-    // 同步共享配置（仅刷新率）+ 独立通知 refresh 线程
-    crate::config::reload_refresh_only();
+    /* 完整 reload: 重建前台 uid 表 (rfr 标志)。若只 reload_refresh_only(),
+     * "最后一步是刷新率操作"时 rfr 标志不更新 → 刷新率不生效
+     * (先线程后刷新率 / 同时添加场景)。 */
+    crate::config::config_reload_now();
     REFRESH_FORCE_RELOAD.store(true, Ordering::Release);
     wake();
 }
@@ -715,8 +717,8 @@ pub fn refresh_del_app(pkg: &str) -> bool {
     if !crate::config::save_config_lines(&path, &lines) {
         return false;
     }
-    // 同步共享配置（仅刷新率）+ 独立通知 refresh 线程
-    crate::config::reload_refresh_only();
+    /* 完整 reload: 重建前台 uid 表 (rfr 标志), 与 refresh_add_app 一致 */
+    crate::config::config_reload_now();
     REFRESH_FORCE_RELOAD.store(true, Ordering::Release);
     wake();
     true
