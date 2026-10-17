@@ -1203,20 +1203,37 @@ fn main() {
                                     let _ = tx.send(crate::cpu_affinity::CpuMsg::EvictUid(uid));
                                 }
                             }
-                            // 刷新率: 主 pid 退出 → 移除监听 + 清 webui 命中
+                            // 刷新率: 主 pid 退出 → 移除监听 + 清 webui 命中 + 回落
                             if state.rfr_monitored.remove(&pid).is_some() {
                                 RFR_MON.lock().unwrap().remove(&pid);
+                                state.refresh_keep_top();   /* 结束规则应用 → 其它 top 规则 / 全局 */
                             }
-                            // waylay: 主 pid 退出 → 移除记录 + 下发 vfc_fg 0 停止内核 vfc 规则
+                            // waylay (vfc + prop): 主 pid 退出 → 移除;
+                            // 仍有其它 top 规则应用 → 保持其 uid; 无 → 停止 + 恢复 prop 伪装
                             if state.waylay_monitored.remove(&pid).is_some() {
                                 if let Some(es) = state.ebpf_state.as_ref() {
-                                    es.bpf.vfc_fg(0);
+                                    match AppState::monitored_top_uid(&mut state.waylay_monitored)
+                                    {
+                                        Some(u) => es.bpf.vfc_fg(u),
+                                        None => {
+                                            es.bpf.vfc_fg(0);
+                                            /* 无其它 waylay 规则应用 → 恢复属性伪装 */
+                                            if state.prop_active_cur {
+                                                crate::config::set_prop_rules(&[]);
+                                                es.bpf.prop_file_apply(false);
+                                                state.prop_active_cur = false;
+                                            }
+                                        }
+                                    }
                                 }
                             }
-                            // srv: 主 pid 退出 → 移除记录 + 通知停止 srv (srv_active 0)
+                            // srv: 主 pid 退出 → 移除; 仍有其它 top srv 规则应用 → 保持; 无 → 停止
                             if state.srv_monitored.remove(&pid).is_some() {
                                 if let Some(es) = state.ebpf_state.as_ref() {
-                                    es.bpf.srv_active(false);
+                                    let keep =
+                                        AppState::monitored_top_uid(&mut state.srv_monitored)
+                                            .is_some();
+                                    es.bpf.srv_active(keep);
                                 }
                             }
                         }
