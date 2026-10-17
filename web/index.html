@@ -1378,7 +1378,7 @@ $('w-conn-chips').addEventListener('click',async e=>{
   const b=e.target.closest('button');if(!b)return;
   const on=b.dataset.v==='1';
   try{
-    await api('/api/waylay',{arm:on,rules:buildRules()});
+    await api('/api/waylay',{arm:on});
     const conn=await loadWaylay();
     if(on) toast(conn?'已连接 (模块已武装)':'未连接: KPM 未就绪');
     else toast('已断开 (模块已解除)');
@@ -1396,7 +1396,7 @@ $('w-scr').addEventListener('click',async e=>{
   const on=b.dataset.v==='1';
   renderScr(on);
   try{
-    await api('/api/waylay',{scr:on,rules:buildRules()});
+    await api('/api/waylay',{scr:on});
     toast(on?'已开启挂机 (长按 3 秒黑屏, 单击渐亮恢复)':'已关闭挂机');
   }catch(e){toast(e.message)}
 });
@@ -1567,7 +1567,7 @@ $('rd-batch-modal').addEventListener('click',e=>{if(e.target.id==='rd-batch-moda
 $('rd-batch-ok').onclick=()=>{
   const f=$('rd-batch-from').value.trim(),t=$('rd-batch-to').value.trim();
   if(!f.length||f.length!==t.length||f.length>64){$('rd-batch-err').textContent='原/新字符数需一致 (ASCII ≤64)';$('rd-batch-err').hidden=false;return}else{$('rd-batch-err').hidden=true}
-  if(!rdApps.length){$('rd-batch-err').textContent='无法保存: 需要添加目标应用';$('rd-batch-err').hidden=false;return}else{$('rd-batch-err').hidden=true}
+  if(!rdBatchTmp.length){$('rd-batch-err').textContent='无法保存: 需要添加目标应用';$('rd-batch-err').hidden=false;return}else{$('rd-batch-err').hidden=true}
   if(f.split('').some(c=>c.charCodeAt(0)>127)||t.split('').some(c=>c.charCodeAt(0)>127)){$('rd-batch-err').textContent='仅支持 ASCII 字符';$('rd-batch-err').hidden=false;return}else{$('rd-batch-err').hidden=true}
   const paths=$('rd-batch-targets').value.split('\n').map(x=>x.trim()).filter(Boolean);
   const seen=new Set();let added=0;
@@ -2521,6 +2521,8 @@ async function apLoad(){
     /* 同步应用名到 wlLabel: 供目标应用/生效应用列表 labelOf 使用 (覆盖未在规则中的包) */
     apData.forEach(a=>{if(a.label)wlLabel[a.pkg]=a.label;});
     apRender();
+    /* label 填充完成 → 重绘隐藏页应用列表: 应用名即时显示 (无需保存重进) */
+    renderWaylayApps();renderWpApps();renderRdApps();renderRdpApps();renderRdNameApps();
   }catch(e){toast(e.message)}
 }
 function apRender(){
@@ -2588,6 +2590,7 @@ document.addEventListener('click',e=>{
 api('/api/apps').then(d=>{
   apData=d.apps||[];
   apData.forEach(a=>{if(a.label)wlLabel[a.pkg]=a.label;});
+  renderWaylayApps();renderWpApps();renderRdApps();renderRdpApps();renderRdNameApps();
 }).catch(()=>{});
 startStat();
 </script>
