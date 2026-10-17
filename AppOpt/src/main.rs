@@ -393,6 +393,12 @@ struct AppState {
     waylay_monitored: HashMap<i32, i32>,
     /// srv 规则应用主 pid 监听表: pid → uid (内核 srv_active 通知门控; 主 pid 退出移除)
     srv_monitored: HashMap<i32, i32>,
+    /// cpuset top-app inotify 监听: 从规则应用切到非规则应用时 watch
+    /// /dev/cpuset/top-app/tasks, 规则应用迁出 top-app (tasks 变化) → 回落;
+    /// 回调变规则应用 / 被监听 pid 掉出 top → 停止监听
+    top_tasks_fd: libc::c_int,
+    top_tasks_wd: libc::c_int,
+    top_tasks_pids: HashSet<i32>,
 }
 
 impl AppState {
@@ -419,6 +425,9 @@ impl AppState {
             rfr_monitored: HashMap::new(),
             waylay_monitored: HashMap::new(),
             srv_monitored: HashMap::new(),
+            top_tasks_fd: unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) },
+            top_tasks_wd: -1,
+            top_tasks_pids: HashSet::new(),
             rule_cache: Vec::new(),
             vfc_uid_set: std::collections::HashSet::new(),
             uid_rules: std::collections::HashMap::new(),
@@ -619,6 +628,91 @@ impl AppState {
             .unwrap_or(false)
     }
 
+    /// 非规则应用前台回调 → 开始监听 /dev/cpuset/top-app/tasks。
+    /// 回调时 cpuset 尚未迁移: 等规则应用迁出 top-app (tasks 写入触发) 再回落。
+    fn top_tasks_start(&mut self) {
+        if self.top_tasks_fd < 0 {
+            return;
+        }
+        if self.top_tasks_wd < 0 {
+            let Some(path) =
+                std::ffi::CString::new("/dev/cpuset/top-app/tasks").ok()
+            else {
+                return;
+            };
+            let wd = unsafe {
+                libc::inotify_add_watch(
+                    self.top_tasks_fd,
+                    path.as_ptr(),
+                    libc::IN_MODIFY | libc::IN_CLOSE_WRITE,
+                )
+            };
+            if wd >= 0 {
+                self.top_tasks_wd = wd;
+            } else {
+                return;   /* cpuset 路径不存在 / inotify 不支持 → 无法监听 */
+            }
+        }
+        /* 收集当前规则应用主 pid (rfr / waylay / srv) */
+        for &p in self.rfr_monitored.keys() {
+            self.top_tasks_pids.insert(p);
+        }
+        for &p in self.waylay_monitored.keys() {
+            self.top_tasks_pids.insert(p);
+        }
+        for &p in self.srv_monitored.keys() {
+            self.top_tasks_pids.insert(p);
+        }
+    }
+
+    /// 回调变成规则应用 → 停止监听 (重新应用其规则, 无需回落)
+    fn top_tasks_stop(&mut self) {
+        if self.top_tasks_fd >= 0 && self.top_tasks_wd >= 0 {
+            unsafe { libc::inotify_rm_watch(self.top_tasks_fd, self.top_tasks_wd); }
+        }
+        self.top_tasks_wd = -1;
+        self.top_tasks_pids.clear();
+    }
+
+    /// top-app tasks 变化事件: 被监听规则应用迁出 top-app → 回落 + 移除;
+    /// 全部掉出 → 停止监听
+    fn top_tasks_evict(&mut self) {
+        let pids: Vec<i32> = self.top_tasks_pids.iter().copied().collect();
+        for pid in pids {
+            if !Self::pid_in_top_app(pid) {
+                self.cpuset_evict(pid);
+            }
+        }
+        if self.top_tasks_pids.is_empty() {
+            self.top_tasks_stop();
+        }
+    }
+
+    /// 规则应用掉出 top-app / 主进程退出: 回落 (刷新率全局 / 停 vfc+srv / 恢复 prop)。
+    /// CPU 亲和性规则除外 (不回落)。同时停止该 pid 的监听。
+    fn cpuset_evict(&mut self, pid: i32) {
+        self.top_tasks_pids.remove(&pid);
+        if self.rfr_monitored.remove(&pid).is_some() {
+            RFR_MON.lock().unwrap().remove(&pid);
+            self.refresh_apply(crate::config::DEFAULT_REFRESH_PACKAGE.to_string());
+        }
+        if self.waylay_monitored.remove(&pid).is_some() {
+            if let Some(es) = self.ebpf_state.as_ref() {
+                es.bpf.vfc_fg(0);
+                if self.prop_active_cur {
+                    crate::config::set_prop_rules(&[]);
+                    es.bpf.prop_file_apply(false);
+                    self.prop_active_cur = false;
+                }
+            }
+        }
+        if self.srv_monitored.remove(&pid).is_some() {
+            if let Some(es) = self.ebpf_state.as_ref() {
+                es.bpf.srv_active(false);
+            }
+        }
+    }
+
     /// binder 前台回调 (pid+uid): 查 uid 表分发 CPU (冷启动 ApplyPkg + pidfd watch)
     /// 与刷新率 (包名) —— 原 EV_FG 分支主体
     fn on_fg(&mut self, pid: i32, uid: i32) {
@@ -638,18 +732,17 @@ impl AppState {
                 self.waylay_monitored.insert(pid, uid);
                 crate::event_probe::watch(pid);
             }
+            self.top_tasks_stop();   /* 回调变规则应用 → 停止 cpuset 监听 */
             Some(uid)
         } else {
-            // 非规则应用回调: 先检查是否有记录; 空 → 不做任何动作 (不再下发 -1);
-            // 有记录 → 检查 top-app: 有 top → 不下发 (保持); 无 top → 下发 0 (停止)
-            if self.waylay_monitored.is_empty() {
-                None
-            } else {
-                match Self::monitored_top_uid(&mut self.waylay_monitored) {
-                    Some(_) => None,  // 有 top → 不下发
-                    None => Some(0),  // 有记录但无 top → 通知停止 (vfc_fg 0)
-                }
+            // 规则应用回调 → 变成非规则应用回调: 有规则应用记录才监听 cpuset 回落
+            if !self.rfr_monitored.is_empty()
+                || !self.waylay_monitored.is_empty()
+                || !self.srv_monitored.is_empty()
+            {
+                self.top_tasks_start();
             }
+            None
         };
         if let Some(es) = self.ebpf_state.as_ref() {
             if let Some(u) = fg_uid {
@@ -667,16 +760,17 @@ impl AppState {
                 self.srv_monitored.insert(pid, uid);
                 crate::event_probe::watch(pid);
             }
+            self.top_tasks_stop();   /* 回调变规则应用 → 停止 cpuset 监听 */
             Some(true)
         } else {
-            if self.srv_monitored.is_empty() {
-                None
-            } else {
-                match Self::monitored_top_uid(&mut self.srv_monitored) {
-                    Some(_) => None,        // 有 top → 不下发 (保持激活)
-                    None => Some(false),    // 无 top → 通知停止
-                }
+            // 规则应用回调 → 变成非规则应用回调: 有规则应用记录才监听 cpuset 回落
+            if !self.rfr_monitored.is_empty()
+                || !self.waylay_monitored.is_empty()
+                || !self.srv_monitored.is_empty()
+            {
+                self.top_tasks_start();
             }
+            None
         };
         if let Some(es) = self.ebpf_state.as_ref() {
             if let Some(on) = srv_on {
@@ -690,6 +784,9 @@ impl AppState {
             .map(|r| (r.from.clone(), r.to.clone()))
             .collect();
         let want_prop = !prop_rules.is_empty();
+        if want_prop {
+            self.top_tasks_stop();   /* prop 规则应用 → 停止 cpuset 监听 */
+        }
         if want_prop != self.prop_active_cur {
             self.prop_active_cur = want_prop;
             if let Some(es) = self.ebpf_state.as_ref() {
@@ -717,16 +814,27 @@ impl AppState {
                 // 规则应用 → 应用规则并监听主 pid (已监听则不检查 cpuset 直接应用)
                 if rfr {
                     if pkg == crate::config::DEFAULT_REFRESH_PACKAGE {
-                        self.refresh_keep_top();
+                        /* 规则应用 → 桌面/非规则: 有规则应用记录才监听 cpuset 回落 */
+                        if !self.rfr_monitored.is_empty()
+                            || !self.waylay_monitored.is_empty()
+                            || !self.srv_monitored.is_empty()
+                        {
+                            self.top_tasks_start();
+                        }
                     } else {
                         self.refresh_fg_rule_app(pid, &pkg);
+                        self.top_tasks_stop();    /* 规则应用 → 停止监听 */
                     }
                 }
             }
             None => {
-                // 非规则应用回调 (不在 uid 表): 刷新率保持 top-app 主 pid 规则;
-                // 无 top-app 时回落全局默认
-                self.refresh_keep_top();
+                // 规则应用回调 → 变成非规则应用回调: 有规则应用记录才监听 cpuset 回落
+                if !self.rfr_monitored.is_empty()
+                    || !self.waylay_monitored.is_empty()
+                    || !self.srv_monitored.is_empty()
+                {
+                    self.top_tasks_start();
+                }
             }
         }
     }
@@ -751,45 +859,7 @@ impl AppState {
         self.refresh_apply(pkg.to_string());
     }
 
-    /// 非规则应用前台回调: 扫描已监听主 pid, 有仍处于 top-app 的 → 应用其规则 (保持);
-    /// 无 top-app → 回落全局默认 (桌面配置); 顺带移除已退出主 pid 的监听。
-    fn refresh_keep_top(&mut self) {
-        let mut top: Option<String> = None;
-        self.rfr_monitored.retain(|p, pkg| {
-            if Self::pid_in_top_app(*p) {
-                if top.is_none() {
-                    top = Some(pkg.clone());
-                }
-                true
-            } else {
-                // 已退出 (cpuset 文件消失) → 移除监听; 仍存活但不在 top → 保留
-                std::path::Path::new(&format!("/proc/{}/cpuset", p)).exists()
-            }
-        });
-        match top {
-            Some(pkg) => self.refresh_apply(pkg),
-            None => self.refresh_apply(crate::config::DEFAULT_REFRESH_PACKAGE.to_string()),
-        }
-    }
-
-    /// 通用 top 保护: 扫描已监听主 pid 表 (pid→uid), 返回其中处于 top-app 的 uid
-    /// (有 → 调用方不下发, 内核保持); 顺带移除已退出 (cpuset 文件消失) 的记录。
-    /// vfc(waylay_monitored) 与 srv(srv_monitored) 共用。
-    fn monitored_top_uid(monitored: &mut HashMap<i32, i32>) -> Option<i32> {
-        let mut top: Option<i32> = None;
-        monitored.retain(|p, u| {
-            if Self::pid_in_top_app(*p) {
-                if top.is_none() {
-                    top = Some(*u);
-                }
-                true
-            } else {
-                // 已退出 (cpuset 文件消失) → 移除记录; 仍存活但不在 top → 保留
-                std::path::Path::new(&format!("/proc/{}/cpuset", p)).exists()
-            }
-        });
-        top
-    }
+    // cpuset_evict: 掉出 top-app / 主进程退出时的统一回落 (见上方)
 }
 
 /// pidfd 监听的刷新率规则应用主进程表 (pid→pkg; 可多个正在运行的规则应用)。
@@ -999,6 +1069,7 @@ fn main() {
     const EV_TOUCH: u64 = 8; // 用户态 /dev/input 触摸/输入活动 (替代 4.19 内核 input hook)
     const EV_EXIT_PID: u64 = 9; // pidfd 进程退出监听 (全模式统一退出来源)
     const EV_WAYLAY: u64 = 10; // waylay.conf inotify (外部编辑/原子替换 → 重读校验全量下发)
+    const EV_CGROUP: u64 = 11; // /dev/cpuset/top-app/tasks 变化 (规则应用迁出 top-app → 回落)
 
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epfd < 0 {
@@ -1031,6 +1102,10 @@ fn main() {
     let waylay_fd = crate::config::init_waylay_inotify();
     if waylay_fd > 0 {
         epoll_add(epfd, waylay_fd, EV_WAYLAY);
+    }
+    // cpuset top-app tasks inotify: 规则应用迁出 top-app → 回落 (fd 由 AppState 创建)
+    if state.top_tasks_fd >= 0 {
+        epoll_add(epfd, state.top_tasks_fd, EV_CGROUP);
     }
 
     // 初始全量应用 (两种驱动模式都执行: KPM 事件驱动 / 纯用户态)
@@ -1203,41 +1278,28 @@ fn main() {
                                     let _ = tx.send(crate::cpu_affinity::CpuMsg::EvictUid(uid));
                                 }
                             }
-                            // 刷新率: 主 pid 退出 → 移除监听 + 清 webui 命中 + 回落
-                            if state.rfr_monitored.remove(&pid).is_some() {
-                                RFR_MON.lock().unwrap().remove(&pid);
-                                state.refresh_keep_top();   /* 结束规则应用 → 其它 top 规则 / 全局 */
+                            // 规则应用主进程退出 → 回落 (移除各表 + 刷新率全局 / 停 vfc+srv / 恢复 prop)
+                            if state.rfr_monitored.contains_key(&pid)
+                                || state.waylay_monitored.contains_key(&pid)
+                                || state.srv_monitored.contains_key(&pid)
+                            {
+                                state.cpuset_evict(pid);
                             }
-                            // waylay (vfc + prop): 主 pid 退出 → 移除;
-                            // 仍有其它 top 规则应用 → 保持其 uid; 无 → 停止 + 恢复 prop 伪装
-                            if state.waylay_monitored.remove(&pid).is_some() {
-                                if let Some(es) = state.ebpf_state.as_ref() {
-                                    match AppState::monitored_top_uid(&mut state.waylay_monitored)
-                                    {
-                                        Some(u) => es.bpf.vfc_fg(u),
-                                        None => {
-                                            es.bpf.vfc_fg(0);
-                                            /* 无其它 waylay 规则应用 → 恢复属性伪装 */
-                                            if state.prop_active_cur {
-                                                crate::config::set_prop_rules(&[]);
-                                                es.bpf.prop_file_apply(false);
-                                                state.prop_active_cur = false;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            // srv: 主 pid 退出 → 移除; 仍有其它 top srv 规则应用 → 保持; 无 → 停止
-                            if state.srv_monitored.remove(&pid).is_some() {
-                                if let Some(es) = state.ebpf_state.as_ref() {
-                                    let keep =
-                                        AppState::monitored_top_uid(&mut state.srv_monitored)
-                                            .is_some();
-                                    es.bpf.srv_active(keep);
-                                }
-                            }
+                            // waylay/srv 回落已由上方 cpuset_evict 统一处理
                         }
                     }
+                }
+                EV_CGROUP => {
+                    // /dev/cpuset/top-app/tasks 变化: 规则应用迁出 top-app → 回落
+                    let mut buf = [0u8; 4096];
+                    let _ = unsafe {
+                        libc::read(
+                            state.top_tasks_fd,
+                            buf.as_mut_ptr() as *mut libc::c_void,
+                            buf.len(),
+                        )
+                    };
+                    state.top_tasks_evict();
                 }
                 EV_INOTIFY => {
                     // 配置变更 (inotify): 与 EV_CONFIG 共用 reload_config
