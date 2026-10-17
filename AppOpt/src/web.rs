@@ -1005,9 +1005,13 @@ fn waylay_set_api(req: &Request) -> (u16, String) {
         settings_save();
         crate::config::set_scr_req(on);
     }
+    /* 仅带 rules 字段的请求才保存配置; 连接/挂机开关等无 rules 请求不落盘,
+     * 防止前端空规则内存 (未加载) 时把 waylay.conf 清空 */
+    let Some(arr) = v["rules"].as_array() else {
+        return (200, json!({ "ok": true }).to_string());
+    };
     let mut rules: Vec<crate::config::WaylayRule> = Vec::new();
-    if let Some(arr) = v["rules"].as_array() {
-        for r in arr {
+    for r in arr {
             let pkg = r["pkg"].as_str().unwrap_or("").trim().to_string();
             let kind_t = r["kind"].as_str().unwrap_or("").to_string();
             let f = r["from"].as_str().unwrap_or("").to_string();
@@ -1070,7 +1074,6 @@ fn waylay_set_api(req: &Request) -> (u16, String) {
                 to: t,
             });
         }
-    }
     /* L1: 复用主循环同一套映射+校验, 保存前即时反馈全部错误 (编号与内核下发一致) */
     let pkguid = pkg_uid_map();   /* 全量缓存, 不再每次读 packages.list */
     let (_tbl, vrows, srows) = crate::build_rule_rows(&rules, &pkguid);
