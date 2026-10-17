@@ -668,7 +668,7 @@ impl AppState {
     /// 回调变成规则应用 → 停止监听 (重新应用其规则, 无需回落)
     fn top_tasks_stop(&mut self) {
         if self.top_tasks_fd >= 0 && self.top_tasks_wd >= 0 {
-            unsafe { libc::inotify_rm_watch(self.top_tasks_fd, self.top_tasks_wd); }
+            unsafe { libc::inotify_rm_watch(self.top_tasks_fd, self.top_tasks_wd as u32); }
         }
         self.top_tasks_wd = -1;
         self.top_tasks_pids.clear();
