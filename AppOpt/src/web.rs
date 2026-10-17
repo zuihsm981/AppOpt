@@ -1352,6 +1352,12 @@ pub fn refresh_pkg_cache() {
             if uid <= 0 || uid >= 100000 {
                 continue;   /* 仅当前用户 (与 cpu/waylay uid 表一致) */
             }
+            let _flag = it.next();
+            /* 第 4 列 data 目录: 非 0 用户应用为 null → 过滤 (仅主用户应用) */
+            let Some(data_dir) = it.next() else { continue };
+            if data_dir == "null" || !data_dir.starts_with("/data/user/0/") {
+                continue;
+            }
             /* 应用类别: 条目末尾标记 @system=系统应用, @null=用户应用 */
             let system = line.trim_end().ends_with("@system");
             /* 应用名: 用户应用从 /data/app 的 base.apk 用 aapt2 取 label (系统应用不在 /data/app) */
