@@ -1112,7 +1112,7 @@ function openRdNameEdit(idx){
 }
 $('rd-name-close').onclick=()=>{$('rd-name-modal').hidden=true;};
 $('rd-name-modal').addEventListener('click',e=>{if(e.target.id==='rd-name-modal')$('rd-name-modal').hidden=true;});
-function rdNameAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!rdNameTmp.includes(pkg))rdNameTmp.push(pkg);$('rd-name-app-input').value='';$('rd-name-sg').hidden=true;renderRdNameApps();}
+async function rdNameAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!rdNameTmp.includes(pkg))rdNameTmp.push(pkg);$('rd-name-app-input').value='';$('rd-name-sg').hidden=true;renderRdNameApps();await apLoad();}
 suggest_bind($('rd-name-app-input'),$('rd-name-sg'),{onpick:rdNameAddApp});
 $('rd-name-apps').addEventListener('click',e=>{const b=e.target.closest('[data-i]');if(b){rdNameTmp.splice(+b.dataset.i,1);renderRdNameApps();return}const h=e.target.closest('.grp-head');if(h)h.parentElement.classList.toggle('open');});
 $('rd-name-ok').onclick=()=>{
@@ -1155,11 +1155,11 @@ $('rd-field-ok').onclick=()=>{
   if(rdFGroupRoot)openFGroup(rdFGroupRoot);
   $('rd-field-err').textContent='已添加';$('rd-field-err').style.color='#12a150';$('rd-field-err').hidden=false;
 };
-function wlAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!svAddTmp.includes(pkg))svAddTmp.push(pkg);$('sv-add-app-input').value='';$('sv-add-sg').hidden=true;renderWaylayApps();}
-function wpAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!wpAddTmp.includes(pkg))wpAddTmp.push(pkg);$('wp-add-app-input').value='';$('wp-add-sg').hidden=true;renderWpApps();}
-function rdAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!rdAddTmp.includes(pkg))rdAddTmp.push(pkg);$('rd-add-app-input').value='';$('rd-add-sg').hidden=true;renderRdApps();}
-function rdBatchAdd(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!rdBatchTmp.includes(pkg))rdBatchTmp.push(pkg);$('rd-batch-app-input').value='';$('rd-batch-sg').hidden=true;renderRdApps();}
-function rdpAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!rdpTmp.includes(pkg))rdpTmp.push(pkg);$('rd-field-app-input').value='';$('rd-field-sg').hidden=true;renderRdpApps();}
+async function wlAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!svAddTmp.includes(pkg))svAddTmp.push(pkg);$('sv-add-app-input').value='';$('sv-add-sg').hidden=true;renderWaylayApps();await apLoad();}
+async function wpAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!wpAddTmp.includes(pkg))wpAddTmp.push(pkg);$('wp-add-app-input').value='';$('wp-add-sg').hidden=true;renderWpApps();await apLoad();}
+async function rdAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!rdAddTmp.includes(pkg))rdAddTmp.push(pkg);$('rd-add-app-input').value='';$('rd-add-sg').hidden=true;renderRdApps();await apLoad();}
+async function rdBatchAdd(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!rdBatchTmp.includes(pkg))rdBatchTmp.push(pkg);$('rd-batch-app-input').value='';$('rd-batch-sg').hidden=true;renderRdApps();await apLoad();}
+async function rdpAddApp(pkg){pkg=(pkg||'').trim();if(!pkg)return;if(!rdpTmp.includes(pkg))rdpTmp.push(pkg);$('rd-field-app-input').value='';$('rd-field-sg').hidden=true;renderRdpApps();await apLoad();}
 suggest_bind($('rd-batch-app-input'),$('rd-batch-sg'),{onpick:rdBatchAdd});
 $('rd-batch-apps').addEventListener('click',e=>{
   const b=e.target.closest('[data-i]');
