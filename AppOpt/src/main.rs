@@ -393,11 +393,8 @@ struct AppState {
     waylay_monitored: HashMap<i32, i32>,
     /// srv 规则应用主 pid 监听表: pid → uid (内核 srv_active 通知门控; 主 pid 退出移除)
     srv_monitored: HashMap<i32, i32>,
-    /// cpuset top-app inotify 监听: 从规则应用切到非规则应用时 watch
-    /// /dev/cpuset/top-app/tasks, 规则应用迁出 top-app (tasks 变化) → 回落;
-    /// 回调变规则应用 / 被监听 pid 掉出 top → 停止监听
-    top_tasks_fd: libc::c_int,
-    top_tasks_wd: libc::c_int,
+    /// cpuset 轮询监听: 规则应用 → 非规则切换后每秒检查规则应用主 pid 的 cpuset,
+    /// 迁出 top-app → 回落; 回调变规则应用 / 全部掉出 → 停止监听
     top_tasks_pids: HashSet<i32>,
 }
 
@@ -425,8 +422,6 @@ impl AppState {
             rfr_monitored: HashMap::new(),
             waylay_monitored: HashMap::new(),
             srv_monitored: HashMap::new(),
-            top_tasks_fd: unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) },
-            top_tasks_wd: -1,
             top_tasks_pids: HashSet::new(),
             rule_cache: Vec::new(),
             vfc_uid_set: std::collections::HashSet::new(),
@@ -628,32 +623,8 @@ impl AppState {
             .unwrap_or(false)
     }
 
-    /// 非规则应用前台回调 → 开始监听 /dev/cpuset/top-app/tasks。
-    /// 回调时 cpuset 尚未迁移: 等规则应用迁出 top-app (tasks 写入触发) 再回落。
+    /// 规则应用 → 非规则应用回调: 收集当前规则应用主 pid (每秒轮询其 cpuset 回落)
     fn top_tasks_start(&mut self) {
-        if self.top_tasks_fd < 0 {
-            return;
-        }
-        if self.top_tasks_wd < 0 {
-            let Some(path) =
-                std::ffi::CString::new("/dev/cpuset/top-app/tasks").ok()
-            else {
-                return;
-            };
-            let wd = unsafe {
-                libc::inotify_add_watch(
-                    self.top_tasks_fd,
-                    path.as_ptr(),
-                    libc::IN_MODIFY | libc::IN_CLOSE_WRITE,
-                )
-            };
-            if wd >= 0 {
-                self.top_tasks_wd = wd;
-            } else {
-                return;   /* cpuset 路径不存在 / inotify 不支持 → 无法监听 */
-            }
-        }
-        /* 收集当前规则应用主 pid (rfr / waylay / srv) */
         for &p in self.rfr_monitored.keys() {
             self.top_tasks_pids.insert(p);
         }
@@ -665,17 +636,12 @@ impl AppState {
         }
     }
 
-    /// 回调变成规则应用 → 停止监听 (重新应用其规则, 无需回落)
+    /// 回调变成规则应用 → 停止轮询监听
     fn top_tasks_stop(&mut self) {
-        if self.top_tasks_fd >= 0 && self.top_tasks_wd >= 0 {
-            unsafe { libc::inotify_rm_watch(self.top_tasks_fd, self.top_tasks_wd as u32); }
-        }
-        self.top_tasks_wd = -1;
         self.top_tasks_pids.clear();
     }
 
-    /// top-app tasks 变化事件: 被监听规则应用迁出 top-app → 回落 + 移除;
-    /// 全部掉出 → 停止监听
+    /// 每秒轮询: 被监听规则应用迁出 top-app → 回落; 全部掉出 → 停止监听
     fn top_tasks_evict(&mut self) {
         let pids: Vec<i32> = self.top_tasks_pids.iter().copied().collect();
         for pid in pids {
@@ -1069,7 +1035,7 @@ fn main() {
     const EV_TOUCH: u64 = 8; // 用户态 /dev/input 触摸/输入活动 (替代 4.19 内核 input hook)
     const EV_EXIT_PID: u64 = 9; // pidfd 进程退出监听 (全模式统一退出来源)
     const EV_WAYLAY: u64 = 10; // waylay.conf inotify (外部编辑/原子替换 → 重读校验全量下发)
-    const EV_CGROUP: u64 = 11; // /dev/cpuset/top-app/tasks 变化 (规则应用迁出 top-app → 回落)
+    const EV_SCAN: u64 = 12; // 每秒轮询规则应用主 pid 的 cpuset (迁出 top-app → 回落)
 
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epfd < 0 {
@@ -1103,9 +1069,17 @@ fn main() {
     if waylay_fd > 0 {
         epoll_add(epfd, waylay_fd, EV_WAYLAY);
     }
-    // cpuset top-app tasks inotify: 规则应用迁出 top-app → 回落 (fd 由 AppState 创建)
-    if state.top_tasks_fd >= 0 {
-        epoll_add(epfd, state.top_tasks_fd, EV_CGROUP);
+    // cpuset 轮询: 每秒检查被监听规则应用主 pid 的 /proc/<pid>/cpuset
+    // (规则应用 → 非规则切换后启动, 迁出 top-app → 回落)
+    let scan_fd =
+        unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC | libc::TFD_NONBLOCK) };
+    if scan_fd >= 0 {
+        let its = libc::itimerspec {
+            it_interval: libc::timespec { tv_sec: 1, tv_nsec: 0 },
+            it_value: libc::timespec { tv_sec: 1, tv_nsec: 0 },
+        };
+        unsafe { libc::timerfd_settime(scan_fd, 0, &its, std::ptr::null_mut()); }
+        epoll_add(epfd, scan_fd, EV_SCAN);
     }
 
     // 初始全量应用 (两种驱动模式都执行: KPM 事件驱动 / 纯用户态)
@@ -1289,17 +1263,13 @@ fn main() {
                         }
                     }
                 }
-                EV_CGROUP => {
-                    // /dev/cpuset/top-app/tasks 变化: 规则应用迁出 top-app → 回落
-                    let mut buf = [0u8; 4096];
-                    let _ = unsafe {
-                        libc::read(
-                            state.top_tasks_fd,
-                            buf.as_mut_ptr() as *mut libc::c_void,
-                            buf.len(),
-                        )
-                    };
-                    state.top_tasks_evict();
+                EV_SCAN => {
+                    // 每秒: 规则应用 → 非规则切换后, 被监听规则应用迁出 top-app → 回落
+                    let mut tmp = [0u8; 8];
+                    let _ = unsafe { libc::read(scan_fd, tmp.as_mut_ptr() as *mut _, 8) };
+                    if !state.top_tasks_pids.is_empty() {
+                        state.top_tasks_evict();
+                    }
                 }
                 EV_INOTIFY => {
                     // 配置变更 (inotify): 与 EV_CONFIG 共用 reload_config
