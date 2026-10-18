@@ -36,6 +36,7 @@ type FnParcelDelete = unsafe extern "C" fn(*mut c_void);
 type FnWriteBinder = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
 type FnReadI32 = unsafe extern "C" fn(*mut c_void, *mut i32) -> c_int;
 type FnWriteI32 = unsafe extern "C" fn(*mut c_void, i32) -> c_int;
+type FnWriteStr = unsafe extern "C" fn(*mut c_void, *const c_char, u32) -> c_int;
 type FnJoinThreadPool = unsafe extern "C" fn();
 type FnStartThreadPool = unsafe extern "C" fn();
 type FnAssociateClass = unsafe extern "C" fn(*mut c_void, *const c_void) -> bool;
@@ -49,6 +50,7 @@ struct BinderNdk {
     parcel_delete: FnParcelDelete,
     write_binder: FnWriteBinder,
     write_int32: FnWriteI32,
+    write_string: FnWriteStr,
     read_i32: FnReadI32,
     join_thread_pool: FnJoinThreadPool,
     start_thread_pool: FnStartThreadPool,
@@ -76,6 +78,7 @@ fn ndk() -> Option<&'static BinderNdk> {
         let p_parcel_delete = sym("AParcel_delete");
         let p_write_binder = sym("AParcel_writeStrongBinder");
         let p_write_i32 = sym("AParcel_writeInt32");
+        let p_write_str = sym("AParcel_writeString");
         let p_read_i32 = sym("AParcel_readInt32");
         let p_join = sym("ABinderProcess_joinThreadPool");
         let p_start = sym("ABinderProcess_startThreadPool");
@@ -83,7 +86,7 @@ fn ndk() -> Option<&'static BinderNdk> {
         if p_get_service.is_null() || p_class_define.is_null() || p_binder_new.is_null()
             || p_prepare_tx.is_null() || p_transact.is_null() || p_parcel_delete.is_null()
             || p_write_binder.is_null() || p_write_i32.is_null()
-            || p_read_i32.is_null() || p_join.is_null() || p_start.is_null() || p_associate.is_null()
+            || p_write_str.is_null() || p_read_i32.is_null() || p_join.is_null() || p_start.is_null() || p_associate.is_null()
         { return None; }
         
         Some(BinderNdk {
@@ -95,6 +98,7 @@ fn ndk() -> Option<&'static BinderNdk> {
             parcel_delete: std::mem::transmute(p_parcel_delete),
             write_binder: std::mem::transmute(p_write_binder),
             write_int32: std::mem::transmute(p_write_i32),
+            write_string: std::mem::transmute(p_write_str),
             read_i32: std::mem::transmute(p_read_i32),
             join_thread_pool: std::mem::transmute(p_join),
             start_thread_pool: std::mem::transmute(p_start),
@@ -320,4 +324,119 @@ pub fn set_refresh_rate_binder(mode: i32) -> bool {
     }
 
     ok
+}
+// ===== SCREEN_BRIGHT_WAKE_LOCK (binder → PowerManagerService) =====
+// 防止系统屏超时自动息屏 (挂机黑屏期间保持前台不 onPause)。
+// IPowerManager 事务 (framework.jar smali 提取):
+//   acquireWakeLock = 0x1, releaseWakeLock = 0x3
+//   acquire 参数序列: lock(IBinder) flags(int) tag(String) packageName(String)
+//                     workSource(null→0) historyTag(String) flags2(int) callback(null→0)
+const SCREEN_BRIGHT_WAKE_LOCK: i32 = 0x0a;
+const TX_ACQUIRE_WAKE_LOCK: u32 = 0x1;
+const TX_RELEASE_WAKE_LOCK: u32 = 0x3;
+
+struct SendPtr(*mut c_void);
+unsafe impl Send for SendPtr {}
+unsafe impl Sync for SendPtr {}
+static WL_TOKEN: OnceLock<SendPtr> = OnceLock::new();
+
+fn wake_token() -> Option<*mut c_void> {
+    if let Some(p) = WL_TOKEN.get() {
+        return Some(p.0);
+    }
+    let ndk = ndk()?;
+    let clazz = unsafe {
+        (ndk.class_define)(
+            b"com.appopt.wakelock\0".as_ptr() as *const c_char,
+            Some(on_create),
+            Some(on_destroy),
+            Some(am_dummy_on_transact),
+        )
+    };
+    if clazz.is_null() {
+        return None;
+    }
+    let token = unsafe { (ndk.binder_new)(clazz, std::ptr::null_mut()) };
+    if token.is_null() {
+        return None;
+    }
+    let _ = WL_TOKEN.set(SendPtr(token));
+    Some(token)
+}
+
+fn power_service() -> Option<*mut c_void> {
+    let ndk = ndk()?;
+    Some(unsafe { (ndk.get_service)(b"power\0".as_ptr() as *const c_char) })
+}
+
+/// 获取 SCREEN_BRIGHT_WAKE_LOCK (挂机开启 / 重启恢复)
+pub fn wake_lock_acquire() -> bool {
+    let Some(ndk) = ndk() else { return false };
+    let Some(power) = power_service() else { return false };
+    let Some(token) = wake_token() else { return false };
+    let mut in_parcel: *mut c_void = std::ptr::null_mut();
+    let mut out_parcel: *mut c_void = std::ptr::null_mut();
+    unsafe {
+        if (ndk.prepare_tx)(power, &mut in_parcel) != STATUS_OK || in_parcel.is_null() {
+            return false;
+        }
+        let _ = (ndk.write_binder)(in_parcel, token);   // lock
+        let _ = (ndk.write_int32)(in_parcel, SCREEN_BRIGHT_WAKE_LOCK);   // flags
+        let tag = b"AppOpt-hang\0";
+        let _ = (ndk.write_string)(in_parcel, tag.as_ptr() as *const c_char, (tag.len() - 1) as u32);
+        let pkg = b"com.android.shell\0";
+        let _ = (ndk.write_string)(in_parcel, pkg.as_ptr() as *const c_char, (pkg.len() - 1) as u32);
+        let _ = (ndk.write_int32)(in_parcel, 0);   // workSource null
+        let _ = (ndk.write_string)(in_parcel, std::ptr::null(), 0);   // historyTag null
+        let _ = (ndk.write_int32)(in_parcel, 0);   // flags2
+        let _ = (ndk.write_binder)(in_parcel, std::ptr::null_mut());   // callback null
+
+        let status =
+            (ndk.transact)(power, TX_ACQUIRE_WAKE_LOCK, &mut in_parcel, &mut out_parcel, 0);
+        let mut ok = status == STATUS_OK;
+        if ok && !out_parcel.is_null() {
+            let mut exc = 0i32;
+            let _ = (ndk.read_i32)(out_parcel, &mut exc);
+            if exc != 0 {
+                ok = false;
+            }
+        }
+        (ndk.parcel_delete)(in_parcel);
+        if !out_parcel.is_null() {
+            (ndk.parcel_delete)(out_parcel);
+        }
+        ok
+    }
+}
+
+/// 释放 SCREEN_BRIGHT_WAKE_LOCK (挂机关闭)
+pub fn wake_lock_release() -> bool {
+    let Some(ndk) = ndk() else { return false };
+    let Some(power) = power_service() else { return false };
+    let Some(token) = WL_TOKEN.get().map(|p| p.0) else { return false };
+    let mut in_parcel: *mut c_void = std::ptr::null_mut();
+    let mut out_parcel: *mut c_void = std::ptr::null_mut();
+    unsafe {
+        if (ndk.prepare_tx)(power, &mut in_parcel) != STATUS_OK || in_parcel.is_null() {
+            return false;
+        }
+        let _ = (ndk.write_binder)(in_parcel, token);
+        let _ = (ndk.write_int32)(in_parcel, 0);   // release flags
+
+        let status =
+            (ndk.transact)(power, TX_RELEASE_WAKE_LOCK, &mut in_parcel, &mut out_parcel, 0);
+        let mut ok = status == STATUS_OK;
+        if ok && !out_parcel.is_null() {
+            let mut exc = 0i32;
+            let _ = (ndk.read_i32)(out_parcel, &mut exc);
+            if exc != 0 {
+                ok = false;
+            }
+        }
+        (ndk.parcel_delete)(in_parcel);
+        if !out_parcel.is_null() {
+            (ndk.parcel_delete)(out_parcel);
+        }
+        ok
+    }
 }

@@ -1003,6 +1003,13 @@ fn waylay_set_api(req: &Request) -> (u16, String) {
         let on = v["scr"].as_bool().unwrap_or(false);
         set_hang_black(on);
         settings_save();
+        /* 防系统屏超时灭屏: SCREEN_BRIGHT_WAKE_LOCK (binder → PowerManagerService),
+         * 挂机期间系统永不自动息屏 → 游戏保持前台不 onPause */
+        if on {
+            crate::process_observer::wake_lock_acquire();
+        } else {
+            crate::process_observer::wake_lock_release();
+        }
         crate::config::set_scr_req(on);
     }
     /* 仅带 rules 字段的请求才保存配置; 连接/挂机开关等无 rules 请求不落盘,
