@@ -263,6 +263,37 @@ pub fn scr_read_brightness() -> Option<i32> {
         .and_then(|s| s.trim().parse::<i32>().ok())
 }
 
+/// 挂机时屏幕超时原值 (关闭挂机还原用)
+static SCR_TIMEOUT_OLD: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// 挂机开启: 记录原 screen_off_timeout 并设为最大值 (绕过 UI 30min 上限,
+/// PMS 永不自动息屏 → 游戏保持前台不 onPause; root 面具模块可直接改)
+pub fn scr_timeout_max() {
+    if let Ok(s) = std::process::Command::new("settings")
+        .args(["get", "system", "screen_off_timeout"])
+        .output()
+    {
+        if s.status.success() {
+            let v = String::from_utf8_lossy(&s.stdout).trim().to_string();
+            if !v.is_empty() {
+                *SCR_TIMEOUT_OLD.lock().unwrap() = Some(v);
+            }
+        }
+    }
+    let _ = std::process::Command::new("settings")
+        .args(["put", "system", "screen_off_timeout", "2147483647"])
+        .status();
+}
+
+/// 挂机关闭: 还原原 screen_off_timeout
+pub fn scr_timeout_restore() {
+    if let Some(v) = SCR_TIMEOUT_OLD.lock().unwrap().take() {
+        let _ = std::process::Command::new("settings")
+            .args(["put", "system", "screen_off_timeout", &v])
+            .status();
+    }
+}
+
 /// 屏幕挂机黑屏: 写亮度
 pub fn scr_set_brightness(v: i32) {
     if let Some(d) = backlight_dir() {

@@ -905,10 +905,10 @@ fn main() {
     crate::web::init_uclamp_support();
     // 挂机黑屏: 初始化扫描背光设备 (动态路径)
     crate::ebpf_mode::backlight_init();
-    // 挂机黑屏持久状态: 上次开启 → 自动恢复 (启动监听线程 + SCREEN_BRIGHT_WAKE_LOCK)
+    // 挂机黑屏持久状态: 上次开启 → 自动恢复 (启动监听线程 + screen_off_timeout 设最大)
     if crate::web::hang_black_active() {
         crate::event_probe::start_hang_monitor();
-        crate::process_observer::wake_lock_acquire();
+        crate::ebpf_mode::scr_timeout_max();
     }
 
     // ================= 初始化并发: 独立无依赖项并行 =================

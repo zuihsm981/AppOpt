@@ -1003,12 +1003,12 @@ fn waylay_set_api(req: &Request) -> (u16, String) {
         let on = v["scr"].as_bool().unwrap_or(false);
         set_hang_black(on);
         settings_save();
-        /* 防系统屏超时灭屏: SCREEN_BRIGHT_WAKE_LOCK (binder → PowerManagerService),
-         * 挂机期间系统永不自动息屏 → 游戏保持前台不 onPause */
+        /* 防系统屏超时灭屏: screen_off_timeout 设最大 (root 绕过 UI 30min 上限),
+         * 挂机期间系统永不自动息屏 → 游戏保持前台不 onPause; 关闭还原 */
         if on {
-            crate::process_observer::wake_lock_acquire();
+            crate::ebpf_mode::scr_timeout_max();
         } else {
-            crate::process_observer::wake_lock_release();
+            crate::ebpf_mode::scr_timeout_restore();
         }
         crate::config::set_scr_req(on);
     }
