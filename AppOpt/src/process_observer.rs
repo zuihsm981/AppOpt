@@ -370,11 +370,12 @@ struct StrBuf {
 
 unsafe extern "C" fn copy_str_fn(data: *mut c_void, s: *const c_char, len: usize) -> usize {
     unsafe {
-        if !data.is_null() {
+        // 只返回 len 即算成功 (NDK 只看返回值, parcel 位置由 NDK 内部推进);
+        // 仅在 len 安全 (≤ 缓冲区且非空) 时才拷贝, 异常 len 不碰内存避免越界读崩溃
+        if !data.is_null() && !s.is_null() && len > 0 && len <= 512 {
             let b = &mut *(data as *mut StrBuf);
-            let n = len.min(b.data.len());
-            std::ptr::copy_nonoverlapping(s as *const u8, b.data.as_mut_ptr(), n);
-            b.len = n;
+            std::ptr::copy_nonoverlapping(s as *const u8, b.data.as_mut_ptr(), len);
+            b.len = len;
         }
     }
     len
