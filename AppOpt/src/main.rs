@@ -619,11 +619,67 @@ impl AppState {
         self.refresh_apply(crate::config::DEFAULT_REFRESH_PACKAGE.to_string());
     }
 
+    /// 聚焦确认结果 (桌面/非规则回调触发的 effectiveUid 查询):
+    /// 按聚焦 uid 应用规则 — 规则应用 → 应用; 无规则 (桌面等) → 回落。
+    /// 覆盖"按最近键回落 → 返回原应用聚焦切回"的误回落。
+    fn apply_focused_uid(&mut self, uid: i32) {
+        if uid <= 0 {
+            return;   // 查询失败/无聚焦 → 不动 (保持当前)
+        }
+        let my = self.uid_rules.get(&uid).cloned().unwrap_or_default();
+        if let Some(es) = self.ebpf_state.as_ref() {
+            es.bpf.vfc_fg(if self.vfc_uid_set.contains(&uid) { uid } else { 0 });
+            let in_srv = my.iter().any(|r| r.kind == crate::config::WaylayKind::Src);
+            es.bpf.srv_active(in_srv);
+        }
+        // prop (系统属性伪装): 聚焦应用有 prop 规则 → 激活; 无 → 恢复
+        let prop_rules: Vec<(String, String)> = my
+            .iter()
+            .filter(|r| r.kind == crate::config::WaylayKind::Prop)
+            .map(|r| (r.from.clone(), r.to.clone()))
+            .collect();
+        let want_prop = !prop_rules.is_empty();
+        if want_prop != self.prop_active_cur {
+            self.prop_active_cur = want_prop;
+            if let Some(es) = self.ebpf_state.as_ref() {
+                if want_prop {
+                    crate::config::set_prop_rules(&prop_rules);
+                }
+                es.bpf.prop_file_apply(want_prop);
+            }
+        }
+        // 刷新率: 规则应用 → 应用; 无刷新率规则 → 回落全局
+        match self.uid_map.get(&uid) {
+            Some(e) if e.rfr => self.refresh_apply(e.pkg.clone()),
+            _ => self.refresh_apply(crate::config::DEFAULT_REFRESH_PACKAGE.to_string()),
+        }
+    }
+
+    /// 桌面/非规则回调 (回落路径): 异步查询聚焦 effectiveUid → 主线程 EV_CONFIRM
+    /// apply_focused_uid 纠正 (无防抖 — 按最近键→快速返回要求第二次查询不被挡)
+    fn request_focus_confirm() {
+        let wfd = CONFIRM_W_FD.load(Ordering::Acquire);
+        if wfd < 0 {
+            return;
+        }
+        std::thread::spawn(move || {
+            let uid = crate::process_observer::query_focused_effective_uid().unwrap_or(-1);
+            let _ = unsafe { libc::write(wfd, &uid as *const i32 as *const libc::c_void, 4) };
+        });
+    }
+
     /// binder 前台回调 (pid+uid): 查 uid 表分发 CPU (冷启动 ApplyPkg + pidfd watch)
     /// 与刷新率 (包名) —— 原 EV_FG 分支主体
     fn on_fg(&mut self, pid: i32, uid: i32) {
         /* 四功能统一 uid: 直接查 uid 规则表 (uid 在该表 = 有规则) */
         self.last_fg_uid = uid;
+        // 桌面 (launcher) 回调: 不立即回落 — 先异步查询聚焦 effectiveUid,
+        // 由 EV_CONFIRM apply_focused_uid 统一决定 (返回原应用时聚焦已切回游戏,
+        // 避免误回落闪烁; 真切桌面则查询确认后回落)。只针对桌面, 其他无规则应用照常回落。
+        if uid == LAUNCHER_UID.load(Ordering::Relaxed) {
+            Self::request_focus_confirm();
+            return;
+        }
         let my: Vec<crate::config::WaylayRule> = self
             .uid_rules
             .get(&uid)
@@ -695,7 +751,7 @@ impl AppState {
                 // 无刷新率规则应用 (含纯 CPU 规则应用) → 直接回落全局
                 if rfr {
                     if pkg == crate::config::DEFAULT_REFRESH_PACKAGE {
-                        /* 桌面/非规则: 直接回落全局 (按当前 uid 规则决定, 无需记录判断) */
+                        /* 桌面回调已在 on_fg 开头拦截 (聚焦确认), 此处防御性回落 */
                         self.rfr_evict_all();
                     } else {
                         self.refresh_fg_rule_app(pid, &pkg);
@@ -744,6 +800,12 @@ static RFR_MON: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i
 pub fn rfr_hit_list() -> Vec<(i32, String)> {
     RFR_MON.lock().unwrap().iter().map(|(p, k)| (*p, k.clone())).collect()
 }
+
+/// 桌面 (launcher) uid: 聚焦确认只针对桌面回调 (启动时从 packages.list 解析)
+static LAUNCHER_UID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+/// 聚焦确认: 查询结果写端 (查询线程 → 主线程 EV_CONFIRM)
+pub(crate) static CONFIRM_W_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+/// 聚焦确认: 查询结果写端 (查询线程 → 主线程 EV_CONFIRM)
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -852,20 +914,6 @@ fn main() {
         }
     });
 
-    // 临时探针: binder 直连 activity_task getFocusedRootTaskInfo (事务 32),
-    // 每 2 秒重试一次 (10 次), 覆盖写文件 — 亮屏(桌面可见)后自动拿到有值结果
-    std::thread::spawn(|| {
-        for _ in 0..10 {
-            std::thread::sleep(std::time::Duration::from_millis(2000));
-            let msg = match crate::process_observer::probe_focused_root_task_info() {
-                Ok(s) => format!("AppOptProbe ok: {}", s),
-                Err(err) => format!("AppOptProbe failed: {}", err),
-            };
-            println!("{}", msg);
-            let _ = std::fs::write("/data/local/tmp/appopt_probe.txt", format!("{}\n", msg));
-        }
-    });
-
     // T4: packages.list inotify (返回 fd; 完成后线程退出)
     let pkg_inotify_thread = std::thread::spawn(crate::config::init_pkg_inotify);
 
@@ -930,6 +978,26 @@ fn main() {
     let mut touch_sv: [libc::c_int; 2] = [-1, -1];
     let mut exit_sv: [libc::c_int; 2] = [-1, -1];
     let (touch_ok, exit_ok) = spawn_event_probe(&mut touch_sv, &mut exit_sv);
+    // 聚焦确认通道: 桌面回调时异步查询 effectiveUid → 主线程 EV_CONFIRM 判回落
+    let mut confirm_sv: [libc::c_int; 2] = [-1, -1];
+    let confirm_ok = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+            confirm_sv.as_mut_ptr(),
+        ) == 0
+    };
+    if confirm_ok {
+        CONFIRM_W_FD.store(confirm_sv[1], Ordering::Release);
+        LAUNCHER_UID.store(
+            crate::pkg_to_uid_map()
+                .get(crate::config::DEFAULT_REFRESH_PACKAGE)
+                .copied()
+                .unwrap_or(-1),
+            Ordering::Relaxed,
+        );
+    }
     RFR_MON.lock().unwrap().clear();   /* 初始化: 清空 pidfd 监听刷新率命中记录 */
     crate::cpu_affinity::cpu_stats_clear();   /* 初始化: 清空线程状态页命中应用 */
     // T4: packages.list inotify fd
@@ -955,6 +1023,7 @@ fn main() {
     const EV_TOUCH: u64 = 8; // 用户态 /dev/input 触摸/输入活动 (替代 4.19 内核 input hook)
     const EV_EXIT_PID: u64 = 9; // pidfd 进程退出监听 (全模式统一退出来源)
     const EV_WAYLAY: u64 = 10; // waylay.conf inotify (外部编辑/原子替换 → 重读校验全量下发)
+    const EV_CONFIRM: u64 = 13; // 聚焦确认查询结果 (桌面回调时异步查询 effectiveUid 回传)
 
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epfd < 0 {
@@ -977,6 +1046,9 @@ fn main() {
     }
     if exit_ok {
         epoll_add(epfd, exit_sv[0], EV_EXIT_PID);
+    }
+    if confirm_ok {
+        epoll_add(epfd, confirm_sv[0], EV_CONFIRM);
     }
 
     // packages.list inotify: 应用安装/卸载/替换 → 重建 uid 表 (fd 由并发 T4 线程建立;
@@ -1161,6 +1233,24 @@ fn main() {
                             }
                             // 刷新率规则应用退出: 清 web 命中显示表 (回落已由前台回调驱动)
                             RFR_MON.lock().unwrap().remove(&pid);
+                        }
+                    }
+                }
+                EV_CONFIRM => {
+                    // TaskStackListener 聚焦事件触发的 effectiveUid 查询结果:
+                    // 按聚焦 uid 应用规则 (规则应用 → 应用; 无规则 → 回落)
+                    if confirm_ok && confirm_sv[0] > 0 {
+                        let mut uid = 0i32;
+                        let n = unsafe {
+                            libc::recv(
+                                confirm_sv[0],
+                                &mut uid as *mut i32 as *mut libc::c_void,
+                                4,
+                                0,
+                            )
+                        };
+                        if n == 4 {
+                            state.apply_focused_uid(uid);
                         }
                     }
                 }
