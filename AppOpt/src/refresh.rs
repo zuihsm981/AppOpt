@@ -135,6 +135,9 @@ enum RefreshEvent {
     Input,
     /// 主线程判定前台 uid 命中刷新率表后, 下发包名应用刷新率
     FgPkg(String),
+    /// 挂机黑屏挂起/恢复: true=停止空闲回落定时器 (刷新率保持 active,
+    /// 单击恢复时无刷新率切换, 避免面板切换绿屏/瞬亮); false=重启定时器
+    HangSuspend(bool),
 }
 
 struct AppRefreshConfig {
@@ -480,6 +483,17 @@ pub fn refresh_init(display_modes: std::thread::JoinHandle<Vec<(u32, u32, u32, f
                                 RefreshEvent::FgPkg(pkg) => {
                                     try_apply_fg_pkg(&mut state, &pkg);
                                 }
+                                RefreshEvent::HangSuspend(on) => {
+                                    if on {
+                                        // 黑屏: 停止空闲回落定时器 → 刷新率保持 active,
+                                        // 单击时 handle_input 切回 active 无实际切换
+                                        timerfd_cancel(state.timer_fd);
+                                        state.last_reset_time = None;
+                                    } else {
+                                        // 渐亮稳定: 重启空闲回落定时器
+                                        reset_timer(&mut state, true);
+                                    }
+                                }
                             }
                         }
                         check_config(&mut state);
@@ -511,6 +525,18 @@ pub fn refresh_send_fg_pkg(pkg: String) {
     let guard = crate::lock_ignore_poison(&REFRESH_TX);
     if let Some(tx) = guard.as_ref() {
         let _ = tx.send(RefreshEvent::FgPkg(pkg));
+        wake();
+    }
+}
+
+/// 挂机黑屏挂起/恢复 (由 hang_monitor 线程调用):
+///   true  = 黑屏写 0 后: 停止空闲回落定时器 (刷新率保持 active,
+///           单击恢复时无刷新率切换, 避免面板切换绿屏/瞬亮);
+///   false = 渐亮稳定后: 重启空闲回落定时器。
+pub fn refresh_hang_suspend(on: bool) {
+    let guard = crate::lock_ignore_poison(&REFRESH_TX);
+    if let Some(tx) = guard.as_ref() {
+        let _ = tx.send(RefreshEvent::HangSuspend(on));
         wake();
     }
 }
