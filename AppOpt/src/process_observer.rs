@@ -360,9 +360,30 @@ pub fn set_refresh_rate_binder(mode: i32) -> bool {
     ok
 }
 
-/// AParcel_readString 的 copy_func: 不拷贝 (data 为 null), 仅返回长度使读取成功 → 跳过字符串
-unsafe extern "C" fn skip_str_fn(_data: *mut c_void, _s: *const c_char, len: usize) -> usize {
+/// 读字符串缓冲区 (copy_func 目标): data 为 [StrBuf], 拷贝并记录实际长度
+/// (string_data 必须非 null, 否则 AParcel_readString 直接失败 → 跳过错位)
+#[repr(C)]
+struct StrBuf {
+    data: [u8; 512],
+    len: usize,
+}
+
+unsafe extern "C" fn copy_str_fn(data: *mut c_void, s: *const c_char, len: usize) -> usize {
+    unsafe {
+        if !data.is_null() {
+            let b = &mut *(data as *mut StrBuf);
+            let n = len.min(b.data.len());
+            std::ptr::copy_nonoverlapping(s as *const u8, b.data.as_mut_ptr(), n);
+            b.len = n;
+        }
+    }
     len
+}
+
+/// 跳过 parcel 里的一个字符串 (非 null 缓冲区保证 AParcel_readString 成功)
+fn skip_string(ndk: &BinderNdk, p: *mut c_void) -> bool {
+    let mut sb = StrBuf { data: [0u8; 512], len: 0 };
+    unsafe { (ndk.read_string)(p, &mut sb as *mut _ as *mut c_void, copy_str_fn) }
 }
 
 /// binder 查询: getFocusedRootTaskInfo (事务 0x20=32) 只读 effectiveUid (第 3 字段),
@@ -419,7 +440,7 @@ pub fn query_focused_effective_uid() -> Result<i32, String> {
     let _ = unsafe { (ndk.read_i32)(p, &mut n) };   // childTaskNames 长度
     let mut str_fail = 0i32;
     for _ in 0..n.max(0) {
-        if !unsafe { (ndk.read_string)(p, std::ptr::null_mut(), skip_str_fn) } {
+        if !skip_string(ndk, p) {
             str_fail += 1;
         }
     }
