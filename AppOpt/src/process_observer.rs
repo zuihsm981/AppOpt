@@ -387,6 +387,46 @@ fn skip_string(ndk: &BinderNdk, p: *mut c_void) -> bool {
     unsafe { (ndk.read_string)(p, &mut sb as *mut _ as *mut c_void, copy_str_fn) }
 }
 
+/// 临时诊断: dump getFocusedRootTaskInfo 回复 parcel 前 28 个 int32 (定位解析偏移)
+pub fn dump_root_task_ints() {
+    let Some(ndk) = ndk() else { return };
+    let svc = unsafe { (ndk.get_service)(b"activity_task\0".as_ptr() as *const c_char) };
+    if svc.is_null() { return; }
+    let atm_class = get_atm_class();
+    if atm_class.is_null() { return; }
+    if !unsafe { (ndk.associate_class)(svc, atm_class as *const c_void) } { return; }
+    let mut in_parcel: *mut c_void = std::ptr::null_mut();
+    if unsafe { (ndk.prepare_tx)(svc, &mut in_parcel) } != STATUS_OK || in_parcel.is_null() { return; }
+    let mut out_parcel: *mut c_void = std::ptr::null_mut();
+    let status = unsafe { (ndk.transact)(svc, 32, &mut in_parcel, &mut out_parcel, 0) };
+    unsafe { (ndk.parcel_delete)(in_parcel); }
+    if status != STATUS_OK || out_parcel.is_null() {
+        if !out_parcel.is_null() { unsafe { (ndk.parcel_delete)(out_parcel); } }
+        return;
+    }
+    let p = out_parcel;
+    let mut exc = 0i32;
+    let _ = unsafe { (ndk.read_i32)(p, &mut exc) };
+    let mut obj = 0i32;
+    let _ = unsafe { (ndk.read_i32)(p, &mut obj) };
+    let mut s = format!("dump exc={} obj={}", exc, obj);
+    for i in 0..28 {
+        let mut v = 0i32;
+        let ok = unsafe { (ndk.read_i32)(p, &mut v) };
+        s.push_str(&format!(" [{}]={}ok{}", i, v, ok as i32));
+    }
+    unsafe { (ndk.parcel_delete)(p); }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/data/local/tmp/appopt_dbg.txt")
+    {
+        use std::io::Write;
+        let _ = f.write_all(s.as_bytes());
+        let _ = f.write_all(b"\n");
+    }
+}
+
 /// binder 查询: getFocusedRootTaskInfo (事务 0x20=32) 只读 effectiveUid (第 3 字段),
 /// 用于"桌面回调时确认聚焦" — 不读 baseIntent/ComponentName, 无崩溃风险。
 /// Ok(effectiveUid) = 聚焦任务的有效 uid; Err = 无聚焦/失败。

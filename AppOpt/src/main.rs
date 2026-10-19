@@ -1035,6 +1035,12 @@ fn main() {
     let fg_recv_fd = fg_sv[0];
     let mut fg_buf = [0u8; 8];
 
+    // 临时诊断: dump 一次 RootTaskInfo 原始 int 序列 (定位解析偏移)
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        crate::process_observer::dump_root_task_ints();
+    });
+
     crate::cpu_affinity::start();
 
     // 刷新率控制模块，独立线程运行 (binder 回调经主线程 uid 表 → FgPkg 消息驱动)
