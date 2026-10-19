@@ -853,15 +853,17 @@ fn main() {
     });
 
     // 临时探针: binder 直连 activity_task getFocusedRootTaskInfo (事务 32),
-    // 实测 RootTaskInfo parcel 前段 + baseIntent null 标志 (决定后续实现路线)
+    // 每 2 秒重试一次 (10 次), 覆盖写文件 — 亮屏(桌面可见)后自动拿到有值结果
     std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_millis(800));
-        let msg = match crate::process_observer::probe_focused_root_task_info() {
-            Ok(s) => format!("AppOptProbe ok: {}", s),
-            Err(err) => format!("AppOptProbe failed: {}", err),
-        };
-        println!("{}", msg);
-        let _ = std::fs::write("/data/local/tmp/appopt_probe.txt", format!("{}\n", msg));
+        for _ in 0..10 {
+            std::thread::sleep(std::time::Duration::from_millis(2000));
+            let msg = match crate::process_observer::probe_focused_root_task_info() {
+                Ok(s) => format!("AppOptProbe ok: {}", s),
+                Err(err) => format!("AppOptProbe failed: {}", err),
+            };
+            println!("{}", msg);
+            let _ = std::fs::write("/data/local/tmp/appopt_probe.txt", format!("{}\n", msg));
+        }
     });
 
     // T4: packages.list inotify (返回 fd; 完成后线程退出)

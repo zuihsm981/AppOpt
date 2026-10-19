@@ -421,6 +421,14 @@ pub fn probe_focused_root_task_info() -> Result<String, String> {
     }
 
     let p = out_parcel;
+    // readTypedObject(RootTaskInfo.CREATOR) 外层 null 标志: 0=null(无聚焦任务), 1=非 null
+    let mut obj_flag = 0i32;
+    let _ = unsafe { (ndk.read_i32)(p, &mut obj_flag) };
+    if obj_flag == 0 {
+        unsafe { (ndk.parcel_delete)(p); }
+        return Ok("返回 null (当前无聚焦 root task, 常见于息屏/锁屏)".to_string());
+    }
+
     let mut n = 0i32;
     // RootTaskInfo 子类 readFromParcel: bounds Rect (null 标志 + left/top/right/bottom)
     let _ = unsafe { (ndk.read_i32)(p, &mut n) };
