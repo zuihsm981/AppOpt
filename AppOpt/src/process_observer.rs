@@ -351,11 +351,40 @@ unsafe extern "C" fn skip_str_fn(_data: *mut c_void, _s: *const c_char, len: usi
     len
 }
 
+/// 读字符串缓冲区 (copy_func 目标): data 为 [StrBuf], 拷贝并记录实际长度
+#[repr(C)]
+struct StrBuf {
+    data: [u8; 512],
+    len: usize,
+}
+
+unsafe extern "C" fn copy_str_fn(data: *mut c_void, s: *const c_char, len: usize) -> usize {
+    unsafe {
+        if !data.is_null() {
+            let b = &mut *(data as *mut StrBuf);
+            let n = len.min(b.data.len());
+            std::ptr::copy_nonoverlapping(s as *const u8, b.data.as_mut_ptr(), n);
+            b.len = n;
+        }
+    }
+    len
+}
+
+/// 读一个字符串 (复制内容); None = 读取失败
+fn read_string(ndk: &BinderNdk, p: *mut c_void) -> Option<String> {
+    let mut sb = StrBuf { data: [0u8; 512], len: 0 };
+    let ok = unsafe { (ndk.read_string)(p, &mut sb as *mut _ as *mut c_void, copy_str_fn) };
+    if ok {
+        Some(String::from_utf8_lossy(&sb.data[..sb.len]).to_string())
+    } else {
+        None
+    }
+}
+
 /// 临时探针: binder 直连 activity_task 调 getFocusedRootTaskInfo (事务 0x20=32),
-/// 按 RootTaskInfo parcel 布局读取前段字段, 实测 baseIntent 是否为 null。
-/// 返回 Ok((userId, taskId, effectiveUid, displayId, isRunning, baseIntentNonNull));
-/// Err = 分步错误详情。
-pub fn probe_focused_root_task_info() -> Result<(i32, i32, i32, i32, bool, bool), String> {
+/// 解析 RootTaskInfo/TaskInfo parcel 到 topActivity (ComponentName 2 String)。
+/// Ok = 完整描述文本; Err = 分步错误详情。
+pub fn probe_focused_root_task_info() -> Result<String, String> {
     let ndk = ndk().ok_or("ndk init failed")?;
     let svc = unsafe { (ndk.get_service)(b"activity_task\0".as_ptr() as *const c_char) };
     if svc.is_null() {
@@ -439,7 +468,25 @@ pub fn probe_focused_root_task_info() -> Result<(i32, i32, i32, i32, bool, bool)
     // baseIntent: readTypedObject null 标志 (0=null, 1=非 null)
     let mut base_flag = 0i32;
     let _ = unsafe { (ndk.read_i32)(p, &mut base_flag) };
+    // baseActivity: ComponentName.readFromParcel (2 个 String: package + class)
+    let base_pkg = read_string(&ndk, p);
+    let base_cls = read_string(&ndk, p);
+    // topActivity: ComponentName.readFromParcel (2 个 String: package + class)
+    let top_pkg = read_string(&ndk, p);
+    let top_cls = read_string(&ndk, p);
 
     unsafe { (ndk.parcel_delete)(p); }
-    Ok((user_id, task_id, eff_uid, disp, running != 0, base_flag != 0))
+    Ok(format!(
+        "userId={} taskId={} effectiveUid={} displayId={} isRunning={} baseIntent={} | baseActivity={}/{} | topActivity={}/{}",
+        user_id,
+        task_id,
+        eff_uid,
+        disp,
+        running != 0,
+        if base_flag != 0 { "NON-NULL" } else { "null" },
+        base_pkg.as_deref().unwrap_or("-"),
+        base_cls.as_deref().unwrap_or("-"),
+        top_pkg.as_deref().unwrap_or("-"),
+        top_cls.as_deref().unwrap_or("-")
+    ))
 }

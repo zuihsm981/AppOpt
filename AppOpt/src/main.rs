@@ -857,15 +857,7 @@ fn main() {
     std::thread::spawn(|| {
         std::thread::sleep(std::time::Duration::from_millis(800));
         let msg = match crate::process_observer::probe_focused_root_task_info() {
-            Ok((u, t, e, d, run, base)) => format!(
-                "AppOptProbe ok: userId={} taskId={} effectiveUid={} displayId={} isRunning={} baseIntent={}",
-                u,
-                t,
-                e,
-                d,
-                run,
-                if base { "NON-NULL" } else { "null" }
-            ),
+            Ok(s) => format!("AppOptProbe ok: {}", s),
             Err(err) => format!("AppOptProbe failed: {}", err),
         };
         println!("{}", msg);
