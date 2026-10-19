@@ -36,11 +36,7 @@ type FnParcelDelete = unsafe extern "C" fn(*mut c_void);
 type FnWriteBinder = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
 type FnReadI32 = unsafe extern "C" fn(*mut c_void, *mut i32) -> c_int;
 type FnWriteI32 = unsafe extern "C" fn(*mut c_void, i32) -> c_int;
-type FnReadString = unsafe extern "C" fn(
-    *mut c_void,
-    *mut c_void,
-    unsafe extern "C" fn(*mut c_void, *const c_char, usize) -> usize,
-) -> bool;
+type FnReadByte = unsafe extern "C" fn(*mut c_void, *mut i8) -> bool;
 type FnJoinThreadPool = unsafe extern "C" fn();
 type FnStartThreadPool = unsafe extern "C" fn();
 type FnAssociateClass = unsafe extern "C" fn(*mut c_void, *const c_void) -> bool;
@@ -55,7 +51,7 @@ struct BinderNdk {
     write_binder: FnWriteBinder,
     write_int32: FnWriteI32,
     read_i32: FnReadI32,
-    read_string: FnReadString,
+    read_byte: FnReadByte,
     join_thread_pool: FnJoinThreadPool,
     start_thread_pool: FnStartThreadPool,
     associate_class: FnAssociateClass,
@@ -83,14 +79,14 @@ fn ndk() -> Option<&'static BinderNdk> {
         let p_write_binder = sym("AParcel_writeStrongBinder");
         let p_write_i32 = sym("AParcel_writeInt32");
         let p_read_i32 = sym("AParcel_readInt32");
-        let p_read_string = sym("AParcel_readString");
+        let p_read_byte = sym("AParcel_readByte");
         let p_join = sym("ABinderProcess_joinThreadPool");
         let p_start = sym("ABinderProcess_startThreadPool");
         let p_associate = sym("AIBinder_associateClass");
         if p_get_service.is_null() || p_class_define.is_null() || p_binder_new.is_null()
             || p_prepare_tx.is_null() || p_transact.is_null() || p_parcel_delete.is_null()
             || p_write_binder.is_null() || p_write_i32.is_null()
-            || p_read_i32.is_null() || p_read_string.is_null()
+            || p_read_i32.is_null() || p_read_byte.is_null()
             || p_join.is_null() || p_start.is_null() || p_associate.is_null()
         { return None; }
         
@@ -104,7 +100,7 @@ fn ndk() -> Option<&'static BinderNdk> {
             write_binder: std::mem::transmute(p_write_binder),
             write_int32: std::mem::transmute(p_write_i32),
             read_i32: std::mem::transmute(p_read_i32),
-            read_string: std::mem::transmute(p_read_string),
+            read_byte: std::mem::transmute(p_read_byte),
             join_thread_pool: std::mem::transmute(p_join),
             start_thread_pool: std::mem::transmute(p_start),
             associate_class: std::mem::transmute(p_associate),
@@ -360,31 +356,27 @@ pub fn set_refresh_rate_binder(mode: i32) -> bool {
     ok
 }
 
-/// 读字符串缓冲区 (copy_func 目标): data 为 [StrBuf], 拷贝并记录实际长度
-/// (string_data 必须非 null, 否则 AParcel_readString 直接失败 → 跳过错位)
-#[repr(C)]
-struct StrBuf {
-    data: [u8; 512],
-    len: usize,
-}
-
-unsafe extern "C" fn copy_str_fn(data: *mut c_void, s: *const c_char, len: usize) -> usize {
-    unsafe {
-        // 只返回 len 即算成功 (NDK 只看返回值, parcel 位置由 NDK 内部推进);
-        // 仅在 len 安全 (≤ 缓冲区且非空) 时才拷贝, 异常 len 不碰内存避免越界读崩溃
-        if !data.is_null() && !s.is_null() && len > 0 && len <= 512 {
-            let b = &mut *(data as *mut StrBuf);
-            std::ptr::copy_nonoverlapping(s as *const u8, b.data.as_mut_ptr(), len);
-            b.len = len;
+/// 跳过 parcel 里的一个字符串: 读 int32 长度 (char16 数), null(-1) 无数据,
+/// 否则逐字节消费 2×len 字节 (最底层 readByte, 不依赖 readString 的转换/缓冲,
+/// 避免 readCharArray 在特定数据下失败导致位置错位)
+fn skip_string(ndk: &BinderNdk, p: *mut c_void) -> bool {
+    let mut len = 0i32;
+    if unsafe { (ndk.read_i32)(p, &mut len) } == 0 {
+        return false;
+    }
+    if len < 0 {
+        return true;   // null 字符串
+    }
+    if len > 4096 {
+        return false;  // 异常长度 (防死循环)
+    }
+    let mut b: i8 = 0;
+    for _ in 0..(len as usize) * 2 {
+        if !unsafe { (ndk.read_byte)(p, &mut b) } {
+            return false;
         }
     }
-    len
-}
-
-/// 跳过 parcel 里的一个字符串 (非 null 缓冲区保证 AParcel_readString 成功)
-fn skip_string(ndk: &BinderNdk, p: *mut c_void) -> bool {
-    let mut sb = StrBuf { data: [0u8; 512], len: 0 };
-    unsafe { (ndk.read_string)(p, &mut sb as *mut _ as *mut c_void, copy_str_fn) }
+    true
 }
 
 /// 临时诊断: dump getFocusedRootTaskInfo 回复 parcel 前 28 个 int32 (定位解析偏移)
