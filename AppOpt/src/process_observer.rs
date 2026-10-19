@@ -432,10 +432,13 @@ pub fn query_focused_effective_uid() -> Result<i32, String> {
         unsafe { (ndk.parcel_delete)(p); }
         return Err("no focused root task".into());
     }
-    // RootTaskInfo 子类 7 字段 + TaskInfo: userId / taskId / effectiveUid
+    // RootTaskInfo 子类 readFromParcel: bounds Rect (readTypedObject:
+    // null 标志 + 非 null 时 left/top/right/bottom 4×int)
     let mut n = 0i32;
     let _ = unsafe { (ndk.read_i32)(p, &mut n) };   // bounds null 标志
-    for _ in 0..4 { let _ = unsafe { (ndk.read_i32)(p, &mut n) }; }  // Rect
+    if n != 0 {
+        for _ in 0..4 { let _ = unsafe { (ndk.read_i32)(p, &mut n) }; }  // Rect
+    }
     let _ = unsafe { (ndk.read_i32)(p, &mut n) };   // childTaskIds 长度
     for _ in 0..n.max(0) { let _ = unsafe { (ndk.read_i32)(p, &mut n) }; }
     let _ = unsafe { (ndk.read_i32)(p, &mut n) };   // childTaskNames 长度
