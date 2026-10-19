@@ -673,6 +673,23 @@ impl AppState {
     fn on_fg(&mut self, pid: i32, uid: i32) {
         /* 四功能统一 uid: 直接查 uid 规则表 (uid 在该表 = 有规则) */
         self.last_fg_uid = uid;
+        // 临时诊断: 记录前台回调
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/data/local/tmp/appopt_dbg.txt")
+        {
+            use std::io::Write;
+            let _ = f.write_all(
+                format!(
+                    "on_fg pid={} uid={} launcher={}\n",
+                    pid,
+                    uid,
+                    uid == LAUNCHER_UID.load(Ordering::Relaxed)
+                )
+                .as_bytes(),
+            );
+        }
         // 桌面 (launcher) 回调: 不立即回落 — 先异步查询聚焦 effectiveUid,
         // 由 EV_CONFIRM apply_focused_uid 统一决定 (返回原应用时聚焦已切回游戏,
         // 避免误回落闪烁; 真切桌面则查询确认后回落)。只针对桌面, 其他无规则应用照常回落。
@@ -1237,7 +1254,7 @@ fn main() {
                     }
                 }
                 EV_CONFIRM => {
-                    // TaskStackListener 聚焦事件触发的 effectiveUid 查询结果:
+                    // 桌面回调触发的聚焦确认查询结果 (effectiveUid):
                     // 按聚焦 uid 应用规则 (规则应用 → 应用; 无规则 → 回落)
                     if confirm_ok && confirm_sv[0] > 0 {
                         let mut uid = 0i32;
@@ -1250,6 +1267,15 @@ fn main() {
                             )
                         };
                         if n == 4 {
+                            // 临时诊断: 记录聚焦确认结果
+                            if let Ok(mut f) = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open("/data/local/tmp/appopt_dbg.txt")
+                            {
+                                use std::io::Write;
+                                let _ = f.write_all(format!("confirm uid={}\n", uid).as_bytes());
+                            }
                             state.apply_focused_uid(uid);
                         }
                     }

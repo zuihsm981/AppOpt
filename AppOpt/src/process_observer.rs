@@ -436,5 +436,14 @@ pub fn query_focused_effective_uid() -> Result<i32, String> {
     let _ = unsafe { (ndk.read_i32)(p, &mut eff_uid) };
 
     unsafe { (ndk.parcel_delete)(p); }
+    // 临时诊断: 记录 effectiveUid 查询结果
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/data/local/tmp/appopt_dbg.txt")
+    {
+        use std::io::Write;
+        let _ = f.write_all(format!("focus_eff_uid={}\n", eff_uid).as_bytes());
+    }
     Ok(eff_uid)
 }
