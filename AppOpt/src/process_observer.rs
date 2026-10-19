@@ -162,6 +162,20 @@ extern "C" fn on_transact(
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut uid) };
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut fg_val) };
 
+            // 临时诊断: 记录所有前台回调 (含 started=false) 到文件,
+            // 验证"按最近键→返回原应用"时是否产生回调 / 哪些回调
+            if pid > 0 {
+                let line = format!("pid={} uid={} fg={}\n", pid, uid, fg_val != 0);
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/data/local/tmp/appopt_fg_cb.txt")
+                {
+                    use std::io::Write;
+                    let _ = f.write_all(line.as_bytes());
+                }
+            }
+
             let fg = fg_val != 0;
 
             if fg && pid > 0 {
