@@ -343,6 +343,9 @@ fn hang_monitor_loop() {
                                     crate::ebpf_mode::scr_fade_in(t);
                                 }
                                 hung = false;
+                                /* 渐亮稳定后: 重新启动刷新率触摸监听
+                                 * (黑屏期间停监听, 单击不会触发切回 active 的面板切换) */
+                                set_enabled(true);
                             }
                         } else if press_start.is_none() {
                             /* 亮屏态: 记录按下时刻, 供长按 3s 检测 (静止按住无新事件) */
@@ -369,6 +372,9 @@ fn hang_monitor_loop() {
                             crate::ebpf_mode::scr_store_saved(v);
                             crate::ebpf_mode::scr_set_brightness(0);
                             hung = true;
+                            /* 黑屏写 0 后: 停止刷新率触摸监听, 黑屏期间
+                             * 触摸不会切回 active 刷新率 (避免面板切换绿屏/瞬亮) */
+                            set_enabled(false);
                         }
                         press_start = None;
                     }
