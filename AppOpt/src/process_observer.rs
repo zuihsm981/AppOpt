@@ -436,12 +436,15 @@ pub fn query_focused_effective_uid() -> Result<i32, String> {
     // null 标志 + 非 null 时 left/top/right/bottom 4×int)
     let mut n = 0i32;
     let _ = unsafe { (ndk.read_i32)(p, &mut n) };   // bounds null 标志
+    let bnull = n;
     if n != 0 {
         for _ in 0..4 { let _ = unsafe { (ndk.read_i32)(p, &mut n) }; }  // Rect
     }
     let _ = unsafe { (ndk.read_i32)(p, &mut n) };   // childTaskIds 长度
+    let ids_len = n;
     for _ in 0..n.max(0) { let _ = unsafe { (ndk.read_i32)(p, &mut n) }; }
     let _ = unsafe { (ndk.read_i32)(p, &mut n) };   // childTaskNames 长度
+    let names_len = n;
     let mut str_fail = 0i32;
     for _ in 0..n.max(0) {
         if !skip_string(ndk, p) {
@@ -449,11 +452,13 @@ pub fn query_focused_effective_uid() -> Result<i32, String> {
         }
     }
     let _ = unsafe { (ndk.read_i32)(p, &mut n) };   // childTaskBounds 长度
+    let barr_len = n;
     for _ in 0..n.max(0) {
         let _ = unsafe { (ndk.read_i32)(p, &mut n) };
         for _ in 0..4 { let _ = unsafe { (ndk.read_i32)(p, &mut n) }; }
     }
     let _ = unsafe { (ndk.read_i32)(p, &mut n) };   // childTaskUserIds 长度
+    let uids_len = n;
     for _ in 0..n.max(0) { let _ = unsafe { (ndk.read_i32)(p, &mut n) }; }
     let _ = unsafe { (ndk.read_i32)(p, &mut n) };   // visible
     let _ = unsafe { (ndk.read_i32)(p, &mut n) };   // position
@@ -466,7 +471,7 @@ pub fn query_focused_effective_uid() -> Result<i32, String> {
     let _ = unsafe { (ndk.read_i32)(p, &mut eff_uid) };
 
     unsafe { (ndk.parcel_delete)(p); }
-    // 临时诊断: 记录查询中间值 (定位 effectiveUid=0 是解析错位还是真实)
+    // 临时诊断: 记录逐字段长度 (定位错位字段)
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -475,8 +480,8 @@ pub fn query_focused_effective_uid() -> Result<i32, String> {
         use std::io::Write;
         let _ = f.write_all(
             format!(
-                "focus obj={} uid={} tid={} eff={} strfail={}\n",
-                obj_flag, user_id, task_id, eff_uid, str_fail
+                "focus bnull={} ids={} names={} barr={} uids={} | u={} t={} e={} sf={}\n",
+                bnull, ids_len, names_len, barr_len, uids_len, user_id, task_id, eff_uid, str_fail
             )
             .as_bytes(),
         );
