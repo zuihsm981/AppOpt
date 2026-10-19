@@ -365,6 +365,7 @@ fn skip_string(ndk: &BinderNdk, p: *mut c_void) -> bool {
         crate::main_dbg("skip read_len_fail");
         return false;
     }
+    crate::main_dbg(&format!("skip len={}", len));
     if len < 0 {
         return true;   // null 字符串
     }
