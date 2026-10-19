@@ -123,6 +123,7 @@ unsafe impl Send for SendClass {}
 unsafe impl Sync for SendClass {}
 static OBSERVER_CLASS: OnceLock<SendClass> = OnceLock::new();
 static AM_CLASS: OnceLock<SendClass> = OnceLock::new();
+static ATM_CLASS: OnceLock<SendClass> = OnceLock::new();
 // SurfaceFlinger 的 ISurfaceComposer 描述符：
 // ISurfaceComposer.h 中 DECLARE_META_INTERFACE(SurfaceComposer) →
 // IMPLEMENT_META_INTERFACE(SurfaceComposer, "android.ui.ISurfaceComposer")，
@@ -206,6 +207,20 @@ fn get_am_class() -> *mut c_void {
         let class = unsafe {
             (ndk.class_define)(
                 b"android.app.IActivityManager\0".as_ptr() as *const c_char,
+                Some(on_create), Some(on_destroy), Some(am_dummy_on_transact),
+            )
+        };
+        SendClass(class)
+    }).0
+}
+
+/// IActivityTaskManager 本地 class (供 probe 直连 activity_task 时 associateClass)
+fn get_atm_class() -> *mut c_void {
+    let Some(ndk) = ndk() else { return std::ptr::null_mut() };
+    ATM_CLASS.get_or_init(|| {
+        let class = unsafe {
+            (ndk.class_define)(
+                b"android.app.IActivityTaskManager\0".as_ptr() as *const c_char,
                 Some(on_create), Some(on_destroy), Some(am_dummy_on_transact),
             )
         };
@@ -345,6 +360,14 @@ pub fn probe_focused_root_task_info() -> Result<(i32, i32, i32, i32, bool, bool)
     let svc = unsafe { (ndk.get_service)(b"activity_task\0".as_ptr() as *const c_char) };
     if svc.is_null() {
         return Err("get_service(activity_task) returned null".into());
+    }
+    // NDK prepareTransaction 需要先关联本地 class (接口 token 写入依赖 class descriptor)
+    let atm_class = get_atm_class();
+    if atm_class.is_null() {
+        return Err("atm class define failed".into());
+    }
+    if !unsafe { (ndk.associate_class)(svc, atm_class as *const c_void) } {
+        return Err("associate_class(activity_task, IActivityTaskManager) failed (descriptor mismatch?)".into());
     }
     let mut in_parcel: *mut c_void = std::ptr::null_mut();
     let prep = unsafe { (ndk.prepare_tx)(svc, &mut in_parcel) };
