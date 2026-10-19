@@ -852,6 +852,26 @@ fn main() {
         }
     });
 
+    // 临时探针: binder 直连 activity_task getFocusedRootTaskInfo (事务 32),
+    // 实测 RootTaskInfo parcel 前段 + baseIntent null 标志 (决定后续实现路线)
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        let msg = match crate::process_observer::probe_focused_root_task_info() {
+            Some((u, t, e, d, run, base)) => format!(
+                "AppOptProbe ok: userId={} taskId={} effectiveUid={} displayId={} isRunning={} baseIntent={}",
+                u,
+                t,
+                e,
+                d,
+                run,
+                if base { "NON-NULL" } else { "null" }
+            ),
+            None => "AppOptProbe failed: binder/transaction error".to_string(),
+        };
+        println!("{}", msg);
+        let _ = std::fs::write("/data/local/tmp/appopt_probe.txt", format!("{}\n", msg));
+    });
+
     // T4: packages.list inotify (返回 fd; 完成后线程退出)
     let pkg_inotify_thread = std::thread::spawn(crate::config::init_pkg_inotify);
 
