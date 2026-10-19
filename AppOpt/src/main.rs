@@ -857,7 +857,7 @@ fn main() {
     std::thread::spawn(|| {
         std::thread::sleep(std::time::Duration::from_millis(800));
         let msg = match crate::process_observer::probe_focused_root_task_info() {
-            Some((u, t, e, d, run, base)) => format!(
+            Ok((u, t, e, d, run, base)) => format!(
                 "AppOptProbe ok: userId={} taskId={} effectiveUid={} displayId={} isRunning={} baseIntent={}",
                 u,
                 t,
@@ -866,7 +866,7 @@ fn main() {
                 run,
                 if base { "NON-NULL" } else { "null" }
             ),
-            None => "AppOptProbe failed: binder/transaction error".to_string(),
+            Err(err) => format!("AppOptProbe failed: {}", err),
         };
         println!("{}", msg);
         let _ = std::fs::write("/data/local/tmp/appopt_probe.txt", format!("{}\n", msg));

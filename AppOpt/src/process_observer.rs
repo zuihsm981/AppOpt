@@ -338,32 +338,34 @@ unsafe extern "C" fn skip_str_fn(_data: *mut c_void, _s: *const c_char, len: usi
 
 /// 临时探针: binder 直连 activity_task 调 getFocusedRootTaskInfo (事务 0x20=32),
 /// 按 RootTaskInfo parcel 布局读取前段字段, 实测 baseIntent 是否为 null。
-/// 返回 (userId, taskId, effectiveUid, displayId, isRunning, baseIntentNonNull);
-/// None = 事务失败/异常。
-pub fn probe_focused_root_task_info() -> Option<(i32, i32, i32, i32, bool, bool)> {
-    let ndk = ndk()?;
+/// 返回 Ok((userId, taskId, effectiveUid, displayId, isRunning, baseIntentNonNull));
+/// Err = 分步错误详情。
+pub fn probe_focused_root_task_info() -> Result<(i32, i32, i32, i32, bool, bool), String> {
+    let ndk = ndk().ok_or("ndk init failed")?;
     let svc = unsafe { (ndk.get_service)(b"activity_task\0".as_ptr() as *const c_char) };
     if svc.is_null() {
-        return None;
+        return Err("get_service(activity_task) returned null".into());
     }
     let mut in_parcel: *mut c_void = std::ptr::null_mut();
-    if unsafe { (ndk.prepare_tx)(svc, &mut in_parcel) } != STATUS_OK || in_parcel.is_null() {
-        return None;
+    let prep = unsafe { (ndk.prepare_tx)(svc, &mut in_parcel) };
+    if prep != STATUS_OK || in_parcel.is_null() {
+        return Err(format!("prepare_tx status={} parcel={}", prep, in_parcel.is_null()));
     }
     let mut out_parcel: *mut c_void = std::ptr::null_mut();
     let status = unsafe { (ndk.transact)(svc, 32, &mut in_parcel, &mut out_parcel, 0) };
     unsafe { (ndk.parcel_delete)(in_parcel); }
     if status != STATUS_OK || out_parcel.is_null() {
+        let null_out = out_parcel.is_null();
         if !out_parcel.is_null() {
             unsafe { (ndk.parcel_delete)(out_parcel); }
         }
-        return None;
+        return Err(format!("transact status={} out_null={}", status, null_out));
     }
     let mut exc = 0i32;
     let _ = unsafe { (ndk.read_i32)(out_parcel, &mut exc) };
     if exc != 0 {
         unsafe { (ndk.parcel_delete)(out_parcel); }
-        return None;
+        return Err(format!("reply exception={}", exc));
     }
 
     let p = out_parcel;
@@ -416,5 +418,5 @@ pub fn probe_focused_root_task_info() -> Option<(i32, i32, i32, i32, bool, bool)
     let _ = unsafe { (ndk.read_i32)(p, &mut base_flag) };
 
     unsafe { (ndk.parcel_delete)(p); }
-    Some((user_id, task_id, eff_uid, disp, running != 0, base_flag != 0))
+    Ok((user_id, task_id, eff_uid, disp, running != 0, base_flag != 0))
 }
