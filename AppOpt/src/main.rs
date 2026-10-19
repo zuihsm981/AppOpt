@@ -623,6 +623,17 @@ impl AppState {
     /// 按聚焦 uid 应用规则 — 规则应用 → 应用; 无规则 (桌面等) → 回落。
     /// 覆盖"按最近键回落 → 返回原应用聚焦切回"的误回落。
     fn apply_focused_uid(&mut self, uid: i32) {
+        // 临时诊断: 记录应用结果 (uid<=0 不动作原因)
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/data/local/tmp/appopt_dbg.txt")
+        {
+            use std::io::Write;
+            let _ = f.write_all(
+                format!("apply uid={} (skip={})\n", uid, uid <= 0).as_bytes(),
+            );
+        }
         if uid <= 0 {
             return;   // 查询失败/无聚焦 → 不动 (保持当前)
         }

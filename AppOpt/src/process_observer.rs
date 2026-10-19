@@ -417,7 +417,12 @@ pub fn query_focused_effective_uid() -> Result<i32, String> {
     let _ = unsafe { (ndk.read_i32)(p, &mut n) };   // childTaskIds 长度
     for _ in 0..n.max(0) { let _ = unsafe { (ndk.read_i32)(p, &mut n) }; }
     let _ = unsafe { (ndk.read_i32)(p, &mut n) };   // childTaskNames 长度
-    for _ in 0..n.max(0) { let _ = unsafe { (ndk.read_string)(p, std::ptr::null_mut(), skip_str_fn) }; }
+    let mut str_fail = 0i32;
+    for _ in 0..n.max(0) {
+        if !unsafe { (ndk.read_string)(p, std::ptr::null_mut(), skip_str_fn) } {
+            str_fail += 1;
+        }
+    }
     let _ = unsafe { (ndk.read_i32)(p, &mut n) };   // childTaskBounds 长度
     for _ in 0..n.max(0) {
         let _ = unsafe { (ndk.read_i32)(p, &mut n) };
@@ -436,14 +441,20 @@ pub fn query_focused_effective_uid() -> Result<i32, String> {
     let _ = unsafe { (ndk.read_i32)(p, &mut eff_uid) };
 
     unsafe { (ndk.parcel_delete)(p); }
-    // 临时诊断: 记录 effectiveUid 查询结果
+    // 临时诊断: 记录查询中间值 (定位 effectiveUid=0 是解析错位还是真实)
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open("/data/local/tmp/appopt_dbg.txt")
     {
         use std::io::Write;
-        let _ = f.write_all(format!("focus_eff_uid={}\n", eff_uid).as_bytes());
+        let _ = f.write_all(
+            format!(
+                "focus obj={} uid={} tid={} eff={} strfail={}\n",
+                obj_flag, user_id, task_id, eff_uid, str_fail
+            )
+            .as_bytes(),
+        );
     }
     Ok(eff_uid)
 }
