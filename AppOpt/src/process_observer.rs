@@ -362,19 +362,25 @@ pub fn set_refresh_rate_binder(mode: i32) -> bool {
 fn skip_string(ndk: &BinderNdk, p: *mut c_void) -> bool {
     let mut len = 0i32;
     if unsafe { (ndk.read_i32)(p, &mut len) } == 0 {
+        crate::main_dbg("skip read_len_fail");
         return false;
     }
     if len < 0 {
         return true;   // null 字符串
     }
     if len > 4096 {
+        crate::main_dbg(&format!("skip abnormal_len={}", len));
         return false;  // 异常长度 (防死循环)
     }
     let mut b: i8 = 0;
-    for _ in 0..(len as usize) * 2 {
+    let total = (len as usize) * 2;
+    let mut i = 0usize;
+    while i < total {
         if !unsafe { (ndk.read_byte)(p, &mut b) } {
+            crate::main_dbg(&format!("skip bytefail_at={} len={}", i, len));
             return false;
         }
+        i += 1;
     }
     true
 }

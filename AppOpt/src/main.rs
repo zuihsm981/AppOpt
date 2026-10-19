@@ -674,6 +674,7 @@ impl AppState {
             return;
         }
         std::thread::spawn(move || {
+            crate::process_observer::dump_root_task_ints();   // 临时诊断: query 前 dump
             let uid = crate::process_observer::query_focused_effective_uid().unwrap_or(-1);
             let _ = unsafe { libc::write(wfd, &uid as *const i32 as *const libc::c_void, 4) };
         });
@@ -823,6 +824,18 @@ static RFR_MON: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i
     std::sync::LazyLock::new(|| {
         std::sync::Mutex::new(std::collections::HashMap::new())
     });
+
+/// 临时诊断: 追加一行到 appopt_dbg.txt (定位 skip_string 失败原因)
+pub(crate) fn main_dbg(msg: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/data/local/tmp/appopt_dbg.txt")
+    {
+        use std::io::Write;
+        let _ = f.write_all(format!("{}\n", msg).as_bytes());
+    }
+}
 
 /// webui 轮询: 全部 pidfd 监听的刷新率主进程 (pid, pkg) 快照
 pub fn rfr_hit_list() -> Vec<(i32, String)> {
