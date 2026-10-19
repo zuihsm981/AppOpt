@@ -476,22 +476,30 @@ pub fn probe_focused_root_task_info() -> Result<String, String> {
     // baseIntent: readTypedObject null 标志 (0=null, 1=非 null)
     let mut base_flag = 0i32;
     let _ = unsafe { (ndk.read_i32)(p, &mut base_flag) };
-    // baseActivity: ComponentName.readFromParcel (2 个 String: package + class)
+    if base_flag != 0 {
+        // baseIntent 非 null: 不继续解析 — Intent parcel 需按 Intent.readFromParcel
+        // 完整消费才能读到 baseActivity/topActivity, 贸然按 ComponentName 读会
+        // 从 Intent 数据中间误读长度 → NDK readString 内部 abort 导致进程崩溃。
+        unsafe { (ndk.parcel_delete)(p); }
+        return Ok(format!(
+            "userId={} taskId={} effectiveUid={} displayId={} isRunning={} | baseIntent=NON-NULL (需实现 Intent 跳过才能读 topActivity)",
+            user_id, task_id, eff_uid, disp, running != 0
+        ));
+    }
+    // baseIntent null: 极简解析 baseActivity/topActivity (ComponentName 2 String)
     let base_pkg = read_string(&ndk, p);
     let base_cls = read_string(&ndk, p);
-    // topActivity: ComponentName.readFromParcel (2 个 String: package + class)
     let top_pkg = read_string(&ndk, p);
     let top_cls = read_string(&ndk, p);
 
     unsafe { (ndk.parcel_delete)(p); }
     Ok(format!(
-        "userId={} taskId={} effectiveUid={} displayId={} isRunning={} baseIntent={} | baseActivity={}/{} | topActivity={}/{}",
+        "userId={} taskId={} effectiveUid={} displayId={} isRunning={} baseIntent=null | baseActivity={}/{} | topActivity={}/{}",
         user_id,
         task_id,
         eff_uid,
         disp,
         running != 0,
-        if base_flag != 0 { "NON-NULL" } else { "null" },
         base_pkg.as_deref().unwrap_or("-"),
         base_cls.as_deref().unwrap_or("-"),
         top_pkg.as_deref().unwrap_or("-"),
