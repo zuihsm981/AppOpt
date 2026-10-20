@@ -1258,12 +1258,19 @@ fn main() {
                         };
                         if n == 4 {
                             LAST_TASK_UID.store(uid, Ordering::Relaxed);
-                            if state.last_fg_uid == LAUNCHER_UID.load(Ordering::Relaxed) {
-                                if uid > 0 && uid != LAUNCHER_UID.load(Ordering::Relaxed) {
-                                    state.apply_focused_uid(uid);   // 规则应用 → 重新应用
-                                } else {
-                                    state.revert_all_rules();       // 桌面 → 回落
-                                }
+                            // 连续桌面状态 (on_fg 首次桌面回调已回落):
+                            // 前移任务是需要补发规则的应用 (vfc 或刷新率规则; 含刷新率的
+                            // 桌面已由 uid != LAUNCHER_UID 排除; 只有 CPU 规则 → 已应用一次, 不补)
+                            if state.last_fg_uid == LAUNCHER_UID.load(Ordering::Relaxed)
+                                && uid > 0
+                                && uid != LAUNCHER_UID.load(Ordering::Relaxed)
+                                && (state.vfc_uid_set.contains(&uid)
+                                    || state
+                                        .uid_map
+                                        .get(&uid)
+                                        .map_or(false, |e| e.rfr))
+                            {
+                                state.apply_focused_uid(uid);
                             }
                         }
                     }
