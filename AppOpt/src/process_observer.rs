@@ -177,7 +177,7 @@ extern "C" fn on_transact(
                 let mut last = crate::lock_ignore_poison(&LAST_FG_T);
                 let due = pid != last.0
                     || uid != last.1
-                    || now.duration_since(last.2).as_millis() >= 100;
+                    || now.duration_since(last.2).as_millis() >= 50;
                 if due {
                     *last = (pid, uid, now);
                     // 触发分离：Binder 回调携带 pid + uid（8 字节）。
