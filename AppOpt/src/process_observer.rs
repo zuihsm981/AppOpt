@@ -369,7 +369,16 @@ fn skip_string(ndk: &BinderNdk, p: *mut c_void) -> bool {
     let mut b: i8 = 0;
     for i in 0..4 {
         if !unsafe { (ndk.read_byte)(p, &mut b) } {
-            crate::main_dbg(&format!("skip len_bytefail at{}", i));
+            // 诊断: readByte 失败 → 同位置用 readInt32 重试, 对比返回值/值/dsz
+            let mut l2 = 0i32;
+            let ok2 = unsafe { (ndk.read_i32)(p, &mut l2) };
+            let dsz = unsafe { (ndk.get_data_size)(p) };
+            let mut l3 = 0i32;
+            let ok3 = unsafe { (ndk.read_i32)(p, &mut l3) };
+            crate::main_dbg(&format!(
+                "skip bytefail_at={} retryI32_1=({},{}) retryI32_2=({},{}) dsz={}",
+                i, ok2, l2, ok3, l3, dsz
+            ));
             return false;
         }
         buf[i] = b as u8;
