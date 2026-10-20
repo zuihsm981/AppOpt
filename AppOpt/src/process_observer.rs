@@ -365,11 +365,11 @@ unsafe extern "C" fn skip_str_fn(_data: *mut c_void, _s: *const c_char, len: usi
     len
 }
 
-/// binder 查询: getFocusedRootTaskInfo (事务 0x20=32), 只读聚焦任务的 effectiveUid。
+/// binder 查询: getFocusedRootTaskInfo (事务 0x20=32), 读聚焦任务 TaskInfo 前 3 字段。
 /// 用于"桌面回调时确认聚焦": 聚焦 uid == 桌面 → 回落; 否则按聚焦 uid 应用规则。
 /// 字符串跳过用 NDK readString (稳健, 无手动字节错位); 不读 baseIntent/ComponentName (无崩溃风险)。
-/// Ok(effectiveUid) = 聚焦任务有效 uid; Err = 无聚焦/失败。
-pub fn probe_focused_root_task_info() -> Result<i32, String> {
+/// Ok((userId, taskId, effectiveUid)); Err = 无聚焦/失败。
+pub fn probe_focused_root_task_info() -> Result<(i32, i32, i32), String> {
     let ndk = ndk().ok_or("ndk init failed")?;
     let svc = unsafe { (ndk.get_service)(b"activity_task\0".as_ptr() as *const c_char) };
     if svc.is_null() {
@@ -447,10 +447,12 @@ pub fn probe_focused_root_task_info() -> Result<i32, String> {
     let _ = unsafe { (ndk.read_i32)(p, &mut n) };
     let _ = unsafe { (ndk.read_i32)(p, &mut n) };
     // TaskInfo.readTaskFromParcel: userId / taskId / effectiveUid (第 3 字段 = 目标)
-    let _ = unsafe { (ndk.read_i32)(p, &mut n) };
-    let _ = unsafe { (ndk.read_i32)(p, &mut n) };
+    let mut user_id = 0i32;
+    let _ = unsafe { (ndk.read_i32)(p, &mut user_id) };
+    let mut task_id = 0i32;
+    let _ = unsafe { (ndk.read_i32)(p, &mut task_id) };
     let mut eff_uid = 0i32;
     let _ = unsafe { (ndk.read_i32)(p, &mut eff_uid) };
     unsafe { (ndk.parcel_delete)(p); }
-    Ok(eff_uid)
+    Ok((user_id, task_id, eff_uid))
 }

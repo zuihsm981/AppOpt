@@ -625,7 +625,19 @@ impl AppState {
     fn apply_focused_uid(&mut self, uid: i32) {
         crate::main_dbg(&format!("apply focus uid={}", uid));
         if uid <= 0 {
-            return;   // 查询失败/无聚焦 → 不动 (保持当前)
+            // 查询失败/无有效聚焦 (息屏/无聚焦任务) → 保守回落全局 (桌面场景合理)
+            crate::main_dbg("apply focus: no valid uid, revert all");
+            self.waylay_evict_all();   // vfc_fg(0)
+            self.srv_evict_all();      // srv_active(false)
+            if self.prop_active_cur {
+                crate::config::set_prop_rules(&[]);
+                if let Some(es) = self.ebpf_state.as_ref() {
+                    es.bpf.prop_file_apply(false);
+                }
+                self.prop_active_cur = false;
+            }
+            self.rfr_evict_all();      // refresh_apply(launcher)
+            return;
         }
         // 防护: 不在规则表且非 app uid (解析错位垃圾值) → 不动, 不误下发内核
         if !self.vfc_uid_set.contains(&uid)
@@ -673,12 +685,25 @@ impl AppState {
         }
         crate::main_dbg("focus query start");
         std::thread::spawn(move || {
-            let r = crate::process_observer::probe_focused_root_task_info();
-            match &r {
-                Ok(u) => crate::main_dbg(&format!("focus uid={}", u)),
-                Err(e) => crate::main_dbg(&format!("focus err: {}", e)),
+            // 首次查询 + 延迟重试一次 (回调先于系统聚焦更新, 300ms 后聚焦任务才切好)
+            let mut uid = -1i32;
+            for attempt in 0..2 {
+                let r = crate::process_observer::probe_focused_root_task_info();
+                match &r {
+                    Ok((u, t, e)) => crate::main_dbg(&format!(
+                        "focus attempt={} userId={} taskId={} effUid={}",
+                        attempt, u, t, e
+                    )),
+                    Err(err) => crate::main_dbg(&format!("focus attempt={} err: {}", attempt, err)),
+                }
+                if let Ok((_, _, e)) = &r {
+                    if *e > 0 {
+                        uid = *e;
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(300));
             }
-            let uid = r.unwrap_or(-1);
             let _ = unsafe { libc::write(wfd, &uid as *const i32 as *const libc::c_void, 4) };
         });
     }
