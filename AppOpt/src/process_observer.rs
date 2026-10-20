@@ -37,6 +37,7 @@ type FnWriteBinder = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
 type FnReadI32 = unsafe extern "C" fn(*mut c_void, *mut i32) -> bool;
 type FnWriteI32 = unsafe extern "C" fn(*mut c_void, i32) -> c_int;
 type FnReadByte = unsafe extern "C" fn(*mut c_void, *mut i8) -> bool;
+type FnGetDataSize = unsafe extern "C" fn(*mut c_void) -> usize;
 type FnJoinThreadPool = unsafe extern "C" fn();
 type FnStartThreadPool = unsafe extern "C" fn();
 type FnAssociateClass = unsafe extern "C" fn(*mut c_void, *const c_void) -> bool;
@@ -52,6 +53,7 @@ struct BinderNdk {
     write_int32: FnWriteI32,
     read_i32: FnReadI32,
     read_byte: FnReadByte,
+    get_data_size: FnGetDataSize,
     join_thread_pool: FnJoinThreadPool,
     start_thread_pool: FnStartThreadPool,
     associate_class: FnAssociateClass,
@@ -80,13 +82,14 @@ fn ndk() -> Option<&'static BinderNdk> {
         let p_write_i32 = sym("AParcel_writeInt32");
         let p_read_i32 = sym("AParcel_readInt32");
         let p_read_byte = sym("AParcel_readByte");
+        let p_get_data_size = sym("AParcel_getDataSize");
         let p_join = sym("ABinderProcess_joinThreadPool");
         let p_start = sym("ABinderProcess_startThreadPool");
         let p_associate = sym("AIBinder_associateClass");
         if p_get_service.is_null() || p_class_define.is_null() || p_binder_new.is_null()
             || p_prepare_tx.is_null() || p_transact.is_null() || p_parcel_delete.is_null()
             || p_write_binder.is_null() || p_write_i32.is_null()
-            || p_read_i32.is_null() || p_read_byte.is_null()
+            || p_read_i32.is_null() || p_read_byte.is_null() || p_get_data_size.is_null()
             || p_join.is_null() || p_start.is_null() || p_associate.is_null()
         { return None; }
         
@@ -101,6 +104,7 @@ fn ndk() -> Option<&'static BinderNdk> {
             write_int32: std::mem::transmute(p_write_i32),
             read_i32: std::mem::transmute(p_read_i32),
             read_byte: std::mem::transmute(p_read_byte),
+            get_data_size: std::mem::transmute(p_get_data_size),
             join_thread_pool: std::mem::transmute(p_join),
             start_thread_pool: std::mem::transmute(p_start),
             associate_class: std::mem::transmute(p_associate),
@@ -463,6 +467,8 @@ pub fn query_focused_effective_uid() -> Result<i32, String> {
     }
     let p = out_parcel;
     let mut log = String::from("q");
+    let dsz = unsafe { (ndk.get_data_size)(p) };
+    log.push_str(&format!(" dsz={}", dsz));
     let mut exc = 0i32;
     let _ = unsafe { (ndk.read_i32)(p, &mut exc) };
     log.push_str(&format!(" exc={}", exc));
