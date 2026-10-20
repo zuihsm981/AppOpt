@@ -623,6 +623,7 @@ impl AppState {
     /// 聚焦=桌面 (launcher) → 回落全局; 聚焦=规则应用 → 应用其规则;
     /// 聚焦=其他无规则应用 → 回落全局。查询失败 (uid<=0) / 垃圾 uid → 不动。
     fn apply_focused_uid(&mut self, uid: i32) {
+        crate::main_dbg(&format!("apply focus uid={}", uid));
         if uid <= 0 {
             return;   // 查询失败/无聚焦 → 不动 (保持当前)
         }
@@ -667,10 +668,17 @@ impl AppState {
     fn request_focus_confirm() {
         let wfd = CONFIRM_W_FD.load(Ordering::Acquire);
         if wfd < 0 {
+            crate::main_dbg("focus query skipped (no fd)");
             return;
         }
+        crate::main_dbg("focus query start");
         std::thread::spawn(move || {
-            let uid = crate::process_observer::probe_focused_root_task_info().unwrap_or(-1);
+            let r = crate::process_observer::probe_focused_root_task_info();
+            match &r {
+                Ok(u) => crate::main_dbg(&format!("focus uid={}", u)),
+                Err(e) => crate::main_dbg(&format!("focus err: {}", e)),
+            }
+            let uid = r.unwrap_or(-1);
             let _ = unsafe { libc::write(wfd, &uid as *const i32 as *const libc::c_void, 4) };
         });
     }
@@ -684,9 +692,11 @@ impl AppState {
         // EV_CONFIRM 按聚焦 uid 决定 (聚焦=桌面 → 回落; 聚焦=规则应用 → 应用其规则;
         // 覆盖"按最近键回落 → 返回原应用聚焦切回"的误回落)
         if uid == LAUNCHER_UID.load(Ordering::Relaxed) {
+            crate::main_dbg(&format!("on_fg desktop uid={} launcher_uid={}", uid, LAUNCHER_UID.load(Ordering::Relaxed)));
             Self::request_focus_confirm();
             return;
         }
+        crate::main_dbg(&format!("on_fg uid={}", uid));
         let my: Vec<crate::config::WaylayRule> = self
             .uid_rules
             .get(&uid)
@@ -806,6 +816,23 @@ static RFR_MON: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i
 /// webui 轮询: 全部 pidfd 监听的刷新率主进程 (pid, pkg) 快照
 pub fn rfr_hit_list() -> Vec<(i32, String)> {
     RFR_MON.lock().unwrap().iter().map(|(p, k)| (*p, k.clone())).collect()
+}
+
+/// 统一诊断日志: 追加一行到 /data/local/tmp/appopt_dbg.txt (限制 ≤2MB 防磁盘暴涨)
+pub(crate) fn main_dbg(msg: &str) {
+    if let Ok(md) = std::fs::metadata("/data/local/tmp/appopt_dbg.txt") {
+        if md.len() > 2 * 1024 * 1024 {
+            return;
+        }
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/data/local/tmp/appopt_dbg.txt")
+    {
+        use std::io::Write;
+        let _ = f.write_all(format!("{}\n", msg).as_bytes());
+    }
 }
 
 /// 桌面 (launcher) uid: 聚焦确认针对桌面回调 (启动时从 packages.list 解析)
@@ -1012,17 +1039,6 @@ fn main() {
     let _ = observer_thread.join();
     let fg_recv_fd = fg_sv[0];
     let mut fg_buf = [0u8; 8];
-
-    // 临时诊断探针: 启动 2s 后查询一次聚焦 effectiveUid 写文件 (不参与主逻辑)
-    std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_millis(2000));
-        let msg = match crate::process_observer::probe_focused_root_task_info() {
-            Ok(uid) => format!("AppOptProbe ok: effectiveUid={}", uid),
-            Err(err) => format!("AppOptProbe failed: {}", err),
-        };
-        println!("{}", msg);
-        let _ = std::fs::write("/data/local/tmp/appopt_probe.txt", format!("{}\n", msg));
-    });
 
     crate::cpu_affinity::start();
 
