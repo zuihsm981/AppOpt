@@ -1,8 +1,9 @@
-//! CPU 亲和性模块（binder 前台回调触发, 无周期扫描）
+//! CPU 亲和性模块（TaskStackListener task event 触发, 无周期扫描）
 //!
 //! 设计:
-//!   - 触发: IProcessObserver binder 前台回调 (主线程 EV_FG 接收 pid+uid); 主线程查
-//!     cpu uid 表, 命中且冷启动时发 CpuMsg::ApplyPkg(pid, uid, pkg); ApplyAll = 启动/配置全量。
+//!   - 触发: TaskStackListener 任务前移事件 (主线程 EV_TASK 接收前移任务 effectiveUid);
+//!     主线程查 cpu uid 表, 命中且冷启动 (CPU_KNOWN 无该 uid) 时发
+//!     CpuMsg::ApplyPkgByUid(uid, pkg) 立即应用并登记; ApplyAll = 启动/配置全量。
 //!   - 归因: 包名由主线程 cpu uid 表提供 (随 CpuMsg 消息携带); 按 uid 读
 //!     /sys/fs/cgroup/apps/uid_<uid>/ 下 pid_* 目录 (Android cgroup apps 布局,
 //!     精确 O(该 uid 进程数), 含主进程与全部子进程; 布局缺失视为未运行)。
@@ -20,26 +21,15 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
-use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock, RwLock};
 use std::thread;
-use std::time::Duration;
 
 use crate::config::AppConfig;
 use crate::cpuset::{CpuSet, CpuTopology};
 
-/// 前台回调后延迟枚举时长: 冷启动子进程 (pkg:child) 常在回调后 0.5~2s 内 spawn,
-/// 延迟后 cgroup 取一遍该 uid 全部 pid 覆盖冷启动窗口 (主进程回调时已在, 无影响)。
-/// 延迟值由 web 设置项「线程放置延迟」控制 (默认 2000ms)。
-fn enum_delay() -> Duration {
-    Duration::from_millis(crate::web::AFFINITY_DELAY_MS.load(Ordering::Relaxed))
-}
-
 /// CPU worker 消息
 pub enum CpuMsg {
-    /// 主线程判定冷启动后, 下发 (主 pid, uid, 包名) → 延迟按 uid 取该应用全部进程
-    ApplyPkg(i32, i32, String),
     /// 规则应用主进程退出 (pidfd 退出事件): 按 uid 清除该应用在 managed 的全部条目
     /// → web 命中归零 (按 uid 整清, 不依赖主线程 tid 是否在 managed)
     EvictUid(i32),
@@ -47,7 +37,8 @@ pub enum CpuMsg {
     ApplyAll(HashMap<String, i32>),
     /// web 轮询请求刷新 CPU 统计快照 (仅在轮询时发布, 避免每次事件都构建)
     PublishStats,
-    /// 整包重放 (整包规则编辑保存): 主线程反查 uid 后下发, worker 仅对已接管应用重放
+    /// task event 驱动 CPU 应用: 冷启动 (未登记) 现扫应用并登记; 热启动由主线程
+    /// cpu_known_has 判断不发; 也是整包编辑保存后的重放入口
     ApplyPkgByUid(i32, String),
     /// 单线程重放 (单线程规则编辑保存): 只对该包中 comm==thread 的 tid 设亲和
     ApplyThreadByUid(i32, String, String),
@@ -61,11 +52,26 @@ static CPU_FG_TX: OnceLock<Mutex<mpsc::Sender<CpuMsg>>> = OnceLock::new();
 pub static CPU_KNOWN: std::sync::LazyLock<RwLock<HashMap<i32, (i32, Vec<i32>)>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
-/// 冷热判断: cpu_known 中该 uid 的 pid 与回调 pid 一致 → 热
-pub fn cpu_known_is_hot(uid: i32, pid: i32) -> bool {
-    crate::rw_read_ignore_poison(&CPU_KNOWN)
-        .get(&uid)
-        .is_some_and(|(p, _)| *p == pid)
+/// 冷热判断 (task event 驱动): 表里有该 uid = 已应用过 (热); 无 = 冷 (需应用)
+pub fn cpu_known_has(uid: i32) -> bool {
+    uid > 0 && crate::rw_read_ignore_poison(&CPU_KNOWN).contains_key(&uid)
+}
+
+/// 按 uid 从 cgroup apps 目录取全部 pid (task event 驱动: web 命中显示/退出监听,
+/// CPU worker 也复用)。失败 (布局不存在/未运行) 返回 None。
+pub fn cgroup_pids(uid: i32) -> Option<Vec<i32>> {
+    let dir_path = format!("/sys/fs/cgroup/apps/uid_{uid}");
+    let rd = std::fs::read_dir(&dir_path).ok()?;
+    let mut pids: Vec<i32> = Vec::new();
+    for ent in rd.flatten() {
+        let name = ent.file_name().to_string_lossy().into_owned();
+        if let Some(rest) = name.strip_prefix("pid_")
+            && let Ok(p) = rest.parse::<i32>()
+        {
+            pids.push(p);
+        }
+    }
+    Some(pids)
 }
 /// 按主 pid 反查 uid (退出事件路径用: 反查后发 EvictUid, 身份清理统一由
 /// CPU worker 的 evict_uid 完成, 避免主线程/worker 双重清理)
@@ -112,14 +118,6 @@ pub fn apply_all_now(pkg_uids: HashMap<String, i32>) {
     }
 }
 
-/// 延迟放置任务 (冷启动 ApplyPkg 登记, 到期应用)
-struct PendingTask {
-    due: std::time::Instant,
-    pid: i32,
-    uid: i32,
-    pkg: String,
-}
-
 /// CPU 亲和性执行器 (worker 线程独占)
 pub struct CpuAffinity {
     /// 已管理线程 tid → 包名 (用于清理已退出线程)
@@ -131,9 +129,6 @@ pub struct CpuAffinity {
     uid_pkg: HashMap<i32, String>,
     /// 合并 CPU 集合 bits → cpuset 目录名 缓存 (相同集合只 ensure 一次, 避免每线程重复建目录)
     cpuset_cache: HashMap<u64, String>,
-    /// 延迟放置任务队列 (异步): 冷启动 ApplyPkg 登记, 到期应用;
-    /// EvictUid/ApplyAll 会清理对应任务 (防止与身份/配置不同步)。
-    pending: Vec<PendingTask>,
 }
 
 impl CpuAffinity {
@@ -143,14 +138,12 @@ impl CpuAffinity {
             managed_tok: HashMap::new(),
             uid_pkg: HashMap::new(),
             cpuset_cache: HashMap::new(),
-            pending: Vec::new(),
         }
     }
 
     /// 应用退出清理: Cgroup 主 pid 目录消失 / 显式 EvictUid 消息共用
     fn evict_uid(&mut self, uid: i32) {
         crate::rw_write_ignore_poison(&CPU_KNOWN).remove(&uid);
-        self.pending.retain(|t| t.uid != uid);
         let pkg = self.uid_pkg.remove(&uid);
         if let Some(pkg) = pkg {
             self.managed.remove(&pkg); // pkg→tids, O(1) 整清 (替代 retain 全表扫)
@@ -176,33 +169,12 @@ impl CpuAffinity {
     /// 含主进程与全部子进程)。失败 (布局不存在/目录缺失) 返回 None →
     /// 该 uid 视为未运行 (空)。
     fn cgroup_apps_pids(uid: i32) -> Option<Vec<i32>> {
-        let dir_path = format!("/sys/fs/cgroup/apps/uid_{uid}");
-        let rd = std::fs::read_dir(&dir_path).ok()?;
-        let mut pids: Vec<i32> = Vec::new();
-        for ent in rd.flatten() {
-            let name = ent.file_name().to_string_lossy().into_owned();
-            if let Some(rest) = name.strip_prefix("pid_")
-                && let Ok(p) = rest.parse::<i32>()
-            {
-                pids.push(p);
-            }
-        }
-        Some(pids)
+        crate::cpu_affinity::cgroup_pids(uid)
     }
 
-    /// 应用已登记的前台应用: uid 目录直接取全部 pid, 再由 /proc/<pid>/task 取全部线程;
-    /// 无 /proc 全量 uid 扫描。
-    fn on_uid(&mut self, uid: i32, pkg: &str, cfg: &AppConfig) -> Vec<i32> {
-        // cgroup apps 精确枚举: uid_<uid> 不存在 (含 uid<=0/未运行) → None → 空, 天然短路
-        let pids = Self::cgroup_apps_pids(uid).unwrap_or_default();
-        self.apply_tids(&pids, pkg, cfg);
-        pids
-    }
-
-    /// 全量重放规则亲和性 (启动 / 配置变更): 只设亲和性 —— cgroup 按 uid 取全部 pid,
-    /// /proc/<pid>/task 取线程 → 应用规则。
-    /// 不写身份 (CPU_KNOWN): 身份仅由 binder 前台回调 (ApplyPkg)
-    /// 产生, 因为只有它知道"谁是前台主进程"。
+    /// 全量重放规则亲和性 (启动 / 配置变更): cgroup 按 uid 取全部 pid,
+    /// /proc/<pid>/task 取线程 → 应用规则。不写 CPU_KNOWN 身份
+    /// (该表由前台驱动 ApplyPkgByUid 按任务前移时机维护)。
     pub fn apply_all(&mut self, cfg: &AppConfig, pkg_uids: HashMap<String, i32>) -> usize {
         let mut applied = 0usize;
         for (pkg, uid) in &pkg_uids {
@@ -211,8 +183,7 @@ impl CpuAffinity {
                 continue; // 未运行
             }
             self.apply_tids(&pids, pkg, cfg);
-            // 记录 uid→pkg 清理索引 (managed 按包名索引, 退出 evict_uid 需反查;
-            // 不写 CPU_KNOWN —— 前台主 pid 身份仍只由 ApplyPkg 产生)
+            // 记录 uid→pkg 清理索引 (managed 按包名索引, 退出 evict_uid 需反查)
             self.uid_pkg.insert(*uid, pkg.clone());
             applied += 1;
         }
@@ -370,7 +341,7 @@ impl CpuAffinity {
         d
     }
 
-    /// 常驻线程入口 (纯事件驱动, 无重试/无周期)
+    /// 常驻线程入口 (纯事件驱动: 阻塞等消息, task event / 全量 / 退出 全部即时处理)
     pub fn run(mut self, rx: mpsc::Receiver<CpuMsg>) {
         let name = CString::new("CpuAffinity").unwrap();
         unsafe {
@@ -378,87 +349,46 @@ impl CpuAffinity {
         }
 
         loop {
-            let now = std::time::Instant::now();
-            let timeout = self
-                .pending
-                .iter()
-                .map(|t| t.due.saturating_duration_since(now))
-                .min()
-                .unwrap_or(std::time::Duration::from_secs(3600)); // 无 pending: 长阻塞 (消息唤醒)
-            match rx.recv_timeout(timeout) {
+            match rx.recv() {
                 Ok(msg) => self.handle_msg(msg),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(_) => break,
             }
-
-            // 到期应用: 先取出到期任务, 再处理 (状态在 apply_pkg 前已更新)
-            let now = std::time::Instant::now();
-            let (due, rest): (Vec<_>, Vec<_>) = self.pending.drain(..).partition(|t| t.due <= now);
-            self.pending = rest;
-            for t in due {
-                self.apply_pkg(t.pid, t.uid, &t.pkg);
-            }
         }
     }
 
-    /// 应用已登记的前台应用 (到期执行): cgroup 取 uid 全部 pid → /proc/<pid>/task
-    /// 线程 → 设亲和 + 回写身份
-    fn apply_pkg(&mut self, pid: i32, uid: i32, pkg: &str) {
-        let Some(cfg) = crate::config::current_cfg() else {
-            // 配置异常缺失: 清占位身份, 等下次前台回调重新触发
-            crate::rw_write_ignore_poison(&CPU_KNOWN).remove(&uid);
-            return;
-        };
-        let pids = self.on_uid(uid, pkg, &cfg);
-        if pids.is_empty() {
-            // 应用已退出 (EvictUid 已清身份) → 不重插空身份
-            crate::rw_write_ignore_poison(&CPU_KNOWN).remove(&uid);
-            return;
-        }
-        // 设置亲和性后: 该 uid 主进程+全部子进程 pid 列表写入 cpu_known
-        // (供后续冷热判断/统计); pids 已消费完, 直接 move
-        crate::rw_write_ignore_poison(&CPU_KNOWN).insert(uid, (pid, pids));
-        // 记录 uid→pkg (退出时按 uid 整清 managed)
-        self.uid_pkg.insert(uid, pkg.to_string());
-    }
-
-    /// 消息处理 (即时; 顺序保真)。ApplyPkg 登记延迟任务; ApplyAll/EvictUid 清理 pending
+    /// 消息处理 (即时; 顺序保真): ApplyPkgByUid 一次性应用并登记;
+    /// ApplyAll/EvictUid 全量/清理。
     fn handle_msg(&mut self, msg: CpuMsg) {
         match msg {
-            CpuMsg::ApplyPkg(pid, uid, pkg) => {
-                // 配置未就绪 (CURRENT_CONFIG 未写入): 不占位不登记, 下次前台回调重试
-                if crate::config::current_cfg().is_none() {
-                    return;
-                }
-                // 冷启动: 占位 (冷热判断) + 登记延迟应用; 同 uid 重复前台合并 (保留最新)
-                crate::rw_write_ignore_poison(&CPU_KNOWN).insert(uid, (pid, Vec::new()));
-                let due = std::time::Instant::now() + enum_delay();
-                match self.pending.iter_mut().find(|t| t.uid == uid) {
-                    Some(t) => {
-                        t.due = due;
-                        t.pid = pid;
-                        t.pkg = pkg;
-                    }
-                    None => self.pending.push(PendingTask { due, pid, uid, pkg }),
-                }
-            }
             CpuMsg::ApplyAll(pkg_uids) => {
-                // 全量应用覆盖所有应用: 清掉未到期任务 (防旧任务用旧 pid/身份覆盖新配置)
-                self.pending.clear();
+                // 全量应用覆盖所有应用 (启动 / 配置变更)
                 if let Some(cfg) = crate::config::current_cfg() {
                     self.apply_all(&cfg, pkg_uids);
                 }
             }
             CpuMsg::ApplyPkgByUid(uid, pkg) => {
-                // 整包重放: 仅对已接管 (CPU_KNOWN 有记录) 的应用重放; 未运行则跳过
+                // task event 驱动 CPU 应用: 冷启动 (未登记) 也现扫应用并登记;
+                // 已登记复用缓存 pids (热启动由主线程 cpu_known_has 判断, 不会发到这里)
                 let cached = crate::rw_read_ignore_poison(&CPU_KNOWN).get(&uid).cloned();
                 let pids = match cached {
                     Some((_, pids)) if !pids.is_empty() => pids, // 复用缓存 pids
-                    Some(_) => Self::cgroup_apps_pids(uid).unwrap_or_default(), // 占位中现扫
-                    None => return,                              // 未运行: 跳过本条
+                    _ => Self::cgroup_apps_pids(uid).unwrap_or_default(), // 未登记: 现扫
                 };
+                if pids.is_empty() {
+                    // 进程不在 → 清身份 (下次 task event 冷启动重新应用)
+                    crate::rw_write_ignore_poison(&CPU_KNOWN).remove(&uid);
+                    return;
+                }
                 let Some(cfg) = crate::config::current_cfg() else { return };
                 self.apply_tids(&pids, &pkg, &cfg);
+                // 登记身份: 主 pid = cgroup 下最小 pid (主进程最先 fork)
+                let main = *pids.iter().min().unwrap_or(&0);
+                crate::rw_write_ignore_poison(&CPU_KNOWN).insert(uid, (main, pids));
+                self.uid_pkg.insert(uid, pkg.to_string());
+                // 退出监听 (保留原 on_fg 功能): 主 pid 退出 → EV_EXIT_PID → EvictUid 清身份
+                if main > 0 {
+                    crate::event_probe::watch(main);
+                }
             }
             CpuMsg::ApplyThreadByUid(uid, pkg, thread) => {
                 // 单线程重放: 同上存活判断; 收集 comm==thread 的 tid
@@ -493,8 +423,8 @@ pub fn start() {
         return;
     }
     // 用户态与 KPM 模式统一启动 CPU worker: 身份记录/进程枚举/亲和性施加全部经
-    // ApplyPkg 消息驱动; 亲和完全由用户态 apply_affinity::affinity_set 施加
-    // (内核 KPM 只做 service list 替换, 不参与亲和)。
+    // ApplyPkgByUid (前台 task event 驱动) / ApplyAll 消息驱动; 亲和完全由用户态
+    // apply_affinity::affinity_set 施加 (内核 KPM 只做 service list 替换, 不参与亲和)。
     let (tx, rx) = mpsc::channel::<CpuMsg>();
     let _ = CPU_FG_TX.set(Mutex::new(tx));
     let cpu = CpuAffinity::new();

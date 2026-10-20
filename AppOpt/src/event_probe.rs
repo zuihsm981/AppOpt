@@ -62,6 +62,7 @@ pub fn set_enabled(on: bool) {
 }
 
 /// 为规则应用主 pid 注册退出监听 (幂等)。全模式统一由调用方注册。
+/// (task event 驱动 CPU 冷启动时由 CPU worker 注册主 pid, 退出 → EvictUid 清身份)
 /// 跨线程 epoll_ctl: epfd 是内核对象, 任意线程可 ADD; 失败 (pidfd 不可用) 静默跳过。
 pub fn watch(pid: i32) {
     if pid <= 0 {

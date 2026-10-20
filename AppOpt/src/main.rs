@@ -60,7 +60,7 @@ struct UidEntry {
 
 /// 从 packages.list 构建 uid→条目 静态表 (主线程持有):
 ///   cpu = 有 CPU 规则的应用; rfr = com.android.launcher3 + 有刷新率规则的应用。
-/// 一个应用可同时 CPU + 刷新率 (合表后用标志位表达)。前台回调只查本表。
+/// 一个应用可同时 CPU + 刷新率 (合表后用标志位表达)。前台驱动 (on_fg/task event) 查本表。
 fn build_uid_tables(cfg: &AppConfig) -> (HashMap<i32, UidEntry>, HashMap<String, i32>) {
     let mut cpu_pkgs: HashSet<&str> = HashSet::new();
     for r in &cfg.rules {
@@ -678,13 +678,11 @@ impl AppState {
         self.rfr_evict_all();      // refresh_apply(launcher)
     }
 
-    /// binder 前台回调 (pid+uid): CPU 亲和性冷启动应用 (一次); 刷新率/vfc/srv/prop
-    /// 按回调 uid 应用/回落 — 桌面回调时查看 TaskStackListener 最新 uid (LAST_TASK_UID)
-    /// 确认真实前台: 按最近键返回后回调仍桌面, 但前移任务已是原应用 → 应用其规则不误回落。
-    /// binder 前台回调 (pid+uid): 按 uid 规则应用/回落 (vfc/srv/prop/刷新率 + CPU 冷启动)。
-    /// 连续桌面回调 (上次回调也是桌面): 检查 TaskStackListener 最新 uid —
-    /// 若是规则应用 (按最近键返回后回调仍桌面但前移任务已切回) → 重新应用其规则; 桌面 → 回落。
-    fn on_fg(&mut self, pid: i32, uid: i32) {
+    /// binder 前台回调 (pid+uid): 仅 vfc/srv/prop 按回调 uid 应用/回落;
+    /// CPU 与刷新率由 task event (TaskStackListener) 驱动, 不在此处理。
+    /// 连续桌面回调 (上次回调也是桌面): 完全交给 task event 驱动决定,
+    /// 只更新状态返回 — 不回落/不应用/不碰任何规则。
+    fn on_fg(&mut self, _pid: i32, uid: i32) {
         /* 连续桌面回调: 回调仍桌面但真实前台可能已切回原应用 —
          * 完全由 task event (TaskStackListener) 驱动决定 (不回落/不应用/不碰 CPU) */
         if uid == LAUNCHER_UID.load(Ordering::Relaxed)
@@ -743,54 +741,11 @@ impl AppState {
                 es.bpf.prop_file_apply(want_prop);
             }
         }
-        // 提前取出 uid 表条目 (克隆), 避免持有 self 借用时再 &mut self
-        let entry = self.uid_map.get(&uid).map(|e| (e.cpu, e.rfr, e.pkg.clone()));
-        match entry {
-            Some((cpu, rfr, pkg)) => {
-                // CPU 规则: 冷热判断 (cpu_known 中 uid+pid 一致=热); 冷时 pidfd 监听
-                if cpu && !crate::cpu_affinity::cpu_known_is_hot(uid, pid) {
-                    crate::event_probe::watch(pid);
-                    if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
-                        let _ = tx.send(crate::cpu_affinity::CpuMsg::ApplyPkg(
-                            pid, uid, pkg.clone(),
-                        ));
-                    }
-                }
-                // 刷新率: 桌面/非规则 → 回落全局; 规则应用 → 应用规则并监听主 pid
-                if rfr {
-                    if pkg == crate::config::DEFAULT_REFRESH_PACKAGE {
-                        self.rfr_evict_all();
-                    } else {
-                        self.refresh_fg_rule_app(pid, &pkg);
-                    }
-                } else {
-                    self.rfr_evict_all();
-                }
-            }
-            None => {
-                // 非规则应用回调: 直接回落全局
-                self.rfr_evict_all();
-            }
-        }
     }
 
     /// 刷新率应用规则: 主线程命中后下发包名给刷新率线程
     fn refresh_apply(&mut self, pkg: String) {
         crate::refresh::refresh_send_fg_pkg(pkg);
-    }
-
-    /// 规则应用前台回调: 未命中 → 应用规则并注册 pidfd 监听 (退出清命中表);
-    /// 已命中 → 直接应用规则。
-    fn refresh_fg_rule_app(&mut self, pid: i32, pkg: &str) {
-        if RFR_MON.lock().unwrap().contains_key(&pid) {
-            self.refresh_apply(pkg.to_string());
-            return;
-        }
-        // 首次回调: 应用规则 + 入命中表 (主 pid 退出时 EV_EXIT_PID 移除);
-        // pidfd 监听主进程 → webui 命中应用 (经表查 pkg/label)
-        crate::event_probe::watch(pid);
-        RFR_MON.lock().unwrap().insert(pid, pkg.to_string());
-        self.refresh_apply(pkg.to_string());
     }
 
 }
@@ -984,7 +939,7 @@ fn main() {
     let mut touch_sv: [libc::c_int; 2] = [-1, -1];
     let mut exit_sv: [libc::c_int; 2] = [-1, -1];
     let (touch_ok, exit_ok) = spawn_event_probe(&mut touch_sv, &mut exit_sv);
-    // TaskStackListener 事件通道: 任务栈变化 → taskId → 主线程 EV_TASK 查询 getRootTaskInfo
+    // TaskStackListener 事件通道: 任务前移 → RunningTaskInfo 解析 effectiveUid → EV_TASK
     let mut task_sv: [libc::c_int; 2] = [-1, -1];
     let task_ok = unsafe {
         libc::socketpair(
@@ -1015,7 +970,7 @@ fn main() {
 
     crate::cpu_affinity::start();
 
-    // 刷新率控制模块，独立线程运行 (binder 回调经主线程 uid 表 → FgPkg 消息驱动)
+    // 刷新率控制模块，独立线程运行 (task event 驱动 uid → FgPkg 消息)
     refresh::refresh_init(display_modes_thread);
     let _ = crate::web::START.get_or_init(|| std::time::Instant::now());
 
@@ -1029,7 +984,7 @@ fn main() {
     const EV_TOUCH: u64 = 8; // 用户态 /dev/input 触摸/输入活动 (替代 4.19 内核 input hook)
     const EV_EXIT_PID: u64 = 9; // pidfd 进程退出监听 (全模式统一退出来源)
     const EV_WAYLAY: u64 = 10; // waylay.conf inotify (外部编辑/原子替换 → 重读校验全量下发)
-    const EV_TASK: u64 = 13; // TaskStackListener 任务栈变化 (taskId → getRootTaskInfo → uid)
+    const EV_TASK: u64 = 13; // TaskStackListener 任务前移 (effectiveUid 驱动 CPU/刷新率)
 
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epfd < 0 {
@@ -1244,8 +1199,7 @@ fn main() {
                 }
                 EV_TASK => {
                     // TaskStackListener onTaskMovedToFront → 前移任务 effectiveUid。
-                    // 连续桌面状态 (最近回调是桌面): 由 task event 决定 — 规则应用 → 重新应用;
-                    // 桌面 → 回落。非连续桌面状态: 仅记录 LAST_TASK_UID (on_fg 正常回调已处理)。
+                    // 驱动: CPU (冷启动按 uid 应用并登记, 热跳过) + 刷新率 (应用/回落)。
                     if task_ok && task_sv[0] > 0 {
                         let mut uid = 0i32;
                         let n = unsafe {
@@ -1258,9 +1212,44 @@ fn main() {
                         };
                         if n == 4 {
                             LAST_TASK_UID.store(uid, Ordering::Relaxed);
+                            // CPU: task event 驱动 — 表无该 uid (冷) → 应用并登记; 热 → 跳过
+                            if let Some(e) = state.uid_map.get(&uid) {
+                                if e.cpu && !crate::cpu_affinity::cpu_known_has(uid) {
+                                    if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
+                                        let _ = tx.send(
+                                            crate::cpu_affinity::CpuMsg::ApplyPkgByUid(
+                                                uid,
+                                                e.pkg.clone(),
+                                            ),
+                                        );
+                                    }
+                                }
+                                // 刷新率: task event 驱动 — rfr → 应用 + web 命中 (RFR_MON: pid→pkg, 主 pid cgroup);
+                                // 无 → 回落全局
+                                if e.rfr {
+                                    // web 命中显示: 主 pid (cgroup 最小) → RFR_MON + 退出监听
+                                    let pids =
+                                        crate::cpu_affinity::cgroup_pids(uid).unwrap_or_default();
+                                    if let Some(&rpid) = pids.iter().min() {
+                                        if !RFR_MON.lock().unwrap().contains_key(&rpid) {
+                                            crate::event_probe::watch(rpid);
+                                            RFR_MON.lock().unwrap().insert(rpid, e.pkg.clone());
+                                        }
+                                    }
+                                    state.refresh_apply(e.pkg.clone());
+                                } else {
+                                    state.refresh_apply(
+                                        crate::config::DEFAULT_REFRESH_PACKAGE.to_string(),
+                                    );
+                                }
+                            } else {
+                                // 无规则应用 → 回落全局
+                                state.refresh_apply(
+                                    crate::config::DEFAULT_REFRESH_PACKAGE.to_string(),
+                                );
+                            }
                             // 连续桌面状态 (on_fg 首次桌面回调已回落):
-                            // 前移任务是需要补发规则的应用 (vfc 或刷新率规则; 含刷新率的
-                            // 桌面已由 uid != LAUNCHER_UID 排除; 只有 CPU 规则 → 已应用一次, 不补)
+                            // 前移任务是需要补发规则的应用 (vfc 或刷新率; 桌面/纯CPU 排除)
                             if state.last_fg_uid == LAUNCHER_UID.load(Ordering::Relaxed)
                                 && uid > 0
                                 && uid != LAUNCHER_UID.load(Ordering::Relaxed)

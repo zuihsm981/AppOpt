@@ -123,7 +123,7 @@ static ATM_CLASS: OnceLock<SendClass> = OnceLock::new();
 static SF_CLASS: OnceLock<SendClass> = OnceLock::new();
 // ITaskStackListener 本地 class (任务栈变化事件接收)
 static TSL_CLASS: OnceLock<SendClass> = OnceLock::new();
-/// TaskStackListener 事件通道写端: 解析出的 taskId → 主线程 EV_TASK
+/// TaskStackListener 事件通道写端: 解析出的 effectiveUid → 主线程 EV_TASK
 static TASK_SEND_FD: AtomicI32 = AtomicI32::new(-1);
 
 /// IProcessObserver 前台回调防抖: 同 (pid, uid) 高频回调 (launcher fg 波动) 200ms 内只发一次
@@ -273,8 +273,9 @@ fn get_tsl_class() -> *mut c_void {
 }
 
 /// ITaskStackListener 回调 onTransact: onTaskMovedToFront=0xb 参数 RunningTaskInfo
-/// (readTypedObject → null 标志 + TaskInfo 基类前 3 int: userId/taskId/effectiveUid),
-/// 直接取 effectiveUid 发送到主线程 EV_TASK (无需再查 getRootTaskInfo)。
+/// (readTypedObject → null 标志 + RunningTaskInfo.id + TaskInfo: userId/taskId/effectiveUid,
+/// effectiveUid = null 标志后第 4 个 int),
+/// 直接取 effectiveUid 发送到主线程 EV_TASK。
 extern "C" fn tsl_on_transact(
     _binder: *mut c_void,
     code: u32,
@@ -314,7 +315,7 @@ extern "C" fn tsl_on_transact(
     STATUS_OK
 }
 
-/// 注册 ITaskStackListener (事务 0x2f): 任务栈变化 → taskId → 主线程 EV_TASK 查询
+/// 注册 ITaskStackListener (事务 0x2f): 任务前移 → effectiveUid → 主线程 EV_TASK
 pub fn init_task_stack_listener(send_fd: i32) -> bool {
     TASK_SEND_FD.store(send_fd, Ordering::Release);
     let Some(ndk) = ndk() else { return false };
