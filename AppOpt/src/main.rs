@@ -625,18 +625,9 @@ impl AppState {
     fn apply_focused_uid(&mut self, uid: i32) {
         crate::main_dbg(&format!("apply focus uid={}", uid));
         if uid <= 0 {
-            // 查询失败/无有效聚焦 (息屏/无聚焦任务) → 保守回落全局 (桌面场景合理)
+            // 查询失败/无有效聚焦 (息屏/无聚焦任务) → 保守回落全局
             crate::main_dbg("apply focus: no valid uid, revert all");
-            self.waylay_evict_all();   // vfc_fg(0)
-            self.srv_evict_all();      // srv_active(false)
-            if self.prop_active_cur {
-                crate::config::set_prop_rules(&[]);
-                if let Some(es) = self.ebpf_state.as_ref() {
-                    es.bpf.prop_file_apply(false);
-                }
-                self.prop_active_cur = false;
-            }
-            self.rfr_evict_all();      // refresh_apply(launcher)
+            self.revert_all_rules();
             return;
         }
         // 防护: 不在规则表且非 app uid (解析错位垃圾值) → 不动, 不误下发内核
@@ -675,10 +666,41 @@ impl AppState {
         }
     }
 
-    /// binder 前台回调 (pid+uid): 查 uid 表分发 CPU (冷启动 ApplyPkg + pidfd watch)
-    /// 与刷新率 (包名) —— 原 EV_FG 分支主体
+    /// 回落全部规则 (vfc/srv/prop/刷新率全局); CPU 亲和性不回落 (一次应用保持)
+    fn revert_all_rules(&mut self) {
+        self.waylay_evict_all();   // vfc_fg(0)
+        self.srv_evict_all();      // srv_active(false)
+        if self.prop_active_cur {
+            crate::config::set_prop_rules(&[]);
+            if let Some(es) = self.ebpf_state.as_ref() {
+                es.bpf.prop_file_apply(false);
+            }
+            self.prop_active_cur = false;
+        }
+        self.rfr_evict_all();      // refresh_apply(launcher)
+    }
+
+    /// binder 前台回调 (pid+uid): CPU 亲和性冷启动应用 (一次); 刷新率/vfc/srv/prop
+    /// 按回调 uid 应用/回落 — 桌面回调时查看 TaskStackListener 最新 uid (LAST_TASK_UID)
+    /// 确认真实前台: 按最近键返回后回调仍桌面, 但前移任务已是原应用 → 应用其规则不误回落。
+    /// binder 前台回调 (pid+uid): 按 uid 规则应用/回落 (vfc/srv/prop/刷新率 + CPU 冷启动)。
+    /// 连续桌面回调 (上次回调也是桌面): 检查 TaskStackListener 最新 uid —
+    /// 若是规则应用 (按最近键返回后回调仍桌面但前移任务已切回) → 重新应用其规则; 桌面 → 回落。
     fn on_fg(&mut self, pid: i32, uid: i32) {
-        /* 四功能统一 uid: 直接查 uid 规则表 (uid 在该表 = 有规则) */
+        /* 连续桌面回调: 回调仍桌面但真实前台可能已切回原应用 (TaskStackListener 驱动过) */
+        if uid == LAUNCHER_UID.load(Ordering::Relaxed)
+            && self.last_fg_uid == LAUNCHER_UID.load(Ordering::Relaxed)
+        {
+            let task_uid = LAST_TASK_UID.load(Ordering::Relaxed);
+            crate::main_dbg(&format!("on_fg desktop->desktop task_uid={}", task_uid));
+            if task_uid > 0 && task_uid != LAUNCHER_UID.load(Ordering::Relaxed) {
+                self.apply_focused_uid(task_uid);   // 规则应用 → 重新应用规则
+            } else {
+                self.revert_all_rules();            // 桌面 → 回落
+            }
+            self.last_fg_uid = uid;
+            return;
+        }
         self.last_fg_uid = uid;
         crate::main_dbg(&format!("on_fg uid={}", uid));
         let my: Vec<crate::config::WaylayRule> = self
@@ -686,13 +708,11 @@ impl AppState {
             .get(&uid)
             .cloned()
             .unwrap_or_default();
-        // ---- 前台 uid 通知内核 (vfc_fg): 规则应用 → 下发 uid;
-        //      非规则应用 → 直接回落 vfc_fg(0) (仅全局) ----
+        // ---- 前台 uid 通知内核 (vfc_fg): 规则应用 → 下发 uid; 非规则 → vfc_fg(0) ----
         let in_vfc = self.vfc_uid_set.contains(&uid);
         let fg_uid: Option<i32> = if in_vfc {
             Some(uid)
         } else {
-            // 非 waylay 规则应用回调: 直接回落 vfc (按当前 uid 规则决定, 无需记录判断)
             self.waylay_evict_all();
             None
         };
@@ -701,15 +721,13 @@ impl AppState {
                 es.bpf.vfc_fg(u);
             }
         }
-        // ---- src (系统服务伪装): 内核侧用 srv_active 通知 (0/1) ----
-        //      规则应用 → 下发激活通知; 非规则应用 → 直接停止
+        // ---- src (系统服务伪装): 规则应用 → 激活; 非规则 → 停止 ----
         let in_srv = my
             .iter()
             .any(|r| r.kind == crate::config::WaylayKind::Src);
         let srv_on: Option<bool> = if in_srv {
             Some(true)
         } else {
-            // 非 srv 规则应用回调: 直接回落 srv (按当前 uid 规则决定, 无需记录判断)
             self.srv_evict_all();
             None
         };
@@ -718,7 +736,7 @@ impl AppState {
                 es.bpf.srv_active(on);
             }
         }
-        // prop (系统属性伪装): 该包 prop 规则前台激活, 切走恢复 (用户态 tmpfs 写替换)
+        // prop (系统属性伪装): 该包 prop 规则前台激活, 切走恢复
         let prop_rules: Vec<(String, String)> = my
             .iter()
             .filter(|r| r.kind == crate::config::WaylayKind::Prop)
@@ -738,8 +756,7 @@ impl AppState {
         let entry = self.uid_map.get(&uid).map(|e| (e.cpu, e.rfr, e.pkg.clone()));
         match entry {
             Some((cpu, rfr, pkg)) => {
-                // CPU 规则: 冷热判断 (cpu_known 中 uid+pid 一致=热);
-                // 冷时注册 pidfd 监听 (退出清理由 EV_EXIT_PID 驱动)
+                // CPU 规则: 冷热判断 (cpu_known 中 uid+pid 一致=热); 冷时 pidfd 监听
                 if cpu && !crate::cpu_affinity::cpu_known_is_hot(uid, pid) {
                     crate::event_probe::watch(pid);
                     if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
@@ -748,17 +765,14 @@ impl AppState {
                         ));
                     }
                 }
-                // 刷新率: 桌面 (非规则) → 直接回落全局; 规则应用 → 应用规则并监听主 pid;
-                // 无刷新率规则应用 (含纯 CPU 规则应用) → 直接回落全局
+                // 刷新率: 桌面/非规则 → 回落全局; 规则应用 → 应用规则并监听主 pid
                 if rfr {
                     if pkg == crate::config::DEFAULT_REFRESH_PACKAGE {
-                        /* 规则应用 → 桌面/非规则: 直接回落全局 */
                         self.rfr_evict_all();
                     } else {
                         self.refresh_fg_rule_app(pid, &pkg);
                     }
                 } else {
-                    /* 非刷新率规则应用 (纯 CPU 规则等): 直接回落全局 */
                     self.rfr_evict_all();
                 }
             }
@@ -818,6 +832,11 @@ pub(crate) fn main_dbg(msg: &str) {
         let _ = f.write_all(format!("{}\n", msg).as_bytes());
     }
 }
+
+/// 桌面 (launcher) uid: 桌面回调判断 (启动时从 packages.list 解析)
+static LAUNCHER_UID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+/// TaskStackListener 最新驱动的前移任务 uid (on_fg 桌面回调时查看确认真实前台)
+static LAST_TASK_UID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -1002,6 +1021,13 @@ fn main() {
     };
     if task_ok {
         crate::process_observer::init_task_stack_listener(task_sv[1]);
+        LAUNCHER_UID.store(
+            crate::pkg_to_uid_map()
+                .get(crate::config::DEFAULT_REFRESH_PACKAGE)
+                .copied()
+                .unwrap_or(-1),
+            Ordering::Relaxed,
+        );
     }
     RFR_MON.lock().unwrap().clear();   /* 初始化: 清空 pidfd 监听刷新率命中记录 */
     crate::cpu_affinity::cpu_stats_clear();   /* 初始化: 清空线程状态页命中应用 */
@@ -1242,8 +1268,9 @@ fn main() {
                     }
                 }
                 EV_TASK => {
-                    // TaskStackListener onTaskMovedToFront → 前移任务的 effectiveUid
-                    // → apply_focused_uid 应用/回落 (事件驱动, 覆盖最近键返回等所有任务前移)
+                    // TaskStackListener onTaskMovedToFront → 前移任务 effectiveUid,
+                    // 仅记录 LAST_TASK_UID (数据源) — 应用/回落由 on_fg 回调驱动
+                    // (连续桌面分支按 LAST_TASK_UID 决定重新应用或回落)
                     if task_ok && task_sv[0] > 0 {
                         let mut uid = 0i32;
                         let n = unsafe {
@@ -1256,7 +1283,7 @@ fn main() {
                         };
                         if n == 4 {
                             crate::main_dbg(&format!("task event uid={}", uid));
-                            state.apply_focused_uid(uid);
+                            LAST_TASK_UID.store(uid, Ordering::Relaxed);
                         }
                     }
                 }
