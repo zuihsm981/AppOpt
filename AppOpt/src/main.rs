@@ -1242,28 +1242,21 @@ fn main() {
                     }
                 }
                 EV_TASK => {
-                    // TaskStackListener 事件: taskId → getRootTaskInfo(taskId) → effectiveUid
-                    // → 应用/回落 (事件驱动, 覆盖最近键返回等所有任务前移场景)
+                    // TaskStackListener onTaskMovedToFront → 前移任务的 effectiveUid
+                    // → apply_focused_uid 应用/回落 (事件驱动, 覆盖最近键返回等所有任务前移)
                     if task_ok && task_sv[0] > 0 {
-                        let mut task_id = 0i32;
+                        let mut uid = 0i32;
                         let n = unsafe {
                             libc::recv(
                                 task_sv[0],
-                                &mut task_id as *mut i32 as *mut libc::c_void,
+                                &mut uid as *mut i32 as *mut libc::c_void,
                                 4,
                                 0,
                             )
                         };
-                        if n == 4 && task_id > 0 {
-                            crate::main_dbg(&format!("task event taskId={}", task_id));
-                            let r = crate::process_observer::get_root_task_uid(task_id);
-                            match &r {
-                                Ok(uid) => crate::main_dbg(&format!("root task {} uid={}", task_id, uid)),
-                                Err(e) => crate::main_dbg(&format!("root task {} err: {}", task_id, e)),
-                            }
-                            if let Ok(uid) = r {
-                                state.apply_focused_uid(uid);
-                            }
+                        if n == 4 {
+                            crate::main_dbg(&format!("task event uid={}", uid));
+                            state.apply_focused_uid(uid);
                         }
                     }
                 }

@@ -36,11 +36,6 @@ type FnParcelDelete = unsafe extern "C" fn(*mut c_void);
 type FnWriteBinder = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
 type FnReadI32 = unsafe extern "C" fn(*mut c_void, *mut i32) -> c_int;
 type FnWriteI32 = unsafe extern "C" fn(*mut c_void, i32) -> c_int;
-type FnReadString = unsafe extern "C" fn(
-    *mut c_void,
-    *mut c_void,
-    unsafe extern "C" fn(*mut c_void, *const c_char, usize) -> usize,
-) -> bool;
 type FnJoinThreadPool = unsafe extern "C" fn();
 type FnStartThreadPool = unsafe extern "C" fn();
 type FnAssociateClass = unsafe extern "C" fn(*mut c_void, *const c_void) -> bool;
@@ -55,7 +50,6 @@ struct BinderNdk {
     write_binder: FnWriteBinder,
     write_int32: FnWriteI32,
     read_i32: FnReadI32,
-    read_string: FnReadString,
     join_thread_pool: FnJoinThreadPool,
     start_thread_pool: FnStartThreadPool,
     associate_class: FnAssociateClass,
@@ -83,14 +77,13 @@ fn ndk() -> Option<&'static BinderNdk> {
         let p_write_binder = sym("AParcel_writeStrongBinder");
         let p_write_i32 = sym("AParcel_writeInt32");
         let p_read_i32 = sym("AParcel_readInt32");
-        let p_read_string = sym("AParcel_readString");
         let p_join = sym("ABinderProcess_joinThreadPool");
         let p_start = sym("ABinderProcess_startThreadPool");
         let p_associate = sym("AIBinder_associateClass");
         if p_get_service.is_null() || p_class_define.is_null() || p_binder_new.is_null()
             || p_prepare_tx.is_null() || p_transact.is_null() || p_parcel_delete.is_null()
             || p_write_binder.is_null() || p_write_i32.is_null()
-            || p_read_i32.is_null() || p_read_string.is_null()
+            || p_read_i32.is_null()
             || p_join.is_null() || p_start.is_null() || p_associate.is_null()
         { return None; }
         
@@ -104,7 +97,6 @@ fn ndk() -> Option<&'static BinderNdk> {
             write_binder: std::mem::transmute(p_write_binder),
             write_int32: std::mem::transmute(p_write_i32),
             read_i32: std::mem::transmute(p_read_i32),
-            read_string: std::mem::transmute(p_read_string),
             join_thread_pool: std::mem::transmute(p_join),
             start_thread_pool: std::mem::transmute(p_start),
             associate_class: std::mem::transmute(p_associate),
@@ -274,10 +266,9 @@ fn get_tsl_class() -> *mut c_void {
     }).0
 }
 
-/// ITaskStackListener 回调 onTransact: 解析 taskId (onTaskMovedToFront=0xb /
-/// onTaskFocusChanged=0x17 / onTaskStackChanged=0x1), 发送到主线程 EV_TASK。
-/// onTaskMovedToFront 参数 RunningTaskInfo: readTypedObject → null 标志 +
-/// TaskInfo 基类前 2 int (userId/taskId)。
+/// ITaskStackListener 回调 onTransact: onTaskMovedToFront=0xb 参数 RunningTaskInfo
+/// (readTypedObject → null 标志 + TaskInfo 基类前 3 int: userId/taskId/effectiveUid),
+/// 直接取 effectiveUid 发送到主线程 EV_TASK (无需再查 getRootTaskInfo)。
 extern "C" fn tsl_on_transact(
     _binder: *mut c_void,
     code: u32,
@@ -285,36 +276,29 @@ extern "C" fn tsl_on_transact(
     _out: *mut c_void,
 ) -> c_int {
     let Some(ndk) = ndk() else { return STATUS_UNKNOWN_TRANSACTION };
-    let mut task_id = -1i32;
+    let mut uid = -1i32;
     match code {
-        0x01 => {
-            // onTaskStackChanged: 无参数 — 发 -1 (主线程忽略或兜底)
-            task_id = -1;
-        }
         0x0b => {
-            // onTaskMovedToFront(RunningTaskInfo): null 标志 + userId + taskId
+            // onTaskMovedToFront(RunningTaskInfo): 前 3 int = userId/taskId/effectiveUid
             let mut flag = 0i32;
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut flag) };
             if flag != 0 {
                 let mut _user_id = 0i32;
                 let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _user_id) };
-                let _ = unsafe { (ndk.read_i32)(in_parcel, &mut task_id) };
+                let mut _task_id = 0i32;
+                let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _task_id) };
+                let _ = unsafe { (ndk.read_i32)(in_parcel, &mut uid) };
             }
         }
-        0x17 => {
-            // onTaskFocusChanged(int taskId, boolean isFocused)
-            let mut focused = 0i32;
-            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut task_id) };
-            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut focused) };
-        }
         _ => {
-            return STATUS_UNKNOWN_TRANSACTION;
+            // onTaskStackChanged/onTaskFocusChanged 等: 无有效 uid 负载, 忽略
+            return STATUS_OK;
         }
     }
     let fd = TASK_SEND_FD.load(Ordering::Acquire);
-    if fd >= 0 && task_id > 0 {
+    if fd >= 0 && uid > 0 {
         let _ = unsafe {
-            libc::send(fd, &task_id as *const i32 as *const libc::c_void, 4, libc::MSG_DONTWAIT)
+            libc::send(fd, &uid as *const i32 as *const libc::c_void, 4, libc::MSG_DONTWAIT)
         };
     }
     STATUS_OK
@@ -468,94 +452,3 @@ pub fn set_refresh_rate_binder(mode: i32) -> bool {
     ok
 }
 
-/// AParcel_readString 的 copy_func: 不拷贝 (data 为 null), 仅返回长度使读取成功 → 跳过字符串
-unsafe extern "C" fn skip_str_fn(_data: *mut c_void, _s: *const c_char, len: usize) -> usize {
-    len
-}
-
-/// binder 查询: getRootTaskInfo(taskId, displayId=0) (事务 0x38), 返回该任务 effectiveUid。
-/// TaskStackListener 事件给 taskId → 按 taskId 精确查任务 (不受 input focus 影响)。
-/// 解析布局与 getFocusedRootTaskInfo 相同 (RootTaskInfo 子类 + TaskInfo 前 3 字段)。
-pub fn get_root_task_uid(task_id: i32) -> Result<i32, String> {
-    let ndk = ndk().ok_or("ndk init failed")?;
-    let svc = unsafe { (ndk.get_service)(b"activity_task\0".as_ptr() as *const c_char) };
-    if svc.is_null() {
-        return Err("get_service(activity_task) returned null".into());
-    }
-    let atm_class = get_atm_class();
-    if atm_class.is_null() {
-        return Err("atm class define failed".into());
-    }
-    if !unsafe { (ndk.associate_class)(svc, atm_class as *const c_void) } {
-        return Err("associate_class failed (descriptor mismatch?)".into());
-    }
-    let mut in_parcel: *mut c_void = std::ptr::null_mut();
-    let prep = unsafe { (ndk.prepare_tx)(svc, &mut in_parcel) };
-    if prep != STATUS_OK || in_parcel.is_null() {
-        return Err(format!("prepare_tx status={}", prep));
-    }
-    let _ = unsafe { (ndk.write_int32)(in_parcel, task_id) };
-    let _ = unsafe { (ndk.write_int32)(in_parcel, 0) };   // displayId = 0 (主屏)
-    let mut out_parcel: *mut c_void = std::ptr::null_mut();
-    let status = unsafe { (ndk.transact)(svc, 0x38, &mut in_parcel, &mut out_parcel, 0) };
-    unsafe { (ndk.parcel_delete)(in_parcel); }
-    if status != STATUS_OK || out_parcel.is_null() {
-        let null_out = out_parcel.is_null();
-        if !out_parcel.is_null() {
-            unsafe { (ndk.parcel_delete)(out_parcel); }
-        }
-        return Err(format!("transact status={} out_null={}", status, null_out));
-    }
-    let mut exc = 0i32;
-    let _ = unsafe { (ndk.read_i32)(out_parcel, &mut exc) };
-    if exc != 0 {
-        unsafe { (ndk.parcel_delete)(out_parcel); }
-        return Err(format!("reply exception={}", exc));
-    }
-    let p = out_parcel;
-    let mut obj_flag = 0i32;
-    let _ = unsafe { (ndk.read_i32)(p, &mut obj_flag) };
-    if obj_flag == 0 {
-        unsafe { (ndk.parcel_delete)(p); }
-        return Err("root task null".into());
-    }
-    let mut n = 0i32;
-    // RootTaskInfo 子类: bounds Rect (null 标志 + 4×int)
-    let _ = unsafe { (ndk.read_i32)(p, &mut n) };
-    for _ in 0..4 {
-        let _ = unsafe { (ndk.read_i32)(p, &mut n) };
-    }
-    // childTaskIds: int[]
-    let _ = unsafe { (ndk.read_i32)(p, &mut n) };
-    for _ in 0..n.max(0) {
-        let _ = unsafe { (ndk.read_i32)(p, &mut n) };
-    }
-    // childTaskNames: String[] (NDK readString 跳过)
-    let _ = unsafe { (ndk.read_i32)(p, &mut n) };
-    for _ in 0..n.max(0) {
-        let _ = unsafe { (ndk.read_string)(p, std::ptr::null_mut(), skip_str_fn) };
-    }
-    // childTaskBounds: Rect[]
-    let _ = unsafe { (ndk.read_i32)(p, &mut n) };
-    for _ in 0..n.max(0) {
-        let _ = unsafe { (ndk.read_i32)(p, &mut n) };
-        for _ in 0..4 {
-            let _ = unsafe { (ndk.read_i32)(p, &mut n) };
-        }
-    }
-    // childTaskUserIds: int[]
-    let _ = unsafe { (ndk.read_i32)(p, &mut n) };
-    for _ in 0..n.max(0) {
-        let _ = unsafe { (ndk.read_i32)(p, &mut n) };
-    }
-    // visible / position
-    let _ = unsafe { (ndk.read_i32)(p, &mut n) };
-    let _ = unsafe { (ndk.read_i32)(p, &mut n) };
-    // TaskInfo: userId / taskId / effectiveUid
-    let _ = unsafe { (ndk.read_i32)(p, &mut n) };
-    let _ = unsafe { (ndk.read_i32)(p, &mut n) };
-    let mut eff_uid = 0i32;
-    let _ = unsafe { (ndk.read_i32)(p, &mut eff_uid) };
-    unsafe { (ndk.parcel_delete)(p); }
-    Ok(eff_uid)
-}
