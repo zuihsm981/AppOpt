@@ -623,10 +623,8 @@ impl AppState {
     /// 聚焦=桌面 (launcher) → 回落全局; 聚焦=规则应用 → 应用其规则;
     /// 聚焦=其他无规则应用 → 回落全局。查询失败 (uid<=0) / 垃圾 uid → 不动。
     fn apply_focused_uid(&mut self, uid: i32) {
-        crate::main_dbg(&format!("apply focus uid={}", uid));
         if uid <= 0 {
             // 查询失败/无有效聚焦 (息屏/无聚焦任务) → 保守回落全局
-            crate::main_dbg("apply focus: no valid uid, revert all");
             self.revert_all_rules();
             return;
         }
@@ -696,7 +694,6 @@ impl AppState {
             return;
         }
         self.last_fg_uid = uid;
-        crate::main_dbg(&format!("on_fg uid={}", uid));
         let my: Vec<crate::config::WaylayRule> = self
             .uid_rules
             .get(&uid)
@@ -810,22 +807,6 @@ pub fn rfr_hit_list() -> Vec<(i32, String)> {
     RFR_MON.lock().unwrap().iter().map(|(p, k)| (*p, k.clone())).collect()
 }
 
-/// 统一诊断日志: 追加一行到 /data/local/tmp/appopt_dbg.txt (限制 ≤2MB 防磁盘暴涨)
-pub(crate) fn main_dbg(msg: &str) {
-    if let Ok(md) = std::fs::metadata("/data/local/tmp/appopt_dbg.txt") {
-        if md.len() > 2 * 1024 * 1024 {
-            return;
-        }
-    }
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/data/local/tmp/appopt_dbg.txt")
-    {
-        use std::io::Write;
-        let _ = f.write_all(format!("{}\n", msg).as_bytes());
-    }
-}
 
 /// 桌面 (launcher) uid: 桌面回调判断 (启动时从 packages.list 解析)
 static LAUNCHER_UID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
@@ -1276,7 +1257,6 @@ fn main() {
                             )
                         };
                         if n == 4 {
-                            crate::main_dbg(&format!("task event uid={}", uid));
                             LAST_TASK_UID.store(uid, Ordering::Relaxed);
                             if state.last_fg_uid == LAUNCHER_UID.load(Ordering::Relaxed) {
                                 if uid > 0 && uid != LAUNCHER_UID.load(Ordering::Relaxed) {

@@ -126,6 +126,16 @@ static TSL_CLASS: OnceLock<SendClass> = OnceLock::new();
 /// TaskStackListener 事件通道写端: 解析出的 taskId → 主线程 EV_TASK
 static TASK_SEND_FD: AtomicI32 = AtomicI32::new(-1);
 
+/// IProcessObserver 前台回调防抖: 同 (pid, uid) 高频回调 (launcher fg 波动) 200ms 内只发一次
+static LAST_FG_T: std::sync::LazyLock<std::sync::Mutex<(i32, i32, std::time::Instant)>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Mutex::new((
+            0,
+            0,
+            std::time::Instant::now() - std::time::Duration::from_secs(10),
+        ))
+    });
+
 extern "C" fn on_create(_args: *mut c_void) -> *mut c_void { std::ptr::null_mut() }
 extern "C" fn on_destroy(_user_data: *mut c_void) {}
 extern "C" fn am_dummy_on_transact(_b: *mut c_void, _c: u32, _i: *mut c_void, _o: *mut c_void) -> c_int { STATUS_UNKNOWN_TRANSACTION }
@@ -158,31 +168,26 @@ extern "C" fn on_transact(
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut uid) };
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut fg_val) };
 
-            // 临时诊断: 记录所有前台回调 (含 started=false) 到文件,
-            // 验证"按最近键→返回原应用"时是否产生回调 / 哪些回调
-            if pid > 0 {
-                let line = format!("pid={} uid={} fg={}\n", pid, uid, fg_val != 0);
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/data/local/tmp/appopt_fg_cb.txt")
-                {
-                    use std::io::Write;
-                    let _ = f.write_all(line.as_bytes());
-                }
-            }
-
             let fg = fg_val != 0;
 
             if fg && pid > 0 {
-                // 触发分离：Binder 回调携带 pid + uid（8 字节）。
-                // 刷新率按 pid 解析包名; CPU 亲和性按 uid 取该应用全部进程
-                let fd = FG_SEND_FD.load(Ordering::Acquire);
-                if fd >= 0 {
-                    let pkt = [pid, uid];
-                    let _ = unsafe {
-                        libc::send(fd, pkt.as_ptr() as *const libc::c_void, 8, 0)
-                    };
+                // 200ms 防抖: 同 (pid, uid) 高频回调 (launcher fg 波动) 只发一次
+                let now = std::time::Instant::now();
+                let mut last = crate::lock_ignore_poison(&LAST_FG_T);
+                let due = pid != last.0
+                    || uid != last.1
+                    || now.duration_since(last.2).as_millis() >= 200;
+                if due {
+                    *last = (pid, uid, now);
+                    // 触发分离：Binder 回调携带 pid + uid（8 字节）。
+                    // 刷新率按 pid 解析包名; CPU 亲和性按 uid 取该应用全部进程
+                    let fd = FG_SEND_FD.load(Ordering::Acquire);
+                    if fd >= 0 {
+                        let pkt = [pid, uid];
+                        let _ = unsafe {
+                            libc::send(fd, pkt.as_ptr() as *const libc::c_void, 8, 0)
+                        };
+                    }
                 }
             }
             STATUS_OK
