@@ -360,11 +360,17 @@ pub fn set_refresh_rate_binder(mode: i32) -> bool {
 /// 否则逐字节消费 2×len 字节 (最底层 readByte, 不依赖 readString 的转换/缓冲,
 /// 避免 readCharArray 在特定数据下失败导致位置错位)
 fn skip_string(ndk: &BinderNdk, p: *mut c_void) -> bool {
-    let mut len = 0i32;
-    if !unsafe { (ndk.read_i32)(p, &mut len) } {
-        crate::main_dbg("skip read_len_fail");
-        return false;
+    // 长度 (int32) 用 readByte 逐字节读 (小端), 避开 readInt32 的返回值/位置问题
+    let mut buf = [0u8; 4];
+    let mut b: i8 = 0;
+    for i in 0..4 {
+        if !unsafe { (ndk.read_byte)(p, &mut b) } {
+            crate::main_dbg(&format!("skip len_bytefail at{}", i));
+            return false;
+        }
+        buf[i] = b as u8;
     }
+    let len = i32::from_le_bytes(buf);
     if len < 0 {
         return true;   // null 字符串
     }
@@ -372,7 +378,6 @@ fn skip_string(ndk: &BinderNdk, p: *mut c_void) -> bool {
         crate::main_dbg(&format!("skip abnormal_len={}", len));
         return false;  // 异常长度 (防死循环)
     }
-    let mut b: i8 = 0;
     let total = (len as usize) * 2;
     let mut i = 0usize;
     while i < total {
