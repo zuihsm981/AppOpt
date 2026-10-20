@@ -364,23 +364,12 @@ pub fn set_refresh_rate_binder(mode: i32) -> bool {
 /// 否则逐字节消费 2×len 字节 (最底层 readByte, 不依赖 readString 的转换/缓冲,
 /// 避免 readCharArray 在特定数据下失败导致位置错位)
 fn skip_string(ndk: &BinderNdk, p: *mut c_void) -> bool {
-    // 长度 (int32) 用 readByte 逐字节读 (小端), 避开 readInt32 的返回值/位置问题
+    // 长度 (int32) 用 readByte 逐字节读 (小端)。忽略 NDK 返回值
+    // (实测读取本身成功, 仅返回值判断不可靠), 靠 len 合理性兜底。
     let mut buf = [0u8; 4];
     let mut b: i8 = 0;
     for i in 0..4 {
-        if !unsafe { (ndk.read_byte)(p, &mut b) } {
-            // 诊断: readByte 失败 → 同位置用 readInt32 重试, 对比返回值/值/dsz
-            let mut l2 = 0i32;
-            let ok2 = unsafe { (ndk.read_i32)(p, &mut l2) };
-            let dsz = unsafe { (ndk.get_data_size)(p) };
-            let mut l3 = 0i32;
-            let ok3 = unsafe { (ndk.read_i32)(p, &mut l3) };
-            crate::main_dbg(&format!(
-                "skip bytefail_at={} retryI32_1=({},{}) retryI32_2=({},{}) dsz={}",
-                i, ok2, l2, ok3, l3, dsz
-            ));
-            return false;
-        }
+        let _ = unsafe { (ndk.read_byte)(p, &mut b) };
         buf[i] = b as u8;
     }
     let len = i32::from_le_bytes(buf);
@@ -394,10 +383,7 @@ fn skip_string(ndk: &BinderNdk, p: *mut c_void) -> bool {
     let total = (len as usize) * 2;
     let mut i = 0usize;
     while i < total {
-        if !unsafe { (ndk.read_byte)(p, &mut b) } {
-            crate::main_dbg(&format!("skip bytefail_at={} len={}", i, len));
-            return false;
-        }
+        let _ = unsafe { (ndk.read_byte)(p, &mut b) };
         i += 1;
     }
     true
@@ -443,18 +429,16 @@ pub fn dump_root_task_ints() {
     }
 }
 
-/// 用 readByte 读 4 字节组合成 int32 (小端); 全底层, 位置按字节精确前进
-fn rb_i32(ndk: &BinderNdk, p: *mut c_void, tag: &str) -> Option<i32> {
+/// 用 readByte 读 4 字节组合成 int32 (小端)。注意: 忽略 NDK 返回值
+/// (transmute 后 bool 判断不可靠, 实测读取本身成功), 靠数据合理性兜底。
+fn rb_i32(ndk: &BinderNdk, p: *mut c_void) -> i32 {
     let mut buf = [0u8; 4];
     let mut b: i8 = 0;
     for i in 0..4 {
-        if !unsafe { (ndk.read_byte)(p, &mut b) } {
-            crate::main_dbg(&format!("rb_i32_bytefail tag={} at={}", tag, i));
-            return None;
-        }
+        let _ = unsafe { (ndk.read_byte)(p, &mut b) };
         buf[i] = b as u8;
     }
-    Some(i32::from_le_bytes(buf))
+    i32::from_le_bytes(buf)
 }
 
 /// binder 查询: getFocusedRootTaskInfo (事务 0x20=32) 只读 effectiveUid (第 3 字段),
@@ -492,35 +476,35 @@ pub fn query_focused_effective_uid() -> Result<i32, String> {
     let mut log = String::from("q");
     let dsz = unsafe { (ndk.get_data_size)(p) };
     log.push_str(&format!(" dsz={}", dsz));
-    let exc = rb_i32(&ndk, p, "exc").unwrap_or(-999);
+    let exc = rb_i32(&ndk, p);
     log.push_str(&format!(" exc={}", exc));
     if exc != 0 {
         unsafe { (ndk.parcel_delete)(p); }
         crate::main_dbg(&log);
         return Err(format!("reply exception={}", exc));
     }
-    let obj_flag = rb_i32(&ndk, p, "obj").unwrap_or(0);
+    let obj_flag = rb_i32(&ndk, p);
     log.push_str(&format!(" obj={}", obj_flag));
     if obj_flag == 0 {
         unsafe { (ndk.parcel_delete)(p); }
         crate::main_dbg(&log);
         return Err("no focused root task".into());
     }
-    let b0 = rb_i32(&ndk, p, "b0").unwrap_or(0);
+    let b0 = rb_i32(&ndk, p);
     log.push_str(&format!(" b0={}", b0));
     if b0 != 0 {
         for _ in 0..4 {
-            let v = rb_i32(&ndk, p, "r").unwrap_or(0);
+            let v = rb_i32(&ndk, p);
             log.push_str(&format!(" r={}", v));
         }
     }
-    let ids_len = rb_i32(&ndk, p, "ids").unwrap_or(0);
+    let ids_len = rb_i32(&ndk, p);
     log.push_str(&format!(" ids={}", ids_len));
     for _ in 0..ids_len.max(0).min(128) {
-        let v = rb_i32(&ndk, p, "ids0").unwrap_or(0);
+        let v = rb_i32(&ndk, p);
         log.push_str(&format!(" ids0={}", v));
     }
-    let names_len = rb_i32(&ndk, p, "names").unwrap_or(0);
+    let names_len = rb_i32(&ndk, p);
     log.push_str(&format!(" names={}", names_len));
     let mut str_fail = 0i32;
     for _ in 0..names_len.max(0).min(128) {
@@ -528,31 +512,31 @@ pub fn query_focused_effective_uid() -> Result<i32, String> {
             str_fail += 1;
         }
     }
-    let barr_len = rb_i32(&ndk, p, "barr").unwrap_or(0);
+    let barr_len = rb_i32(&ndk, p);
     log.push_str(&format!(" barr={}", barr_len));
     for _ in 0..barr_len.max(0).min(128) {
-        let v = rb_i32(&ndk, p, "b0").unwrap_or(0);
+        let v = rb_i32(&ndk, p);
         log.push_str(&format!(" b0={}", v));
         for _ in 0..4 {
-            let v = rb_i32(&ndk, p, "br").unwrap_or(0);
+            let v = rb_i32(&ndk, p);
             log.push_str(&format!(" br={}", v));
         }
     }
-    let uids_len = rb_i32(&ndk, p, "uids").unwrap_or(0);
+    let uids_len = rb_i32(&ndk, p);
     log.push_str(&format!(" uids={}", uids_len));
     for _ in 0..uids_len.max(0).min(128) {
-        let v = rb_i32(&ndk, p, "uid0").unwrap_or(0);
+        let v = rb_i32(&ndk, p);
         log.push_str(&format!(" uid0={}", v));
     }
-    let vis = rb_i32(&ndk, p, "vis").unwrap_or(0);
+    let vis = rb_i32(&ndk, p);
     log.push_str(&format!(" vis={}", vis));
-    let pos = rb_i32(&ndk, p, "pos").unwrap_or(0);
+    let pos = rb_i32(&ndk, p);
     log.push_str(&format!(" pos={}", pos));
-    let user_id = rb_i32(&ndk, p, "uidf").unwrap_or(0);
+    let user_id = rb_i32(&ndk, p);
     log.push_str(&format!(" uidf={}", user_id));
-    let task_id = rb_i32(&ndk, p, "tid").unwrap_or(0);
+    let task_id = rb_i32(&ndk, p);
     log.push_str(&format!(" tid={}", task_id));
-    let eff_uid = rb_i32(&ndk, p, "eff").unwrap_or(0);
+    let eff_uid = rb_i32(&ndk, p);
     log.push_str(&format!(" eff={}", eff_uid));
     unsafe { (ndk.parcel_delete)(p); }
     // 临时诊断: 完整读取序列 + 解析结果
