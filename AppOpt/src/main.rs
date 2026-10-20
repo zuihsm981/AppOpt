@@ -1214,14 +1214,25 @@ fn main() {
                             LAST_TASK_UID.store(uid, Ordering::Relaxed);
                             // CPU: task event 驱动 — 表无该 uid (冷) → 应用并登记; 热 → 跳过
                             if let Some(e) = state.uid_map.get(&uid) {
-                                if e.cpu && !crate::cpu_affinity::cpu_known_has(uid) {
-                                    if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
-                                        let _ = tx.send(
-                                            crate::cpu_affinity::CpuMsg::ApplyPkgByUid(
-                                                uid,
-                                                e.pkg.clone(),
-                                            ),
-                                        );
+                                if e.cpu {
+                                    let known = crate::cpu_affinity::cpu_known_has(uid);
+                                    crate::cpu_affinity::cpu_dbg(&format!(
+                                        "EV_TASK cpu uid={} pkg={} known={}",
+                                        uid, e.pkg, known
+                                    ));
+                                    if !known {
+                                        if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
+                                            let _ = tx.send(
+                                                crate::cpu_affinity::CpuMsg::ApplyPkgByUid(
+                                                    uid,
+                                                    e.pkg.clone(),
+                                                ),
+                                            );
+                                        }
+                                        crate::cpu_affinity::cpu_dbg(&format!(
+                                            "EV_TASK sent ApplyPkgByUid uid={} pkg={}",
+                                            uid, e.pkg
+                                        ));
                                     }
                                 }
                                 // 刷新率: task event 驱动 — rfr → 应用 + web 命中 (RFR_MON: pid→pkg, 主 pid cgroup);

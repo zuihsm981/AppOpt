@@ -52,9 +52,27 @@ static CPU_FG_TX: OnceLock<Mutex<mpsc::Sender<CpuMsg>>> = OnceLock::new();
 pub static CPU_KNOWN: std::sync::LazyLock<RwLock<HashMap<i32, (i32, Vec<i32>)>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
-/// 冷热判断 (task event 驱动): 表里有该 uid = 已应用过 (热); 无 = 冷 (需应用)
+/// 冷热判断: 表里有该 uid = 已登记应用过 (热); 无 = 冷 (需应用)。uid 登记即热,
+/// 与主 pid 无关; 进程退出由 pidfd 退出监听 (EvictUid) 清表。
 pub fn cpu_known_has(uid: i32) -> bool {
     uid > 0 && crate::rw_read_ignore_poison(&CPU_KNOWN).contains_key(&uid)
+}
+
+/// CPU 链路调试日志 (临时; 写 /data/local/tmp/appopt_cpu_dbg.txt, ≤1MB)
+pub(crate) fn cpu_dbg(msg: &str) {
+    use std::io::Write;
+    if let Ok(md) = std::fs::metadata("/data/local/tmp/appopt_cpu_dbg.txt") {
+        if md.len() > 1024 * 1024 {
+            return;
+        }
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/data/local/tmp/appopt_cpu_dbg.txt")
+    {
+        let _ = f.write_all(format!("t={:?} {}\n", std::time::Instant::now().elapsed(), msg).as_bytes());
+    }
 }
 
 /// 按 uid 从 cgroup apps 目录取全部 pid (task event 驱动: web 命中显示/退出监听,
@@ -189,6 +207,9 @@ impl CpuAffinity {
         }
         // 初始化 (初始全量应用) 完成后: 整树时间戳同步一次 (仅首次)
         crate::cpuset::sync_init_once();
+        if applied > 0 {
+            self.publish_stats();
+        }
         applied
     }
 
@@ -367,20 +388,46 @@ impl CpuAffinity {
                 }
             }
             CpuMsg::ApplyPkgByUid(uid, pkg) => {
-                // task event 驱动 CPU 应用: 冷启动 (未登记) 也现扫应用并登记;
-                // 已登记复用缓存 pids (热启动由主线程 cpu_known_has 判断, 不会发到这里)
+                // task event 驱动 CPU 应用: 冷启动现扫应用并登记; 已登记复用缓存 pids
+                crate::cpu_affinity::cpu_dbg(&format!(
+                    "worker recv ApplyPkgByUid uid={} pkg={}",
+                    uid, pkg
+                ));
                 let cached = crate::rw_read_ignore_poison(&CPU_KNOWN).get(&uid).cloned();
+                let had_cached = cached.is_some();
                 let pids = match cached {
                     Some((_, pids)) if !pids.is_empty() => pids, // 复用缓存 pids
                     _ => Self::cgroup_apps_pids(uid).unwrap_or_default(), // 未登记: 现扫
                 };
+                crate::cpu_affinity::cpu_dbg(&format!(
+                    "ApplyPkgByUid uid={} pkg={} cached={} scan_pids={:?}",
+                    uid,
+                    pkg,
+                    had_cached,
+                    pids.iter().take(6).collect::<Vec<_>>()
+                ));
                 if pids.is_empty() {
                     // 进程不在 → 清身份 (下次 task event 冷启动重新应用)
                     crate::rw_write_ignore_poison(&CPU_KNOWN).remove(&uid);
+                    crate::cpu_affinity::cpu_dbg(&format!(
+                        "ApplyPkgByUid uid={} pkg={} PIDS_EMPTY (cgroup 扫不到)",
+                        uid, pkg
+                    ));
                     return;
                 }
-                let Some(cfg) = crate::config::current_cfg() else { return };
+                let Some(cfg) = crate::config::current_cfg() else {
+                    crate::cpu_affinity::cpu_dbg(&format!("ApplyPkgByUid uid={} pkg={} cfg_none", uid, pkg));
+                    return;
+                };
                 self.apply_tids(&pids, &pkg, &cfg);
+                // 复检统计 (tok: 线程名→是否全部 ok; bad>0 → set_affinity 未生效)
+                let tok = self.managed_tok.get(&pkg).cloned().unwrap_or_default();
+                let ok_n = tok.values().filter(|v| **v).count();
+                let bad_n = tok.values().filter(|v| !**v).count();
+                crate::cpu_affinity::cpu_dbg(&format!(
+                    "ApplyPkgByUid uid={} pkg={} pids={:?} aff_threads={} tok_ok={} tok_bad={}",
+                    uid, pkg, pids, pids.len(), ok_n, bad_n
+                ));
                 // 登记身份: 主 pid = cgroup 下最小 pid (主进程最先 fork)
                 let main = *pids.iter().min().unwrap_or(&0);
                 crate::rw_write_ignore_poison(&CPU_KNOWN).insert(uid, (main, pids));
@@ -389,6 +436,9 @@ impl CpuAffinity {
                 if main > 0 {
                     crate::event_probe::watch(main);
                 }
+                // 应用后立即发布命中统计 (web 轮询 PublishStats 是"发一轮读下一轮",
+                // 不立即发布会晚两个轮询周期才显示)
+                self.publish_stats();
             }
             CpuMsg::ApplyThreadByUid(uid, pkg, thread) => {
                 // 单线程重放: 同上存活判断; 收集 comm==thread 的 tid
