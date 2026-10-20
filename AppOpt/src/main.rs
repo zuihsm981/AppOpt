@@ -637,6 +637,10 @@ impl AppState {
         if uid <= 0 {
             return;   // 查询失败/无聚焦 → 不动 (保持当前)
         }
+        // 防护: uid 不在任何规则表 (解析错位产生的垃圾 uid) → 不动, 不误下发内核
+        if !self.vfc_uid_set.contains(&uid) && !self.uid_map.contains_key(&uid) {
+            return;
+        }
         let my = self.uid_rules.get(&uid).cloned().unwrap_or_default();
         if let Some(es) = self.ebpf_state.as_ref() {
             es.bpf.vfc_fg(if self.vfc_uid_set.contains(&uid) { uid } else { 0 });

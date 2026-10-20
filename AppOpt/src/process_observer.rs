@@ -34,7 +34,7 @@ type FnTransact = unsafe extern "C" fn(
 ) -> c_int;
 type FnParcelDelete = unsafe extern "C" fn(*mut c_void);
 type FnWriteBinder = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
-type FnReadI32 = unsafe extern "C" fn(*mut c_void, *mut i32) -> c_int;
+type FnReadI32 = unsafe extern "C" fn(*mut c_void, *mut i32) -> bool;
 type FnWriteI32 = unsafe extern "C" fn(*mut c_void, i32) -> c_int;
 type FnReadByte = unsafe extern "C" fn(*mut c_void, *mut i8) -> bool;
 type FnJoinThreadPool = unsafe extern "C" fn();
@@ -361,7 +361,7 @@ pub fn set_refresh_rate_binder(mode: i32) -> bool {
 /// 避免 readCharArray 在特定数据下失败导致位置错位)
 fn skip_string(ndk: &BinderNdk, p: *mut c_void) -> bool {
     let mut len = 0i32;
-    if unsafe { (ndk.read_i32)(p, &mut len) } == 0 {
+    if !unsafe { (ndk.read_i32)(p, &mut len) } {
         crate::main_dbg("skip read_len_fail");
         return false;
     }
