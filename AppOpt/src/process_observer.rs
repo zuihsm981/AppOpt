@@ -171,12 +171,13 @@ extern "C" fn on_transact(
             let fg = fg_val != 0;
 
             if fg && pid > 0 {
-                // 200ms 防抖: 同 (pid, uid) 高频回调 (launcher fg 波动) 只发一次
+                // 100ms 防抖: 同 (pid, uid) 高频回调 (launcher fg 波动, 几十 ms 内) 只发一次;
+                // 人工切换一般 >100ms, 不受抑制 (避免快速往返吞掉切换导致不回落)
                 let now = std::time::Instant::now();
                 let mut last = crate::lock_ignore_poison(&LAST_FG_T);
                 let due = pid != last.0
                     || uid != last.1
-                    || now.duration_since(last.2).as_millis() >= 200;
+                    || now.duration_since(last.2).as_millis() >= 100;
                 if due {
                     *last = (pid, uid, now);
                     // 触发分离：Binder 回调携带 pid + uid（8 字节）。
