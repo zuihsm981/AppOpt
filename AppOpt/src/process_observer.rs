@@ -34,10 +34,13 @@ type FnTransact = unsafe extern "C" fn(
 ) -> c_int;
 type FnParcelDelete = unsafe extern "C" fn(*mut c_void);
 type FnWriteBinder = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
-type FnReadI32 = unsafe extern "C" fn(*mut c_void, *mut i32) -> bool;
+type FnReadI32 = unsafe extern "C" fn(*mut c_void, *mut i32) -> c_int;
 type FnWriteI32 = unsafe extern "C" fn(*mut c_void, i32) -> c_int;
-type FnReadByte = unsafe extern "C" fn(*mut c_void, *mut i8) -> bool;
-type FnGetDataSize = unsafe extern "C" fn(*mut c_void) -> usize;
+type FnReadString = unsafe extern "C" fn(
+    *mut c_void,
+    *mut c_void,
+    unsafe extern "C" fn(*mut c_void, *const c_char, usize) -> usize,
+) -> bool;
 type FnJoinThreadPool = unsafe extern "C" fn();
 type FnStartThreadPool = unsafe extern "C" fn();
 type FnAssociateClass = unsafe extern "C" fn(*mut c_void, *const c_void) -> bool;
@@ -52,8 +55,7 @@ struct BinderNdk {
     write_binder: FnWriteBinder,
     write_int32: FnWriteI32,
     read_i32: FnReadI32,
-    read_byte: FnReadByte,
-    get_data_size: FnGetDataSize,
+    read_string: FnReadString,
     join_thread_pool: FnJoinThreadPool,
     start_thread_pool: FnStartThreadPool,
     associate_class: FnAssociateClass,
@@ -81,15 +83,14 @@ fn ndk() -> Option<&'static BinderNdk> {
         let p_write_binder = sym("AParcel_writeStrongBinder");
         let p_write_i32 = sym("AParcel_writeInt32");
         let p_read_i32 = sym("AParcel_readInt32");
-        let p_read_byte = sym("AParcel_readByte");
-        let p_get_data_size = sym("AParcel_getDataSize");
+        let p_read_string = sym("AParcel_readString");
         let p_join = sym("ABinderProcess_joinThreadPool");
         let p_start = sym("ABinderProcess_startThreadPool");
         let p_associate = sym("AIBinder_associateClass");
         if p_get_service.is_null() || p_class_define.is_null() || p_binder_new.is_null()
             || p_prepare_tx.is_null() || p_transact.is_null() || p_parcel_delete.is_null()
             || p_write_binder.is_null() || p_write_i32.is_null()
-            || p_read_i32.is_null() || p_read_byte.is_null() || p_get_data_size.is_null()
+            || p_read_i32.is_null() || p_read_string.is_null()
             || p_join.is_null() || p_start.is_null() || p_associate.is_null()
         { return None; }
         
@@ -103,8 +104,7 @@ fn ndk() -> Option<&'static BinderNdk> {
             write_binder: std::mem::transmute(p_write_binder),
             write_int32: std::mem::transmute(p_write_i32),
             read_i32: std::mem::transmute(p_read_i32),
-            read_byte: std::mem::transmute(p_read_byte),
-            get_data_size: std::mem::transmute(p_get_data_size),
+            read_string: std::mem::transmute(p_read_string),
             join_thread_pool: std::mem::transmute(p_join),
             start_thread_pool: std::mem::transmute(p_start),
             associate_class: std::mem::transmute(p_associate),
@@ -360,107 +360,62 @@ pub fn set_refresh_rate_binder(mode: i32) -> bool {
     ok
 }
 
-/// 跳过 parcel 里的一个字符串: 读 int32 长度 (char16 数), null(-1) 无数据,
-/// 否则逐字节消费 2×len 字节 (最底层 readByte, 不依赖 readString 的转换/缓冲,
-/// 避免 readCharArray 在特定数据下失败导致位置错位)
-fn skip_string(ndk: &BinderNdk, p: *mut c_void) -> bool {
-    // 长度 (int32) 用 readByte 逐字节读 (小端)。忽略 NDK 返回值
-    // (实测读取本身成功, 仅返回值判断不可靠), 靠 len 合理性兜底。
-    let mut buf = [0u8; 4];
-    let mut b: i8 = 0;
-    for i in 0..4 {
-        let _ = unsafe { (ndk.read_byte)(p, &mut b) };
-        buf[i] = b as u8;
-    }
-    let len = i32::from_le_bytes(buf);
-    if len < 0 {
-        return true;   // null 字符串
-    }
-    if len > 4096 {
-        crate::main_dbg(&format!("skip abnormal_len={}", len));
-        return false;  // 异常长度 (防死循环)
-    }
-    let total = (len as usize) * 2;
-    let mut i = 0usize;
-    while i < total {
-        let _ = unsafe { (ndk.read_byte)(p, &mut b) };
-        i += 1;
-    }
-    true
+/// AParcel_readString 的 copy_func: 不拷贝 (data 为 null), 仅返回长度使读取成功 → 跳过字符串
+unsafe extern "C" fn skip_str_fn(_data: *mut c_void, _s: *const c_char, len: usize) -> usize {
+    len
 }
 
-/// 临时诊断: dump getFocusedRootTaskInfo 回复 parcel 前 28 个 int32 (定位解析偏移)
-pub fn dump_root_task_ints() {
-    let Some(ndk) = ndk() else { return };
-    let svc = unsafe { (ndk.get_service)(b"activity_task\0".as_ptr() as *const c_char) };
-    if svc.is_null() { return; }
-    let atm_class = get_atm_class();
-    if atm_class.is_null() { return; }
-    if !unsafe { (ndk.associate_class)(svc, atm_class as *const c_void) } { return; }
-    let mut in_parcel: *mut c_void = std::ptr::null_mut();
-    if unsafe { (ndk.prepare_tx)(svc, &mut in_parcel) } != STATUS_OK || in_parcel.is_null() { return; }
-    let mut out_parcel: *mut c_void = std::ptr::null_mut();
-    let status = unsafe { (ndk.transact)(svc, 32, &mut in_parcel, &mut out_parcel, 0) };
-    unsafe { (ndk.parcel_delete)(in_parcel); }
-    if status != STATUS_OK || out_parcel.is_null() {
-        if !out_parcel.is_null() { unsafe { (ndk.parcel_delete)(out_parcel); } }
-        return;
+/// 读字符串缓冲区 (copy_func 目标): data 为 [StrBuf], 拷贝并记录实际长度
+#[repr(C)]
+struct StrBuf {
+    data: [u8; 512],
+    len: usize,
+}
+
+unsafe extern "C" fn copy_str_fn(data: *mut c_void, s: *const c_char, len: usize) -> usize {
+    unsafe {
+        if !data.is_null() {
+            let b = &mut *(data as *mut StrBuf);
+            let n = len.min(b.data.len());
+            std::ptr::copy_nonoverlapping(s as *const u8, b.data.as_mut_ptr(), n);
+            b.len = n;
+        }
     }
-    let p = out_parcel;
-    let mut exc = 0i32;
-    let _ = unsafe { (ndk.read_i32)(p, &mut exc) };
-    let mut obj = 0i32;
-    let _ = unsafe { (ndk.read_i32)(p, &mut obj) };
-    let mut s = format!("dump exc={} obj={}", exc, obj);
-    for i in 0..28 {
-        let mut v = 0i32;
-        let ok = unsafe { (ndk.read_i32)(p, &mut v) };
-        s.push_str(&format!(" [{}]={}ok{}", i, v, ok as i32));
-    }
-    unsafe { (ndk.parcel_delete)(p); }
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/data/local/tmp/appopt_dbg.txt")
-    {
-        use std::io::Write;
-        let _ = f.write_all(s.as_bytes());
-        let _ = f.write_all(b"\n");
+    len
+}
+
+/// 读一个字符串 (复制内容); None = 读取失败
+fn read_string(ndk: &BinderNdk, p: *mut c_void) -> Option<String> {
+    let mut sb = StrBuf { data: [0u8; 512], len: 0 };
+    let ok = unsafe { (ndk.read_string)(p, &mut sb as *mut _ as *mut c_void, copy_str_fn) };
+    if ok {
+        Some(String::from_utf8_lossy(&sb.data[..sb.len]).to_string())
+    } else {
+        None
     }
 }
 
-/// 用 readByte 读 4 字节组合成 int32 (小端)。注意: 忽略 NDK 返回值
-/// (transmute 后 bool 判断不可靠, 实测读取本身成功), 靠数据合理性兜底。
-fn rb_i32(ndk: &BinderNdk, p: *mut c_void) -> i32 {
-    let mut buf = [0u8; 4];
-    let mut b: i8 = 0;
-    for i in 0..4 {
-        let _ = unsafe { (ndk.read_byte)(p, &mut b) };
-        buf[i] = b as u8;
-    }
-    i32::from_le_bytes(buf)
-}
-
-/// binder 查询: getFocusedRootTaskInfo (事务 0x20=32) 只读 effectiveUid (第 3 字段),
-/// 用于"桌面回调时确认聚焦" — 不读 baseIntent/ComponentName, 无崩溃风险。
-/// Ok(effectiveUid) = 聚焦任务的有效 uid; Err = 无聚焦/失败。
-pub fn query_focused_effective_uid() -> Result<i32, String> {
+/// 临时探针: binder 直连 activity_task 调 getFocusedRootTaskInfo (事务 0x20=32),
+/// 解析 RootTaskInfo/TaskInfo parcel 到 topActivity (ComponentName 2 String)。
+/// Ok = 完整描述文本; Err = 分步错误详情。
+pub fn probe_focused_root_task_info() -> Result<String, String> {
     let ndk = ndk().ok_or("ndk init failed")?;
     let svc = unsafe { (ndk.get_service)(b"activity_task\0".as_ptr() as *const c_char) };
     if svc.is_null() {
         return Err("get_service(activity_task) returned null".into());
     }
+    // NDK prepareTransaction 需要先关联本地 class (接口 token 写入依赖 class descriptor)
     let atm_class = get_atm_class();
     if atm_class.is_null() {
         return Err("atm class define failed".into());
     }
     if !unsafe { (ndk.associate_class)(svc, atm_class as *const c_void) } {
-        return Err("associate_class failed (descriptor mismatch?)".into());
+        return Err("associate_class(activity_task, IActivityTaskManager) failed (descriptor mismatch?)".into());
     }
     let mut in_parcel: *mut c_void = std::ptr::null_mut();
     let prep = unsafe { (ndk.prepare_tx)(svc, &mut in_parcel) };
     if prep != STATUS_OK || in_parcel.is_null() {
-        return Err(format!("prepare_tx status={}", prep));
+        return Err(format!("prepare_tx status={} parcel={}", prep, in_parcel.is_null()));
     }
     let mut out_parcel: *mut c_void = std::ptr::null_mut();
     let status = unsafe { (ndk.transact)(svc, 32, &mut in_parcel, &mut out_parcel, 0) };
@@ -472,77 +427,96 @@ pub fn query_focused_effective_uid() -> Result<i32, String> {
         }
         return Err(format!("transact status={} out_null={}", status, null_out));
     }
-    let p = out_parcel;
-    let mut log = String::from("q");
-    let dsz = unsafe { (ndk.get_data_size)(p) };
-    log.push_str(&format!(" dsz={}", dsz));
-    let exc = rb_i32(&ndk, p);
-    log.push_str(&format!(" exc={}", exc));
+    let mut exc = 0i32;
+    let _ = unsafe { (ndk.read_i32)(out_parcel, &mut exc) };
     if exc != 0 {
-        unsafe { (ndk.parcel_delete)(p); }
-        crate::main_dbg(&log);
+        unsafe { (ndk.parcel_delete)(out_parcel); }
         return Err(format!("reply exception={}", exc));
     }
-    let obj_flag = rb_i32(&ndk, p);
-    log.push_str(&format!(" obj={}", obj_flag));
+
+    let p = out_parcel;
+    // readTypedObject(RootTaskInfo.CREATOR) 外层 null 标志: 0=null(无聚焦任务), 1=非 null
+    let mut obj_flag = 0i32;
+    let _ = unsafe { (ndk.read_i32)(p, &mut obj_flag) };
     if obj_flag == 0 {
         unsafe { (ndk.parcel_delete)(p); }
-        crate::main_dbg(&log);
-        return Err("no focused root task".into());
+        return Ok("返回 null (当前无聚焦 root task, 常见于息屏/锁屏)".to_string());
     }
-    let b0 = rb_i32(&ndk, p);
-    log.push_str(&format!(" b0={}", b0));
-    if b0 != 0 {
+
+    let mut n = 0i32;
+    // RootTaskInfo 子类 readFromParcel: bounds Rect (null 标志 + left/top/right/bottom)
+    let _ = unsafe { (ndk.read_i32)(p, &mut n) };
+    for _ in 0..4 {
+        let _ = unsafe { (ndk.read_i32)(p, &mut n) };
+    }
+    // childTaskIds: int[] (长度 + n×int)
+    let _ = unsafe { (ndk.read_i32)(p, &mut n) };
+    for _ in 0..n.max(0) {
+        let _ = unsafe { (ndk.read_i32)(p, &mut n) };
+    }
+    // childTaskNames: String[] (长度 + n×string, NDK readString 跳过)
+    let _ = unsafe { (ndk.read_i32)(p, &mut n) };
+    for _ in 0..n.max(0) {
+        let _ = unsafe { (ndk.read_string)(p, std::ptr::null_mut(), skip_str_fn) };
+    }
+    // childTaskBounds: Rect[] (长度 + n×(null 标志 + 4×int))
+    let _ = unsafe { (ndk.read_i32)(p, &mut n) };
+    for _ in 0..n.max(0) {
+        let _ = unsafe { (ndk.read_i32)(p, &mut n) };
         for _ in 0..4 {
-            let v = rb_i32(&ndk, p);
-            log.push_str(&format!(" r={}", v));
+            let _ = unsafe { (ndk.read_i32)(p, &mut n) };
         }
     }
-    let ids_len = rb_i32(&ndk, p);
-    log.push_str(&format!(" ids={}", ids_len));
-    for _ in 0..ids_len.max(0).min(128) {
-        let v = rb_i32(&ndk, p);
-        log.push_str(&format!(" ids0={}", v));
+    // childTaskUserIds: int[] (长度 + n×int)
+    let _ = unsafe { (ndk.read_i32)(p, &mut n) };
+    for _ in 0..n.max(0) {
+        let _ = unsafe { (ndk.read_i32)(p, &mut n) };
     }
-    let names_len = rb_i32(&ndk, p);
-    log.push_str(&format!(" names={}", names_len));
-    let mut str_fail = 0i32;
-    for _ in 0..names_len.max(0).min(128) {
-        if !skip_string(&ndk, p) {
-            str_fail += 1;
-        }
+    // visible: int, position: int
+    let _ = unsafe { (ndk.read_i32)(p, &mut n) };
+    let _ = unsafe { (ndk.read_i32)(p, &mut n) };
+    // TaskInfo.readTaskFromParcel: userId/taskId/effectiveUid/displayId
+    let mut user_id = 0i32;
+    let mut task_id = 0i32;
+    let mut eff_uid = 0i32;
+    let mut disp = 0i32;
+    let _ = unsafe { (ndk.read_i32)(p, &mut user_id) };
+    let _ = unsafe { (ndk.read_i32)(p, &mut task_id) };
+    let _ = unsafe { (ndk.read_i32)(p, &mut eff_uid) };
+    let _ = unsafe { (ndk.read_i32)(p, &mut disp) };
+    // isRunning: boolean (int32)
+    let mut running = 0i32;
+    let _ = unsafe { (ndk.read_i32)(p, &mut running) };
+    // baseIntent: readTypedObject null 标志 (0=null, 1=非 null)
+    let mut base_flag = 0i32;
+    let _ = unsafe { (ndk.read_i32)(p, &mut base_flag) };
+    if base_flag != 0 {
+        // baseIntent 非 null: 不继续解析 — Intent parcel 需按 Intent.readFromParcel
+        // 完整消费才能读到 baseActivity/topActivity, 贸然按 ComponentName 读会
+        // 从 Intent 数据中间误读长度 → NDK readString 内部 abort 导致进程崩溃。
+        unsafe { (ndk.parcel_delete)(p); }
+        return Ok(format!(
+            "userId={} taskId={} effectiveUid={} displayId={} isRunning={} | baseIntent=NON-NULL (需实现 Intent 跳过才能读 topActivity)",
+            user_id, task_id, eff_uid, disp, running != 0
+        ));
     }
-    let barr_len = rb_i32(&ndk, p);
-    log.push_str(&format!(" barr={}", barr_len));
-    for _ in 0..barr_len.max(0).min(128) {
-        let v = rb_i32(&ndk, p);
-        log.push_str(&format!(" b0={}", v));
-        for _ in 0..4 {
-            let v = rb_i32(&ndk, p);
-            log.push_str(&format!(" br={}", v));
-        }
-    }
-    let uids_len = rb_i32(&ndk, p);
-    log.push_str(&format!(" uids={}", uids_len));
-    for _ in 0..uids_len.max(0).min(128) {
-        let v = rb_i32(&ndk, p);
-        log.push_str(&format!(" uid0={}", v));
-    }
-    let vis = rb_i32(&ndk, p);
-    log.push_str(&format!(" vis={}", vis));
-    let pos = rb_i32(&ndk, p);
-    log.push_str(&format!(" pos={}", pos));
-    let user_id = rb_i32(&ndk, p);
-    log.push_str(&format!(" uidf={}", user_id));
-    let task_id = rb_i32(&ndk, p);
-    log.push_str(&format!(" tid={}", task_id));
-    let eff_uid = rb_i32(&ndk, p);
-    log.push_str(&format!(" eff={}", eff_uid));
+    // baseIntent null: 极简解析 baseActivity/topActivity (ComponentName 2 String)
+    let base_pkg = read_string(&ndk, p);
+    let base_cls = read_string(&ndk, p);
+    let top_pkg = read_string(&ndk, p);
+    let top_cls = read_string(&ndk, p);
+
     unsafe { (ndk.parcel_delete)(p); }
-    // 临时诊断: 完整读取序列 + 解析结果
-    crate::main_dbg(&format!(
-        "{} | ids={} names={} barr={} uids={} sf={} | u={} t={} e={}",
-        log, ids_len, names_len, barr_len, uids_len, str_fail, user_id, task_id, eff_uid
-    ));
-    Ok(eff_uid)
+    Ok(format!(
+        "userId={} taskId={} effectiveUid={} displayId={} isRunning={} baseIntent=null | baseActivity={}/{} | topActivity={}/{}",
+        user_id,
+        task_id,
+        eff_uid,
+        disp,
+        running != 0,
+        base_pkg.as_deref().unwrap_or("-"),
+        base_cls.as_deref().unwrap_or("-"),
+        top_pkg.as_deref().unwrap_or("-"),
+        top_cls.as_deref().unwrap_or("-")
+    ))
 }
