@@ -443,6 +443,20 @@ pub fn dump_root_task_ints() {
     }
 }
 
+/// 用 readByte 读 4 字节组合成 int32 (小端); 全底层, 位置按字节精确前进
+fn rb_i32(ndk: &BinderNdk, p: *mut c_void, tag: &str) -> Option<i32> {
+    let mut buf = [0u8; 4];
+    let mut b: i8 = 0;
+    for i in 0..4 {
+        if !unsafe { (ndk.read_byte)(p, &mut b) } {
+            crate::main_dbg(&format!("rb_i32_bytefail tag={} at={}", tag, i));
+            return None;
+        }
+        buf[i] = b as u8;
+    }
+    Some(i32::from_le_bytes(buf))
+}
+
 /// binder 查询: getFocusedRootTaskInfo (事务 0x20=32) 只读 effectiveUid (第 3 字段),
 /// 用于"桌面回调时确认聚焦" — 不读 baseIntent/ComponentName, 无崩溃风险。
 /// Ok(effectiveUid) = 聚焦任务的有效 uid; Err = 无聚焦/失败。
@@ -478,86 +492,68 @@ pub fn query_focused_effective_uid() -> Result<i32, String> {
     let mut log = String::from("q");
     let dsz = unsafe { (ndk.get_data_size)(p) };
     log.push_str(&format!(" dsz={}", dsz));
-    let mut exc = 0i32;
-    let _ = unsafe { (ndk.read_i32)(p, &mut exc) };
+    let exc = rb_i32(&ndk, p, "exc").unwrap_or(-999);
     log.push_str(&format!(" exc={}", exc));
     if exc != 0 {
         unsafe { (ndk.parcel_delete)(p); }
         crate::main_dbg(&log);
         return Err(format!("reply exception={}", exc));
     }
-    // readTypedObject 外层 null 标志: 0=null(无聚焦任务)
-    let mut obj_flag = 0i32;
-    let _ = unsafe { (ndk.read_i32)(p, &mut obj_flag) };
+    let obj_flag = rb_i32(&ndk, p, "obj").unwrap_or(0);
     log.push_str(&format!(" obj={}", obj_flag));
     if obj_flag == 0 {
         unsafe { (ndk.parcel_delete)(p); }
         crate::main_dbg(&log);
         return Err("no focused root task".into());
     }
-    // RootTaskInfo 子类: bounds Rect (null 标志 + 非 null 4×int)
-    let mut n = 0i32;
-    let _ = unsafe { (ndk.read_i32)(p, &mut n) };
-    log.push_str(&format!(" b0={}", n));
-    if n != 0 {
+    let b0 = rb_i32(&ndk, p, "b0").unwrap_or(0);
+    log.push_str(&format!(" b0={}", b0));
+    if b0 != 0 {
         for _ in 0..4 {
-            let _ = unsafe { (ndk.read_i32)(p, &mut n) };
-            log.push_str(&format!(" r={}", n));
+            let v = rb_i32(&ndk, p, "r").unwrap_or(0);
+            log.push_str(&format!(" r={}", v));
         }
     }
-    // childTaskIds
-    let _ = unsafe { (ndk.read_i32)(p, &mut n) };
-    log.push_str(&format!(" ids={}", n));
-    let ids_len = n;
-    for _ in 0..n.max(0).min(128) {
-        let _ = unsafe { (ndk.read_i32)(p, &mut n) };
-        log.push_str(&format!(" ids0={}", n));
+    let ids_len = rb_i32(&ndk, p, "ids").unwrap_or(0);
+    log.push_str(&format!(" ids={}", ids_len));
+    for _ in 0..ids_len.max(0).min(128) {
+        let v = rb_i32(&ndk, p, "ids0").unwrap_or(0);
+        log.push_str(&format!(" ids0={}", v));
     }
-    // childTaskNames
-    let _ = unsafe { (ndk.read_i32)(p, &mut n) };
-    log.push_str(&format!(" names={}", n));
-    let names_len = n;
+    let names_len = rb_i32(&ndk, p, "names").unwrap_or(0);
+    log.push_str(&format!(" names={}", names_len));
     let mut str_fail = 0i32;
-    for _ in 0..n.max(0).min(128) {
-        if !skip_string(ndk, p) {
+    for _ in 0..names_len.max(0).min(128) {
+        if !skip_string(&ndk, p) {
             str_fail += 1;
         }
     }
-    // childTaskBounds
-    let _ = unsafe { (ndk.read_i32)(p, &mut n) };
-    log.push_str(&format!(" barr={}", n));
-    let barr_len = n;
-    for _ in 0..n.max(0).min(128) {
-        let _ = unsafe { (ndk.read_i32)(p, &mut n) };
-        log.push_str(&format!(" b0={}", n));
+    let barr_len = rb_i32(&ndk, p, "barr").unwrap_or(0);
+    log.push_str(&format!(" barr={}", barr_len));
+    for _ in 0..barr_len.max(0).min(128) {
+        let v = rb_i32(&ndk, p, "b0").unwrap_or(0);
+        log.push_str(&format!(" b0={}", v));
         for _ in 0..4 {
-            let _ = unsafe { (ndk.read_i32)(p, &mut n) };
-            log.push_str(&format!(" br={}", n));
+            let v = rb_i32(&ndk, p, "br").unwrap_or(0);
+            log.push_str(&format!(" br={}", v));
         }
     }
-    // childTaskUserIds
-    let _ = unsafe { (ndk.read_i32)(p, &mut n) };
-    log.push_str(&format!(" uids={}", n));
-    let uids_len = n;
-    for _ in 0..n.max(0).min(128) {
-        let _ = unsafe { (ndk.read_i32)(p, &mut n) };
-        log.push_str(&format!(" uid0={}", n));
+    let uids_len = rb_i32(&ndk, p, "uids").unwrap_or(0);
+    log.push_str(&format!(" uids={}", uids_len));
+    for _ in 0..uids_len.max(0).min(128) {
+        let v = rb_i32(&ndk, p, "uid0").unwrap_or(0);
+        log.push_str(&format!(" uid0={}", v));
     }
-    // visible / position
-    let _ = unsafe { (ndk.read_i32)(p, &mut n) };
-    log.push_str(&format!(" vis={}", n));
-    let _ = unsafe { (ndk.read_i32)(p, &mut n) };
-    log.push_str(&format!(" pos={}", n));
-    // TaskInfo: userId / taskId / effectiveUid
-    let _ = unsafe { (ndk.read_i32)(p, &mut n) };
-    log.push_str(&format!(" uidf={}", n));
-    let user_id = n;
-    let _ = unsafe { (ndk.read_i32)(p, &mut n) };
-    log.push_str(&format!(" tid={}", n));
-    let task_id = n;
-    let _ = unsafe { (ndk.read_i32)(p, &mut n) };
-    log.push_str(&format!(" eff={}", n));
-    let eff_uid = n;
+    let vis = rb_i32(&ndk, p, "vis").unwrap_or(0);
+    log.push_str(&format!(" vis={}", vis));
+    let pos = rb_i32(&ndk, p, "pos").unwrap_or(0);
+    log.push_str(&format!(" pos={}", pos));
+    let user_id = rb_i32(&ndk, p, "uidf").unwrap_or(0);
+    log.push_str(&format!(" uidf={}", user_id));
+    let task_id = rb_i32(&ndk, p, "tid").unwrap_or(0);
+    log.push_str(&format!(" tid={}", task_id));
+    let eff_uid = rb_i32(&ndk, p, "eff").unwrap_or(0);
+    log.push_str(&format!(" eff={}", eff_uid));
     unsafe { (ndk.parcel_delete)(p); }
     // 临时诊断: 完整读取序列 + 解析结果
     crate::main_dbg(&format!(
