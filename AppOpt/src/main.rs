@@ -696,7 +696,18 @@ impl AppState {
             if task_uid > 0 && task_uid != LAUNCHER_UID.load(Ordering::Relaxed) {
                 self.apply_focused_uid(task_uid);   // 规则应用 → 重新应用规则
             } else {
-                self.revert_all_rules();            // 桌面 → 回落
+                // 时序: 返回原应用时 launcher 残留回调先于游戏前移事件 (task event 后到),
+                // LAST 仍是桌面旧值 → 延迟 200ms 复查 (EV_CONFIRM2 到期读 LAST 再决定)
+                let tf = CONFIRM2_FD.load(Ordering::Acquire);
+                if tf >= 0 {
+                    let its = libc::itimerspec {
+                        it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
+                        it_value: libc::timespec { tv_sec: 0, tv_nsec: 200_000_000 },
+                    };
+                    unsafe { libc::timerfd_settime(tf, 0, &its, std::ptr::null_mut()); }
+                } else {
+                    self.revert_all_rules();
+                }
             }
             self.last_fg_uid = uid;
             return;
@@ -835,8 +846,11 @@ pub(crate) fn main_dbg(msg: &str) {
 
 /// 桌面 (launcher) uid: 桌面回调判断 (启动时从 packages.list 解析)
 static LAUNCHER_UID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
-/// TaskStackListener 最新驱动的前移任务 uid (on_fg 桌面回调时查看确认真实前台)
+/// TaskStackListener 最新驱动的前移任务 uid (on_fg 连续桌面回调时查看确认真实前台)
 static LAST_TASK_UID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+/// 连续桌面延迟复查定时器 (timerfd): on_fg 连续桌面且 LAST 仍桌面时设 200ms 一次性,
+/// 到期 EV_CONFIRM2 读 LAST_TASK_UID 再决定 — 解决 launcher 残留回调先于游戏前移事件到达的时序
+static CONFIRM2_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -1029,6 +1043,10 @@ fn main() {
             Ordering::Relaxed,
         );
     }
+    // 连续桌面延迟复查定时器 (一次性 200ms; on_fg 连续桌面 LAST=桌面时设置)
+    let confirm2_fd =
+        unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC | libc::TFD_NONBLOCK) };
+    CONFIRM2_FD.store(confirm2_fd, Ordering::Release);
     RFR_MON.lock().unwrap().clear();   /* 初始化: 清空 pidfd 监听刷新率命中记录 */
     crate::cpu_affinity::cpu_stats_clear();   /* 初始化: 清空线程状态页命中应用 */
     // T4: packages.list inotify fd
@@ -1055,6 +1073,7 @@ fn main() {
     const EV_EXIT_PID: u64 = 9; // pidfd 进程退出监听 (全模式统一退出来源)
     const EV_WAYLAY: u64 = 10; // waylay.conf inotify (外部编辑/原子替换 → 重读校验全量下发)
     const EV_TASK: u64 = 13; // TaskStackListener 任务栈变化 (taskId → getRootTaskInfo → uid)
+    const EV_CONFIRM2: u64 = 14; // 连续桌面延迟复查 (timerfd 到期读 LAST_TASK_UID 决定)
 
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epfd < 0 {
@@ -1080,6 +1099,9 @@ fn main() {
     }
     if task_ok {
         epoll_add(epfd, task_sv[0], EV_TASK);
+    }
+    if confirm2_fd >= 0 {
+        epoll_add(epfd, confirm2_fd, EV_CONFIRM2);
     }
 
     // packages.list inotify: 应用安装/卸载/替换 → 重建 uid 表 (fd 由并发 T4 线程建立;
@@ -1284,6 +1306,21 @@ fn main() {
                         if n == 4 {
                             crate::main_dbg(&format!("task event uid={}", uid));
                             LAST_TASK_UID.store(uid, Ordering::Relaxed);
+                        }
+                    }
+                }
+                EV_CONFIRM2 => {
+                    // 连续桌面延迟复查 (200ms 后): launcher 残留回调先于游戏前移事件,
+                    // 到期读 LAST_TASK_UID — 前移任务是规则应用 → 应用; 仍桌面 → 回落
+                    if confirm2_fd >= 0 {
+                        let mut tmp = [0u8; 8];
+                        let _ = unsafe { libc::read(confirm2_fd, tmp.as_mut_ptr() as *mut _, 8) };
+                        let task_uid = LAST_TASK_UID.load(Ordering::Relaxed);
+                        crate::main_dbg(&format!("confirm2 task_uid={}", task_uid));
+                        if task_uid > 0 && task_uid != LAUNCHER_UID.load(Ordering::Relaxed) {
+                            state.apply_focused_uid(task_uid);
+                        } else {
+                            state.revert_all_rules();
                         }
                     }
                 }
