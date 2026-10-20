@@ -675,52 +675,11 @@ impl AppState {
         }
     }
 
-    /// 桌面回调 (回落路径): 异步查询聚焦 effectiveUid → 主线程 EV_CONFIRM
-    /// apply_focused_uid 决定 (聚焦=桌面 → 回落; 聚焦=规则应用 → 应用其规则)
-    fn request_focus_confirm() {
-        let wfd = CONFIRM_W_FD.load(Ordering::Acquire);
-        if wfd < 0 {
-            crate::main_dbg("focus query skipped (no fd)");
-            return;
-        }
-        crate::main_dbg("focus query start");
-        std::thread::spawn(move || {
-            // 首次查询 + 延迟重试一次 (回调先于系统聚焦更新, 300ms 后聚焦任务才切好)
-            let mut uid = -1i32;
-            for attempt in 0..2 {
-                let r = crate::process_observer::probe_focused_root_task_info();
-                match &r {
-                    Ok((u, t, e)) => crate::main_dbg(&format!(
-                        "focus attempt={} userId={} taskId={} effUid={}",
-                        attempt, u, t, e
-                    )),
-                    Err(err) => crate::main_dbg(&format!("focus attempt={} err: {}", attempt, err)),
-                }
-                if let Ok((_, _, e)) = &r {
-                    if *e > 0 {
-                        uid = *e;
-                        break;
-                    }
-                }
-                std::thread::sleep(std::time::Duration::from_millis(300));
-            }
-            let _ = unsafe { libc::write(wfd, &uid as *const i32 as *const libc::c_void, 4) };
-        });
-    }
-
     /// binder 前台回调 (pid+uid): 查 uid 表分发 CPU (冷启动 ApplyPkg + pidfd watch)
     /// 与刷新率 (包名) —— 原 EV_FG 分支主体
     fn on_fg(&mut self, pid: i32, uid: i32) {
         /* 四功能统一 uid: 直接查 uid 规则表 (uid 在该表 = 有规则) */
         self.last_fg_uid = uid;
-        // 桌面回调: 不立即回落 — 异步查询聚焦任务 effectiveUid,
-        // EV_CONFIRM 按聚焦 uid 决定 (聚焦=桌面 → 回落; 聚焦=规则应用 → 应用其规则;
-        // 覆盖"按最近键回落 → 返回原应用聚焦切回"的误回落)
-        if uid == LAUNCHER_UID.load(Ordering::Relaxed) {
-            crate::main_dbg(&format!("on_fg desktop uid={} launcher_uid={}", uid, LAUNCHER_UID.load(Ordering::Relaxed)));
-            Self::request_focus_confirm();
-            return;
-        }
         crate::main_dbg(&format!("on_fg uid={}", uid));
         let my: Vec<crate::config::WaylayRule> = self
             .uid_rules
@@ -859,11 +818,6 @@ pub(crate) fn main_dbg(msg: &str) {
         let _ = f.write_all(format!("{}\n", msg).as_bytes());
     }
 }
-
-/// 桌面 (launcher) uid: 聚焦确认针对桌面回调 (启动时从 packages.list 解析)
-static LAUNCHER_UID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
-/// 聚焦确认: 查询结果写端 (查询线程 → 主线程 EV_CONFIRM)
-pub(crate) static CONFIRM_W_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -1036,25 +990,18 @@ fn main() {
     let mut touch_sv: [libc::c_int; 2] = [-1, -1];
     let mut exit_sv: [libc::c_int; 2] = [-1, -1];
     let (touch_ok, exit_ok) = spawn_event_probe(&mut touch_sv, &mut exit_sv);
-    // 聚焦确认通道: 桌面回调 → 异步查询聚焦 effectiveUid → 主线程 EV_CONFIRM
-    let mut confirm_sv: [libc::c_int; 2] = [-1, -1];
-    let confirm_ok = unsafe {
+    // TaskStackListener 事件通道: 任务栈变化 → taskId → 主线程 EV_TASK 查询 getRootTaskInfo
+    let mut task_sv: [libc::c_int; 2] = [-1, -1];
+    let task_ok = unsafe {
         libc::socketpair(
             libc::AF_UNIX,
             libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
             0,
-            confirm_sv.as_mut_ptr(),
+            task_sv.as_mut_ptr(),
         ) == 0
     };
-    if confirm_ok {
-        CONFIRM_W_FD.store(confirm_sv[1], Ordering::Release);
-        LAUNCHER_UID.store(
-            crate::pkg_to_uid_map()
-                .get(crate::config::DEFAULT_REFRESH_PACKAGE)
-                .copied()
-                .unwrap_or(-1),
-            Ordering::Relaxed,
-        );
+    if task_ok {
+        crate::process_observer::init_task_stack_listener(task_sv[1]);
     }
     RFR_MON.lock().unwrap().clear();   /* 初始化: 清空 pidfd 监听刷新率命中记录 */
     crate::cpu_affinity::cpu_stats_clear();   /* 初始化: 清空线程状态页命中应用 */
@@ -1081,7 +1028,7 @@ fn main() {
     const EV_TOUCH: u64 = 8; // 用户态 /dev/input 触摸/输入活动 (替代 4.19 内核 input hook)
     const EV_EXIT_PID: u64 = 9; // pidfd 进程退出监听 (全模式统一退出来源)
     const EV_WAYLAY: u64 = 10; // waylay.conf inotify (外部编辑/原子替换 → 重读校验全量下发)
-    const EV_CONFIRM: u64 = 13; // 聚焦确认查询结果 (桌面回调时异步查询 effectiveUid 回传)
+    const EV_TASK: u64 = 13; // TaskStackListener 任务栈变化 (taskId → getRootTaskInfo → uid)
 
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epfd < 0 {
@@ -1105,8 +1052,8 @@ fn main() {
     if exit_ok {
         epoll_add(epfd, exit_sv[0], EV_EXIT_PID);
     }
-    if confirm_ok {
-        epoll_add(epfd, confirm_sv[0], EV_CONFIRM);
+    if task_ok {
+        epoll_add(epfd, task_sv[0], EV_TASK);
     }
 
     // packages.list inotify: 应用安装/卸载/替换 → 重建 uid 表 (fd 由并发 T4 线程建立;
@@ -1294,21 +1241,29 @@ fn main() {
                         }
                     }
                 }
-                EV_CONFIRM => {
-                    // 桌面回调触发的聚焦确认结果 (effectiveUid):
-                    // 聚焦=桌面 → 回落; 聚焦=规则应用 → 应用其规则 (覆盖最近键误回落)
-                    if confirm_ok && confirm_sv[0] > 0 {
-                        let mut uid = 0i32;
+                EV_TASK => {
+                    // TaskStackListener 事件: taskId → getRootTaskInfo(taskId) → effectiveUid
+                    // → 应用/回落 (事件驱动, 覆盖最近键返回等所有任务前移场景)
+                    if task_ok && task_sv[0] > 0 {
+                        let mut task_id = 0i32;
                         let n = unsafe {
                             libc::recv(
-                                confirm_sv[0],
-                                &mut uid as *mut i32 as *mut libc::c_void,
+                                task_sv[0],
+                                &mut task_id as *mut i32 as *mut libc::c_void,
                                 4,
                                 0,
                             )
                         };
-                        if n == 4 {
-                            state.apply_focused_uid(uid);
+                        if n == 4 && task_id > 0 {
+                            crate::main_dbg(&format!("task event taskId={}", task_id));
+                            let r = crate::process_observer::get_root_task_uid(task_id);
+                            match &r {
+                                Ok(uid) => crate::main_dbg(&format!("root task {} uid={}", task_id, uid)),
+                                Err(e) => crate::main_dbg(&format!("root task {} err: {}", task_id, e)),
+                            }
+                            if let Ok(uid) = r {
+                                state.apply_focused_uid(uid);
+                            }
                         }
                     }
                 }

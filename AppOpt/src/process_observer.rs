@@ -129,6 +129,10 @@ static ATM_CLASS: OnceLock<SendClass> = OnceLock::new();
 // IMPLEMENT_META_INTERFACE(SurfaceComposer, "android.ui.ISurfaceComposer")，
 // 即旧版 C++ binder 接口注册的就是 android.ui.ISurfaceComposer
 static SF_CLASS: OnceLock<SendClass> = OnceLock::new();
+// ITaskStackListener 本地 class (任务栈变化事件接收)
+static TSL_CLASS: OnceLock<SendClass> = OnceLock::new();
+/// TaskStackListener 事件通道写端: 解析出的 taskId → 主线程 EV_TASK
+static TASK_SEND_FD: AtomicI32 = AtomicI32::new(-1);
 
 extern "C" fn on_create(_args: *mut c_void) -> *mut c_void { std::ptr::null_mut() }
 extern "C" fn on_destroy(_user_data: *mut c_void) {}
@@ -256,6 +260,110 @@ fn get_sf_class() -> *mut c_void {
     }).0
 }
 
+/// ITaskStackListener 本地 class (任务栈变化事件接收)
+fn get_tsl_class() -> *mut c_void {
+    let Some(ndk) = ndk() else { return std::ptr::null_mut() };
+    TSL_CLASS.get_or_init(|| {
+        let class = unsafe {
+            (ndk.class_define)(
+                b"android.app.ITaskStackListener\0".as_ptr() as *const c_char,
+                Some(on_create), Some(on_destroy), Some(tsl_on_transact),
+            )
+        };
+        SendClass(class)
+    }).0
+}
+
+/// ITaskStackListener 回调 onTransact: 解析 taskId (onTaskMovedToFront=0xb /
+/// onTaskFocusChanged=0x17 / onTaskStackChanged=0x1), 发送到主线程 EV_TASK。
+/// onTaskMovedToFront 参数 RunningTaskInfo: readTypedObject → null 标志 +
+/// TaskInfo 基类前 2 int (userId/taskId)。
+extern "C" fn tsl_on_transact(
+    _binder: *mut c_void,
+    code: u32,
+    in_parcel: *mut c_void,
+    _out: *mut c_void,
+) -> c_int {
+    let Some(ndk) = ndk() else { return STATUS_UNKNOWN_TRANSACTION };
+    let mut task_id = -1i32;
+    match code {
+        0x01 => {
+            // onTaskStackChanged: 无参数 — 发 -1 (主线程忽略或兜底)
+            task_id = -1;
+        }
+        0x0b => {
+            // onTaskMovedToFront(RunningTaskInfo): null 标志 + userId + taskId
+            let mut flag = 0i32;
+            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut flag) };
+            if flag != 0 {
+                let mut _user_id = 0i32;
+                let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _user_id) };
+                let _ = unsafe { (ndk.read_i32)(in_parcel, &mut task_id) };
+            }
+        }
+        0x17 => {
+            // onTaskFocusChanged(int taskId, boolean isFocused)
+            let mut focused = 0i32;
+            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut task_id) };
+            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut focused) };
+        }
+        _ => {
+            return STATUS_UNKNOWN_TRANSACTION;
+        }
+    }
+    let fd = TASK_SEND_FD.load(Ordering::Acquire);
+    if fd >= 0 && task_id > 0 {
+        let _ = unsafe {
+            libc::send(fd, &task_id as *const i32 as *const libc::c_void, 4, libc::MSG_DONTWAIT)
+        };
+    }
+    STATUS_OK
+}
+
+/// 注册 ITaskStackListener (事务 0x2f): 任务栈变化 → taskId → 主线程 EV_TASK 查询
+pub fn init_task_stack_listener(send_fd: i32) -> bool {
+    TASK_SEND_FD.store(send_fd, Ordering::Release);
+    let Some(ndk) = ndk() else { return false };
+    let class = get_tsl_class();
+    if class.is_null() {
+        return false;
+    }
+    let listener = unsafe { (ndk.binder_new)(class, std::ptr::null_mut()) };
+    if listener.is_null() {
+        return false;
+    }
+    let am = unsafe { (ndk.get_service)(b"activity_task\0".as_ptr() as *const c_char) };
+    if am.is_null() {
+        return false;
+    }
+    let atm_class = get_atm_class();
+    if atm_class.is_null() {
+        return false;
+    }
+    if !unsafe { (ndk.associate_class)(am, atm_class as *const c_void) } {
+        return false;
+    }
+    let mut in_parcel: *mut c_void = std::ptr::null_mut();
+    if unsafe { (ndk.prepare_tx)(am, &mut in_parcel) } != STATUS_OK || in_parcel.is_null() {
+        return false;
+    }
+    // writeStrongInterface(listener)
+    let _ = unsafe { (ndk.write_binder)(in_parcel, listener) };
+    let mut out_parcel: *mut c_void = std::ptr::null_mut();
+    let status = unsafe { (ndk.transact)(am, 0x2f, &mut in_parcel, &mut out_parcel, 0) };
+    unsafe { (ndk.parcel_delete)(in_parcel); }
+    if status == STATUS_OK && !out_parcel.is_null() {
+        let mut exc = 0i32;
+        let _ = unsafe { (ndk.read_i32)(out_parcel, &mut exc) };
+        unsafe { (ndk.parcel_delete)(out_parcel); }
+        return exc == 0;
+    }
+    if !out_parcel.is_null() {
+        unsafe { (ndk.parcel_delete)(out_parcel); }
+    }
+    false
+}
+
 pub fn init_observer(send_fd: i32) -> bool {
     FG_SEND_FD.store(send_fd, Ordering::Release);
 
@@ -365,31 +473,31 @@ unsafe extern "C" fn skip_str_fn(_data: *mut c_void, _s: *const c_char, len: usi
     len
 }
 
-/// binder 查询: getFocusedRootTaskInfo (事务 0x20=32), 读聚焦任务 TaskInfo 前 3 字段。
-/// 用于"桌面回调时确认聚焦": 聚焦 uid == 桌面 → 回落; 否则按聚焦 uid 应用规则。
-/// 字符串跳过用 NDK readString (稳健, 无手动字节错位); 不读 baseIntent/ComponentName (无崩溃风险)。
-/// Ok((userId, taskId, effectiveUid)); Err = 无聚焦/失败。
-pub fn probe_focused_root_task_info() -> Result<(i32, i32, i32), String> {
+/// binder 查询: getRootTaskInfo(taskId, displayId=0) (事务 0x38), 返回该任务 effectiveUid。
+/// TaskStackListener 事件给 taskId → 按 taskId 精确查任务 (不受 input focus 影响)。
+/// 解析布局与 getFocusedRootTaskInfo 相同 (RootTaskInfo 子类 + TaskInfo 前 3 字段)。
+pub fn get_root_task_uid(task_id: i32) -> Result<i32, String> {
     let ndk = ndk().ok_or("ndk init failed")?;
     let svc = unsafe { (ndk.get_service)(b"activity_task\0".as_ptr() as *const c_char) };
     if svc.is_null() {
         return Err("get_service(activity_task) returned null".into());
     }
-    // NDK prepareTransaction 需要先关联本地 class (接口 token 写入依赖 class descriptor)
     let atm_class = get_atm_class();
     if atm_class.is_null() {
         return Err("atm class define failed".into());
     }
     if !unsafe { (ndk.associate_class)(svc, atm_class as *const c_void) } {
-        return Err("associate_class(activity_task, IActivityTaskManager) failed (descriptor mismatch?)".into());
+        return Err("associate_class failed (descriptor mismatch?)".into());
     }
     let mut in_parcel: *mut c_void = std::ptr::null_mut();
     let prep = unsafe { (ndk.prepare_tx)(svc, &mut in_parcel) };
     if prep != STATUS_OK || in_parcel.is_null() {
-        return Err(format!("prepare_tx status={} parcel={}", prep, in_parcel.is_null()));
+        return Err(format!("prepare_tx status={}", prep));
     }
+    let _ = unsafe { (ndk.write_int32)(in_parcel, task_id) };
+    let _ = unsafe { (ndk.write_int32)(in_parcel, 0) };   // displayId = 0 (主屏)
     let mut out_parcel: *mut c_void = std::ptr::null_mut();
-    let status = unsafe { (ndk.transact)(svc, 32, &mut in_parcel, &mut out_parcel, 0) };
+    let status = unsafe { (ndk.transact)(svc, 0x38, &mut in_parcel, &mut out_parcel, 0) };
     unsafe { (ndk.parcel_delete)(in_parcel); }
     if status != STATUS_OK || out_parcel.is_null() {
         let null_out = out_parcel.is_null();
@@ -404,33 +512,30 @@ pub fn probe_focused_root_task_info() -> Result<(i32, i32, i32), String> {
         unsafe { (ndk.parcel_delete)(out_parcel); }
         return Err(format!("reply exception={}", exc));
     }
-
     let p = out_parcel;
-    // readTypedObject(RootTaskInfo.CREATOR) 外层 null 标志: 0=null(无聚焦任务), 1=非 null
     let mut obj_flag = 0i32;
     let _ = unsafe { (ndk.read_i32)(p, &mut obj_flag) };
     if obj_flag == 0 {
         unsafe { (ndk.parcel_delete)(p); }
-        return Err("no focused root task".into());
+        return Err("root task null".into());
     }
-
     let mut n = 0i32;
-    // RootTaskInfo 子类 readFromParcel: bounds Rect (null 标志 + left/top/right/bottom)
+    // RootTaskInfo 子类: bounds Rect (null 标志 + 4×int)
     let _ = unsafe { (ndk.read_i32)(p, &mut n) };
     for _ in 0..4 {
         let _ = unsafe { (ndk.read_i32)(p, &mut n) };
     }
-    // childTaskIds: int[] (长度 + n×int)
+    // childTaskIds: int[]
     let _ = unsafe { (ndk.read_i32)(p, &mut n) };
     for _ in 0..n.max(0) {
         let _ = unsafe { (ndk.read_i32)(p, &mut n) };
     }
-    // childTaskNames: String[] (长度 + n×string, NDK readString 跳过)
+    // childTaskNames: String[] (NDK readString 跳过)
     let _ = unsafe { (ndk.read_i32)(p, &mut n) };
     for _ in 0..n.max(0) {
         let _ = unsafe { (ndk.read_string)(p, std::ptr::null_mut(), skip_str_fn) };
     }
-    // childTaskBounds: Rect[] (长度 + n×(null 标志 + 4×int))
+    // childTaskBounds: Rect[]
     let _ = unsafe { (ndk.read_i32)(p, &mut n) };
     for _ in 0..n.max(0) {
         let _ = unsafe { (ndk.read_i32)(p, &mut n) };
@@ -438,21 +543,19 @@ pub fn probe_focused_root_task_info() -> Result<(i32, i32, i32), String> {
             let _ = unsafe { (ndk.read_i32)(p, &mut n) };
         }
     }
-    // childTaskUserIds: int[] (长度 + n×int)
+    // childTaskUserIds: int[]
     let _ = unsafe { (ndk.read_i32)(p, &mut n) };
     for _ in 0..n.max(0) {
         let _ = unsafe { (ndk.read_i32)(p, &mut n) };
     }
-    // visible: int, position: int
+    // visible / position
     let _ = unsafe { (ndk.read_i32)(p, &mut n) };
     let _ = unsafe { (ndk.read_i32)(p, &mut n) };
-    // TaskInfo.readTaskFromParcel: userId / taskId / effectiveUid (第 3 字段 = 目标)
-    let mut user_id = 0i32;
-    let _ = unsafe { (ndk.read_i32)(p, &mut user_id) };
-    let mut task_id = 0i32;
-    let _ = unsafe { (ndk.read_i32)(p, &mut task_id) };
+    // TaskInfo: userId / taskId / effectiveUid
+    let _ = unsafe { (ndk.read_i32)(p, &mut n) };
+    let _ = unsafe { (ndk.read_i32)(p, &mut n) };
     let mut eff_uid = 0i32;
     let _ = unsafe { (ndk.read_i32)(p, &mut eff_uid) };
     unsafe { (ndk.parcel_delete)(p); }
-    Ok((user_id, task_id, eff_uid))
+    Ok(eff_uid)
 }
