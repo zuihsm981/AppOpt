@@ -1,19 +1,14 @@
-//! IProcessObserver binder 回调实现（dlopen 运行时加载 libbinder_ndk.so）
+//! ITaskStackListener binder 回调实现（dlopen 运行时加载 libbinder_ndk.so）
 //!
 //! 触发分离/数据共享（参考 优化.md）：
-//! Binder 回调提取 pid+uid, 经 socketpair(SOCK_DGRAM) 发送 8 字节 (pid+uid);
-//! 主线程据此查 uid 静态表并分发 CPU(按 uid 取该应用全部进程)/刷新率(按包)线程。
+//! Binder 回调 onTaskMovedToFront 解析 RunningTaskInfo 的 effectiveUid,
+//! 经 socketpair(SOCK_DGRAM) 发送 4 字节 uid; 主线程 EV_TASK 统一驱动
+//! CPU / 刷新率 / vfc / srv / prop (IProcessObserver on_fg 驱动已移除)。
 
 use std::ffi::c_void;
 use std::sync::{OnceLock};
 use std::sync::atomic::{AtomicI32, Ordering};
 use libc::{c_char, c_int, dlopen, dlsym, RTLD_LAZY};
-
-// ── 硬编码事务码 ──
-const TX_REGISTER_PROCESS_OBSERVER: u32 = 0x0d;
-const TX_ON_PROCESS_STARTED: u32 = 0x01;
-const TX_ON_FG_ACTIVITIES_CHANGED: u32 = 0x02;
-const TX_ON_FG_SERVICES_CHANGED: u32 = 0x03;
 
 // ── FFI 函数指针类型 ──
 type FnGetService = unsafe extern "C" fn(*const c_char) -> *mut c_void;
@@ -107,14 +102,9 @@ fn ndk() -> Option<&'static BinderNdk> {
 const STATUS_OK: c_int = 0;
 const STATUS_UNKNOWN_TRANSACTION: c_int = -29;
 
-// fg 事件经 socketpair(SOCK_DGRAM) 传递 pid+uid (8 字节); 主线程 EV_FG 分发
-static FG_SEND_FD: AtomicI32 = AtomicI32::new(-1);
-
 struct SendClass(*mut c_void);
 unsafe impl Send for SendClass {}
 unsafe impl Sync for SendClass {}
-static OBSERVER_CLASS: OnceLock<SendClass> = OnceLock::new();
-static AM_CLASS: OnceLock<SendClass> = OnceLock::new();
 static ATM_CLASS: OnceLock<SendClass> = OnceLock::new();
 // SurfaceFlinger 的 ISurfaceComposer 描述符：
 // ISurfaceComposer.h 中 DECLARE_META_INTERFACE(SurfaceComposer) →
@@ -126,109 +116,9 @@ static TSL_CLASS: OnceLock<SendClass> = OnceLock::new();
 /// TaskStackListener 事件通道写端: 解析出的 effectiveUid → 主线程 EV_TASK
 static TASK_SEND_FD: AtomicI32 = AtomicI32::new(-1);
 
-/// IProcessObserver 前台回调防抖: 同 (pid, uid) 高频回调 (launcher fg 波动) 200ms 内只发一次
-static LAST_FG_T: std::sync::LazyLock<std::sync::Mutex<(i32, i32, std::time::Instant)>> =
-    std::sync::LazyLock::new(|| {
-        std::sync::Mutex::new((
-            0,
-            0,
-            std::time::Instant::now() - std::time::Duration::from_secs(10),
-        ))
-    });
-
 extern "C" fn on_create(_args: *mut c_void) -> *mut c_void { std::ptr::null_mut() }
 extern "C" fn on_destroy(_user_data: *mut c_void) {}
 extern "C" fn am_dummy_on_transact(_b: *mut c_void, _c: u32, _i: *mut c_void, _o: *mut c_void) -> c_int { STATUS_UNKNOWN_TRANSACTION }
-
-/// onTransact 回调
-extern "C" fn on_transact(
-    _binder: *mut c_void,
-    code: u32,
-    in_parcel: *mut c_void,
-    _out: *mut c_void,
-) -> c_int {
-    let Some(ndk) = ndk() else { return STATUS_UNKNOWN_TRANSACTION };
-
-    // NDK 的 AIBinder_onTransact 内部已通过 checkInterface() 读取了 Interface Token
-    // (strict_mode i32 + UTF-16 descriptor)，且不重置 parcel 位置
-    // 因此这里直接从事务数据开始读取，不再重复读 token
-
-    match code {
-        TX_ON_PROCESS_STARTED => {
-            // 本事务不携带有效负载; 即使协议变体带参数, 每次 onTransact 也是独立
-            // parcel (无跨事务位置状态), oneway 无 reply —— 漏读不影响后续
-            STATUS_OK
-        }
-        TX_ON_FG_ACTIVITIES_CHANGED => {
-            let mut pid = 0i32;
-            let mut uid = 0i32;
-            let mut fg_val = 0i32;
-
-            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut pid) };
-            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut uid) };
-            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut fg_val) };
-
-            let fg = fg_val != 0;
-
-            if fg && pid > 0 {
-                // 100ms 防抖: 同 (pid, uid) 高频回调 (launcher fg 波动, 几十 ms 内) 只发一次;
-                // 人工切换一般 >100ms, 不受抑制 (避免快速往返吞掉切换导致不回落)
-                let now = std::time::Instant::now();
-                let mut last = crate::lock_ignore_poison(&LAST_FG_T);
-                let due = pid != last.0
-                    || uid != last.1
-                    || now.duration_since(last.2).as_millis() >= 50;
-                if due {
-                    *last = (pid, uid, now);
-                    // 触发分离：Binder 回调携带 pid + uid（8 字节）。
-                    // 刷新率按 pid 解析包名; CPU 亲和性按 uid 取该应用全部进程
-                    let fd = FG_SEND_FD.load(Ordering::Acquire);
-                    if fd >= 0 {
-                        let pkt = [pid, uid];
-                        let _ = unsafe {
-                            libc::send(fd, pkt.as_ptr() as *const libc::c_void, 8, 0)
-                        };
-                    }
-                }
-            }
-            STATUS_OK
-        }
-        TX_ON_FG_SERVICES_CHANGED => {
-            let mut _pid = 0i32; let mut _uid = 0i32; let mut _st = 0i32;
-            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _pid) };
-            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _uid) };
-            let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _st) };
-            STATUS_OK
-        }
-        _ => { STATUS_UNKNOWN_TRANSACTION }
-    }
-}
-
-fn get_observer_class() -> *mut c_void {
-    let Some(ndk) = ndk() else { return std::ptr::null_mut() };
-    OBSERVER_CLASS.get_or_init(|| {
-        let class = unsafe {
-            (ndk.class_define)(
-                b"android.app.IProcessObserver\0".as_ptr() as *const c_char,
-                Some(on_create), Some(on_destroy), Some(on_transact),
-            )
-        };
-        SendClass(class)
-    }).0
-}
-
-fn get_am_class() -> *mut c_void {
-    let Some(ndk) = ndk() else { return std::ptr::null_mut() };
-    AM_CLASS.get_or_init(|| {
-        let class = unsafe {
-            (ndk.class_define)(
-                b"android.app.IActivityManager\0".as_ptr() as *const c_char,
-                Some(on_create), Some(on_destroy), Some(am_dummy_on_transact),
-            )
-        };
-        SendClass(class)
-    }).0
-}
 
 /// IActivityTaskManager 本地 class (供 probe 直连 activity_task 时 associateClass)
 fn get_atm_class() -> *mut c_void {
@@ -351,64 +241,23 @@ pub fn init_task_stack_listener(send_fd: i32) -> bool {
         let mut exc = 0i32;
         let _ = unsafe { (ndk.read_i32)(out_parcel, &mut exc) };
         unsafe { (ndk.parcel_delete)(out_parcel); }
-        return exc == 0;
+        if exc == 0 {
+            // binder 线程池: 原由 IProcessObserver 注册启动; on_fg 驱动移除后,
+            // TaskStackListener 回调依赖此线程池 → 注册成功后在此启动
+            let start_fn = ndk.start_thread_pool;
+            let join_fn = ndk.join_thread_pool;
+            std::thread::spawn(move || {
+                unsafe { start_fn(); }
+                unsafe { join_fn(); }
+            });
+            return true;
+        }
+        return false;
     }
     if !out_parcel.is_null() {
         unsafe { (ndk.parcel_delete)(out_parcel); }
     }
     false
-}
-
-pub fn init_observer(send_fd: i32) -> bool {
-    FG_SEND_FD.store(send_fd, Ordering::Release);
-
-    let Some(ndk) = ndk() else { return false };
-    let class = get_observer_class();
-    if class.is_null() { return false; }
-
-    let observer = unsafe { (ndk.binder_new)(class, std::ptr::null_mut()) };
-    if observer.is_null() { return false; }
-
-    let am = unsafe { (ndk.get_service)(b"activity\0".as_ptr() as *const c_char) };
-    if am.is_null() { return false; }
-
-    let am_class = get_am_class();
-    if am_class.is_null() { return false; }
-    if !unsafe { (ndk.associate_class)(am, am_class as *const c_void) } {
-        return false;
-    }
-
-    let mut in_parcel: *mut c_void = std::ptr::null_mut();
-    let prep_status = unsafe { (ndk.prepare_tx)(am, &mut in_parcel) };
-    if prep_status != STATUS_OK || in_parcel.is_null() {
-        return false;
-    }
-
-    let _ = unsafe { (ndk.write_binder)(in_parcel, observer) };
-
-    let mut out_parcel: *mut c_void = std::ptr::null_mut();
-    let status = unsafe { (ndk.transact)(am, TX_REGISTER_PROCESS_OBSERVER, &mut in_parcel, &mut out_parcel, 0) };
-
-    // 读取 reply 异常码以排空 parcel（不再输出日志）
-    if status == STATUS_OK && !out_parcel.is_null() {
-        let mut _exception_code = 0i32;
-        let _ = unsafe { (ndk.read_i32)(out_parcel, &mut _exception_code) };
-    }
-
-    unsafe { (ndk.parcel_delete)(in_parcel) };
-    if !out_parcel.is_null() { unsafe { (ndk.parcel_delete)(out_parcel) }; }
-
-    if status == STATUS_OK {
-        let start_fn = ndk.start_thread_pool;
-        let join_fn = ndk.join_thread_pool;
-        std::thread::spawn(move || {
-            unsafe { start_fn(); }
-            unsafe { join_fn(); }
-        });
-        true
-    } else {
-        false
-    }
 }
 
 /// binder 直连 SurfaceFlinger 设置刷新率：事务码 1035，一个 int32 参数

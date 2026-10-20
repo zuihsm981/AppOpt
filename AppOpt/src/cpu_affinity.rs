@@ -3,7 +3,9 @@
 //! 设计:
 //!   - 触发: TaskStackListener 任务前移事件 (主线程 EV_TASK 接收前移任务 effectiveUid);
 //!     主线程查 cpu uid 表, 命中且冷启动 (CPU_KNOWN 无该 uid) 时发
-//!     CpuMsg::ApplyPkgByUid(uid, pkg) 立即应用并登记; ApplyAll = 启动/配置全量。
+//!     CpuMsg::ApplyPkgByUid(uid, pkg); worker 冷启动进入 ~2000ms cgroup 收集窗口
+//!     (事件可能早于 pid_* 目录生成, 子进程 fork 更晚 → 扫到 pid 不提前停, 窗口内
+//!     重扫并入并集, 窗口结束一次性应用完整并集并登记); ApplyAll = 启动/配置全量。
 //!   - 归因: 包名由主线程 cpu uid 表提供 (随 CpuMsg 消息携带); 按 uid 读
 //!     /sys/fs/cgroup/apps/uid_<uid>/ 下 pid_* 目录 (Android cgroup apps 布局,
 //!     精确 O(该 uid 进程数), 含主进程与全部子进程; 布局缺失视为未运行)。
@@ -47,11 +49,13 @@ pub enum CpuMsg {
 /// 全局投递通道: 主线程 (main EV_FG) 转发前台回调 → CpuMsg 消息
 static CPU_FG_TX: OnceLock<Mutex<mpsc::Sender<CpuMsg>>> = OnceLock::new();
 
-/// 前台事件 (task event / on_fg) 早于 cgroup pid_* 目录生成的补偿重试参数:
-/// 应用进程 fork → cgroup 迁移存在时序, 事件触发瞬间 uid_<uid> 下可能还没有
-/// pid_* 目录; 现扫为空时按此间隔排期重试 (pending 到期表, 非阻塞), 最多
-/// CGROUP_RETRY_TIMES 次 (总等待上限 ~1s), 期间其他 CPU 消息即时处理不排队。
-const CGROUP_RETRY_MS: u64 = 100;
+/// 前台事件 (task event / on_fg) 早于 cgroup pid_* 目录生成的补偿收集窗口参数:
+/// 1) 事件触发瞬间 uid_<uid> 下可能还没有 pid_* 目录 (进程 fork→cgroup 迁移时序);
+/// 2) 即使已扫到主进程 pid, 应用子进程 (:pkg/:remote 等) fork 晚于主进程 — 扫到 pid
+///    不能提前停, 否则晚 fork 的子进程 pid 会遗漏 (登记后热跳过不再重扫)。
+/// 窗口内每 CGROUP_RETRY_MS 重扫一次并入 seen 并集, 窗口结束 (CGROUP_RETRY_TIMES 次,
+/// 共 ~2000ms) 一次性应用完整并集。非阻塞 (pending 到期表, 不堵其他消息)。
+const CGROUP_RETRY_MS: u64 = 200;
 const CGROUP_RETRY_TIMES: u32 = 10;
 
 /// 冷热身份: uid -> (前台主 pid, 该 uid 全部 pid 列表); 主线程每次 binder 前台
@@ -154,11 +158,11 @@ pub struct CpuAffinity {
     uid_pkg: HashMap<i32, String>,
     /// 合并 CPU 集合 bits → cpuset 目录名 缓存 (相同集合只 ensure 一次, 避免每线程重复建目录)
     cpuset_cache: HashMap<u64, String>,
-    /// cgroup 延迟补偿重试队列: (到期时刻, uid, pkg, 已重试次数)。
-    /// 前台事件 (task event / on_fg) 可能早于 cgroup pid_* 目录生成 (进程 fork→cgroup
-    /// 迁移时序), 现扫为空时排入此队列, worker 空闲等待期间到期重扫 (非阻塞,
-    /// 不堵 EvictUid/PublishStats 消息, 与阻塞 sleep 区别在此)。
-    pending: Vec<(std::time::Instant, i32, String, u32)>,
+    /// cgroup 延迟补偿收集窗口队列: (到期时刻, uid, pkg, 已重扫次数, 已收集 pid 并集)。
+    /// 前台事件可能早于 cgroup pid_* 目录生成 / 子进程 fork, 冷启动进入 ~2000ms 收集
+    /// 窗口: 到期重扫并入并集, 窗口结束一次性应用完整并集 (扫到 pid 不提前停)。
+    /// 非阻塞 (recv_timeout 等待), 不堵 EvictUid/PublishStats 消息。
+    pending: Vec<(std::time::Instant, i32, String, u32, Vec<i32>)>,
 }
 
 impl CpuAffinity {
@@ -175,8 +179,8 @@ impl CpuAffinity {
     /// 应用退出清理: Cgroup 主 pid 目录消失 / 显式 EvictUid 消息共用
     fn evict_uid(&mut self, uid: i32) {
         crate::rw_write_ignore_poison(&CPU_KNOWN).remove(&uid);
-        // 同时摘除该 uid 的延迟重试排期 (进程已退出, 不再重扫重新登记)
-        self.pending.retain(|(_, u, _, _)| *u != uid);
+        // 同时摘除该 uid 的收集窗口排期 (进程已退出, 不再重扫重新登记)
+        self.pending.retain(|(_, u, _, _, _)| *u != uid);
         let pkg = self.uid_pkg.remove(&uid);
         if let Some(pkg) = pkg {
             self.managed.remove(&pkg); // pkg→tids, O(1) 整清 (替代 retain 全表扫)
@@ -391,8 +395,8 @@ impl CpuAffinity {
             let mut i = 0;
             while i < self.pending.len() {
                 if self.pending[i].0 <= now {
-                    let (_, uid, pkg, tries) = self.pending.remove(i);
-                    self.retry_apply(uid, pkg, tries);
+                    let (_, uid, pkg, tries, seen) = self.pending.remove(i);
+                    self.retry_apply(uid, pkg, tries, seen);
                     // 本位置已移除 → 不前进, 继续检查新占位
                 } else {
                     i += 1;
@@ -432,44 +436,42 @@ impl CpuAffinity {
                 }
             }
             CpuMsg::ApplyPkgByUid(uid, pkg) => {
-                // 前台事件驱动 CPU 应用: 冷启动现扫应用并登记; 已登记复用缓存 pids。
-                // 现扫为空 (cgroup pid_* 目录晚于事件生成) → 排入 pending 到期重试,
-                // 不阻塞 worker (EvictUid/PublishStats 即时处理)。
+                // 前台事件驱动 CPU 应用: 已登记 → 复用缓存 pids 立即重应用;
+                // 未登记 (冷) → 进入 ~2000ms 收集窗口 (cgroup pid_* 晚于事件生成 +
+                // 子进程 fork 更晚, 扫到 pid 不提前停, 窗口结束用完整并集一次应用)。
                 crate::cpu_affinity::cpu_dbg(&format!(
                     "worker recv ApplyPkgByUid uid={} pkg={}",
                     uid, pkg
                 ));
                 let cached = crate::rw_read_ignore_poison(&CPU_KNOWN).get(&uid).cloned();
-                let had_cached = cached.is_some();
-                let pids = match cached {
-                    Some((_, pids)) if !pids.is_empty() => pids, // 复用缓存 pids
-                    _ => Self::cgroup_apps_pids(uid).unwrap_or_default(), // 未登记: 现扫
-                };
+                if let Some((_, pids)) = cached {
+                    if !pids.is_empty() {
+                        crate::cpu_affinity::cpu_dbg(&format!(
+                            "ApplyPkgByUid uid={} pkg={} cached reuse pids={:?}",
+                            uid, pkg, pids
+                        ));
+                        self.apply_pkg_uid(uid, pkg, pids);
+                        return;
+                    }
+                }
+                // 冷启动: 首扫即进入收集窗口 (结果作为 seen 初始并集, 可能为空)
+                crate::rw_write_ignore_poison(&CPU_KNOWN).remove(&uid);
+                // 窗口去重: 同 uid 已有排期 → 摘除重排 (窗口进行中又来事件, 以最近为准
+                // 重置 2000ms; watch 已幂等, 但避免窗口结束重复 apply 两遍)
+                self.pending.retain(|(_, u, _, _, _)| *u != uid);
+                let pids = Self::cgroup_apps_pids(uid).unwrap_or_default();
                 crate::cpu_affinity::cpu_dbg(&format!(
-                    "ApplyPkgByUid uid={} pkg={} cached={} scan_pids={:?}",
+                    "ApplyPkgByUid uid={} pkg={} cold start seen={:?} (进入收集窗口)",
+                    uid, pkg, pids
+                ));
+                self.pending.push((
+                    std::time::Instant::now()
+                        + std::time::Duration::from_millis(CGROUP_RETRY_MS),
                     uid,
                     pkg,
-                    had_cached,
-                    pids.iter().take(6).collect::<Vec<_>>()
+                    0,
+                    pids,
                 ));
-                if pids.is_empty() {
-                    // 进程 cgroup 还没建 (事件早于 fork/cgroup 迁移) → 排期到期重扫;
-                    // 期间若进程退出 EvictUid 会摘除排期, 不会误登记
-                    crate::rw_write_ignore_poison(&CPU_KNOWN).remove(&uid);
-                    crate::cpu_affinity::cpu_dbg(&format!(
-                        "ApplyPkgByUid uid={} pkg={} PIDS_EMPTY (排期重试)",
-                        uid, pkg
-                    ));
-                    self.pending.push((
-                        std::time::Instant::now()
-                            + std::time::Duration::from_millis(CGROUP_RETRY_MS),
-                        uid,
-                        pkg,
-                        0,
-                    ));
-                    return;
-                }
-                self.apply_pkg_uid(uid, pkg, pids);
             }
             CpuMsg::ApplyThreadByUid(uid, pkg, thread) => {
                 // 单线程重放: 同上存活判断; 收集 comm==thread 的 tid
@@ -524,41 +526,47 @@ impl CpuAffinity {
         if main > 0 {
             crate::event_probe::watch(main);
         }
-        // 立即发布命中统计 (web 轮询 PublishStats 是"发一轮读下一轮",
-        // 不立即发布会晚两个轮询周期才显示)
-        self.publish_stats();
+        // 命中统计发布统一由 web 轮询驱动 (cpu_stats → PublishStats 消息),
+        // 不再应用后立即发布 (立即发布会跳过一轮轮询延迟, 但发布时机随应用时机,
+        // 与应用时序耦合; 轮询发布每次读都刷新, 语义更简单)
     }
 
-    /// cgroup 延迟补偿: 到期重扫; 仍空且未到上限 → 继续排期, 超限 → 清身份
-    /// (进程始终未进 cgroup = 未真正运行, 下次前台事件重新冷启动)。
-    fn retry_apply(&mut self, uid: i32, pkg: String, tries: u32) {
+    /// cgroup 收集窗口到期: 重扫并入 seen 并集; 未到窗口末 → 继续排期; 窗口末 →
+    /// 用完整并集应用一次 (仍空 → 清身份, 下次前台事件重新冷启动)。
+    fn retry_apply(&mut self, uid: i32, pkg: String, tries: u32, mut seen: Vec<i32>) {
         let pids = Self::cgroup_apps_pids(uid).unwrap_or_default();
+        for p in &pids {
+            if !seen.contains(p) {
+                seen.push(*p);
+            }
+        }
         crate::cpu_affinity::cpu_dbg(&format!(
-            "ApplyPkgByUid uid={} pkg={} retry#{} scan_pids={:?}",
-            uid,
-            pkg,
-            tries,
-            pids.iter().take(6).collect::<Vec<_>>()
+            "ApplyPkgByUid uid={} pkg={} retry#{} seen={:?}",
+            uid, pkg, tries, seen
         ));
-        if pids.is_empty() {
-            if tries < CGROUP_RETRY_TIMES {
-                self.pending.push((
-                    std::time::Instant::now()
-                        + std::time::Duration::from_millis(CGROUP_RETRY_MS),
-                    uid,
-                    pkg,
-                    tries + 1,
-                ));
-            } else {
+        if tries + 1 >= CGROUP_RETRY_TIMES {
+            // 窗口结束: 完整并集 (主进程 + 窗口内晚 fork 的全部子进程) 一次应用
+            if seen.is_empty() {
                 crate::rw_write_ignore_poison(&CPU_KNOWN).remove(&uid);
                 crate::cpu_affinity::cpu_dbg(&format!(
-                    "ApplyPkgByUid uid={} pkg={} PIDS_EMPTY (重试{}次仍无 cgroup, 放弃)",
-                    uid, pkg, CGROUP_RETRY_TIMES
+                    "ApplyPkgByUid uid={} pkg={} PIDS_EMPTY (窗口{}ms 仍无 cgroup, 放弃)",
+                    uid,
+                    pkg,
+                    CGROUP_RETRY_TIMES as u64 * CGROUP_RETRY_MS
                 ));
+            } else {
+                self.apply_pkg_uid(uid, pkg, seen);
             }
-            return;
+        } else {
+            self.pending.push((
+                std::time::Instant::now()
+                    + std::time::Duration::from_millis(CGROUP_RETRY_MS),
+                uid,
+                pkg,
+                tries + 1,
+                seen,
+            ));
         }
-        self.apply_pkg_uid(uid, pkg, pids);
     }
 }
 
