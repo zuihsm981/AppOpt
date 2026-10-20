@@ -282,11 +282,6 @@ body.kb .tabbar,body.kb .navbar{backdrop-filter:none;-webkit-backdrop-filter:non
 <div class="field"><input id="c-file"><button class="btn" id="c-file-save">保存</button></div>
 <div class="hint">修改后立即迁移监听并加载新文件，原文件保留</div>
 </div>
-<div class="card">
-<div class="card-title">线程延迟放置</div>
-<div class="field"><input id="c-delay" type="number" min="0" max="60000" step="100" placeholder="2000"><button class="btn" id="c-delay-save">保存</button></div>
-<div class="hint">如果出现部分线程没有正确设置时尝试调整<br>默认：2000ms</div>
-</div>
 <div class="card" id="scr-card">
 <div class="card-title">挂机黑屏</div>
 <div class="uclamp-chips" id="w-scr">
@@ -2349,7 +2344,6 @@ async function loadCfg(){
     const d=await api('/api/config');
     $('c-cpuset').value=d.cpuset_name;
     $('c-file').value=d.config_file;
-    $('c-delay').value=d.affinity_delay_ms??2000;
     $('c-cpuset-on').textContent=d.cpuset_enabled?'已启用':'不可用';
   }catch(e){toast(e.message)}
 }
@@ -2359,11 +2353,6 @@ async function saveField(body){
 }
 $('c-cpuset-save').onclick=()=>saveField({cpuset_name:$('c-cpuset').value.trim()});
 $('c-file-save').onclick=()=>saveField({config_file:$('c-file').value.trim()});
-$('c-delay-save').onclick=()=>{
-  const n=parseInt($('c-delay').value,10);
-  if(isNaN(n)||n<0||n>60000){toast('请输入 0~60000 的毫秒数');return}
-  saveField({affinity_delay_ms:n});
-};
 
 $('c-about').onclick=async()=>{
   $('page-about').classList.add('show');
