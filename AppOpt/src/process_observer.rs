@@ -365,7 +365,6 @@ fn skip_string(ndk: &BinderNdk, p: *mut c_void) -> bool {
         crate::main_dbg("skip read_len_fail");
         return false;
     }
-    crate::main_dbg(&format!("skip len={}", len));
     if len < 0 {
         return true;   // null 字符串
     }
@@ -490,7 +489,7 @@ pub fn query_focused_effective_uid() -> Result<i32, String> {
     let _ = unsafe { (ndk.read_i32)(p, &mut n) };
     log.push_str(&format!(" ids={}", n));
     let ids_len = n;
-    for _ in 0..n.max(0) {
+    for _ in 0..n.max(0).min(128) {
         let _ = unsafe { (ndk.read_i32)(p, &mut n) };
         log.push_str(&format!(" ids0={}", n));
     }
@@ -499,7 +498,7 @@ pub fn query_focused_effective_uid() -> Result<i32, String> {
     log.push_str(&format!(" names={}", n));
     let names_len = n;
     let mut str_fail = 0i32;
-    for _ in 0..n.max(0) {
+    for _ in 0..n.max(0).min(128) {
         if !skip_string(ndk, p) {
             str_fail += 1;
         }
@@ -508,7 +507,7 @@ pub fn query_focused_effective_uid() -> Result<i32, String> {
     let _ = unsafe { (ndk.read_i32)(p, &mut n) };
     log.push_str(&format!(" barr={}", n));
     let barr_len = n;
-    for _ in 0..n.max(0) {
+    for _ in 0..n.max(0).min(128) {
         let _ = unsafe { (ndk.read_i32)(p, &mut n) };
         log.push_str(&format!(" b0={}", n));
         for _ in 0..4 {
@@ -520,7 +519,7 @@ pub fn query_focused_effective_uid() -> Result<i32, String> {
     let _ = unsafe { (ndk.read_i32)(p, &mut n) };
     log.push_str(&format!(" uids={}", n));
     let uids_len = n;
-    for _ in 0..n.max(0) {
+    for _ in 0..n.max(0).min(128) {
         let _ = unsafe { (ndk.read_i32)(p, &mut n) };
         log.push_str(&format!(" uid0={}", n));
     }

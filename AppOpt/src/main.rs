@@ -825,8 +825,14 @@ static RFR_MON: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i
         std::sync::Mutex::new(std::collections::HashMap::new())
     });
 
-/// 临时诊断: 追加一行到 appopt_dbg.txt (定位 skip_string 失败原因)
+/// 临时诊断: 追加一行到 appopt_dbg.txt (定位 skip_string 失败原因);
+/// 限制日志 ≤2MB, 防解析错位时循环写日志导致磁盘暴涨
 pub(crate) fn main_dbg(msg: &str) {
+    if let Ok(md) = std::fs::metadata("/data/local/tmp/appopt_dbg.txt") {
+        if md.len() > 2 * 1024 * 1024 {
+            return;
+        }
+    }
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
