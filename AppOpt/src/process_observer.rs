@@ -279,10 +279,14 @@ extern "C" fn tsl_on_transact(
     let mut uid = -1i32;
     match code {
         0x0b => {
-            // onTaskMovedToFront(RunningTaskInfo): 前 3 int = userId/taskId/effectiveUid
+            // onTaskMovedToFront(RunningTaskInfo):
+            // [null 标志][RunningTaskInfo.id][TaskInfo.userId][taskId][effectiveUid]...
+            // effectiveUid = null 标志后第 4 个 int
             let mut flag = 0i32;
             let _ = unsafe { (ndk.read_i32)(in_parcel, &mut flag) };
             if flag != 0 {
+                let mut _id = 0i32;
+                let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _id) };
                 let mut _user_id = 0i32;
                 let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _user_id) };
                 let mut _task_id = 0i32;
