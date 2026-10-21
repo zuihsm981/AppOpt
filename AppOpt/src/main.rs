@@ -622,17 +622,30 @@ impl AppState {
 
 }
 
-/// pidfd 监听的刷新率规则应用主进程表 (pid→pkg; 可多个正在运行的规则应用)。
-/// pidfd 退出时清除对应条目。
+/// 刷新率命中表 (uid → pkg): 前移规则应用 (非桌面) 每次尝试登记, 重复跳过。
+/// 键用 uid (task event 自带, 登记零扫描); 主 pid 仅首次登记时现扫一次用于
+/// pidfd 退出监听 (pid→uid 反查表 RFR_PID_UID), 进程存活 pid 不变不再扫描。
 static RFR_MON: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i32, String>>> =
     std::sync::LazyLock::new(|| {
         std::sync::Mutex::new(std::collections::HashMap::new())
     });
+/// 刷新率主 pid → uid 反查 (pidfd 退出事件 → 清理命中表; 与 RFR_MON 同生命周期)
+static RFR_PID_UID: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i32, i32>>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Mutex::new(std::collections::HashMap::new())
+    });
 
-/// webui 轮询: 全部 pidfd 监听的刷新率主进程 (pid, pkg) 快照
+/// webui 轮询: 全部命中刷新率规则应用 (uid, pkg) 快照
 pub fn rfr_hit_list() -> Vec<(i32, String)> {
-    RFR_MON.lock().unwrap().iter().map(|(p, k)| (*p, k.clone())).collect()
+    RFR_MON.lock().unwrap().iter().map(|(u, k)| (*u, k.clone())).collect()
 }
+
+/// RFR_MON 登记重试去重: cgroup 晚于 task event 时在跑重试的 uid 集合 (同 uid 只一个重试线程)
+static RFR_RETRYING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<i32>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+/// RFR_MON 登记重试参数 (只需主 pid: 10×200ms = 2s, 与 CPU 收集窗口一致)
+const RFR_MON_RETRY_MS: u64 = 200;
+const RFR_MON_RETRY_TIMES: u32 = 10;
 
 
 fn main() {
@@ -788,7 +801,8 @@ fn main() {
     if task_ok {
         crate::process_observer::init_task_stack_listener(task_sv[1]);
     }
-    RFR_MON.lock().unwrap().clear();   /* 初始化: 清空 pidfd 监听刷新率命中记录 */
+    RFR_MON.lock().unwrap().clear();   /* 初始化: 清空刷新率命中记录 */
+    RFR_PID_UID.lock().unwrap().clear();   /* 初始化: 清空 pid→uid 反查 */
     crate::cpu_affinity::cpu_stats_clear();   /* 初始化: 清空线程状态页命中应用 */
     // T4: packages.list inotify fd
     let pkg_inotify_fd = pkg_inotify_thread.join().unwrap_or(-1);
@@ -994,8 +1008,10 @@ fn main() {
                                     let _ = tx.send(crate::cpu_affinity::CpuMsg::EvictUid(uid));
                                 }
                             }
-                            // 刷新率规则应用退出: 清 web 命中显示表 (回落已由前台回调驱动)
-                            RFR_MON.lock().unwrap().remove(&pid);
+                            // 刷新率规则应用退出: pid → uid 反查 → 清命中表 (回落已由 task event 驱动)
+                            if let Some(rf_uid) = RFR_PID_UID.lock().unwrap().remove(&pid) {
+                                RFR_MON.lock().unwrap().remove(&rf_uid);
+                            }
                         }
                     }
                 }
@@ -1028,15 +1044,56 @@ fn main() {
                                     }
                                 }
                             }
-                            // ---- 刷新率 web 命中登记 (RFR_MON: 主 pid → pkg + 退出监听) ----
+                            // ---- 刷新率 web 命中登记 (RFR_MON: uid → pkg) ----
+                            // 桌面 (DEFAULT_REFRESH_PACKAGE) 是回落包, 不算命中 → 不登记显示
                             if let Some(e) = state.uid_map.get(&uid) {
-                                if e.rfr {
-                                    let pids = crate::cpu_affinity::cgroup_pids(uid)
-                                        .unwrap_or_default();
-                                    if let Some(&rpid) = pids.iter().min() {
-                                        if !RFR_MON.lock().unwrap().contains_key(&rpid) {
-                                            crate::event_probe::watch(rpid);
-                                            RFR_MON.lock().unwrap().insert(rpid, e.pkg.clone());
+                                if e.rfr && e.pkg != crate::config::DEFAULT_REFRESH_PACKAGE {
+                                    // 每次前移规则应用都尝试登记; 已登记 (重复) → 跳过,
+                                    // 零现扫 (键是 uid, 进程存活主 pid 不变不再取)
+                                    let mut mon = RFR_MON.lock().unwrap();
+                                    if !mon.contains_key(&uid) {
+                                        // 首次登记: 现扫取主 pid 用于 pidfd 退出监听
+                                        let pids = crate::cpu_affinity::cgroup_pids(uid)
+                                            .unwrap_or_default();
+                                        if let Some(&rpid) = pids.iter().min() {
+                                            if !RFR_PID_UID.lock().unwrap().contains_key(&rpid) {
+                                                crate::event_probe::watch(rpid);
+                                                RFR_PID_UID.lock().unwrap()
+                                                    .insert(rpid, uid);
+                                            }
+                                            mon.insert(uid, e.pkg.clone());
+                                        } else if RFR_RETRYING.lock().unwrap().insert(uid) {
+                                            // task event 早于 cgroup 建立: 独立线程短时重试取主 pid
+                                            // (刷新率已生效, 重试只为命中显示 + 退出监听; 只需主 pid)
+                                            let uid2 = uid;
+                                            let pkg2 = e.pkg.clone();
+                                            std::thread::spawn(move || {
+                                                for _ in 0..RFR_MON_RETRY_TIMES {
+                                                    std::thread::sleep(std::time::Duration::from_millis(
+                                                        RFR_MON_RETRY_MS,
+                                                    ));
+                                                    let pids =
+                                                        crate::cpu_affinity::cgroup_pids(uid2)
+                                                            .unwrap_or_default();
+                                                    if let Some(&rpid) = pids.iter().min() {
+                                                        let mut mon = RFR_MON.lock().unwrap();
+                                                        if !mon.contains_key(&uid2) {
+                                                            if !RFR_PID_UID
+                                                                .lock()
+                                                                .unwrap()
+                                                                .contains_key(&rpid)
+                                                            {
+                                                                crate::event_probe::watch(rpid);
+                                                                RFR_PID_UID.lock().unwrap()
+                                                                    .insert(rpid, uid2);
+                                                            }
+                                                            mon.insert(uid2, pkg2.clone());
+                                                        }
+                                                        break;
+                                                    }
+                                                }
+                                                RFR_RETRYING.lock().unwrap().remove(&uid2);
+                                            });
                                         }
                                     }
                                 }

@@ -111,6 +111,11 @@ static ATM_CLASS: OnceLock<SendClass> = OnceLock::new();
 // IMPLEMENT_META_INTERFACE(SurfaceComposer, "android.ui.ISurfaceComposer")，
 // 即旧版 C++ binder 接口注册的就是 android.ui.ISurfaceComposer
 static SF_CLASS: OnceLock<SendClass> = OnceLock::new();
+/// SurfaceFlinger binder 句柄缓存: 只 get_service + associate 一次, 之后直接
+/// transact (AIBinder_transact 线程安全; 顺带消除每帧 get_service 的引用泄漏)。
+/// 失败不缓存 null → 下次调用重试。refresh 线程串行调用, 无并发争用。
+static SF_BINDER: std::sync::LazyLock<std::sync::Mutex<Option<SendClass>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 // ITaskStackListener 本地 class (任务栈变化事件接收)
 static TSL_CLASS: OnceLock<SendClass> = OnceLock::new();
 /// TaskStackListener 事件通道写端: 解析出的 effectiveUid → 主线程 EV_TASK
@@ -267,18 +272,30 @@ pub fn init_task_stack_listener(send_fd: i32) -> bool {
 pub fn set_refresh_rate_binder(mode: i32) -> bool {
     let Some(ndk) = ndk() else { return false };
 
-    let sf = unsafe { (ndk.get_service)(b"SurfaceFlinger\0".as_ptr() as *const c_char) };
-    if sf.is_null() {
-        return false;
-    }
-
-    let sf_class = get_sf_class();
-    if sf_class.is_null() {
-        return false;
-    }
-    if !unsafe { (ndk.associate_class)(sf, sf_class as *const c_void) } {
-        return false;
-    }
+    // SurfaceFlinger binder 句柄缓存: 首次 get_service + associate 后复用
+    // (不缓存 null: 失败下次调用重试; 缓存成功即免每帧服务解析/引用泄漏)
+    let sf = {
+        let mut slot = crate::lock_ignore_poison(&SF_BINDER);
+        match slot.as_ref() {
+            Some(c) => c.0,
+            None => {
+                let sf =
+                    unsafe { (ndk.get_service)(b"SurfaceFlinger\0".as_ptr() as *const c_char) };
+                if sf.is_null() {
+                    return false;
+                }
+                let sf_class = get_sf_class();
+                if sf_class.is_null() {
+                    return false;
+                }
+                if !unsafe { (ndk.associate_class)(sf, sf_class as *const c_void) } {
+                    return false;
+                }
+                *slot = Some(SendClass(sf));
+                sf
+            }
+        }
+    };
 
     let mut in_parcel: *mut c_void = std::ptr::null_mut();
     let prep_status = unsafe { (ndk.prepare_tx)(sf, &mut in_parcel) };
