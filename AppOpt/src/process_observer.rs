@@ -31,7 +31,7 @@ type FnParcelDelete = unsafe extern "C" fn(*mut c_void);
 type FnWriteBinder = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
 type FnReadI32 = unsafe extern "C" fn(*mut c_void, *mut i32) -> c_int;
 type FnWriteI32 = unsafe extern "C" fn(*mut c_void, i32) -> c_int;
-type FnReadString = unsafe extern "C" fn(*mut c_void, *mut *const c_char) -> c_int;
+type FnReadString = unsafe extern "C" fn(*mut c_void, *mut *const c_char, *mut usize) -> c_int;
 type FnJoinThreadPool = unsafe extern "C" fn();
 type FnStartThreadPool = unsafe extern "C" fn();
 type FnAssociateClass = unsafe extern "C" fn(*mut c_void, *const c_void) -> bool;
@@ -353,7 +353,8 @@ fn p_i32(ndk: &BinderNdk, p: *mut c_void) -> Option<i32> {
 #[inline]
 fn p_str(ndk: &BinderNdk, p: *mut c_void) -> Option<String> {
     let mut s: *const c_char = std::ptr::null();
-    if unsafe { (ndk.read_string)(p, &mut s) } != 0 || s.is_null() {
+    let mut len: usize = 0;
+    if unsafe { (ndk.read_string)(p, &mut s, &mut len) } != 0 || s.is_null() {
         return None;
     }
     Some(unsafe { std::ffi::CStr::from_ptr(s) }.to_string_lossy().into_owned())
