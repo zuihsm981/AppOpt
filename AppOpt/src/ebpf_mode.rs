@@ -356,8 +356,14 @@ impl KpmHandle {
 
     /// service list 伪装开关 (前台回调驱动): on=true 激活(无差别替换 listServices)
     pub(crate) fn srv_active(&self, on: bool) {
-        let args = format!("srv_active {}", if on { 1 } else { 0 });
-        self.cmd(&args);
+        self.cmd(&format!("srv_active {}", if on { 1 } else { 0 }));
+    }
+
+    /// activity 事件检测开关 (KPM START_ACTIVITY 拦截, EV_TASK 前台驱动):
+    /// on=true 捕获 activity 事务 (act 规则应用前台); false 关闭 (非规则/桌面/无块)。
+    /// 无 KPM 模块时下发失败静默 (不影响用户态逻辑)。
+    pub(crate) fn act_enable(&self, on: bool) {
+        self.cmd(&format!("act_enable {}", if on { 1 } else { 0 }));
     }
 
     /// 清空全部替换规则 (waylay.conf 重载前)

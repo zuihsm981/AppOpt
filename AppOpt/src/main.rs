@@ -31,7 +31,7 @@ use crate::ebpf_mode::{
     ebpf_init, EbpfState,
 };
 use crate::web::{
-    settings_load, settings_save, web_start, SETTINGS_FILE,
+    settings_load, settings_save, SETTINGS_FILE,
 };
 
 pub const MAX_PKG_LEN: usize = 128;
@@ -643,6 +643,10 @@ pub fn rfr_hit_list() -> Vec<(i32, String)> {
 /// RFR_MON 登记重试去重: cgroup 晚于 task event 时在跑重试的 uid 集合 (同 uid 只一个重试线程)
 static RFR_RETRYING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<i32>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+/// 当前内核 activity 检测开关值 (EV_TASK 每次前移驱动下发 act_enable 到 KPM):
+/// 切到 act 规则应用 (rfr 且非桌面且配了 activity 块) → 1 (内核捕获 START_ACTIVITY);
+/// 切到非规则/桌面/无 act 块应用 → 0 (关闭检测; 其间互相切换保持 0 不重复下发)。
+static ACT_KPM_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// RFR_MON 登记重试参数 (只需主 pid: 10×200ms = 2s, 与 CPU 收集窗口一致)
 const RFR_MON_RETRY_MS: u64 = 200;
 const RFR_MON_RETRY_TIMES: u32 = 10;
@@ -769,8 +773,9 @@ fn main() {
     // waylay 规则: 启动/重载由 reload() 的 load_waylay_rules 加载 (WAYLAY_RULES_NEW)
     crate::ebpf_mode::ensure_prop_maps();
 
+    // web 服务 (web_enable 门控)
     if web_enable {
-        web_start();
+        crate::web::web_start();
     }
     // 落盘当前设置 (含旧默认配置名迁移后的 config_file)，重启后保持一致
     settings_save();
@@ -822,6 +827,7 @@ fn main() {
     const EV_EXIT_PID: u64 = 9; // pidfd 进程退出监听 (全模式统一退出来源)
     const EV_WAYLAY: u64 = 10; // waylay.conf inotify (外部编辑/原子替换 → 重读校验全量下发)
     const EV_TASK: u64 = 13; // TaskStackListener 任务前移 (effectiveUid 驱动 CPU/刷新率)
+    const EV_ACT: u64 = 14; // activity 事件通道 (KPM START_ACTIVITY 检测 → 事件环推送预留)
 
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epfd < 0 {
@@ -833,6 +839,10 @@ fn main() {
     let config_wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     CONFIG_WAKE_FD.store(config_wake_fd, Ordering::Relaxed);
     epoll_add(epfd, config_wake_fd, EV_CONFIG);
+    // activity 事件唤醒 eventfd: KPM 事件环 reader 收到活动事件后写入, 主循环 EV_ACT
+    let act_wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    crate::web::ACT_WAKE_FD.store(act_wake_fd, Ordering::Relaxed);
+    epoll_add(epfd, act_wake_fd, EV_ACT);
     // inotify fd: 配置文件修改
     let inotify_fd = crate::config::INOTIFY_FD.load(Ordering::Acquire);
     epoll_add(epfd, inotify_fd, EV_INOTIFY);
@@ -1031,6 +1041,28 @@ fn main() {
                         };
                         if n == 4 {
                             state.last_fg_uid = uid;   /* 前台 uid (原 on_fg 维护; 现 task event) */
+                            // 内核 activity 检测开关: 切到 act 规则应用 (rfr 且非桌面且配了
+                            // activity 块) → 下发 act_enable 1 (KPM 捕获 START_ACTIVITY);
+                            // 切到非规则/桌面/无 act 块 → 0 (关闭检测; 其间互相切换保持
+                            // 0 不重复下发)。无 KPM 模块时下发失败静默。
+                            let act_app = match state.uid_map.get(&uid) {
+                                Some(e)
+                                    if e.rfr
+                                        && e.pkg
+                                            != crate::config::DEFAULT_REFRESH_PACKAGE =>
+                                {
+                                    state
+                                        .cfg
+                                        .as_ref()
+                                        .is_some_and(|c| c.app_refresh_activity.contains_key(&e.pkg))
+                                }
+                                _ => false,
+                            };
+                            if ACT_KPM_ENABLED.swap(act_app, Ordering::Relaxed) != act_app {
+                                if let Some(es) = state.ebpf_state.as_ref() {
+                                    es.bpf.act_enable(act_app);
+                                }
+                            }
                             // ---- CPU: 冷启动 (表无该 uid) → 收集窗口; 热 → 跳过 ----
                             if let Some(e) = state.uid_map.get(&uid) {
                                 if e.cpu && !crate::cpu_affinity::cpu_known_has(uid) {
@@ -1144,6 +1176,14 @@ fn main() {
                             };
                             state.refresh_apply(rfr_pkg);
                         }
+                    }
+                }
+                EV_ACT => {
+                    // activity 事件通道 (KPM START_ACTIVITY 检测, 事件环推送接入后使用;
+                    // 当前无生产者 → take_act_event 恒 None 空转)
+                    read_eventfd(act_wake_fd);
+                    if let Some((pkg, comp)) = crate::web::take_act_event() {
+                        crate::refresh::refresh_send_fg_act(pkg, comp);
                     }
                 }
                 EV_INOTIFY => {

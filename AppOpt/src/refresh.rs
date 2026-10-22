@@ -135,6 +135,9 @@ enum RefreshEvent {
     Input,
     /// 主线程判定前台 uid 命中刷新率表后, 下发包名应用刷新率
     FgPkg(String),
+    /// activity 级刷新率事件 (KPM START_ACTIVITY 检测): 包名 + activity 完整类名,
+    /// 命中恒值映射 → 该界面恒用对应刷新率 (无回落); 未命中 → 包级默认
+    Act(String, String),
     /// 挂机黑屏挂起/恢复: true=停止空闲回落定时器 (刷新率保持 active,
     /// 单击恢复时无刷新率切换, 避免面板切换绿屏/瞬亮); false=重启定时器
     HangSuspend(bool),
@@ -164,6 +167,8 @@ struct RefreshState {
     /// 全局默认配置 (从 refresh_* 字段加载)
     global: RateConfig,
     app_configs: HashMap<String, AppRefreshConfig>,
+    /// activity 级恒值映射: pkg -> (activity完整类名 -> 刷新率模式码); 命中即恒值无回落
+    app_activity: HashMap<String, HashMap<String, i32>>,
     /// 当前生效配置 (全局默认, 或被应用级配置覆盖)
     effective: RateConfig,
     current_applied_mode: i32,
@@ -194,6 +199,7 @@ fn load_global_config(state: &mut RefreshState) {
 /// 从共享 CURRENT_CONFIG 读取按应用刷新率配置（统一加载）
 fn load_app_configs(state: &mut RefreshState) {
     state.app_configs.clear();
+    state.app_activity.clear();
     let cfg = crate::rw_read_ignore_poison(&crate::config::CURRENT_CONFIG).clone();
     let Some(cfg) = cfg else { return };
     for (pkg, (timeout, active_mode, idle_mode)) in &cfg.app_refresh_configs {
@@ -205,6 +211,9 @@ fn load_app_configs(state: &mut RefreshState) {
                 idle_mode: *idle_mode,
             },
         );
+    }
+    for (pkg, acts) in &cfg.app_refresh_activity {
+        state.app_activity.insert(pkg.clone(), acts.clone());
     }
 }
 
@@ -250,6 +259,51 @@ fn apply_app_config(state: &mut RefreshState, pkg: &str) {
     state.timer_enabled = state.effective.idle != state.effective.active;
     // 同步触摸监听开关 (与 load_global_config 一致): 应用级配置切换后保持状态同步
     crate::event_probe::set_enabled(state.timer_enabled);
+}
+
+/// activity 级刷新率应用 (KPM 事件驱动): 按完整类名精确匹配。
+/// 命中恒值映射 → 该界面恒用对应刷新率 (active==idle, 无空闲回落, timer 关);
+/// 未命中 → 包级默认档位 (回落语义保留); 无包级配置/桌面 → 全局。
+fn apply_activity(state: &mut RefreshState, pkg: &str, comp: &str) {
+    if pkg.is_empty() || comp.is_empty() {
+        return;
+    }
+    // 无 activity 块的包: 包级刷新率已由 task event 应用, activity 事件不干预
+    // (也不重置空闲回落计时); 判定用本线程 app_activity 表 (与 apply 逻辑同源)
+    if !state.app_activity.contains_key(pkg) {
+        return;
+    }
+    state.current_package = pkg.to_string();
+    if pkg == crate::config::DEFAULT_REFRESH_PACKAGE {
+        state.effective.timeout = state.global.timeout;
+        state.effective.active = state.global.active;
+        state.effective.idle = state.global.idle;
+    } else if let Some(cfg) = state.app_configs.get(pkg) {
+        if let Some(v) = state
+            .app_activity
+            .get(pkg)
+            .and_then(|m| m.get(comp))
+            .copied()
+        {
+            // activity 命中: 恒值 (active==idle, 无回落)
+            state.effective.timeout = cfg.timeout;
+            state.effective.active = v;
+            state.effective.idle = v;
+        } else {
+            // 未命中: 包级默认 (回落语义保留)
+            state.effective.timeout = cfg.timeout;
+            state.effective.active = cfg.active_mode;
+            state.effective.idle = cfg.idle_mode;
+        }
+    } else {
+        state.effective.timeout = state.global.timeout;
+        state.effective.active = state.global.active;
+        state.effective.idle = state.global.idle;
+    }
+    state.timer_enabled = state.effective.idle != state.effective.active;
+    crate::event_probe::set_enabled(state.timer_enabled);
+    set_refresh_rate(state, state.effective.active);
+    reset_timer(state, true);
 }
 
 fn timerfd_set(fd: i32, seconds: i32) {
@@ -412,6 +466,7 @@ pub fn refresh_init(display_modes: std::thread::JoinHandle<Vec<(u32, u32, u32, f
             timeout: 30,
         },
         app_configs: HashMap::new(),
+        app_activity: HashMap::new(),
         effective: RateConfig {
             active: crate::config::REFRESH_MODE_120,
             idle: crate::config::REFRESH_MODE_60,
@@ -483,6 +538,9 @@ pub fn refresh_init(display_modes: std::thread::JoinHandle<Vec<(u32, u32, u32, f
                                 RefreshEvent::FgPkg(pkg) => {
                                     try_apply_fg_pkg(&mut state, &pkg);
                                 }
+                                RefreshEvent::Act(pkg, comp) => {
+                                    apply_activity(&mut state, &pkg, &comp);
+                                }
                                 RefreshEvent::HangSuspend(on) => {
                                     if on {
                                         // 黑屏: 停止空闲回落定时器 → 刷新率保持 active,
@@ -525,6 +583,16 @@ pub fn refresh_send_fg_pkg(pkg: String) {
     let guard = crate::lock_ignore_poison(&REFRESH_TX);
     if let Some(tx) = guard.as_ref() {
         let _ = tx.send(RefreshEvent::FgPkg(pkg));
+        wake();
+    }
+}
+
+/// KPM activity 事件: 按完整类名精确匹配 activity 恒值映射并应用刷新率
+/// (命中 → 恒值无回落; 未命中 → 包级默认)。主线程 EV_ACT 调用。
+pub fn refresh_send_fg_act(pkg: String, comp: String) {
+    let guard = crate::lock_ignore_poison(&REFRESH_TX);
+    if let Some(tx) = guard.as_ref() {
+        let _ = tx.send(RefreshEvent::Act(pkg, comp));
         wake();
     }
 }
@@ -659,7 +727,7 @@ pub fn refresh_set_config(timeout: i32, active: &str, idle: &str) {
     wake();
 }
 
-pub fn refresh_get_apps() -> Vec<(String, i32, String, String)> {
+pub fn refresh_get_apps() -> Vec<(String, i32, String, String, Vec<(String, i32)>)> {
     // 刷新率应用配置只从共享 CURRENT_CONFIG 返回，不再单独读取配置文件。
     let Some(cfg) = crate::rw_read_ignore_poison(&crate::config::CURRENT_CONFIG).clone() else {
         return Vec::new();
@@ -667,52 +735,98 @@ pub fn refresh_get_apps() -> Vec<(String, i32, String, String)> {
     cfg.app_refresh_configs
         .iter()
         .map(|(pkg, (t, a, i))| {
+            // activity 块: 内部模式码 → 显示值 (60/90/120)
+            let acts: Vec<(String, i32)> = cfg
+                .app_refresh_activity
+                .get(pkg)
+                .map(|m| {
+                    m.iter()
+                        .map(|(c, v)| {
+                            (
+                                c.clone(),
+                                crate::config::refresh_mode_str(*v).parse().unwrap_or(*v),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             (
                 pkg.clone(),
                 *t,
                 crate::config::refresh_mode_str(*a).to_string(),
                 crate::config::refresh_mode_str(*i).to_string(),
+                acts,
             )
         })
         .collect()
 }
 
-/// 判断一行是否属于该包的刷新率配置 (新格式 pkg=refresh-*)
-fn is_refresh_pkg_line(line: &str, pkg: &str) -> bool {
-    let Some((k, v)) = line.trim().split_once('=') else {
-        return false;
-    };
-    k.trim() == pkg && v.starts_with("refresh-")
+/// 写该包的刷新率配置 (单行或 activity 块):
+/// 先移除旧 refresh 单行/块 (块感知), 再在包末尾插入新内容。
+/// acts 为空 → 单行 `pkg=refresh-<a>-<i>` / `refresh-<t>-<a>-<i>`;
+/// acts 非空 → 块 `pkg=refresh-...{ comp=rate ... }`。
+pub fn refresh_write_config(
+    pkg: &str,
+    timeout: i32,
+    active: &str,
+    idle: &str,
+    acts: &[(String, i32)],
+) -> bool {
+    let path = config_path();
+    let content = fs::read_to_string(&path).unwrap_or_default();
+    // 1) 移除该包旧 refresh 内容 (单行 / 块入口+块内行+结束 }
+    let mut out: Vec<String> = Vec::new();
+    let mut in_block = false;
+    for line in content.lines().map(String::from) {
+        let t = line.trim();
+        if in_block {
+            if crate::config::close_like(t) {
+                in_block = false;
+            }
+            continue;
+        }
+        if let Some((k, v)) = t.split_once('=') {
+            if k.trim() == pkg && v.trim().starts_with("refresh-") {
+                if v.trim().ends_with('{') {
+                    in_block = true; // 块入口 → 连块内行一起跳过
+                }
+                continue; // 单行 → 跳过
+            }
+        }
+        out.push(line);
+    }
+    // 2) 构造新内容
+    let mut new_lines: Vec<String> = Vec::new();
+    if acts.is_empty() {
+        let l = if active == idle {
+            format!("{}=refresh-{}-{}", pkg, active, idle)
+        } else {
+            format!("{}=refresh-{}-{}-{}", pkg, timeout, active, idle)
+        };
+        new_lines.push(l);
+    } else {
+        let head = if active == idle {
+            format!("{}=refresh-{}-{}{{", pkg, active, idle)
+        } else {
+            format!("{}=refresh-{}-{}-{}{{", pkg, timeout, active, idle)
+        };
+        new_lines.push(head);
+        for (comp, rate) in acts {
+            new_lines.push(format!("    {comp}={rate}"));
+        }
+        new_lines.push("}".to_string());
+    }
+    // 3) 插入到该包已有规则之后
+    let at = crate::config::last_pkg_end_index(&out, pkg).unwrap_or(out.len());
+    for (i, l) in new_lines.into_iter().enumerate() {
+        out.insert(at + i, l);
+    }
+    crate::config::save_config_lines(&path, &out)
 }
 
 pub fn refresh_add_app(pkg: &str, timeout: i32, active: &str, idle: &str) {
-    let path = config_path();
-    let content = fs::read_to_string(&path).unwrap_or_default();
-    let mut lines: Vec<String> = content.lines().map(String::from).collect();
-    // 新格式: 活跃==空闲 → pkg=refresh-<active>-<idle> (省略超时);
-    //          活跃!=空闲 → pkg=refresh-<timeout>-<active>-<idle>
-    let new_line = if active == idle {
-        format!("{}=refresh-{}-{}", pkg, active, idle)
-    } else {
-        format!("{}=refresh-{}-{}-{}", pkg, timeout, active, idle)
-    };
-    let mut found = false;
-    for line in lines.iter_mut() {
-        if line.trim().starts_with('#') || line.trim().is_empty() {
-            continue;
-        }
-        if is_refresh_pkg_line(line, pkg) {
-            *line = new_line.clone();
-            found = true;
-            break;
-        }
-    }
-    if !found {
-        // 插到该应用已有规则 (CPU/refresh) 之后, 保持同包行连续
-        let at = crate::config::last_pkg_end_index(&lines, pkg).unwrap_or(lines.len());
-        lines.insert(at, new_line);
-    }
-    if !crate::config::save_config_lines(&path, &lines) {
+    // 统一走 refresh_write_config (无 activity 块 → 单行; 旧块会一并清除)
+    if !refresh_write_config(pkg, timeout, active, idle, &[]) {
         return;
     }
     /* 完整 reload: 重建前台 uid 表 (rfr 标志)。若只 reload_refresh_only(),
@@ -723,24 +837,56 @@ pub fn refresh_add_app(pkg: &str, timeout: i32, active: &str, idle: &str) {
     wake();
 }
 
+/// 保存 activity 块配置 (包级默认 + 活动映射); 供 webui 添加/编辑活动规则调用。
+/// 与 refresh_add_app 同款 reload/wake 语义。
+pub fn refresh_set_activity(
+    pkg: &str,
+    timeout: i32,
+    active: &str,
+    idle: &str,
+    acts: &[(String, i32)],
+) -> bool {
+    if !refresh_write_config(pkg, timeout, active, idle, acts) {
+        return false;
+    }
+    crate::config::config_reload_now();
+    REFRESH_FORCE_RELOAD.store(true, Ordering::Release);
+    wake();
+    true
+}
+
 pub fn refresh_del_app(pkg: &str) -> bool {
     let path = config_path();
     let content = match fs::read_to_string(&path) {
         Ok(s) => s,
         Err(_) => return false,
     };
-    let lines: Vec<String> = content
-        .lines()
-        .filter(|line| {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                return true;
+    // 块感知删除: 移除该包 refresh 单行 / 块 (入口行 + 块内行 + 结束 }), 保留其他
+    let mut out: Vec<String> = Vec::new();
+    let mut in_block = false;
+    for line in content.lines().map(String::from) {
+        let t = line.trim();
+        if in_block {
+            if crate::config::close_like(t) {
+                in_block = false;
             }
-            !is_refresh_pkg_line(line, pkg)
-        })
-        .map(String::from)
-        .collect();
-    if !crate::config::save_config_lines(&path, &lines) {
+            continue;
+        }
+        if t.is_empty() || t.starts_with('#') {
+            out.push(line);
+            continue;
+        }
+        if let Some((k, v)) = t.split_once('=') {
+            if k.trim() == pkg && v.trim().starts_with("refresh-") {
+                if v.trim().ends_with('{') {
+                    in_block = true;
+                }
+                continue;
+            }
+        }
+        out.push(line);
+    }
+    if !crate::config::save_config_lines(&path, &out) {
         return false;
     }
     /* 完整 reload: 重建前台 uid 表 (rfr 标志), 与 refresh_add_app 一致 */

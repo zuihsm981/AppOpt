@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -30,6 +30,18 @@ fn cpuset_leaf() -> String {
 
 /// web 是否启用 (--no-web 时 false)
 pub static WEB_ENABLED: AtomicBool = AtomicBool::new(false);
+/// activity 事件唤醒 eventfd 写端 (main 创建后注入; KPM 事件环 reader 收到
+/// START_ACTIVITY 事件后写入唤醒主循环 EV_ACT — 事件环接入后使用)
+pub static ACT_WAKE_FD: AtomicI32 = AtomicI32::new(-1);
+/// activity 事件 (pkg, activity类名): KPM 检测结果写入, 主线程 EV_ACT 取走
+/// (单槽覆盖式, 无堆积)
+pub static ACT_EVENT: std::sync::Mutex<Option<(String, String)>> =
+    std::sync::Mutex::new(None);
+
+/// 主循环 EV_ACT 取走 activity 事件 (单槽取空)
+pub fn take_act_event() -> Option<(String, String)> {
+    crate::lock_ignore_poison(&ACT_EVENT).take()
+}
 
 /// uclamp (sched_setattr util clamp) 是否可用: /proc/sys/kernel/sched_util_clamp_max 存在
 /// 表示内核支持 uclamp; 启动时检查一次, webui 据此决定是否显示 uclamp 配置 UI。
@@ -223,6 +235,7 @@ fn dispatch(out: &mut TcpStream, req: &Request) {
         ("GET", "/api/refresh/apps") => (200, refresh_apps_json()),
         ("POST", "/api/refresh/app") => refresh_app_add_api(req),
         ("POST", "/api/refresh/app/del") => refresh_app_del_api(req),
+        ("POST", "/api/refresh/act") => refresh_act_set_api(req),
         ("POST", "/api/fs/list") => fs_list_api(req),
         ("GET", "/api/apps") => (200, apps_json()),
         _ => err_json(404, "not found"),
@@ -1472,9 +1485,18 @@ fn refresh_config_set_api(req: &Request) -> (u16, String) {
 
 fn refresh_apps_json() -> String {
     let apps = crate::refresh::refresh_get_apps();
-    let arr: Vec<_> = apps.iter().map(|(pkg, timeout, active, idle)| {
-        json!({"pkg": pkg, "timeout": timeout, "active": active, "idle": idle})
-    }).collect();
+    let arr: Vec<_> = apps
+        .iter()
+        .map(|(pkg, timeout, active, idle, acts)| {
+            json!({
+                "pkg": pkg,
+                "timeout": timeout,
+                "active": active,
+                "idle": idle,
+                "acts": acts.iter().map(|(c, r)| json!({"comp": c, "rate": r})).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
     json!({"apps": arr}).to_string()
 }
 
@@ -1532,5 +1554,65 @@ fn refresh_app_del_api(req: &Request) -> (u16, String) {
         (200, json!({"ok": true}).to_string())
     } else {
         err_json(500, "删除失败")
+    }
+}
+
+/// 保存 activity 块配置: {pkg, timeout, active, idle, acts:[{comp, rate}]}
+/// acts 非空 → 写块格式 `pkg=refresh-...{ comp=rate ... }`; 空 → 单行 (同 refresh/app)
+fn refresh_act_set_api(req: &Request) -> (u16, String) {
+    let v = match parse_json(req) { Ok(v) => v, Err(e) => return e };
+    let Some(pkg) = v["pkg"].as_str().map(str::trim) else {
+        return err_json(400, "缺少 pkg 字段");
+    };
+    if pkg.is_empty() || pkg.len() >= 128 || !pkg.bytes().all(|b| b >= 0x20 && b != 0x7f) {
+        return err_json(400, "无效的包名");
+    }
+    let timeout = v["timeout"].as_u64().unwrap_or(30) as i32;
+    let sv = |k: &str| -> String {
+        v[k].as_str()
+            .map(str::to_string)
+            .or_else(|| v[k].as_i64().map(|n| n.to_string()))
+            .unwrap_or_default()
+    };
+    let active = sv("active");
+    let idle = sv("idle");
+    if timeout < 1 || timeout > 3600 {
+        return err_json(400, "超时时间需在 1-3600 秒之间");
+    }
+    let avail = crate::refresh::refresh_get_status()
+        .map(|s| s.available)
+        .unwrap_or_default();
+    let fix = |r: String| -> String {
+        let r = if r.is_empty() { "120".to_string() } else { r };
+        if avail.is_empty() || avail.iter().any(|a| a.to_string() == r) {
+            r
+        } else {
+            avail[0].to_string()
+        }
+    };
+    let active = fix(active);
+    let idle = fix(idle);
+    if !matches!(active.as_str(), "120" | "90" | "60") || !matches!(idle.as_str(), "120" | "90" | "60") {
+        return err_json(400, "刷新率仅支持 120/90/60");
+    }
+    // acts: [{comp, rate}] — comp 完整类名, rate ∈ 120/90/60
+    let mut acts: Vec<(String, i32)> = Vec::new();
+    if let Some(arr) = v["acts"].as_array() {
+        for it in arr {
+            let Some(comp) = it["comp"].as_str().map(str::trim) else { continue };
+            let rate = it["rate"].as_i64().unwrap_or(0) as i32;
+            if comp.is_empty() || comp.len() >= 256 {
+                continue;
+            }
+            if !matches!(rate, 120 | 90 | 60) {
+                continue;
+            }
+            acts.push((comp.to_string(), rate));
+        }
+    }
+    if crate::refresh::refresh_set_activity(pkg, timeout, &active, &idle, &acts) {
+        (200, json!({"ok": true}).to_string())
+    } else {
+        err_json(500, "写入失败")
     }
 }

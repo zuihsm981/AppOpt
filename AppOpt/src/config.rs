@@ -452,6 +452,8 @@ pub struct AppConfig {
     pub refresh_idle: i32,
     /// 按应用刷新率配置: pkg -> (timeout, active_mode, idle_mode)
     pub app_refresh_configs: HashMap<String, (i32, i32, i32)>,
+    /// activity 级刷新率 (恒值, 无空闲回落): pkg -> (activity完整类名 -> 刷新率模式码)
+    pub app_refresh_activity: HashMap<String, HashMap<String, i32>>,
 }
 
 /// 共享配置: 读多写少 (各线程频繁读, 仅配置重载时写) -> RwLock
@@ -903,13 +905,42 @@ fn organize_lines(lines: &[String]) -> Vec<String> {
 
 /// 只读取统一主配置文件中的刷新率字段。
 /// 刷新率保存后的轻量同步使用此函数，不重新解析 CPU 规则。
-pub fn load_refresh_config(config_file: &str) -> (i32, i32, i32, HashMap<String, (i32, i32, i32)>) {
+pub fn load_refresh_config(
+    config_file: &str,
+) -> (
+    i32,
+    i32,
+    i32,
+    HashMap<String, (i32, i32, i32)>,
+    HashMap<String, HashMap<String, i32>>,
+) {
     let mut timeout = 30;
     let mut active = 0;
     let mut idle = 1;
     let mut apps = HashMap::new();
+    let mut activity: HashMap<String, HashMap<String, i32>> = HashMap::new();
+    let mut refresh_block = String::new();
     if let Ok(content) = fs::read_to_string(config_file) {
         for line in content.lines() {
+            // activity 块 (pkg=refresh-...{ 开头): 块内 "完整类名=单值" → 恒值映射
+            if !refresh_block.is_empty() {
+                let l = strip_comment(line).trim();
+                if close_like(l) {
+                    refresh_block.clear();
+                    continue;
+                }
+                if let Some((comp, v)) = l.split_once('=') {
+                    let comp = comp.trim();
+                    let v = v.trim();
+                    if !comp.is_empty() && comp.contains('.') && !v.is_empty() {
+                        activity
+                            .entry(refresh_block.clone())
+                            .or_default()
+                            .insert(comp.to_string(), parse_refresh_mode(v));
+                    }
+                }
+                continue;
+            }
             if !parse_refresh_config_line(
                 line, &mut timeout, &mut active, &mut idle,
             ) {
@@ -917,12 +948,17 @@ pub fn load_refresh_config(config_file: &str) -> (i32, i32, i32, HashMap<String,
                 // 走 route_pkg_val_line 路由 (与 load_config 主循环一致)
                 let line = strip_comment(line).trim();
                 if let Some((k, v)) = line.split_once('=') {
-                    let _ = route_pkg_val_line(k.trim(), v.trim(), &mut apps);
+                    let (k, v) = (k.trim(), v.trim());
+                    // 行尾 { → activity 块入口 (值先剥 { 再路由)
+                    let v_plain = v.strip_suffix('{').map(str::trim).unwrap_or(v);
+                    if route_pkg_val_line(k, v_plain, &mut apps) && v.ends_with('{') {
+                        refresh_block = k.to_string();
+                    }
                 }
             }
         }
     }
-    (timeout, active, idle, apps)
+    (timeout, active, idle, apps, activity)
 }
 
 /// 加载统一主配置文件，返回 None 表示未变化或解析失败。
@@ -952,6 +988,9 @@ pub fn load_config(
     // 由 refresh 线程从 CURRENT_CONFIG 读取。
     let (mut refresh_timeout, mut refresh_active, mut refresh_idle, mut app_refresh_configs) =
         (30, 0, 1, HashMap::new());
+    // activity 恒值映射: pkg -> (comp -> 模式码); refresh 行带 { 时进入块收集
+    let mut app_refresh_activity: HashMap<String, HashMap<String, i32>> = HashMap::new();
+    let mut refresh_block = String::new();
     let mut cur_pkg = String::new();
     let mut pending_pkg = String::new();
     let mut in_block = false;
@@ -967,6 +1006,25 @@ pub fn load_config(
         if parse_refresh_config_line(
             p, &mut refresh_timeout, &mut refresh_active, &mut refresh_idle,
         ) {
+            continue;
+        }
+
+        // activity 块 (pkg=refresh-...{ 开头): 块内行 "完整类名=单值" → 恒值映射
+        if !refresh_block.is_empty() {
+            if close_like(p) {
+                refresh_block.clear();
+                continue;
+            }
+            if let Some((comp, v)) = p.split_once('=') {
+                let comp = comp.trim();
+                let v = v.trim();
+                if !comp.is_empty() && comp.contains('.') && !v.is_empty() {
+                    app_refresh_activity
+                        .entry(refresh_block.clone())
+                        .or_default()
+                        .insert(comp.to_string(), parse_refresh_mode(v));
+                }
+            }
             continue;
         }
 
@@ -1024,6 +1082,9 @@ pub fn load_config(
                         cur_pkg = pkg.to_string();
                         in_block = true;
                     }
+                } else if open {
+                    // refresh 行带 { → activity 块 (块内 comp=值 恒值映射, 与 CPU 块不同)
+                    refresh_block = pkg.to_string();
                 }
                 pending_pkg.clear();
             }
@@ -1080,6 +1141,7 @@ pub fn load_config(
         refresh_active,
         refresh_idle,
         app_refresh_configs,
+        app_refresh_activity,
     })
 }
 
@@ -1314,7 +1376,7 @@ pub fn reload_refresh_only() {
         if guard.is_none() { return; }
         lock_ignore_poison(&CONFIG_FILE).clone()
     };
-    let (refresh_timeout, refresh_active, refresh_idle, app_refresh_configs) =
+    let (refresh_timeout, refresh_active, refresh_idle, app_refresh_configs, app_refresh_activity) =
         load_refresh_config(&file);
     let mut guard = rw_write_ignore_poison(&CURRENT_CONFIG);
     if let Some(cfg) = guard.as_ref() {
@@ -1323,6 +1385,7 @@ pub fn reload_refresh_only() {
         new_cfg.refresh_active = refresh_active;
         new_cfg.refresh_idle = refresh_idle;
         new_cfg.app_refresh_configs = app_refresh_configs;
+        new_cfg.app_refresh_activity = app_refresh_activity;
         *guard = Some(Arc::new(new_cfg));
     }
 }
