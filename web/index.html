@@ -451,9 +451,11 @@ body.kb .tabbar,body.kb .navbar{backdrop-filter:none;-webkit-backdrop-filter:non
 <div class="core-chips" id="mr-rf-idle-chips"></div>
 </div>
 <div id="mr-rf-timeout-box">
-<div class="tr-head"><span class="tr-tag">空闲超时(秒)</span></div>
-<div class="field"><input id="mr-rf-timeout" type="number" min="1" max="3600" value="10"></div>
+  <div class="tr-head"><span class="tr-tag">空闲超时(秒)</span></div>
+  <div class="field"><input id="mr-rf-timeout" type="number" min="1" max="3600" value="10"></div>
 </div>
+<div id="mr-act-rows"></div>
+<button class="rule-add" id="mr-actaddrow">＋ 活动规则</button>
 </div>
 <div class="modal-actions">
 <button class="btn-outline" id="mr-cancel">取消</button>
@@ -2089,6 +2091,33 @@ $('mr-rows').addEventListener('input',e=>{
   }
 });
 $('mr-addrow').onclick=()=>{mrRows.push(mkRow({}));renderRows();const m=$('mr-addrow').closest('.modal');m.scrollTop=m.scrollHeight};
+// ===== 活动规则 (刷新率配置页签): 同款线程规则行, 输入活动名 + 刷新率 chips =====
+let mrActs=[];
+const ACT_CHIPS=(r)=>((rfAvail&&rfAvail.length?rfAvail:[120,90,60]).map(x=>`<button data-rf="${x}" class="${r.rate===x?'on':''}">${x}Hz</button>`).join(''));
+function renderActRows(){
+  const box=$('mr-act-rows');
+  box.innerHTML=mrActs.map((r,i)=>`
+<div class="tree-row branch" data-ai="${i}">
+<div class="tr-head sg-wrap"><input class="rr-act" placeholder="输入活动名" value="${esc(r.comp)}"><button class="icon-btn danger rr-act-del" title="删除该行">${ICO_TRASH}</button></div>
+<div class="core-chips">${ACT_CHIPS(r)}</div>
+</div>`).join('');
+}
+$('mr-actaddrow').onclick=()=>{mrActs.push({comp:'',rate:0});renderActRows();const m=$('mr-actaddrow').closest('.modal');m.scrollTop=m.scrollHeight};
+$('mr-act-rows').addEventListener('click',e=>{
+  const del=e.target.closest('.rr-act-del');
+  if(del){mrActs.splice(+del.closest('[data-ai]').dataset.ai,1);renderActRows();return}
+  const b=e.target.closest('.core-chips button');
+  if(!b)return;
+  const r=mrActs[+b.closest('[data-ai]').dataset.ai];
+  const v=+b.dataset.rf;
+  r.rate=r.rate===v?0:v;
+  renderActRows();
+});
+$('mr-act-rows').addEventListener('input',e=>{
+  const el=e.target.closest('[data-ai]');
+  const r=mrActs[+el?.dataset.ai];
+  if(r&&e.target.classList.contains('rr-act'))r.comp=e.target.value.trim();
+});
 let mrMode='add-pkg',mrOldThread='',mrOldPkg='',mrOldThreads=new Set(),mrHadPkgRule=false;
 let mrGi=-1; // 当前编辑的应用在 rulesData 中的下标 (add-pkg 时为 -1)
 // 编辑应用时: 当前 jobs 与该包原规则是否完全一致 (一致→跳过规则重存, 避免只改
@@ -2154,14 +2183,18 @@ async function openRuleModal(mode,gi,ii){
     try{const rc=await api('/api/refresh/config');rfAvail=rc.available&&rc.available.length?rc.available:[120,90,60];}catch(e){}
     const rfPkg=mode==='edit-app'?rulesData[gi].pkg:'';
     mrRfActive=0;mrRfIdle=0;mrRfOldRefresh=false;$('mr-rf-timeout').value=10;
+    mrActs=[];
     if(rfPkg){
       try{
         const d=await api('/api/refresh/apps');
         const a=(d.apps||[]).find(x=>x.pkg===rfPkg);
-        if(a){mrRfActive=+a.active;mrRfIdle=+a.idle;mrRfOldRefresh=true;$('mr-rf-timeout').value=a.timeout;}
+        if(a){mrRfActive=+a.active;mrRfIdle=+a.idle;mrRfOldRefresh=true;$('mr-rf-timeout').value=a.timeout;
+          mrActs=(a.acts||[]).map(x=>({comp:x.comp,rate:+x.rate}));
+        }
       }catch(e){}
     }
     renderRfChips();
+    renderActRows();
   }
   if(mode==='add-pkg'){
     $('mr-title').textContent='添加应用';
@@ -2241,11 +2274,15 @@ $('mr-save').onclick=async()=>{
     // ===== 2) 刷新率配置: 始终保存 (不受页签影响); 按设备可用档位校正 =====
     const timeout=Math.max(1,+$('mr-rf-timeout').value||10);
     const rfOk=x=>{const av=rfAvail&&rfAvail.length?rfAvail:[120,90,60];return av.includes(x)?x:(av[0]||x)};
+    // 活动规则: 有效行 (活动名非空 + 已选刷新率)
+    const acts=mrActs.filter(x=>x.comp&&x.rate).map(x=>({comp:x.comp,rate:x.rate}));
     let rfTouched=false;
-    if(mrRfActive||mrRfIdle){
+    if(mrRfActive||mrRfIdle||acts.length){
       const act=rfOk(mrRfActive||mrRfIdle), idl=rfOk(mrRfIdle||mrRfActive);
       if(pkg!==mrOldPkg&&mrRfOldRefresh)await api('/api/refresh/app/del',{pkg:mrOldPkg});
-      await api('/api/refresh/app',{pkg,active:String(act),idle:String(idl),timeout});
+      // 有活动规则 → 写块 (refresh/act); 无 → 单行 (refresh/app)
+      if(acts.length)await api('/api/refresh/act',{pkg,active:String(act),idle:String(idl),timeout,acts});
+      else await api('/api/refresh/app',{pkg,active:String(act),idle:String(idl),timeout});
       rfTouched=true;
     }else if(mrRfOldRefresh){
       await api('/api/refresh/app/del',{pkg});
