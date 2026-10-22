@@ -866,7 +866,10 @@ fn main() {
     epoll_add(epfd, act_wake_fd, EV_ACT);
     // KPM 就绪: 把 eventfd 注册给内核 (act_evt <fd>), token 命中 → 信号唤醒
     if let Some(es) = state.ebpf_state.as_ref() {
-        es.bpf.act_evt(act_wake_fd);
+        let _ = es.bpf.act_evt(act_wake_fd);
+        crate::act_dbg(&format!("act_evt reg 下发 fd={}", act_wake_fd));
+    } else {
+        crate::act_dbg("act_evt 未下发: ebpf_state 为空 (KPM 未加载?)");
     }
     // inotify fd: 配置文件修改
     let inotify_fd = crate::config::INOTIFY_FD.load(Ordering::Acquire);
