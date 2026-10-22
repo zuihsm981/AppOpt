@@ -31,6 +31,7 @@ type FnParcelDelete = unsafe extern "C" fn(*mut c_void);
 type FnWriteBinder = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
 type FnReadI32 = unsafe extern "C" fn(*mut c_void, *mut i32) -> c_int;
 type FnWriteI32 = unsafe extern "C" fn(*mut c_void, i32) -> c_int;
+type FnReadString = unsafe extern "C" fn(*mut c_void, *mut *const c_char) -> c_int;
 type FnJoinThreadPool = unsafe extern "C" fn();
 type FnStartThreadPool = unsafe extern "C" fn();
 type FnAssociateClass = unsafe extern "C" fn(*mut c_void, *const c_void) -> bool;
@@ -45,6 +46,7 @@ struct BinderNdk {
     write_binder: FnWriteBinder,
     write_int32: FnWriteI32,
     read_i32: FnReadI32,
+    read_string: FnReadString,
     join_thread_pool: FnJoinThreadPool,
     start_thread_pool: FnStartThreadPool,
     associate_class: FnAssociateClass,
@@ -72,13 +74,14 @@ fn ndk() -> Option<&'static BinderNdk> {
         let p_write_binder = sym("AParcel_writeStrongBinder");
         let p_write_i32 = sym("AParcel_writeInt32");
         let p_read_i32 = sym("AParcel_readInt32");
+        let p_read_string = sym("AParcel_readString");
         let p_join = sym("ABinderProcess_joinThreadPool");
         let p_start = sym("ABinderProcess_startThreadPool");
         let p_associate = sym("AIBinder_associateClass");
         if p_get_service.is_null() || p_class_define.is_null() || p_binder_new.is_null()
             || p_prepare_tx.is_null() || p_transact.is_null() || p_parcel_delete.is_null()
             || p_write_binder.is_null() || p_write_i32.is_null()
-            || p_read_i32.is_null()
+            || p_read_i32.is_null() || p_read_string.is_null()
             || p_join.is_null() || p_start.is_null() || p_associate.is_null()
         { return None; }
         
@@ -92,6 +95,7 @@ fn ndk() -> Option<&'static BinderNdk> {
             write_binder: std::mem::transmute(p_write_binder),
             write_int32: std::mem::transmute(p_write_i32),
             read_i32: std::mem::transmute(p_read_i32),
+            read_string: std::mem::transmute(p_read_string),
             join_thread_pool: std::mem::transmute(p_join),
             start_thread_pool: std::mem::transmute(p_start),
             associate_class: std::mem::transmute(p_associate),
@@ -327,5 +331,138 @@ pub fn set_refresh_rate_binder(mode: i32) -> bool {
     }
 
     ok
+}
+
+/* ================= activity 查询: binder 直连 getTasks(0x19) 拿 topActivity =================
+ * 内核 token 命中 START_ACTIVITY → eventfd 信号 → 本函数查权威 topActivity (完整类名)。
+ * 用户态解析: 读错/失败只返回 None (不应用), 无崩溃风险 (与内核 copy 崩区分)。
+ */
+
+/// ActivityTaskManager binder 句柄缓存 (getTasks 查询复用; 同 SF_BINDER 模式)
+static ATMS_BINDER: std::sync::LazyLock<std::sync::Mutex<Option<SendClass>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+/// 读 parcel int32
+#[inline]
+fn p_i32(ndk: &BinderNdk, p: *mut c_void) -> Option<i32> {
+    let mut v = 0i32;
+    unsafe { (ndk.read_i32)(p, &mut v) == 0 }.then_some(v)
+}
+
+/// 读 parcel 字符串 (utf8, parcel 内指针; null → None)
+#[inline]
+fn p_str(ndk: &BinderNdk, p: *mut c_void) -> Option<String> {
+    let mut s: *const c_char = std::ptr::null();
+    if unsafe { (ndk.read_string)(p, &mut s) } != 0 || s.is_null() {
+        return None;
+    }
+    Some(unsafe { std::ffi::CStr::from_ptr(s) }.to_string_lossy().into_owned())
+}
+
+/// 宽容跳过 Intent (AOSP Intent.writeToParcel 字段序; 读错无害 — 只影响本次结果)
+fn p_skip_intent(ndk: &BinderNdk, p: *mut c_void) {
+    let _ = p_str(ndk, p);            // mAction
+    if let Some(d) = p_i32(ndk, p) {  // mData 标志 (1=有)
+        if d != 0 {
+            let _ = p_str(ndk, p);   // scheme
+            let _ = p_str(ndk, p);   // ssp
+            let _ = p_str(ndk, p);   // fragment
+            if let Some(au) = p_i32(ndk, p) {
+                if au != 0 {
+                    let _ = p_str(ndk, p);
+                    let _ = p_str(ndk, p);
+                    let _ = p_str(ndk, p);
+                }
+            }
+        }
+    }
+    let _ = p_str(ndk, p);            // mType
+    let _ = p_str(ndk, p);            // mIdentifier
+    let _ = p_str(ndk, p);            // mPackage
+    if let Some(c) = p_i32(ndk, p) {  // mComponent 标志
+        if c != 0 {
+            let _ = p_str(ndk, p);
+            let _ = p_str(ndk, p);
+        }
+    }
+}
+
+/// 解析回复中第一个 RunningTaskInfo 的 topActivity (ComponentName → pkg, cls)
+fn p_parse_top(ndk: &BinderNdk, p: *mut c_void) -> Option<(String, String)> {
+    // readTypedObject 元素 null 标志 (1=有对象)
+    if p_i32(ndk, p) != Some(1) {
+        return None;
+    }
+    let _ = p_i32(ndk, p);            // RunningTaskInfo.id
+    for _ in 0..5 {
+        let _ = p_i32(ndk, p);        // TaskInfo: userId/taskId/effectiveUid/displayId/isRunning
+    }
+    if p_i32(ndk, p) == Some(1) {     // baseIntent (1=有)
+        p_skip_intent(ndk, p);
+    }
+    if p_i32(ndk, p) == Some(1) {     // baseActivity — 跳 pkg/cls
+        let _ = p_str(ndk, p);
+        let _ = p_str(ndk, p);
+    }
+    if p_i32(ndk, p) != Some(1) {     // topActivity
+        return None;
+    }
+    let pkg = p_str(ndk, p)?;
+    let cls = p_str(ndk, p)?;
+    if pkg.is_empty() || cls.is_empty() {
+        return None;
+    }
+    Some((pkg, cls))
+}
+
+/// 当前前台 task 的 topActivity 完整类名 (binder 直连 activity_task getTasks=0x19)
+pub fn get_top_activity() -> Option<(String, String)> {
+    let Some(ndk) = ndk() else { return None };
+    let atm = {
+        let mut slot = crate::lock_ignore_poison(&ATMS_BINDER);
+        match slot.as_ref() {
+            Some(c) => c.0,
+            None => {
+                let a =
+                    unsafe { (ndk.get_service)(b"activity_task\0".as_ptr() as *const c_char) };
+                if a.is_null() {
+                    return None;
+                }
+                let atm_class = get_atm_class();
+                if atm_class.is_null() {
+                    return None;
+                }
+                if !unsafe { (ndk.associate_class)(a, atm_class as *const c_void) } {
+                    return None;
+                }
+                *slot = Some(SendClass(a));
+                a
+            }
+        }
+    };
+    let mut in_parcel: *mut c_void = std::ptr::null_mut();
+    if unsafe { (ndk.prepare_tx)(atm, &mut in_parcel) } != STATUS_OK || in_parcel.is_null() {
+        return None;
+    }
+    let _ = unsafe { (ndk.write_int32)(in_parcel, 1) };   // maxNum
+    let _ = unsafe { (ndk.write_int32)(in_parcel, 0) };   // filterOnlyVisibleRecents
+    let _ = unsafe { (ndk.write_int32)(in_parcel, 0) };   // keepPair
+    let mut out_parcel: *mut c_void = std::ptr::null_mut();
+    let status = unsafe { (ndk.transact)(atm, 0x19, &mut in_parcel, &mut out_parcel, 0) };
+    unsafe { (ndk.parcel_delete)(in_parcel); }
+    let mut r = None;
+    if status == STATUS_OK && !out_parcel.is_null() {
+        let mut exc = 0i32;
+        let _ = unsafe { (ndk.read_i32)(out_parcel, &mut exc) };
+        if exc == 0 {
+            if let Some(n) = p_i32(&ndk, out_parcel) {
+                if n > 0 {
+                    r = p_parse_top(&ndk, out_parcel);
+                }
+            }
+        }
+        unsafe { (ndk.parcel_delete)(out_parcel); }
+    }
+    r
 }
 

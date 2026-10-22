@@ -30,18 +30,9 @@ fn cpuset_leaf() -> String {
 
 /// web 是否启用 (--no-web 时 false)
 pub static WEB_ENABLED: AtomicBool = AtomicBool::new(false);
-/// activity 事件唤醒 eventfd 写端 (main 创建后注入; KPM 事件环 reader 收到
-/// START_ACTIVITY 事件后写入唤醒主循环 EV_ACT — 事件环接入后使用)
+/// activity 事件唤醒 eventfd 写端 (main 创建后注入内核 act_evt <fd>; KPM 内核
+/// token 命中 START_ACTIVITY → 限频 signal → 主循环 EV_ACT)
 pub static ACT_WAKE_FD: AtomicI32 = AtomicI32::new(-1);
-/// activity 事件 (pkg, activity类名): KPM 检测结果写入, 主线程 EV_ACT 取走
-/// (单槽覆盖式, 无堆积)
-pub static ACT_EVENT: std::sync::Mutex<Option<(String, String)>> =
-    std::sync::Mutex::new(None);
-
-/// 主循环 EV_ACT 取走 activity 事件 (单槽取空)
-pub fn take_act_event() -> Option<(String, String)> {
-    crate::lock_ignore_poison(&ACT_EVENT).take()
-}
 
 /// uclamp (sched_setattr util clamp) 是否可用: /proc/sys/kernel/sched_util_clamp_max 存在
 /// 表示内核支持 uclamp; 启动时检查一次, webui 据此决定是否显示 uclamp 配置 UI。

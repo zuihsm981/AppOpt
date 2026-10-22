@@ -366,6 +366,12 @@ impl KpmHandle {
         self.cmd(&format!("act_enable {}", if on { 1 } else { 0 }));
     }
 
+    /// 注册 activity 触发通知 eventfd (主循环 ACT_WAKE_FD):
+    /// 内核 token 命中 START_ACTIVITY → 限频 eventfd 信号 → 主循环 EV_ACT 查 topActivity。
+    pub(crate) fn act_evt(&self, fd: i32) {
+        self.cmd(&format!("act_evt {fd}"));
+    }
+
     /// 清空全部替换规则 (waylay.conf 重载前)
     pub(crate) fn srv_clear(&self) {
         self.cmd("srv_clear");

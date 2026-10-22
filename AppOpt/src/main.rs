@@ -647,6 +647,27 @@ static RFR_RETRYING: std::sync::LazyLock<std::sync::Mutex<std::collections::Hash
 /// 切到 act 规则应用 (rfr 且非桌面且配了 activity 块) → 1 (内核捕获 START_ACTIVITY);
 /// 切到非规则/桌面/无 act 块应用 → 0 (关闭检测; 其间互相切换保持 0 不重复下发)。
 static ACT_KPM_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 最近一次应用的 activity (pkg, 完整类名); EV_ACT 信号 → getTasks 查询 → 变化才应用
+static LAST_ACT_COMP: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+
+/// activity 链路调试日志 (临时; 写 /data/local/tmp/appopt_act_dbg.txt, ≤1MB)
+pub fn act_dbg(msg: &str) {
+    use std::io::Write;
+    if let Ok(md) = std::fs::metadata("/data/local/tmp/appopt_act_dbg.txt") {
+        if md.len() > 1024 * 1024 {
+            return;
+        }
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/data/local/tmp/appopt_act_dbg.txt")
+    {
+        let _ = f.write_all(
+            format!("t={:?} {}\n", std::time::Instant::now().elapsed(), msg).as_bytes(),
+        );
+    }
+}
 /// RFR_MON 登记重试参数 (只需主 pid: 10×200ms = 2s, 与 CPU 收集窗口一致)
 const RFR_MON_RETRY_MS: u64 = 200;
 const RFR_MON_RETRY_TIMES: u32 = 10;
@@ -839,10 +860,14 @@ fn main() {
     let config_wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     CONFIG_WAKE_FD.store(config_wake_fd, Ordering::Relaxed);
     epoll_add(epfd, config_wake_fd, EV_CONFIG);
-    // activity 事件唤醒 eventfd: KPM 事件环 reader 收到活动事件后写入, 主循环 EV_ACT
+    // activity 事件唤醒 eventfd: KPM 内核 token 命中 START_ACTIVITY 后 signal, 主循环 EV_ACT
     let act_wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     crate::web::ACT_WAKE_FD.store(act_wake_fd, Ordering::Relaxed);
     epoll_add(epfd, act_wake_fd, EV_ACT);
+    // KPM 就绪: 把 eventfd 注册给内核 (act_evt <fd>), token 命中 → 信号唤醒
+    if let Some(es) = state.ebpf_state.as_ref() {
+        es.bpf.act_evt(act_wake_fd);
+    }
     // inotify fd: 配置文件修改
     let inotify_fd = crate::config::INOTIFY_FD.load(Ordering::Acquire);
     epoll_add(epfd, inotify_fd, EV_INOTIFY);
@@ -1179,11 +1204,20 @@ fn main() {
                     }
                 }
                 EV_ACT => {
-                    // activity 事件通道 (KPM START_ACTIVITY 检测, 事件环推送接入后使用;
-                    // 当前无生产者 → take_act_event 恒 None 空转)
+                    // 内核 activity 触发信号 (KPM token 命中 START_ACTIVITY, 限频 300ms)
+                    // → binder 直连 getTasks(0x19) 查权威 topActivity → 变化才应用
                     read_eventfd(act_wake_fd);
-                    if let Some((pkg, comp)) = crate::web::take_act_event() {
-                        crate::refresh::refresh_send_fg_act(pkg, comp);
+                    crate::act_dbg("EV_ACT signal received");
+                    match crate::process_observer::get_top_activity() {
+                        Some((pkg, comp)) => {
+                            crate::act_dbg(&format!("top_activity pkg={} comp={}", pkg, comp));
+                            let mut last = crate::lock_ignore_poison(&LAST_ACT_COMP);
+                            if last.as_ref() != Some(&(pkg.clone(), comp.clone())) {
+                                *last = Some((pkg.clone(), comp.clone()));
+                                crate::refresh::refresh_send_fg_act(pkg, comp);
+                            }
+                        }
+                        None => crate::act_dbg("top_activity=NONE (getTasks 解析失败)"),
                     }
                 }
                 EV_INOTIFY => {
