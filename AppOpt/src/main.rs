@@ -643,10 +643,6 @@ pub fn rfr_hit_list() -> Vec<(i32, String)> {
 /// RFR_MON 登记重试去重: cgroup 晚于 task event 时在跑重试的 uid 集合 (同 uid 只一个重试线程)
 static RFR_RETRYING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<i32>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-/// 当前内核 activity 检测开关值 (EV_TASK 每次前移驱动下发 act_enable 到 KPM):
-/// 切到 act 规则应用 (rfr 且非桌面且配了 activity 块) → 1 (内核捕获 START_ACTIVITY);
-/// 切到非规则/桌面/无 act 块应用 → 0 (关闭检测; 其间互相切换保持 0 不重复下发)。
-static ACT_KPM_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// 最近一次应用的 activity (pkg, 完整类名); EV_ACT 信号 → getTasks 查询 → 变化才应用
 static LAST_ACT_COMP: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
 
@@ -668,6 +664,11 @@ pub fn act_dbg(msg: &str) {
         );
     }
 }
+/// 当前内核 activity 检测开关值 (EV_TASK swap 去重下发; KPM 断开恢复由
+/// 断开通知事件重新同步)
+static ACT_KPM_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// act_evt 是否已注册 (独立于 act_enable: 只注册一次; 断开重置后连接自动补注册一次)
+static ACT_EVT_REG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// RFR_MON 登记重试参数 (只需主 pid: 10×200ms = 2s, 与 CPU 收集窗口一致)
 const RFR_MON_RETRY_MS: u64 = 200;
 const RFR_MON_RETRY_TIMES: u32 = 10;
@@ -1069,10 +1070,9 @@ fn main() {
                         };
                         if n == 4 {
                             state.last_fg_uid = uid;   /* 前台 uid (原 on_fg 维护; 现 task event) */
-                            // 内核 activity 检测开关: 切到 act 规则应用 (rfr 且非桌面且配了
-                            // activity 块) → 下发 act_enable 1 (KPM 捕获 START_ACTIVITY);
-                            // 切到非规则/桌面/无 act 块 → 0 (关闭检测; 其间互相切换保持
-                            // 0 不重复下发)。无 KPM 模块时下发失败静默。
+                            // 内核 activity 检测开关 + eventfd 注册 (分开):
+                            // - act_enable: swap 去重, 状态翻转才下发
+                            // - act_evt: 独立"已注册"记忆, 只注册一次 (启动/断开重连各一次)
                             let act_app = match state.uid_map.get(&uid) {
                                 Some(e)
                                     if e.rfr
@@ -1089,6 +1089,11 @@ fn main() {
                             if ACT_KPM_ENABLED.swap(act_app, Ordering::Relaxed) != act_app {
                                 if let Some(es) = state.ebpf_state.as_ref() {
                                     es.bpf.act_enable(act_app);
+                                }
+                            }
+                            if !ACT_EVT_REG.swap(true, Ordering::Relaxed) {
+                                if let Some(es) = state.ebpf_state.as_ref() {
+                                    es.bpf.act_evt(act_wake_fd);
                                 }
                             }
                             // ---- CPU: 冷启动 (表无该 uid) → 收集窗口; 热 → 跳过 ----
@@ -1207,10 +1212,13 @@ fn main() {
                     }
                 }
                 EV_ACT => {
-                    // 内核 activity 触发信号 (KPM token 命中 START_ACTIVITY, 限频 300ms)
-                    // → binder 直连 getTasks(0x19) 查权威 topActivity → 变化才应用
+                    // 内核 eventfd 信号: activity 触发 (token 命中限频) 或 模块断开
+                    // 通知 (cleanup 卸载前)。断开时内核状态清零 → 用户态记忆同样重置
+                    // (act_enable 关闭 + act_evt 未注册), 两边一致; 下次状态翻转自动重发/重注册。
                     read_eventfd(act_wake_fd);
-                    crate::act_dbg("EV_ACT signal received");
+                    ACT_KPM_ENABLED.store(false, Ordering::Relaxed);
+                    ACT_EVT_REG.store(false, Ordering::Relaxed);
+                    crate::act_dbg("EV_ACT signal (activity 或断开通知 -> 状态已重置关闭)");
                     match crate::process_observer::get_top_activity() {
                         Some((pkg, comp)) => {
                             crate::act_dbg(&format!("top_activity pkg={} comp={}", pkg, comp));
