@@ -149,6 +149,13 @@ static SF_BINDER: std::sync::LazyLock<std::sync::Mutex<Option<SendClass>>> =
 static TSL_CLASS: OnceLock<SendClass> = OnceLock::new();
 /// TaskStackListener 事件通道写端: 解析出的 effectiveUid → 主线程 EV_TASK
 static TASK_SEND_FD: AtomicI32 = AtomicI32::new(-1);
+/// onTaskDescriptionChanged(0xc) 事件通道写端 (uid+pkg+comp → 主线程, 测试用)
+static ACTL_SEND_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// 设置 0xc 事件通道写端 (main 创建 socketpair 后注入)
+pub fn set_actl_fd(fd: i32) {
+    ACTL_SEND_FD.store(fd, Ordering::Release);
+}
 
 extern "C" fn on_create(_args: *mut c_void) -> *mut c_void { std::ptr::null_mut() }
 extern "C" fn on_destroy(_user_data: *mut c_void) {}
@@ -208,7 +215,33 @@ extern "C" fn tsl_on_transact(
 ) -> c_int {
     let Some(ndk) = ndk() else { return STATUS_UNKNOWN_TRANSACTION };
     let mut uid = -1i32;
+    let mut actl_pkg = String::new();
+    let mut actl_comp = String::new();
     match code {
+        0x0c => {
+            /* onTaskDescriptionChanged(RunningTaskInfo): 与 getTasks 同布局,
+             * 直接解析 topActivity (事件本身发生在 resume 后 → 无延迟, 无 getTasks) */
+            if p_i32(&ndk, in_parcel) == Some(1) {
+                let _id = p_i32(&ndk, in_parcel);
+                let _user = p_i32(&ndk, in_parcel);
+                let _task = p_i32(&ndk, in_parcel);
+                if let Some(euid) = p_i32(&ndk, in_parcel) {
+                    uid = euid;
+                    let _disp = p_i32(&ndk, in_parcel);
+                    let _run = p_i32(&ndk, in_parcel);
+                    if p_i32(&ndk, in_parcel) == Some(1) {
+                        p_skip_intent(&ndk, in_parcel);
+                    }
+                    let _ba = p_component(&ndk, in_parcel);
+                    if let Some((pk, cl)) = p_component(&ndk, in_parcel) {
+                        actl_pkg = pk;
+                        actl_comp = cl;
+                    }
+                    let _oa = p_component(&ndk, in_parcel);
+                    let _ra = p_component(&ndk, in_parcel);
+                }
+            }
+        }
         0x0b => {
             // onTaskMovedToFront(RunningTaskInfo):
             // [null 标志][RunningTaskInfo.id][TaskInfo.userId][taskId][effectiveUid]...
@@ -228,6 +261,19 @@ extern "C" fn tsl_on_transact(
         _ => {
             // onTaskStackChanged/onTaskFocusChanged 等: 无有效 uid 负载, 忽略
             return STATUS_OK;
+        }
+    }
+    if !actl_pkg.is_empty() && !actl_comp.is_empty() && uid > 0 {
+        /* 0xc: uid(i32 LE) + pkg\0 + comp\0 (SOCK_DGRAM 原子) */
+        let mut msg = Vec::with_capacity(8 + actl_pkg.len() + actl_comp.len());
+        msg.extend_from_slice(&uid.to_le_bytes());
+        msg.extend_from_slice(actl_pkg.as_bytes());
+        msg.push(0);
+        msg.extend_from_slice(actl_comp.as_bytes());
+        msg.push(0);
+        let fd = ACTL_SEND_FD.load(Ordering::Acquire);
+        if fd >= 0 {
+            let _ = unsafe { libc::send(fd, msg.as_ptr() as *const libc::c_void, msg.len(), libc::MSG_DONTWAIT) };
         }
     }
     let fd = TASK_SEND_FD.load(Ordering::Acquire);

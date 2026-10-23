@@ -678,6 +678,24 @@ static ACT_LAST_UID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32
 /// topActivity (去重后不再应用) → 每次事件起一个 200ms 后的一次性查询, 新事件作废旧查询
 static ACT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// activity 链路调试日志 (临时测试用: 观察 0xc 直连 vs 内核 EV_ACT 哪个在触发)
+pub fn act_dbg(msg: &str) {
+    use std::io::Write;
+    if let Ok(md) = std::fs::metadata("/data/local/tmp/appopt_act_dbg.txt") {
+        if md.len() > 1024 * 1024 {
+            return;
+        }
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/data/local/tmp/appopt_act_dbg.txt")
+    {
+        let _ = f.write_all(msg.as_bytes());
+        let _ = f.write_all(b"\n");
+    }
+}
+
 
 
 /// 当前内核 activity 检测开关值 (EV_TASK swap 去重下发; KPM 断开恢复由
@@ -864,6 +882,7 @@ fn main() {
     const EV_WAYLAY: u64 = 10; // waylay.conf inotify (外部编辑/原子替换 → 重读校验全量下发)
     const EV_TASK: u64 = 13; // TaskStackListener 任务前移 (effectiveUid 驱动 CPU/刷新率)
     const EV_ACT: u64 = 14; // activity 事件通道 (KPM START_ACTIVITY 检测 → 事件环推送预留)
+    const EV_ACTL: u64 = 15; // ITaskStackListener.onTaskDescriptionChanged(0xc) 直连通道 (测试)
 
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epfd < 0 {
@@ -890,6 +909,26 @@ fn main() {
     if exit_ok {
         epoll_add(epfd, exit_sv[0], EV_EXIT_PID);
     }
+    // 0xc 直连通道: 任务描述变化 → 已 resume 的 RunningTaskInfo (含 topActivity)
+    let actl_sv: [libc::c_int; 2] = if task_ok {
+        let mut sv = [-1, -1];
+        if unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                0,
+                sv.as_mut_ptr(),
+            ) == 0
+        } {
+            crate::process_observer::set_actl_fd(sv[1]);
+            epoll_add(epfd, sv[0], EV_ACTL);
+            sv
+        } else {
+            [-1, -1]
+        }
+    } else {
+        [-1, -1]
+    };
     if task_ok {
         epoll_add(epfd, task_sv[0], EV_TASK);
     }
@@ -1264,6 +1303,43 @@ fn main() {
                         }
                     }
                 }
+                EV_ACTL => {
+                    // onTaskDescriptionChanged: uid(i32) + pkg\0 + comp\0 (SOCK_DGRAM)
+                    if actl_sv[0] >= 0 {
+                        let mut buf = [0u8; 1024];
+                        let n = unsafe {
+                            libc::recv(
+                                actl_sv[0],
+                                buf.as_mut_ptr() as *mut libc::c_void,
+                                buf.len(),
+                                0,
+                            )
+                        };
+                        if n >= 6 {
+                            let uid = i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                            let rest = &buf[4..n as usize];
+                            if let Some(p0) = rest.iter().position(|&b| b == 0) {
+                                if p0 > 0 {
+                                    let pkg = String::from_utf8_lossy(&rest[..p0]).into_owned();
+                                    let rest2 = &rest[p0 + 1..];
+                                    if let Some(p1) = rest2.iter().position(|&b| b == 0) {
+                                        if p1 > 0 {
+                                            let comp =
+                                                String::from_utf8_lossy(&rest2[..p1]).into_owned();
+                                            if ACT_LIVE_UIDS.lock().unwrap().contains_key(&uid) {
+                                                crate::act_dbg(&format!(
+                                                    "ACTL uid={} pkg={} comp={}",
+                                                    uid, pkg, comp
+                                                ));
+                                                crate::refresh::refresh_send_fg_act(pkg, comp);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 EV_ACT => {
                     // 内核 eventfd 信号: activity 触发 (token 命中限频) 或 模块断开
                     // 通知 (cleanup 卸载前)。断开时内核状态清零 → 用户态记忆同样重置
@@ -1271,6 +1347,7 @@ fn main() {
                     // 内核 eventfd 计数: 1=startActivity (查 topActivity), 2=finishActivity
                     // (不查 top, 直接回落包级规则; 仅当前应用了 act 规则时生效)
                     let kind = read_eventfd(act_wake_fd);
+                    crate::act_dbg(&format!("ACT ev kind={}", kind));
                     if kind == 0 || !ACT_KPM_ENABLED.load(Ordering::Relaxed) {
                         continue;
                     }

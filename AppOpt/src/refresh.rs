@@ -626,8 +626,9 @@ pub fn refresh_send_fg_pkg(pkg: String) {
 pub fn refresh_send_fg_act(pkg: String, comp: String) {
     let guard = crate::lock_ignore_poison(&REFRESH_TX);
     if let Some(tx) = guard.as_ref() {
-        let _ = tx.send(RefreshEvent::Act(pkg, comp));
+        let _ = tx.send(RefreshEvent::Act(pkg.clone(), comp.clone()));
         wake();
+        crate::act_dbg(&format!("send pkg={} comp={}", pkg, comp));
     }
 }
 
