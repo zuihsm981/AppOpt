@@ -31,7 +31,8 @@ type FnParcelDelete = unsafe extern "C" fn(*mut c_void);
 type FnWriteBinder = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
 type FnReadI32 = unsafe extern "C" fn(*mut c_void, *mut i32) -> c_int;
 type FnWriteI32 = unsafe extern "C" fn(*mut c_void, i32) -> c_int;
-type FnReadString = unsafe extern "C" fn(*mut c_void, *mut *const c_char, *mut usize) -> c_int;
+type FnGetDataPos = unsafe extern "C" fn(*mut c_void) -> i32;
+type FnSetDataPos = unsafe extern "C" fn(*mut c_void, i32) -> c_int;
 type FnJoinThreadPool = unsafe extern "C" fn();
 type FnStartThreadPool = unsafe extern "C" fn();
 type FnAssociateClass = unsafe extern "C" fn(*mut c_void, *const c_void) -> bool;
@@ -46,7 +47,8 @@ struct BinderNdk {
     write_binder: FnWriteBinder,
     write_int32: FnWriteI32,
     read_i32: FnReadI32,
-    read_string: FnReadString,
+    data_position: FnGetDataPos,
+    set_data_position: FnSetDataPos,
     join_thread_pool: FnJoinThreadPool,
     start_thread_pool: FnStartThreadPool,
     associate_class: FnAssociateClass,
@@ -74,14 +76,16 @@ fn ndk() -> Option<&'static BinderNdk> {
         let p_write_binder = sym("AParcel_writeStrongBinder");
         let p_write_i32 = sym("AParcel_writeInt32");
         let p_read_i32 = sym("AParcel_readInt32");
-        let p_read_string = sym("AParcel_readString");
+        let p_get_data_pos = sym("AParcel_dataPosition");
+        let p_set_data_pos = sym("AParcel_setDataPosition");
         let p_join = sym("ABinderProcess_joinThreadPool");
         let p_start = sym("ABinderProcess_startThreadPool");
         let p_associate = sym("AIBinder_associateClass");
         if p_get_service.is_null() || p_class_define.is_null() || p_binder_new.is_null()
             || p_prepare_tx.is_null() || p_transact.is_null() || p_parcel_delete.is_null()
             || p_write_binder.is_null() || p_write_i32.is_null()
-            || p_read_i32.is_null() || p_read_string.is_null()
+            || p_read_i32.is_null()
+            || p_get_data_pos.is_null() || p_set_data_pos.is_null()
             || p_join.is_null() || p_start.is_null() || p_associate.is_null()
         { return None; }
         
@@ -95,7 +99,8 @@ fn ndk() -> Option<&'static BinderNdk> {
             write_binder: std::mem::transmute(p_write_binder),
             write_int32: std::mem::transmute(p_write_i32),
             read_i32: std::mem::transmute(p_read_i32),
-            read_string: std::mem::transmute(p_read_string),
+            data_position: std::mem::transmute(p_get_data_pos),
+            set_data_position: std::mem::transmute(p_set_data_pos),
             join_thread_pool: std::mem::transmute(p_join),
             start_thread_pool: std::mem::transmute(p_start),
             associate_class: std::mem::transmute(p_associate),
@@ -350,14 +355,37 @@ fn p_i32(ndk: &BinderNdk, p: *mut c_void) -> Option<i32> {
 }
 
 /// 读 parcel 字符串 (utf8, parcel 内指针; null → None)
+/// 读 parcel 字符串 (Java writeString → string16: int32 单元数(含结尾 NUL) + UTF-16LE; -1=null)。
+/// 纯 read_int32 + dataPosition 实现, 不调用 AParcel_readString (该符号在部分 ROM
+/// 上内部间接调用会跳到非执行区崩溃)。宽容解析: 结果乱/None 时只是本次查询失败。
 #[inline]
 fn p_str(ndk: &BinderNdk, p: *mut c_void) -> Option<String> {
-    let mut s: *const c_char = std::ptr::null();
-    let mut len: usize = 0;
-    if unsafe { (ndk.read_string)(p, &mut s, &mut len) } != 0 || s.is_null() {
+    let start = unsafe { (ndk.data_position)(p) };
+    if start < 0 {
         return None;
     }
-    Some(unsafe { std::ffi::CStr::from_ptr(s) }.to_string_lossy().into_owned())
+    let n = p_i32(ndk, p)?; // UTF-16 单元数 (含结尾 '\0'); -1 = null
+    if n <= 0 || n > 4096 {
+        return None;
+    }
+    // 数据区 n*2 字节; 每 4 字节 (一个 int32) 含两个 UTF-16 单元 (LE: 低16=首单元)
+    let words = (n as usize + 1) / 2;
+    let mut units: Vec<u16> = Vec::with_capacity(n as usize);
+    for _ in 0..words {
+        let w = p_i32(ndk, p)? as u32;
+        units.push((w & 0xffff) as u16);
+        units.push(((w >> 16) & 0xffff) as u16);
+    }
+    units.truncate(n as usize);
+    if units.last() == Some(&0) {
+        units.pop(); // 去掉结尾 NUL 单元
+    }
+    let s = String::from_utf16_lossy(&units);
+    // 游标精确对齐字段尾 (start + 4 + n*2), 校正奇数字数时多读的 2 字节
+    unsafe {
+        let _ = (ndk.set_data_position)(p, start + 4 + n * 2);
+    }
+    Some(s)
 }
 
 /// 宽容跳过 Intent (AOSP Intent.writeToParcel 字段序; 读错无害 — 只影响本次结果)
@@ -448,6 +476,7 @@ pub fn get_top_activity() -> Option<(String, String)> {
     let _ = unsafe { (ndk.write_int32)(in_parcel, 1) };   // maxNum
     let _ = unsafe { (ndk.write_int32)(in_parcel, 0) };   // filterOnlyVisibleRecents
     let _ = unsafe { (ndk.write_int32)(in_parcel, 0) };   // keepPair
+    let _ = unsafe { (ndk.write_int32)(in_parcel, 0) };   // getTasks(IZZI) 第 4 参 (int)
     let mut out_parcel: *mut c_void = std::ptr::null_mut();
     let status = unsafe { (ndk.transact)(atm, 0x19, &mut in_parcel, &mut out_parcel, 0) };
     unsafe { (ndk.parcel_delete)(in_parcel); }
