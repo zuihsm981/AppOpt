@@ -365,8 +365,13 @@ extern "C" fn tsl_on_transact(
                     }
                 }
             };
-            let Some(euid) = euid else { return STATUS_OK };
-            if euid <= 0 || euid != ACT_FG_UID.load(Ordering::Acquire) {
+            let Some(euid) = euid else {
+                crate::act_dbg("0xc no-euid");
+                return STATUS_OK;
+            };
+            let fg = ACT_FG_UID.load(Ordering::Acquire);
+            crate::act_dbg(&format!("0xc euid={} fg={} pass={}", euid, fg, euid > 0 && euid == fg));
+            if euid <= 0 || euid != fg {
                 return STATUS_OK;   /* 非前台规则应用: 零解析零投递 */
             }
             /* 命中规则应用: 复位从头完整解析 (flag/id/userId/taskId 已在跳读时跳过) */
@@ -381,6 +386,7 @@ extern "C" fn tsl_on_transact(
             let _id = p_i32(&ndk, in_parcel);
             let _user = p_i32(&ndk, in_parcel);
             let _task = p_i32(&ndk, in_parcel);
+            let _euid = p_i32(&ndk, in_parcel);   /* 重新消费 effectiveUid (跳读只用于过滤) */
             let _disp = p_i32(&ndk, in_parcel);
             let _run = p_i32(&ndk, in_parcel);
             if p_i32(&ndk, in_parcel) == Some(1) {
@@ -392,6 +398,7 @@ extern "C" fn tsl_on_transact(
             let _ra = p_component(&ndk, in_parcel);
             if let Some((pkg, comp)) = actl {
                 if !pkg.is_empty() && !comp.is_empty() {
+                    crate::act_dbg(&format!("0xc parse pkg={} comp={}", pkg, comp));
                     /* uid(i32 LE) + pkg\0 + comp\0 (SOCK_DGRAM 原子) */
                     let mut msg = Vec::with_capacity(8 + pkg.len() + comp.len());
                     msg.extend_from_slice(&euid.to_le_bytes());
@@ -405,7 +412,11 @@ extern "C" fn tsl_on_transact(
                             libc::send(fd, msg.as_ptr() as *const libc::c_void, msg.len(), libc::MSG_DONTWAIT)
                         };
                     }
+                } else {
+                    crate::act_dbg("0xc parse 空组件");
                 }
+            } else {
+                crate::act_dbg("0xc parse 失败 (组件 None)");
             }
             STATUS_OK
         }

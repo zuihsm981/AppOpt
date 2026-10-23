@@ -661,6 +661,24 @@ static RFR_RETRYING: std::sync::LazyLock<std::sync::Mutex<std::collections::Hash
 /// 0xc 通道 50ms 防抖 (同 (pkg,comp) 去重)
 static ACTL_DB: std::sync::LazyLock<std::sync::Mutex<Option<(std::time::Instant, String, String)>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+/// activity 链路调试日志 (临时诊断: 0xc → ACTL → refresh 全链)
+pub fn act_dbg(msg: &str) {
+    use std::io::Write;
+    if let Ok(md) = std::fs::metadata("/data/local/tmp/appopt_act_dbg.txt") {
+        if md.len() > 1024 * 1024 {
+            return;
+        }
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/data/local/tmp/appopt_act_dbg.txt")
+    {
+        let _ = f.write_all(msg.as_bytes());
+        let _ = f.write_all(b"\n");
+    }
+}
 /// RFR_MON 登记重试参数 (只需主 pid: 10×200ms = 2s, 与 CPU 收集窗口一致)
 const RFR_MON_RETRY_MS: u64 = 200;
 const RFR_MON_RETRY_TIMES: u32 = 10;
@@ -1235,6 +1253,10 @@ fn main() {
                                                         && *p == pkg
                                                         && *c == comp
                                                 });
+                                            crate::act_dbg(&format!(
+                                                "ACTL pkg={} comp={} dup={}",
+                                                pkg, comp, dup
+                                            ));
                                             if !dup {
                                                 *db = Some((now, pkg.clone(), comp.clone()));
                                                 drop(db);

@@ -287,6 +287,14 @@ fn apply_activity(state: &mut RefreshState, pkg: &str, comp: &str) {
     if pkg.is_empty() || comp.is_empty() {
         return;
     }
+    crate::act_dbg(&format!(
+        "apply pkg={} comp={} block={} hit={:?} cur={}",
+        pkg,
+        comp,
+        state.app_activity.contains_key(pkg),
+        state.app_activity.get(pkg).and_then(|m| m.get(comp)).copied(),
+        state.current_applied_mode
+    ));
     // 无 activity 块的包: 包级刷新率已由 task event 应用, activity 事件不干预
     // (也不重置空闲回落计时); 判定用本线程 app_activity 表 (与 apply 逻辑同源)
     if !state.app_activity.contains_key(pkg) {
@@ -613,8 +621,11 @@ pub fn refresh_send_fg_pkg(pkg: String) {
 pub fn refresh_send_fg_act(pkg: String, comp: String) {
     let guard = crate::lock_ignore_poison(&REFRESH_TX);
     if let Some(tx) = guard.as_ref() {
-        let _ = tx.send(RefreshEvent::Act(pkg, comp));
+        let _ = tx.send(RefreshEvent::Act(pkg.clone(), comp.clone()));
         wake();
+        crate::act_dbg(&format!("send pkg={} comp={}", pkg, comp));
+    } else {
+        crate::act_dbg("send 失败: REFRESH_TX 为空");
     }
 }
 
