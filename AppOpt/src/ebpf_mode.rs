@@ -359,29 +359,6 @@ impl KpmHandle {
         self.cmd(&format!("srv_enable {}", if on { 1 } else { 0 }));
     }
 
-    /// activity 事件检测开关 (KPM START_ACTIVITY 拦截, EV_TASK 前台驱动):
-    /// on=true 捕获 activity 事务 (act 规则应用前台); false 关闭 (非规则/桌面/无块)。
-    /// 无 KPM 模块时下发失败静默 (不影响用户态逻辑)。
-    pub(crate) fn act_enable(&self, on: bool) {
-        self.cmd(&format!("act_enable {}", if on { 1 } else { 0 }));
-    }
-
-    /// 开启 activity 检测并只关注该 uid (内核对其余进程的 binder_ioctl 直接返回)
-    pub(crate) fn act_enable_uid(&self, uid: i32) {
-        self.cmd(&format!("act_enable 1 {uid}"));
-    }
-
-    /// 只摘 binder_ioctl 探针 (规则应用全部退出事件用; 不动连接状态)
-    pub(crate) fn srv_probe_off(&self) {
-        self.cmd("srv_probe_off");
-    }
-
-    /// 注册 activity 触发通知 eventfd (主循环 ACT_WAKE_FD):
-    /// 内核 token 命中 START_ACTIVITY → 限频 eventfd 信号 → 主循环 EV_ACT 查 topActivity。
-    pub(crate) fn act_evt(&self, fd: i32) {
-        self.cmd(&format!("act_evt {fd}"));
-    }
-
     /// 清空全部替换规则 (waylay.conf 重载前)
     pub(crate) fn srv_clear(&self) {
         self.cmd("srv_clear");

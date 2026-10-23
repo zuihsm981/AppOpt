@@ -138,9 +138,6 @@ enum RefreshEvent {
     /// activity 级刷新率事件 (KPM START_ACTIVITY 检测): 包名 + activity 完整类名,
     /// 命中恒值映射 → 该界面恒用对应刷新率 (无回落); 未命中 → 包级默认
     Act(String, String),
-    /// activity 结束 (KPM finishActivity 检测): 不查 topActivity, 直接回落包级规则
-    /// (仅当前应用了 act 规则时才动作)
-    ActClear,
     /// 挂机黑屏挂起/恢复: true=停止空闲回落定时器 (刷新率保持 active,
     /// 单击恢复时无刷新率切换, 避免面板切换绿屏/瞬亮); false=重启定时器
     HangSuspend(bool),
@@ -565,16 +562,6 @@ pub fn refresh_init(display_modes: std::thread::JoinHandle<Vec<(u32, u32, u32, f
                                 RefreshEvent::Act(pkg, comp) => {
                                     apply_activity(&mut state, &pkg, &comp);
                                 }
-                                RefreshEvent::ActClear => {
-                                    if state.cur_act.is_some() {
-                                        state.cur_act = None;
-                                        let pkg = state.current_package.clone();
-                                        apply_app_config(&mut state, &pkg);
-                                        let mode = state.effective.active;
-                                        set_refresh_rate(&mut state, mode);
-                                        reset_timer(&mut state, true);
-                                    }
-                                }
                                 RefreshEvent::HangSuspend(on) => {
                                     if on {
                                         // 黑屏: 停止空闲回落定时器 → 刷新率保持 active,
@@ -626,20 +613,11 @@ pub fn refresh_send_fg_pkg(pkg: String) {
 pub fn refresh_send_fg_act(pkg: String, comp: String) {
     let guard = crate::lock_ignore_poison(&REFRESH_TX);
     if let Some(tx) = guard.as_ref() {
-        let _ = tx.send(RefreshEvent::Act(pkg.clone(), comp.clone()));
+        let _ = tx.send(RefreshEvent::Act(pkg, comp));
         wake();
-        crate::act_dbg(&format!("send pkg={} comp={}", pkg, comp));
     }
 }
 
-/// activity 结束 (finishActivity): 不查 topActivity, 直接回落包级规则。
-pub fn refresh_send_act_clear() {
-    let guard = crate::lock_ignore_poison(&REFRESH_TX);
-    if let Some(tx) = guard.as_ref() {
-        let _ = tx.send(RefreshEvent::ActClear);
-        wake();
-    }
-}
 
 /// 挂机黑屏挂起/恢复 (由 hang_monitor 线程调用):
 ///   true  = 黑屏写 0 后: 停止空闲回落定时器 (刷新率保持 active,

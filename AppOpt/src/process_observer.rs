@@ -47,11 +47,10 @@ struct BinderNdk {
     write_binder: FnWriteBinder,
     write_int32: FnWriteI32,
     read_i32: FnReadI32,
-    /* getTasks 回复手动 string16 解析的游标辅助 (可选; 失败仅影响 get_top_activity,
-     * 绝不拖垮 ndk() 核心 —— ITaskStackListener / SF_BINDER 不依赖这两个符号) */
+    /* 手动 parcel 解析的游标辅助 (可选; 失败仅影响 0xc/TSL 事件解析,
+     * 绝不拖垮 ndk() 核心 —— SF_BINDER 不依赖这两个符号) */
     data_position: Option<FnGetDataPos>,
     set_data_position: Option<FnSetDataPos>,
-    data_size: Option<FnGetDataPos>,
     join_thread_pool: FnJoinThreadPool,
     start_thread_pool: FnStartThreadPool,
     associate_class: FnAssociateClass,
@@ -81,7 +80,6 @@ fn ndk() -> Option<&'static BinderNdk> {
         let p_read_i32 = sym("AParcel_readInt32");
         let p_get_data_pos = sym("AParcel_getDataPosition");
         let p_set_data_pos = sym("AParcel_setDataPosition");
-        let p_get_data_size = sym("AParcel_getDataSize");
         let p_join = sym("ABinderProcess_joinThreadPool");
         let p_start = sym("ABinderProcess_startThreadPool");
         let p_associate = sym("AIBinder_associateClass");
@@ -102,11 +100,6 @@ fn ndk() -> Option<&'static BinderNdk> {
         } else {
             Some(std::mem::transmute::<*mut c_void, FnSetDataPos>(p_set_data_pos))
         };
-        let data_size = if p_get_data_size.is_null() {
-            None
-        } else {
-            Some(std::mem::transmute::<*mut c_void, FnGetDataPos>(p_get_data_size))
-        };
 
         Some(BinderNdk {
             get_service: std::mem::transmute(p_get_service),
@@ -120,7 +113,6 @@ fn ndk() -> Option<&'static BinderNdk> {
             read_i32: std::mem::transmute(p_read_i32),
             data_position,
             set_data_position,
-            data_size,
             join_thread_pool: std::mem::transmute(p_join),
             start_thread_pool: std::mem::transmute(p_start),
             associate_class: std::mem::transmute(p_associate),
@@ -149,8 +141,17 @@ static SF_BINDER: std::sync::LazyLock<std::sync::Mutex<Option<SendClass>>> =
 static TSL_CLASS: OnceLock<SendClass> = OnceLock::new();
 /// TaskStackListener 事件通道写端: 解析出的 effectiveUid → 主线程 EV_TASK
 static TASK_SEND_FD: AtomicI32 = AtomicI32::new(-1);
-/// onTaskDescriptionChanged(0xc) 事件通道写端 (uid+pkg+comp → 主线程, 测试用)
+/// onTaskDescriptionChanged(0xc) 事件通道写端 (uid+pkg+comp → 主线程)
 static ACTL_SEND_FD: AtomicI32 = AtomicI32::new(-1);
+/// 有 activity 规则的应用 uid 集合: 0xc 回调早期过滤 (先于 Intent/Component 解析与投递),
+/// 由 main 在 reload/连接时同步; 空集合 = 无规则应用 → 0xc 全忽略
+static ACT_RULE_UIDS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<i32>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// 同步"有 activity 规则的应用 uid"集合 (0xc 早期过滤用)
+pub fn sync_act_rule_uids(uids: std::collections::HashSet<i32>) {
+    *ACT_RULE_UIDS.lock().unwrap() = uids;
+}
 
 /// 设置 0xc 事件通道写端 (main 创建 socketpair 后注入)
 pub fn set_actl_fd(fd: i32) {
@@ -203,6 +204,131 @@ fn get_tsl_class() -> *mut c_void {
     }).0
 }
 
+/// 读 parcel int32
+#[inline]
+fn p_i32(ndk: &BinderNdk, p: *mut c_void) -> Option<i32> {
+    let mut v = 0i32;
+    unsafe { (ndk.read_i32)(p, &mut v) == 0 }.then_some(v)
+}
+
+/// 读 parcel 字符串 (utf8=false → string16; utf8=true → string8)。
+/// Android 16: Intent 的 action/type/identifier/package/categories 用 writeString8 (字节数)，
+/// ComponentName 仍用 writeString (UTF-16 单元数)。int32 长度 + 数据 + 补齐到 4 字节, -1=null。
+fn p_strx(ndk: &BinderNdk, p: *mut c_void, utf8: bool) -> Option<String> {
+    let start = unsafe { (ndk.data_position?)(p) };
+    if start < 0 {
+        return None;
+    }
+    let n = p_i32(ndk, p)?;
+    if n < 0 {
+        return Some(String::new());
+    }
+    let n = n as usize;
+    let width = if utf8 { n + 1 } else { 2 * n + 2 };
+    if width > 65536 {
+        return None;
+    }
+    let words = (width + 3) / 4;
+    let mut raw: Vec<u8> = Vec::with_capacity(words * 4);
+    for _ in 0..words {
+        raw.extend_from_slice(&(p_i32(ndk, p)? as u32).to_le_bytes());
+    }
+    let s = if utf8 {
+        String::from_utf8_lossy(&raw[..n]).into_owned()
+    } else {
+        let units: Vec<u16> = (0..n)
+            .map(|i| u16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]))
+            .collect();
+        String::from_utf16_lossy(&units)
+    };
+    let end = start + 4 + (((width as i32) + 3) & !3);
+    if let Some(sp) = ndk.set_data_position {
+        unsafe {
+            let _ = sp(p, end);
+        }
+    }
+    Some(s)
+}
+
+#[inline]
+fn p_str8(ndk: &BinderNdk, p: *mut c_void) -> Option<String> {
+    p_strx(ndk, p, true)
+}
+
+#[inline]
+fn p_str16(ndk: &BinderNdk, p: *mut c_void) -> Option<String> {
+    p_strx(ndk, p, false)
+}
+
+/// ComponentName.writeToParcel: null → 单个 int32 -1; 否则两个 string16 (pkg, cls)
+fn p_component(ndk: &BinderNdk, p: *mut c_void) -> Option<(String, String)> {
+    let start = unsafe { (ndk.data_position?)(p) };
+    if start < 0 || p_i32(ndk, p)? < 0 {
+        return None;
+    }
+    if let Some(sp) = ndk.set_data_position {
+        unsafe {
+            let _ = sp(p, start);
+        }
+    }
+    let pkg = p_str16(ndk, p)?;
+    let cls = p_str16(ndk, p)?;
+    if pkg.is_empty() || cls.is_empty() {
+        return None;
+    }
+    Some((pkg, cls))
+}
+
+/// 宽容跳过 Intent (lineage-23.2 Intent.writeToParcel 字段序; 读错无害 — 只影响本次结果)
+fn p_skip_intent(ndk: &BinderNdk, p: *mut c_void) {
+    let _ = p_str8(ndk, p);            // mAction
+    if let Some(t) = p_i32(ndk, p) {   // mData: Uri (0=null, 其余 TYPE_ID + string8)
+        if t != 0 {
+            let _ = p_str8(ndk, p);
+        }
+    }
+    let _ = p_str8(ndk, p);            // mType
+    let _ = p_str8(ndk, p);            // mIdentifier
+    let _ = p_i32(ndk, p);             // mFlags
+    let _ = p_i32(ndk, p);             // mExtendedFlags
+    let _ = p_str8(ndk, p);            // mPackage
+    let _ = p_component(ndk, p);       // mComponent
+    if p_i32(ndk, p) == Some(1) {      // mSourceBounds (Rect: 4 个 int32)
+        for _ in 0..4 {
+            let _ = p_i32(ndk, p);
+        }
+    }
+    if let Some(n) = p_i32(ndk, p) {   // mCategories
+        for _ in 0..n.max(0) {
+            let _ = p_str8(ndk, p);
+        }
+    }
+    let _ = p_i32(ndk, p);             // mSelector (null)
+    let _ = p_i32(ndk, p);             // mClipData (null)
+    let _ = p_i32(ndk, p);             // mContentUserHint
+    let pos = ndk.data_position.map(|dp| unsafe { dp(p) });
+    if let Some(l) = p_i32(ndk, p) {   // mExtras (writeBundle: <=0 → 只占 4 字节)
+        if l > 0 {
+            if let (Some(sp), Some(pos)) = (ndk.set_data_position, pos) {
+                unsafe {
+                    let _ = sp(p, pos + 12 + l);
+                }
+            }
+        }
+    }
+    let _ = p_i32(ndk, p);             // mOriginalIntent
+    if p_i32(ndk, p) == Some(1) {      // mCreatorTokenInfo
+        let _ = p_i32(ndk, p);         // strong binder
+        if let Some(n) = p_i32(ndk, p) {
+            for _ in 0..n.max(0) {
+                let _ = p_i32(ndk, p);
+                let _ = p_str8(ndk, p);
+                let _ = p_i32(ndk, p);
+            }
+        }
+    }
+}
+
 /// ITaskStackListener 回调 onTransact: onTaskMovedToFront=0xb 参数 RunningTaskInfo
 /// (readTypedObject → null 标志 + RunningTaskInfo.id + TaskInfo: userId/taskId/effectiveUid,
 /// effectiveUid = null 标志后第 4 个 int),
@@ -214,33 +340,50 @@ extern "C" fn tsl_on_transact(
     _out: *mut c_void,
 ) -> c_int {
     let Some(ndk) = ndk() else { return STATUS_UNKNOWN_TRANSACTION };
-    let mut uid = -1i32;
-    let mut actl_pkg = String::new();
-    let mut actl_comp = String::new();
     match code {
         0x0c => {
             /* onTaskDescriptionChanged(RunningTaskInfo): 与 getTasks 同布局,
-             * 直接解析 topActivity (事件本身发生在 resume 后 → 无延迟, 无 getTasks) */
+             * 直接解析 topActivity (事件本身发生在 resume 后 → 无延迟, 无 getTasks)。
+             * 先读 effectiveUid 早期过滤: 非规则应用直接返回, 不解析 Intent/组件/投递 */
+            if p_i32(&ndk, in_parcel) != Some(1) {
+                return STATUS_OK;
+            }
+            let _id = p_i32(&ndk, in_parcel);
+            let _user = p_i32(&ndk, in_parcel);
+            let _task = p_i32(&ndk, in_parcel);
+            let Some(euid) = p_i32(&ndk, in_parcel) else {
+                return STATUS_OK;
+            };
+            if euid <= 0 || !ACT_RULE_UIDS.lock().unwrap().contains(&euid) {
+                return STATUS_OK;   /* 非规则应用: 零解析零投递 */
+            }
+            let _disp = p_i32(&ndk, in_parcel);
+            let _run = p_i32(&ndk, in_parcel);
             if p_i32(&ndk, in_parcel) == Some(1) {
-                let _id = p_i32(&ndk, in_parcel);
-                let _user = p_i32(&ndk, in_parcel);
-                let _task = p_i32(&ndk, in_parcel);
-                if let Some(euid) = p_i32(&ndk, in_parcel) {
-                    uid = euid;
-                    let _disp = p_i32(&ndk, in_parcel);
-                    let _run = p_i32(&ndk, in_parcel);
-                    if p_i32(&ndk, in_parcel) == Some(1) {
-                        p_skip_intent(&ndk, in_parcel);
+                p_skip_intent(&ndk, in_parcel);
+            }
+            let _ba = p_component(&ndk, in_parcel);
+            let actl = p_component(&ndk, in_parcel);
+            let _oa = p_component(&ndk, in_parcel);
+            let _ra = p_component(&ndk, in_parcel);
+            if let Some((pkg, comp)) = actl {
+                if !pkg.is_empty() && !comp.is_empty() {
+                    /* uid(i32 LE) + pkg\0 + comp\0 (SOCK_DGRAM 原子) */
+                    let mut msg = Vec::with_capacity(8 + pkg.len() + comp.len());
+                    msg.extend_from_slice(&euid.to_le_bytes());
+                    msg.extend_from_slice(pkg.as_bytes());
+                    msg.push(0);
+                    msg.extend_from_slice(comp.as_bytes());
+                    msg.push(0);
+                    let fd = ACTL_SEND_FD.load(Ordering::Acquire);
+                    if fd >= 0 {
+                        let _ = unsafe {
+                            libc::send(fd, msg.as_ptr() as *const libc::c_void, msg.len(), libc::MSG_DONTWAIT)
+                        };
                     }
-                    let _ba = p_component(&ndk, in_parcel);
-                    if let Some((pk, cl)) = p_component(&ndk, in_parcel) {
-                        actl_pkg = pk;
-                        actl_comp = cl;
-                    }
-                    let _oa = p_component(&ndk, in_parcel);
-                    let _ra = p_component(&ndk, in_parcel);
                 }
             }
+            STATUS_OK
         }
         0x0b => {
             // onTaskMovedToFront(RunningTaskInfo):
@@ -255,34 +398,22 @@ extern "C" fn tsl_on_transact(
                 let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _user_id) };
                 let mut _task_id = 0i32;
                 let _ = unsafe { (ndk.read_i32)(in_parcel, &mut _task_id) };
+                let mut uid = -1i32;
                 let _ = unsafe { (ndk.read_i32)(in_parcel, &mut uid) };
+                let fd = TASK_SEND_FD.load(Ordering::Acquire);
+                if fd >= 0 && uid > 0 {
+                    let _ = unsafe {
+                        libc::send(fd, &uid as *const i32 as *const libc::c_void, 4, libc::MSG_DONTWAIT)
+                    };
+                }
             }
+            STATUS_OK
         }
         _ => {
             // onTaskStackChanged/onTaskFocusChanged 等: 无有效 uid 负载, 忽略
-            return STATUS_OK;
+            STATUS_OK
         }
     }
-    if !actl_pkg.is_empty() && !actl_comp.is_empty() && uid > 0 {
-        /* 0xc: uid(i32 LE) + pkg\0 + comp\0 (SOCK_DGRAM 原子) */
-        let mut msg = Vec::with_capacity(8 + actl_pkg.len() + actl_comp.len());
-        msg.extend_from_slice(&uid.to_le_bytes());
-        msg.extend_from_slice(actl_pkg.as_bytes());
-        msg.push(0);
-        msg.extend_from_slice(actl_comp.as_bytes());
-        msg.push(0);
-        let fd = ACTL_SEND_FD.load(Ordering::Acquire);
-        if fd >= 0 {
-            let _ = unsafe { libc::send(fd, msg.as_ptr() as *const libc::c_void, msg.len(), libc::MSG_DONTWAIT) };
-        }
-    }
-    let fd = TASK_SEND_FD.load(Ordering::Acquire);
-    if fd >= 0 && uid > 0 {
-        let _ = unsafe {
-            libc::send(fd, &uid as *const i32 as *const libc::c_void, 4, libc::MSG_DONTWAIT)
-        };
-    }
-    STATUS_OK
 }
 
 /// 注册 ITaskStackListener (事务 0x2f): 任务前移 → effectiveUid → 主线程 EV_TASK
@@ -409,256 +540,4 @@ pub fn set_refresh_rate_binder(mode: i32) -> bool {
  * 用户态解析: 读错/失败只返回 None (不应用), 无崩溃风险 (与内核 copy 崩区分)。
  */
 
-/// ActivityTaskManager binder 句柄缓存 (getTasks 查询复用; 同 SF_BINDER 模式)
-static ATMS_BINDER: std::sync::LazyLock<std::sync::Mutex<Option<SendClass>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
-
-/// 读 parcel int32
-#[inline]
-fn p_i32(ndk: &BinderNdk, p: *mut c_void) -> Option<i32> {
-    let mut v = 0i32;
-    unsafe { (ndk.read_i32)(p, &mut v) == 0 }.then_some(v)
-}
-
-/// 读 parcel 字符串 (utf8=false → string16; utf8=true → string8)。
-/// Android 16: Intent 的 action/type/identifier/package/categories 用 writeString8 (字节数)，
-/// ComponentName 仍用 writeString (UTF-16 单元数)。两种都是 int32 长度 + 数据 + 补齐到 4 字节，
-/// 长度 -1 = null。纯 read_int32 + dataPosition 实现 (不调用 AParcel_readString — 该符号在
-/// 部分 ROM 内部间接调用会跳到非执行区崩溃)。
-fn p_strx(ndk: &BinderNdk, p: *mut c_void, utf8: bool) -> Option<String> {
-    let start = unsafe { (ndk.data_position?)(p) };
-    if start < 0 {
-        return None;
-    }
-    let n = p_i32(ndk, p)?;            // -1 = null
-    if n < 0 {
-        return Some(String::new());
-    }
-    let n = n as usize;
-    let width = if utf8 { n + 1 } else { 2 * n + 2 };   // 含结尾 NUL
-    if width > 65536 {
-        return None;
-    }
-    let words = (width + 3) / 4;
-    let mut raw: Vec<u8> = Vec::with_capacity(words * 4);
-    for _ in 0..words {
-        raw.extend_from_slice(&(p_i32(ndk, p)? as u32).to_le_bytes());
-    }
-    let s = if utf8 {
-        String::from_utf8_lossy(&raw[..n]).into_owned()
-    } else {
-        let units: Vec<u16> = (0..n)
-            .map(|i| u16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]))
-            .collect();
-        String::from_utf16_lossy(&units)
-    };
-    let end = start + 4 + (((width as i32) + 3) & !3);
-    if let Some(sp) = ndk.set_data_position {
-        unsafe {
-            let _ = sp(p, end);
-        }
-    }
-    Some(s)
-}
-
-#[inline]
-fn p_str8(ndk: &BinderNdk, p: *mut c_void) -> Option<String> {
-    p_strx(ndk, p, true)
-}
-
-#[inline]
-fn p_str16(ndk: &BinderNdk, p: *mut c_void) -> Option<String> {
-    p_strx(ndk, p, false)
-}
-
-/// ComponentName.writeToParcel: null → 单个 int32 -1; 否则两个 string16 (pkg, cls)
-fn p_component(ndk: &BinderNdk, p: *mut c_void) -> Option<(String, String)> {
-    let start = unsafe { (ndk.data_position?)(p) };
-    if start < 0 || p_i32(ndk, p)? < 0 {
-        return None;
-    }
-    if let Some(sp) = ndk.set_data_position {
-        unsafe {
-            let _ = sp(p, start);
-        }
-    }
-    let pkg = p_str16(ndk, p)?;
-    let cls = p_str16(ndk, p)?;
-    if pkg.is_empty() || cls.is_empty() {
-        return None;
-    }
-    Some((pkg, cls))
-}
-
-/// 宽容跳过 Intent (lineage-23.2 Intent.writeToParcel 字段序; 读错无害 — 只影响本次结果)
-fn p_skip_intent(ndk: &BinderNdk, p: *mut c_void) {
-    let _ = p_str8(ndk, p);            // mAction
-    if let Some(t) = p_i32(ndk, p) {   // mData: Uri (0=null, 其余 TYPE_ID + string8)
-        if t != 0 {
-            let _ = p_str8(ndk, p);
-        }
-    }
-    let _ = p_str8(ndk, p);            // mType
-    let _ = p_str8(ndk, p);            // mIdentifier
-    let _ = p_i32(ndk, p);             // mFlags
-    let _ = p_i32(ndk, p);             // mExtendedFlags
-    let _ = p_str8(ndk, p);            // mPackage
-    let _ = p_component(ndk, p);       // mComponent
-    if p_i32(ndk, p) == Some(1) {      // mSourceBounds (Rect: 4 个 int32)
-        for _ in 0..4 {
-            let _ = p_i32(ndk, p);
-        }
-    }
-    if let Some(n) = p_i32(ndk, p) {   // mCategories
-        for _ in 0..n.max(0) {
-            let _ = p_str8(ndk, p);
-        }
-    }
-    let _ = p_i32(ndk, p);             // mSelector (null)
-    let _ = p_i32(ndk, p);             // mClipData (null)
-    let _ = p_i32(ndk, p);             // mContentUserHint
-    let pos = ndk.data_position.map(|dp| unsafe { dp(p) });
-    if let Some(l) = p_i32(ndk, p) {   // mExtras (writeBundle: <=0 → 只占 4 字节)
-        if l > 0 {
-            if let (Some(sp), Some(pos)) = (ndk.set_data_position, pos) {
-                unsafe {
-                    let _ = sp(p, pos + 12 + l);   // 长度 + magic + 数据 + hasIntent
-                }
-            }
-        }
-    }
-    let _ = p_i32(ndk, p);             // mOriginalIntent (null; 非 null 罕见 → 后续读乱即失败)
-    if p_i32(ndk, p) == Some(1) {      // mCreatorTokenInfo (preventIntentRedirect)
-        let _ = p_i32(ndk, p);         // strong binder
-        if let Some(n) = p_i32(ndk, p) {
-            for _ in 0..n.max(0) {
-                let _ = p_i32(ndk, p);     // key.mType
-                let _ = p_str8(ndk, p);    // key.mKey
-                let _ = p_i32(ndk, p);     // key.mIndex
-            }
-        }
-    }
-}
-
-/// 名字字段合法 (包名/类名形态), 用于扫描校验
-fn p_ident(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 200
-        && s.bytes()
-            .all(|c| c.is_ascii_alphanumeric() || c == b'.' || c == b'_' || c == b'$')
-}
-
-/// 兜底: baseIntent 布局意外 (extras/selector 等任意数据) 时, 按 4 字节步进扫描
-/// 连续两个同包 ComponentName (= baseActivity, topActivity), 取第二个
-fn p_scan_component(ndk: &BinderNdk, p: *mut c_void, from: i32, size: i32) -> Option<(String, String)> {
-    let sp = ndk.set_data_position?;
-    let mut pos = from & !3;
-    while pos + 16 <= size {
-        unsafe {
-            let _ = sp(p, pos);
-        }
-        if let Some(a) = p_component(ndk, p) {
-            if let Some(b) = p_component(ndk, p) {
-                if a.0 == b.0 && p_ident(&a.0) && p_ident(&b.1) && b.1.contains('.') {
-                    return Some(b);
-                }
-            }
-        }
-        pos += 4;
-    }
-    None
-}
-
-/// 解析回复中第一个 RunningTaskInfo 的 topActivity (ComponentName → pkg, cls)
-fn p_parse_top(ndk: &BinderNdk, p: *mut c_void) -> Option<(String, String)> {
-    // readTypedObject 元素 null 标志 (1=有对象)
-    let f = p_i32(ndk, p);
-    if f != Some(1) {
-        return None;
-    }
-    let _id = p_i32(ndk, p);           // RunningTaskInfo.id
-    let mut t5 = [None; 5];
-    for t in t5.iter_mut() {
-        *t = p_i32(ndk, p);            // userId/taskId/effectiveUid/displayId/isRunning
-    }
-    let bi = p_i32(ndk, p);            // baseIntent 标志 (1=有)
-    if bi == Some(1) {
-        p_skip_intent(ndk, p);
-    }
-    // 4 连 ComponentName: baseActivity / topActivity / origActivity / realActivity
-    let ba = p_component(ndk, p);
-    let ta = p_component(ndk, p);
-    let oa = p_component(ndk, p);
-    let ra = p_component(ndk, p);
-    let _num = p_i32(ndk, p);          // numActivities
-    let _last = p_i32(ndk, p);         // lastActiveTime (long)
-    let _last_hi = p_i32(ndk, p);
-    ta.or(ra).or(oa).or(ba)
-}
-
-/// 当前前台 task 的 topActivity 完整类名 (binder 直连 activity_task getTasks=0x19)
-pub fn get_top_activity() -> Option<(String, String)> {
-    let Some(ndk) = ndk() else { return None };
-    let atm = {
-        let mut slot = crate::lock_ignore_poison(&ATMS_BINDER);
-        match slot.as_ref() {
-            Some(c) => c.0,
-            None => {
-                let a =
-                    unsafe { (ndk.get_service)(b"activity_task\0".as_ptr() as *const c_char) };
-                if a.is_null() {
-                    return None;
-                }
-                let atm_class = get_atm_class();
-                if atm_class.is_null() {
-                    return None;
-                }
-                if !unsafe { (ndk.associate_class)(a, atm_class as *const c_void) } {
-                    return None;
-                }
-                *slot = Some(SendClass(a));
-                a
-            }
-        }
-    };
-    let mut in_parcel: *mut c_void = std::ptr::null_mut();
-    if unsafe { (ndk.prepare_tx)(atm, &mut in_parcel) } != STATUS_OK || in_parcel.is_null() {
-        return None;
-    }
-    let _ = unsafe { (ndk.write_int32)(in_parcel, 1) };   // maxNum
-    let _ = unsafe { (ndk.write_int32)(in_parcel, 0) };   // filterOnlyVisibleRecents
-    let _ = unsafe { (ndk.write_int32)(in_parcel, 0) };   // keepPair
-    let _ = unsafe { (ndk.write_int32)(in_parcel, 0) };   // getTasks(IZZI) 第 4 参 (int)
-    let mut out_parcel: *mut c_void = std::ptr::null_mut();
-    let status = unsafe { (ndk.transact)(atm, 0x19, &mut in_parcel, &mut out_parcel, 0) };
-    unsafe { (ndk.parcel_delete)(in_parcel); }
-    let mut r = None;
-    if status == STATUS_OK && !out_parcel.is_null() {
-        let mut exc = 0i32;
-        let _ = unsafe { (ndk.read_i32)(out_parcel, &mut exc) };
-        if exc == 0 {
-            // 回复体: [0]=exception/status, [1]=列表长度, [2]=元素非 null 标志 ...
-            if let Some(sp) = ndk.set_data_position {
-                unsafe {
-                    let _ = sp(out_parcel, 4);
-                }
-            }
-            let start = ndk.data_position.map(|dp| unsafe { dp(out_parcel) }).unwrap_or(-1);
-            let size = ndk.data_size.map(|ds| unsafe { ds(out_parcel) }).unwrap_or(0);
-            if let Some(n) = p_i32(&ndk, out_parcel) {
-                if n > 0 {
-                    r = p_parse_top(&ndk, out_parcel).or_else(|| {
-                        if start < 0 {
-                            return None;
-                        }
-                        let bound = if size > start { size } else { start + 65536 };
-                        p_scan_component(&ndk, out_parcel, start, bound)
-                    });
-                }
-            }
-        }
-        unsafe { (ndk.parcel_delete)(out_parcel); }
-    }
-    r
-}
 

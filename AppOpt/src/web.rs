@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -32,7 +32,6 @@ fn cpuset_leaf() -> String {
 pub static WEB_ENABLED: AtomicBool = AtomicBool::new(false);
 /// activity 事件唤醒 eventfd 写端 (main 创建后注入内核 act_evt <fd>; KPM 内核
 /// token 命中 START_ACTIVITY → 限频 signal → 主循环 EV_ACT)
-pub static ACT_WAKE_FD: AtomicI32 = AtomicI32::new(-1);
 
 /// uclamp (sched_setattr util clamp) 是否可用: /proc/sys/kernel/sched_util_clamp_max 存在
 /// 表示内核支持 uclamp; 启动时检查一次, webui 据此决定是否显示 uclamp 配置 UI。
