@@ -645,6 +645,9 @@ static RFR_RETRYING: std::sync::LazyLock<std::sync::Mutex<std::collections::Hash
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 /// 最近一次应用的 activity (pkg, 完整类名); EV_ACT 信号 → getTasks 查询 → 变化才应用
 static LAST_ACT_COMP: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+/// EV_ACT 延迟查询代次: startActivity 到目标 activity resume 有延迟, 立即查会拿到旧
+/// topActivity (去重后不再应用) → 每次事件起一个 200ms 后的一次性查询, 新事件作废旧查询
+static ACT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// activity 链路调试日志 (临时; 写 /data/local/tmp/appopt_act_dbg.txt, ≤1MB)
 pub fn act_dbg(msg: &str) {
@@ -1216,20 +1219,40 @@ fn main() {
                     // 通知 (cleanup 卸载前)。断开时内核状态清零 → 用户态记忆同样重置
                     // (act_enable 关闭 + act_evt 未注册), 两边一致; 下次状态翻转自动重发/重注册。
                     read_eventfd(act_wake_fd);
-                    ACT_KPM_ENABLED.store(false, Ordering::Relaxed);
-                    ACT_EVT_REG.store(false, Ordering::Relaxed);
-                    crate::act_dbg("EV_ACT signal (activity 或断开通知 -> 状态已重置关闭)");
-                    match crate::process_observer::get_top_activity() {
-                        Some((pkg, comp)) => {
-                            crate::act_dbg(&format!("top_activity pkg={} comp={}", pkg, comp));
-                            let mut last = crate::lock_ignore_poison(&LAST_ACT_COMP);
-                            if last.as_ref() != Some(&(pkg.clone(), comp.clone())) {
-                                *last = Some((pkg.clone(), comp.clone()));
-                                crate::refresh::refresh_send_fg_act(pkg, comp);
-                            }
-                        }
-                        None => crate::act_dbg("top_activity=NONE (getTasks 解析失败)"),
+                    // 注意: 不能在这里清 ACT_KPM_ENABLED —— 内核 act_enable 并没有被关
+                    // (EV_ACT 只表示有 startActivity), 清了会让 swap 去重失配: 切到无
+                    // activity 规则的应用时 swap(false)==false 不下发 act_enable 0,
+                    // 内核继续捕获所有应用 → 非规则应用也查 getTasks 刷日志。
+                    if !ACT_KPM_ENABLED.load(Ordering::Relaxed) {
+                        crate::act_dbg("EV_ACT 忽略 (act_enable 已关: 非 activity 规则应用)");
+                        continue;
                     }
+                    crate::act_dbg("EV_ACT activity 信号");
+                    let my_gen = ACT_GEN.fetch_add(1, Ordering::Relaxed) + 1;
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                        if ACT_GEN.load(Ordering::Relaxed) != my_gen {
+                            return;   // 有更新的事件, 本次查询作废
+                        }
+                        match crate::process_observer::get_top_activity() {
+                            Some((pkg, comp)) => {
+                                crate::act_dbg(&format!("top_activity pkg={} comp={}", pkg, comp));
+                                let changed = {
+                                    let mut last = crate::lock_ignore_poison(&LAST_ACT_COMP);
+                                    if last.as_ref() != Some(&(pkg.clone(), comp.clone())) {
+                                        *last = Some((pkg.clone(), comp.clone()));
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                };
+                                if changed {
+                                    crate::refresh::refresh_send_fg_act(pkg, comp);
+                                }
+                            }
+                            None => crate::act_dbg("top_activity=NONE (getTasks 解析失败)"),
+                        }
+                    });
                 }
                 EV_INOTIFY => {
                     // 配置变更 (inotify): 与 EV_CONFIG 共用 reload_config
