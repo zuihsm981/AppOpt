@@ -342,21 +342,46 @@ extern "C" fn tsl_on_transact(
     let Some(ndk) = ndk() else { return STATUS_UNKNOWN_TRANSACTION };
     match code {
         0x0c => {
-            /* onTaskDescriptionChanged(RunningTaskInfo): 与 getTasks 同布局,
-             * 直接解析 topActivity (事件本身发生在 resume 后 → 无延迟, 无 getTasks)。
-             * 先读 effectiveUid 早期过滤: 非规则应用直接返回, 不解析 Intent/组件/投递 */
+            /* onTaskDescriptionChanged(RunningTaskInfo): 直接解析 topActivity
+             * (事件发生在 resume 后 → 无延迟, 无 getTasks)。
+             * 早期过滤: 先只取 effectiveUid (跳读 offset 16, 一次定位),
+             * 非规则应用直接返回, 不解析 Intent/组件/投递 */
+            let start = ndk.data_position.map(|dp| unsafe { dp(in_parcel) });
+            let euid = match (start, ndk.set_data_position) {
+                (Some(s), Some(sp)) => {
+                    unsafe {
+                        let _ = sp(in_parcel, s + 16);
+                    }
+                    p_i32(&ndk, in_parcel)
+                }
+                _ => {
+                    /* 无游标辅助: 顺序读到 effectiveUid */
+                    if p_i32(&ndk, in_parcel) != Some(1) {
+                        None
+                    } else {
+                        let _id = p_i32(&ndk, in_parcel);
+                        let _user = p_i32(&ndk, in_parcel);
+                        let _task = p_i32(&ndk, in_parcel);
+                        p_i32(&ndk, in_parcel)
+                    }
+                }
+            };
+            let Some(euid) = euid else { return STATUS_OK };
+            if euid <= 0 || !ACT_RULE_UIDS.lock().unwrap().contains(&euid) {
+                return STATUS_OK;   /* 非规则应用: 零解析零投递 */
+            }
+            /* 命中规则应用: 复位从头完整解析 (flag/id/userId/taskId 已在跳读时跳过) */
+            if let (Some(sp), Some(s)) = (ndk.set_data_position, start) {
+                unsafe {
+                    let _ = sp(in_parcel, s);
+                }
+            }
             if p_i32(&ndk, in_parcel) != Some(1) {
                 return STATUS_OK;
             }
             let _id = p_i32(&ndk, in_parcel);
             let _user = p_i32(&ndk, in_parcel);
             let _task = p_i32(&ndk, in_parcel);
-            let Some(euid) = p_i32(&ndk, in_parcel) else {
-                return STATUS_OK;
-            };
-            if euid <= 0 || !ACT_RULE_UIDS.lock().unwrap().contains(&euid) {
-                return STATUS_OK;   /* 非规则应用: 零解析零投递 */
-            }
             let _disp = p_i32(&ndk, in_parcel);
             let _run = p_i32(&ndk, in_parcel);
             if p_i32(&ndk, in_parcel) == Some(1) {
