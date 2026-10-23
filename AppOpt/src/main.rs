@@ -382,7 +382,7 @@ struct AppState {
     cpu_pkgs_set: HashSet<String>,
     rfr_pkgs_set: HashSet<String>,
     /// 已下发给内核的 service list 伪装开关 (差量下发, 仅应用切换时调整)
-    srv_active_cur: bool,
+    srv_enable_cur: bool,
     /// 最后前移任务 uid (EV_TASK 唯一维护; reload/srv 脱节补偿按它定位当前前台)
     last_fg_uid: i32,
     /* vfc 规则下发指纹缓存: (uid, kind, target, from, to) — 无变化不重发; vfc_uid_set=表内 uid */
@@ -413,7 +413,7 @@ impl AppState {
             pkg_uid,
             cpu_pkgs_set,
             rfr_pkgs_set,
-            srv_active_cur: false,
+            srv_enable_cur: false,
             last_fg_uid: -1,
             rule_cache: Vec::new(),
             vfc_uid_set: std::collections::HashSet::new(),
@@ -446,6 +446,9 @@ impl AppState {
                 /* 连接: act 侧记忆与内核对齐 (模块可能重载过, 内核 act_enable/act_evt
                  * 已归零) → 立即补注册 eventfd; act_enable 由下一次 EV_TASK 重发 */
                 ACT_KPM_ENABLED.store(false, Ordering::Relaxed);
+                ACT_LAST_UID.store(-1, Ordering::Relaxed);
+                ACT_LIVE_UIDS.lock().unwrap().clear();
+                ACT_PID_UID.lock().unwrap().clear();
                 ACT_GEN.fetch_add(1, Ordering::Relaxed);
                 let fd = crate::web::ACT_WAKE_FD.load(Ordering::Relaxed);
                 if fd >= 0 {
@@ -459,15 +462,18 @@ impl AppState {
                 es.bpf.vfc_apply();
             } else {
                 es.bpf.disarm();
-                /* 断开: 复位内核 srv 开关 — 探针已摘除但 srv_active 标志残留,
+                /* 断开: 复位内核 srv 开关 — 探针已摘除但 srv_enable 标志残留,
                  * 否则重连后会在未收到相关前台回调时全局生效 */
-                es.bpf.srv_active(false);
+                es.bpf.srv_enable(false);
                 // 断开把探针摘除 (srv_remove); 重置激活记录 → 下次前台回调重新下发
-                self.srv_active_cur = false;
+                self.srv_enable_cur = false;
                 /* 与卸载模块一致: act 侧全清 —— 内核 act_enable 归零 (探针已摘除),
                  * act_evt 句柄作废由下次连接重注册; 作废在途的延迟查询 */
                 es.bpf.act_enable(false);
                 ACT_KPM_ENABLED.store(false, Ordering::Relaxed);
+                ACT_LAST_UID.store(-1, Ordering::Relaxed);
+                ACT_LIVE_UIDS.lock().unwrap().clear();
+                ACT_PID_UID.lock().unwrap().clear();
                 ACT_GEN.fetch_add(1, Ordering::Relaxed);
             }
             crate::web::KPM_ARMED.store(arm, std::sync::atomic::Ordering::Relaxed);
@@ -537,15 +543,15 @@ impl AppState {
                 }
                 es.bpf.prop_file_apply(prop_any);
                 /* srv: 规则表已重发, 开关按最近前台 uid 的 src 规则重新门控 (防止用户态
-                 * 记录与内核 srv_active 脱节 → 未收到相关前台回调也全局生效) */
+                 * 记录与内核 srv_enable 脱节 → 未收到相关前台回调也全局生效) */
                 let fg_active = self
                     .uid_rules
                     .get(&self.last_fg_uid)
                     .map(|rs| rs.iter().any(|r| r.kind == crate::config::WaylayKind::Src))
                     .unwrap_or(false);
-                if fg_active != self.srv_active_cur {
-                    self.srv_active_cur = fg_active;
-                    es.bpf.srv_active(fg_active);
+                if fg_active != self.srv_enable_cur {
+                    self.srv_enable_cur = fg_active;
+                    es.bpf.srv_enable(fg_active);
                 }
                 self.prop_active_cur = prop_any;
             }
@@ -628,7 +634,7 @@ impl AppState {
     /// 回调切到非 srv 规则应用: 停止 srv 伪装
     fn srv_evict_all(&mut self) {
         if let Some(es) = self.ebpf_state.as_ref() {
-            es.bpf.srv_active(false);
+            es.bpf.srv_enable(false);
         }
     }
 
@@ -660,6 +666,14 @@ pub fn rfr_hit_list() -> Vec<(i32, String)> {
 /// RFR_MON 登记重试去重: cgroup 晚于 task event 时在跑重试的 uid 集合 (同 uid 只一个重试线程)
 static RFR_RETRYING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<i32>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+/// 已下发 act_enable 且主进程存活的规则应用 (uid → 主 pid): 全部退出后才统一 act_enable 0
+static ACT_LIVE_UIDS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i32, i32>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+/// pidfd 退出事件 → act 规则应用 uid 反查 (与 RFR_PID_UID 同构)
+static ACT_PID_UID: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i32, i32>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+/// 当前 act_enable 1 下发的 uid (换 uid 需重发; -1 = 未下发)
+static ACT_LAST_UID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 /// EV_ACT 延迟查询代次: startActivity 到目标 activity resume 有延迟, 立即查会拿到旧
 /// topActivity (去重后不再应用) → 每次事件起一个 200ms 后的一次性查询, 新事件作废旧查询
 static ACT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1046,6 +1060,22 @@ fn main() {
                             if let Some(rf_uid) = RFR_PID_UID.lock().unwrap().remove(&pid) {
                                 RFR_MON.lock().unwrap().remove(&rf_uid);
                             }
+                            // act 规则应用退出: 全部规则应用退出后统一 act_enable 0 + 摘探针
+                            if let Some(act_uid) = ACT_PID_UID.lock().unwrap().remove(&pid) {
+                                let all_gone = {
+                                    let mut live = ACT_LIVE_UIDS.lock().unwrap();
+                                    live.remove(&act_uid);
+                                    live.is_empty()
+                                };
+                                if all_gone {
+                                    ACT_LAST_UID.store(-1, Ordering::Relaxed);
+                                    ACT_KPM_ENABLED.store(false, Ordering::Relaxed);
+                                    if let Some(es) = state.ebpf_state.as_ref() {
+                                        es.bpf.srv_probe_off();
+                                        es.bpf.act_enable(false);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1081,10 +1111,42 @@ fn main() {
                                 }
                                 _ => false,
                             };
-                            if ACT_KPM_ENABLED.swap(act_app, Ordering::Relaxed) != act_app {
-                                if let Some(es) = state.ebpf_state.as_ref() {
-                                    es.bpf.act_enable(act_app);
+                            if act_app {
+                                /* 规则应用进入前台: 首次登记主 pid (pidfd 退出监听);
+                                 * 换 uid 或新登记时重发 act_enable 1 <uid> */
+                                let fresh = {
+                                    let live = ACT_LIVE_UIDS.lock().unwrap();
+                                    if live.contains_key(&uid) {
+                                        false
+                                    } else {
+                                        let rpid = crate::cpu_affinity::cgroup_pids(uid)
+                                            .unwrap_or_default()
+                                            .iter()
+                                            .min()
+                                            .copied();
+                                        drop(live);   /* 先放 LIVE 再锁 PID_UID: 与退出路径同序, 防 AB-BA */
+                                        if let Some(rpid) = rpid {
+                                            if !ACT_PID_UID.lock().unwrap().contains_key(&rpid) {
+                                                crate::event_probe::watch(rpid);
+                                                ACT_PID_UID.lock().unwrap().insert(rpid, uid);
+                                            }
+                                            ACT_LIVE_UIDS.lock().unwrap().insert(uid, rpid);
+                                        }
+                                        true
+                                    }
+                                };
+                                let prev = ACT_LAST_UID.swap(uid, Ordering::Relaxed);
+                                if prev != uid || fresh {
+                                    if let Some(es) = state.ebpf_state.as_ref() {
+                                        es.bpf.act_enable_uid(uid);
+                                    }
                                 }
+                                ACT_KPM_ENABLED.store(true, Ordering::Relaxed);
+                            } else {
+                                /* 非规则应用: 不下发 act_enable 0 —— 内核 uid 过滤已把
+                                 * 信号限制在规则应用自身; 0 统一由退出事件发送 */
+                                ACT_LAST_UID.store(-1, Ordering::Relaxed);
+                                ACT_KPM_ENABLED.store(false, Ordering::Relaxed);
                             }
 
                             // ---- CPU: 冷启动 (表无该 uid) → 收集窗口; 热 → 跳过 ----
@@ -1173,10 +1235,10 @@ fn main() {
                                 .any(|r| r.kind == crate::config::WaylayKind::Src);
                             if in_srv {
                                 if let Some(es) = state.ebpf_state.as_ref() {
-                                    es.bpf.srv_active(true);
+                                    es.bpf.srv_enable(true);
                                 }
                             } else {
-                                state.srv_evict_all();      // srv_active(false)
+                                state.srv_evict_all();      // srv_enable(false)
                             }
                             let prop_rules: Vec<(String, String)> = my
                                 .iter()

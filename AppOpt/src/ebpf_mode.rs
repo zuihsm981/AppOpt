@@ -355,8 +355,8 @@ impl KpmHandle {
     }
 
     /// service list 伪装开关 (前台回调驱动): on=true 激活(无差别替换 listServices)
-    pub(crate) fn srv_active(&self, on: bool) {
-        self.cmd(&format!("srv_active {}", if on { 1 } else { 0 }));
+    pub(crate) fn srv_enable(&self, on: bool) {
+        self.cmd(&format!("srv_enable {}", if on { 1 } else { 0 }));
     }
 
     /// activity 事件检测开关 (KPM START_ACTIVITY 拦截, EV_TASK 前台驱动):
@@ -364,6 +364,16 @@ impl KpmHandle {
     /// 无 KPM 模块时下发失败静默 (不影响用户态逻辑)。
     pub(crate) fn act_enable(&self, on: bool) {
         self.cmd(&format!("act_enable {}", if on { 1 } else { 0 }));
+    }
+
+    /// 开启 activity 检测并只关注该 uid (内核对其余进程的 binder_ioctl 直接返回)
+    pub(crate) fn act_enable_uid(&self, uid: i32) {
+        self.cmd(&format!("act_enable 1 {uid}"));
+    }
+
+    /// 只摘 binder_ioctl 探针 (规则应用全部退出事件用; 不动连接状态)
+    pub(crate) fn srv_probe_off(&self) {
+        self.cmd("srv_probe_off");
     }
 
     /// 注册 activity 触发通知 eventfd (主循环 ACT_WAKE_FD):
