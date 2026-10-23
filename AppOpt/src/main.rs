@@ -439,6 +439,14 @@ impl AppState {
         }
         if let Some(es) = self.ebpf_state.as_ref() {
             if arm {
+                /* 连接: act 侧记忆与内核对齐 (模块可能重载过, 内核 act_enable/act_evt
+                 * 已归零) → 立即补注册 eventfd; act_enable 由下一次 EV_TASK 重发 */
+                ACT_KPM_ENABLED.store(false, Ordering::Relaxed);
+                ACT_GEN.fetch_add(1, Ordering::Relaxed);
+                let fd = crate::web::ACT_WAKE_FD.load(Ordering::Relaxed);
+                if fd >= 0 {
+                    es.bpf.act_evt(fd);
+                }
                 es.bpf.arm();
                 // red-path 副本权限/上下文同步 (连接时校准)
                 crate::config::sync_redpath_perm(&crate::rw_read_ignore_poison(
@@ -452,6 +460,11 @@ impl AppState {
                 es.bpf.srv_active(false);
                 // 断开把探针摘除 (srv_remove); 重置激活记录 → 下次前台回调重新下发
                 self.srv_active_cur = false;
+                /* 与卸载模块一致: act 侧全清 —— 内核 act_enable 归零 (探针已摘除),
+                 * act_evt 句柄作废由下次连接重注册; 作废在途的延迟查询 */
+                es.bpf.act_enable(false);
+                ACT_KPM_ENABLED.store(false, Ordering::Relaxed);
+                ACT_GEN.fetch_add(1, Ordering::Relaxed);
             }
             crate::web::KPM_ARMED.store(arm, std::sync::atomic::Ordering::Relaxed);
         }
@@ -670,8 +683,6 @@ pub fn act_dbg(msg: &str) {
 /// 当前内核 activity 检测开关值 (EV_TASK swap 去重下发; KPM 断开恢复由
 /// 断开通知事件重新同步)
 static ACT_KPM_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// act_evt 是否已注册 (独立于 act_enable: 只注册一次; 断开重置后连接自动补注册一次)
-static ACT_EVT_REG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// RFR_MON 登记重试参数 (只需主 pid: 10×200ms = 2s, 与 CPU 收集窗口一致)
 const RFR_MON_RETRY_MS: u64 = 200;
 const RFR_MON_RETRY_TIMES: u32 = 10;
@@ -868,13 +879,8 @@ fn main() {
     let act_wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     crate::web::ACT_WAKE_FD.store(act_wake_fd, Ordering::Relaxed);
     epoll_add(epfd, act_wake_fd, EV_ACT);
-    // KPM 就绪: 把 eventfd 注册给内核 (act_evt <fd>), token 命中 → 信号唤醒
-    if let Some(es) = state.ebpf_state.as_ref() {
-        let _ = es.bpf.act_evt(act_wake_fd);
-        crate::act_dbg(&format!("act_evt reg 下发 fd={}", act_wake_fd));
-    } else {
-        crate::act_dbg("act_evt 未下发: ebpf_state 为空 (KPM 未加载?)");
-    }
+    // activity eventfd 只在 WebUI 点击「连接」(set_kpm_arm(true)) 时注册给内核;
+    // 启动不注册 (未连接 = 内核无 act_enable/act_evt, 与 UI 状态一致)
     // inotify fd: 配置文件修改
     let inotify_fd = crate::config::INOTIFY_FD.load(Ordering::Acquire);
     epoll_add(epfd, inotify_fd, EV_INOTIFY);
@@ -1094,11 +1100,7 @@ fn main() {
                                     es.bpf.act_enable(act_app);
                                 }
                             }
-                            if !ACT_EVT_REG.swap(true, Ordering::Relaxed) {
-                                if let Some(es) = state.ebpf_state.as_ref() {
-                                    es.bpf.act_evt(act_wake_fd);
-                                }
-                            }
+
                             // ---- CPU: 冷启动 (表无该 uid) → 收集窗口; 热 → 跳过 ----
                             if let Some(e) = state.uid_map.get(&uid) {
                                 if e.cpu && !crate::cpu_affinity::cpu_known_has(uid) {
