@@ -643,11 +643,11 @@ pub fn rfr_hit_list() -> Vec<(i32, String)> {
 /// RFR_MON 登记重试去重: cgroup 晚于 task event 时在跑重试的 uid 集合 (同 uid 只一个重试线程)
 static RFR_RETRYING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<i32>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-/// 最近一次应用的 activity (pkg, 完整类名); EV_ACT 信号 → getTasks 查询 → 变化才应用
-static LAST_ACT_COMP: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
 /// EV_ACT 延迟查询代次: startActivity 到目标 activity resume 有延迟, 立即查会拿到旧
 /// topActivity (去重后不再应用) → 每次事件起一个 200ms 后的一次性查询, 新事件作废旧查询
 static ACT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+
 
 /// activity 链路调试日志 (临时; 写 /data/local/tmp/appopt_act_dbg.txt, ≤1MB)
 pub fn act_dbg(msg: &str) {
@@ -1237,18 +1237,7 @@ fn main() {
                         match crate::process_observer::get_top_activity() {
                             Some((pkg, comp)) => {
                                 crate::act_dbg(&format!("top_activity pkg={} comp={}", pkg, comp));
-                                let changed = {
-                                    let mut last = crate::lock_ignore_poison(&LAST_ACT_COMP);
-                                    if last.as_ref() != Some(&(pkg.clone(), comp.clone())) {
-                                        *last = Some((pkg.clone(), comp.clone()));
-                                        true
-                                    } else {
-                                        false
-                                    }
-                                };
-                                if changed {
-                                    crate::refresh::refresh_send_fg_act(pkg, comp);
-                                }
+                                crate::refresh::refresh_send_fg_act(pkg, comp);
                             }
                             None => crate::act_dbg("top_activity=NONE (getTasks 解析失败)"),
                         }

@@ -169,6 +169,9 @@ struct RefreshState {
     app_configs: HashMap<String, AppRefreshConfig>,
     /// activity 级恒值映射: pkg -> (activity完整类名 -> 刷新率模式码); 命中即恒值无回落
     app_activity: HashMap<String, HashMap<String, i32>>,
+    /// 当前前台 activity (pkg, comp): 包级事件 (EV_TASK → FgPkg) 之后仍能保住 activity 命中,
+    /// 否则包级 apply 会把 activity 恒值覆盖回包默认值 (activity 规则表现为"完全无效")
+    cur_act: Option<(String, String)>,
     /// 当前生效配置 (全局默认, 或被应用级配置覆盖)
     effective: RateConfig,
     current_applied_mode: i32,
@@ -262,6 +265,26 @@ fn apply_app_config(state: &mut RefreshState, pkg: &str) {
         state.effective.active = state.global.active;
         state.effective.idle = state.global.idle;
     }
+    // activity 覆盖: 已知当前 activity 且命中 → 恒值 (包级事件不得把它覆盖回包默认值)
+    if let Some((apkg, acomp)) = state.cur_act.clone() {
+        if apkg == pkg {
+            if let Some(v) = state
+                .app_activity
+                .get(pkg)
+                .and_then(|m| m.get(&acomp))
+                .copied()
+            {
+                state.effective.active = v;
+                state.effective.idle = v;
+                crate::act_dbg(&format!(
+                    "apply_app_config pkg={} 保留 activity 命中 {}={}",
+                    pkg, acomp, v
+                ));
+            }
+        } else {
+            state.cur_act = None;   /* 切到别的包: 旧 activity 失效 */
+        }
+    }
     state.timer_enabled = state.effective.idle != state.effective.active;
     // 同步触摸监听开关 (与 load_global_config 一致): 应用级配置切换后保持状态同步
     crate::event_probe::set_enabled(state.timer_enabled);
@@ -288,6 +311,7 @@ fn apply_activity(state: &mut RefreshState, pkg: &str, comp: &str) {
     if !state.app_activity.contains_key(pkg) {
         return;
     }
+    state.cur_act = Some((pkg.to_string(), comp.to_string()));
     state.current_package = pkg.to_string();
     if pkg == crate::config::DEFAULT_REFRESH_PACKAGE {
         state.effective.timeout = state.global.timeout;
@@ -486,6 +510,7 @@ pub fn refresh_init(display_modes: std::thread::JoinHandle<Vec<(u32, u32, u32, f
         },
         app_configs: HashMap::new(),
         app_activity: HashMap::new(),
+        cur_act: None,
         effective: RateConfig {
             active: crate::config::REFRESH_MODE_120,
             idle: crate::config::REFRESH_MODE_60,
