@@ -528,10 +528,9 @@ fn p_parse_top(ndk: &BinderNdk, p: *mut c_void) -> Option<(String, String)> {
     // readTypedObject 元素 null 标志 (1=有对象)
     let f = p_i32(ndk, p);
     if f != Some(1) {
-        crate::act_dbg(&format!("p_parse_top: elem flag={:?}", f));
         return None;
     }
-    let id = p_i32(ndk, p);            // RunningTaskInfo.id
+    let _id = p_i32(ndk, p);           // RunningTaskInfo.id
     let mut t5 = [None; 5];
     for t in t5.iter_mut() {
         *t = p_i32(ndk, p);            // userId/taskId/effectiveUid/displayId/isRunning
@@ -545,42 +544,10 @@ fn p_parse_top(ndk: &BinderNdk, p: *mut c_void) -> Option<(String, String)> {
     let ta = p_component(ndk, p);
     let oa = p_component(ndk, p);
     let ra = p_component(ndk, p);
-    let num = p_i32(ndk, p);           // numActivities
-    let last = p_i32(ndk, p);          // lastActiveTime (long)
-    let last_hi = p_i32(ndk, p);
-    crate::act_dbg(&format!(
-        "p_parse_top f={:?} id={:?} t5={:?} bi={:?} ba={:?} ta={:?} oa={:?} ra={:?} num={:?} last={:?}:{:?}",
-        f, id, t5, bi, ba, ta, oa, ra, num, last_hi, last
-    ));
+    let _num = p_i32(ndk, p);          // numActivities
+    let _last = p_i32(ndk, p);         // lastActiveTime (long)
+    let _last_hi = p_i32(ndk, p);
     ta.or(ra).or(oa).or(ba)
-}
-
-fn p_hex_dump(ndk: &BinderNdk, p: *mut c_void, max_words: usize) -> String {
-    let Some(dp) = ndk.data_position else {
-        return String::new();
-    };
-    let start = unsafe { dp(p) };
-    if start < 0 {
-        return String::new();
-    }
-    let mut out = String::new();
-    for _ in 0..max_words {
-        let mut v = 0i32;
-        if unsafe { (ndk.read_i32)(p, &mut v) } != 0 {
-            break;
-        }
-        let b = (v as u32).to_le_bytes();
-        out.push_str(&format!(
-            "{:02x}{:02x}{:02x}{:02x}",
-            b[0], b[1], b[2], b[3]
-        ));
-    }
-    if let Some(sp) = ndk.set_data_position {
-        unsafe {
-            let _ = sp(p, start);
-        }
-    }
-    out
 }
 
 /// 当前前台 task 的 topActivity 完整类名 (binder 直连 activity_task getTasks=0x19)
@@ -623,14 +590,6 @@ pub fn get_top_activity() -> Option<(String, String)> {
     if status == STATUS_OK && !out_parcel.is_null() {
         let mut exc = 0i32;
         let _ = unsafe { (ndk.read_i32)(out_parcel, &mut exc) };
-        // 诊断: 回复头原始 hex (从 0 位置, 前 96 个 int32) 核对布局用
-        if let Some(sp) = ndk.set_data_position {
-            unsafe {
-                let _ = sp(out_parcel, 0);
-            }
-        }
-        let head = p_hex_dump(&ndk, out_parcel, 96);
-        crate::act_dbg(&format!("getTasks status={} exc={} head={}", status, exc, head));
         if exc == 0 {
             // 回复体: [0]=exception/status, [1]=列表长度, [2]=元素非 null 标志 ...
             if let Some(sp) = ndk.set_data_position {
@@ -649,8 +608,6 @@ pub fn get_top_activity() -> Option<(String, String)> {
                         let bound = if size > start { size } else { start + 65536 };
                         p_scan_component(&ndk, out_parcel, start, bound)
                     });
-                } else {
-                    crate::act_dbg(&format!("getTasks 列表长度={}", n));
                 }
             }
         }

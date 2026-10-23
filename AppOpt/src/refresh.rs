@@ -138,6 +138,9 @@ enum RefreshEvent {
     /// activity 级刷新率事件 (KPM START_ACTIVITY 检测): 包名 + activity 完整类名,
     /// 命中恒值映射 → 该界面恒用对应刷新率 (无回落); 未命中 → 包级默认
     Act(String, String),
+    /// activity 结束 (KPM finishActivity 检测): 不查 topActivity, 直接回落包级规则
+    /// (仅当前应用了 act 规则时才动作)
+    ActClear,
     /// 挂机黑屏挂起/恢复: true=停止空闲回落定时器 (刷新率保持 active,
     /// 单击恢复时无刷新率切换, 避免面板切换绿屏/瞬亮); false=重启定时器
     HangSuspend(bool),
@@ -222,7 +225,6 @@ fn load_app_configs(state: &mut RefreshState) {
 
 fn set_refresh_rate(state: &mut RefreshState, mode: i32) {
     if mode == state.current_applied_mode {
-        crate::act_dbg(&format!("set_refresh_rate mode={} 已是当前档 (跳过)", mode));
         return;
     }
     // 内部 mode 码 (MODE_120/60/90) → 设备实际显示模式 id (初始化检测所得)
@@ -235,15 +237,10 @@ fn set_refresh_rate(state: &mut RefreshState, mode: i32) {
     // 解析失败/未检测到该档位 (arg<0): 不切换也不改内部状态 (保持原档位,
     // 避免"假切换"——实际没切, 内部却以为切了)
     if arg < 0 {
-        crate::act_dbg(&format!(
-            "set_refresh_rate mode={} arg<0 (设备无该档) rate_args={:?}",
-            mode, state.rate_args
-        ));
         return;
     }
     // 只走 binder 直连 SurfaceFlinger，不再回退到 service 子进程
-    let ok = crate::process_observer::set_refresh_rate_binder(arg);
-    crate::act_dbg(&format!("set_refresh_rate mode={} arg={} ok={}", mode, arg, ok));
+    let _ok = crate::process_observer::set_refresh_rate_binder(arg);
     state.current_applied_mode = mode;
 }
 
@@ -276,10 +273,6 @@ fn apply_app_config(state: &mut RefreshState, pkg: &str) {
             {
                 state.effective.active = v;
                 state.effective.idle = v;
-                crate::act_dbg(&format!(
-                    "apply_app_config pkg={} 保留 activity 命中 {}={}",
-                    pkg, acomp, v
-                ));
             }
         } else {
             state.cur_act = None;   /* 切到别的包: 旧 activity 失效 */
@@ -297,15 +290,6 @@ fn apply_activity(state: &mut RefreshState, pkg: &str, comp: &str) {
     if pkg.is_empty() || comp.is_empty() {
         return;
     }
-    crate::act_dbg(&format!(
-        "apply_activity pkg={} comp={} block={} hit={:?} cur={} cfg={:?}",
-        pkg,
-        comp,
-        state.app_activity.contains_key(pkg),
-        state.app_activity.get(pkg).and_then(|m| m.get(comp)).copied(),
-        state.current_applied_mode,
-        state.app_configs.get(pkg).map(|c| (c.timeout, c.active_mode, c.idle_mode))
-    ));
     // 无 activity 块的包: 包级刷新率已由 task event 应用, activity 事件不干预
     // (也不重置空闲回落计时); 判定用本线程 app_activity 表 (与 apply 逻辑同源)
     if !state.app_activity.contains_key(pkg) {
@@ -342,10 +326,6 @@ fn apply_activity(state: &mut RefreshState, pkg: &str, comp: &str) {
     state.timer_enabled = state.effective.idle != state.effective.active;
     crate::event_probe::set_enabled(state.timer_enabled);
     set_refresh_rate(state, state.effective.active);
-    crate::act_dbg(&format!(
-        "apply_activity -> active={} idle={} applied={}",
-        state.effective.active, state.effective.idle, state.current_applied_mode
-    ));
     reset_timer(state, true);
 }
 
@@ -585,6 +565,16 @@ pub fn refresh_init(display_modes: std::thread::JoinHandle<Vec<(u32, u32, u32, f
                                 RefreshEvent::Act(pkg, comp) => {
                                     apply_activity(&mut state, &pkg, &comp);
                                 }
+                                RefreshEvent::ActClear => {
+                                    if state.cur_act.is_some() {
+                                        state.cur_act = None;
+                                        let pkg = state.current_package.clone();
+                                        apply_app_config(&mut state, &pkg);
+                                        let mode = state.effective.active;
+                                        set_refresh_rate(&mut state, mode);
+                                        reset_timer(&mut state, true);
+                                    }
+                                }
                                 RefreshEvent::HangSuspend(on) => {
                                     if on {
                                         // 黑屏: 停止空闲回落定时器 → 刷新率保持 active,
@@ -635,13 +625,18 @@ pub fn refresh_send_fg_pkg(pkg: String) {
 /// (命中 → 恒值无回落; 未命中 → 包级默认)。主线程 EV_ACT 调用。
 pub fn refresh_send_fg_act(pkg: String, comp: String) {
     let guard = crate::lock_ignore_poison(&REFRESH_TX);
-    match guard.as_ref() {
-        Some(tx) => {
-            let _ = tx.send(RefreshEvent::Act(pkg.clone(), comp.clone()));
-            wake();
-            crate::act_dbg(&format!("refresh_send_fg_act 投递 {} {}", pkg, comp));
-        }
-        None => crate::act_dbg("refresh_send_fg_act: REFRESH_TX 为空 (刷新率线程未启动)"),
+    if let Some(tx) = guard.as_ref() {
+        let _ = tx.send(RefreshEvent::Act(pkg, comp));
+        wake();
+    }
+}
+
+/// activity 结束 (finishActivity): 不查 topActivity, 直接回落包级规则。
+pub fn refresh_send_act_clear() {
+    let guard = crate::lock_ignore_poison(&REFRESH_TX);
+    if let Some(tx) = guard.as_ref() {
+        let _ = tx.send(RefreshEvent::ActClear);
+        wake();
     }
 }
 

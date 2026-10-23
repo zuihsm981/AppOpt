@@ -255,12 +255,16 @@ fn epoll_add(epfd: i32, fd: i32, tag: u64) {
     unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fd, &mut ev) };
 }
 
-fn read_eventfd(fd: i32) {
+fn read_eventfd(fd: i32) -> u64 {
     if fd < 0 {
-        return;
+        return 0;
     }
     let mut buf = [0u8; 8];
-    let _ = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, 8) };
+    if unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, 8) } == 8 {
+        u64::from_ne_bytes(buf)
+    } else {
+        0
+    }
 }
 
 /// 用户态事件探测线程 (合并触摸+退出): 单 epoll 统一监听 触摸 fd (/dev/input eventX,
@@ -662,24 +666,6 @@ static ACT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 
 
 
-/// activity 链路调试日志 (临时; 写 /data/local/tmp/appopt_act_dbg.txt, ≤1MB)
-pub fn act_dbg(msg: &str) {
-    use std::io::Write;
-    if let Ok(md) = std::fs::metadata("/data/local/tmp/appopt_act_dbg.txt") {
-        if md.len() > 1024 * 1024 {
-            return;
-        }
-    }
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/data/local/tmp/appopt_act_dbg.txt")
-    {
-        let _ = f.write_all(
-            format!("t={:?} {}\n", std::time::Instant::now().elapsed(), msg).as_bytes(),
-        );
-    }
-}
 /// 当前内核 activity 检测开关值 (EV_TASK swap 去重下发; KPM 断开恢复由
 /// 断开通知事件重新同步)
 static ACT_KPM_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1220,16 +1206,18 @@ fn main() {
                     // 内核 eventfd 信号: activity 触发 (token 命中限频) 或 模块断开
                     // 通知 (cleanup 卸载前)。断开时内核状态清零 → 用户态记忆同样重置
                     // (act_enable 关闭 + act_evt 未注册), 两边一致; 下次状态翻转自动重发/重注册。
-                    read_eventfd(act_wake_fd);
-                    // 注意: 不能在这里清 ACT_KPM_ENABLED —— 内核 act_enable 并没有被关
-                    // (EV_ACT 只表示有 startActivity), 清了会让 swap 去重失配: 切到无
-                    // activity 规则的应用时 swap(false)==false 不下发 act_enable 0,
-                    // 内核继续捕获所有应用 → 非规则应用也查 getTasks 刷日志。
-                    if !ACT_KPM_ENABLED.load(Ordering::Relaxed) {
-                        crate::act_dbg("EV_ACT 忽略 (act_enable 已关: 非 activity 规则应用)");
+                    // 内核 eventfd 计数: 1=startActivity (查 topActivity), 2=finishActivity
+                    // (不查 top, 直接回落包级规则; 仅当前应用了 act 规则时生效)
+                    let kind = read_eventfd(act_wake_fd);
+                    if kind == 0 || !ACT_KPM_ENABLED.load(Ordering::Relaxed) {
                         continue;
                     }
-                    crate::act_dbg("EV_ACT activity 信号");
+                    if kind & 2 != 0 {
+                        crate::refresh::refresh_send_act_clear();
+                    }
+                    if kind & 1 == 0 {
+                        continue;
+                    }
                     let my_gen = ACT_GEN.fetch_add(1, Ordering::Relaxed) + 1;
                     std::thread::spawn(move || {
                         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -1238,10 +1226,9 @@ fn main() {
                         }
                         match crate::process_observer::get_top_activity() {
                             Some((pkg, comp)) => {
-                                crate::act_dbg(&format!("top_activity pkg={} comp={}", pkg, comp));
                                 crate::refresh::refresh_send_fg_act(pkg, comp);
                             }
-                            None => crate::act_dbg("top_activity=NONE (getTasks 解析失败)"),
+                            None => {}
                         }
                     });
                 }
