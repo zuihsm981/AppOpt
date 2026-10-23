@@ -388,6 +388,29 @@ fn p_str(ndk: &BinderNdk, p: *mut c_void) -> Option<String> {
     Some(s)
 }
 
+fn p_hex_dump(ndk: &BinderNdk, p: *mut c_void, max_words: usize) -> String {
+    let start = unsafe { (ndk.data_position)(p) };
+    if start < 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    for _ in 0..max_words {
+        let mut v = 0i32;
+        if unsafe { (ndk.read_i32)(p, &mut v) } != 0 {
+            break;
+        }
+        let b = (v as u32).to_le_bytes();
+        out.push_str(&format!(
+            "{:02x}{:02x}{:02x}{:02x}",
+            b[0], b[1], b[2], b[3]
+        ));
+    }
+    unsafe {
+        let _ = (ndk.set_data_position)(p, start);
+    }
+    out
+}
+
 /// 宽容跳过 Intent (AOSP Intent.writeToParcel 字段序; 读错无害 — 只影响本次结果)
 fn p_skip_intent(ndk: &BinderNdk, p: *mut c_void) {
     let _ = p_str(ndk, p);            // mAction
@@ -419,21 +442,31 @@ fn p_skip_intent(ndk: &BinderNdk, p: *mut c_void) {
 /// 解析回复中第一个 RunningTaskInfo 的 topActivity (ComponentName → pkg, cls)
 fn p_parse_top(ndk: &BinderNdk, p: *mut c_void) -> Option<(String, String)> {
     // readTypedObject 元素 null 标志 (1=有对象)
-    if p_i32(ndk, p) != Some(1) {
+    let f = p_i32(ndk, p);
+    if f != Some(1) {
+        crate::act_dbg(&format!("p_parse_top: elem flag={:?}", f));
         return None;
     }
-    let _ = p_i32(ndk, p);            // RunningTaskInfo.id
-    for _ in 0..5 {
-        let _ = p_i32(ndk, p);        // TaskInfo: userId/taskId/effectiveUid/displayId/isRunning
+    let id = p_i32(ndk, p);            // RunningTaskInfo.id
+    let mut t5 = [None; 5];
+    for t in t5.iter_mut() {
+        *t = p_i32(ndk, p);            // userId/taskId/effectiveUid/displayId/isRunning
     }
-    if p_i32(ndk, p) == Some(1) {     // baseIntent (1=有)
+    let bi = p_i32(ndk, p);            // baseIntent 标志 (1=有)
+    if bi == Some(1) {
         p_skip_intent(ndk, p);
     }
-    if p_i32(ndk, p) == Some(1) {     // baseActivity — 跳 pkg/cls
+    let ba = p_i32(ndk, p);            // baseActivity 标志
+    if ba == Some(1) {
         let _ = p_str(ndk, p);
         let _ = p_str(ndk, p);
     }
-    if p_i32(ndk, p) != Some(1) {     // topActivity
+    let ta = p_i32(ndk, p);            // topActivity 标志
+    crate::act_dbg(&format!(
+        "p_parse_top f={:?} id={:?} t5={:?} bi={:?} ba={:?} ta={:?}",
+        f, id, t5, bi, ba, ta
+    ));
+    if ta != Some(1) {
         return None;
     }
     let pkg = p_str(ndk, p)?;
@@ -484,6 +517,12 @@ pub fn get_top_activity() -> Option<(String, String)> {
     if status == STATUS_OK && !out_parcel.is_null() {
         let mut exc = 0i32;
         let _ = unsafe { (ndk.read_i32)(out_parcel, &mut exc) };
+        // 诊断: 回复头原始 hex (从 0 位置, 前 96 个 int32) 核对布局用
+        unsafe {
+            let _ = (ndk.set_data_position)(out_parcel, 0);
+        }
+        let head = p_hex_dump(&ndk, out_parcel, 96);
+        crate::act_dbg(&format!("getTasks status={} exc={} head={}", status, exc, head));
         if exc == 0 {
             if let Some(n) = p_i32(&ndk, out_parcel) {
                 if n > 0 {
