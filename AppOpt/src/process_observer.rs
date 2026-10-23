@@ -143,13 +143,15 @@ static TSL_CLASS: OnceLock<SendClass> = OnceLock::new();
 static TASK_SEND_FD: AtomicI32 = AtomicI32::new(-1);
 /// onTaskDescriptionChanged(0xc) 事件通道写端 (uid+pkg+comp → 主线程)
 static ACTL_SEND_FD: AtomicI32 = AtomicI32::new(-1);
-/// 当前前台"有 activity 规则的应用" uid (main 在 EV_TASK 时写; -1 = 无规则应用前台)。
-/// 0xc 回调用它做单一值比较过滤 (比 uid 集合哈希更省, 且后台规则应用事件也被滤掉)
-static ACT_FG_UID: AtomicI32 = AtomicI32::new(-1);
+/// 有 activity 规则的应用 uid 集合 (main 在 reload 时同步)。
+/// 用集合而非"当前前台单值"过滤: 单值依赖 EV_TASK 时序 (规则应用 0xc 可能先于
+/// EV_TASK/uid_map 就绪到达 → 被滤 → 失效), 集合与 uid_map 同批构建, 时序无关。
+static ACT_RULE_UIDS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<i32>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
-/// 设置当前前台规则应用 uid (main EV_TASK / reload / 断开时写)
-pub fn set_act_fg_uid(uid: i32) {
-    ACT_FG_UID.store(uid, Ordering::Release);
+/// 同步"有 activity 规则的应用 uid"集合 (0xc 早期过滤用)
+pub fn sync_act_rule_uids(uids: std::collections::HashSet<i32>) {
+    *ACT_RULE_UIDS.lock().unwrap() = uids;
 }
 
 /// 设置 0xc 事件通道写端 (main 创建 socketpair 后注入)
@@ -366,13 +368,10 @@ extern "C" fn tsl_on_transact(
                 }
             };
             let Some(euid) = euid else {
-                crate::act_dbg("0xc no-euid");
                 return STATUS_OK;
             };
-            let fg = ACT_FG_UID.load(Ordering::Acquire);
-            crate::act_dbg(&format!("0xc euid={} fg={} pass={}", euid, fg, euid > 0 && euid == fg));
-            if euid <= 0 || euid != fg {
-                return STATUS_OK;   /* 非前台规则应用: 零解析零投递 */
+            if euid <= 0 || !ACT_RULE_UIDS.lock().unwrap().contains(&euid) {
+                return STATUS_OK;   /* 非规则应用: 零解析零投递 */
             }
             /* 命中规则应用: 复位从头完整解析 (flag/id/userId/taskId 已在跳读时跳过) */
             if let (Some(sp), Some(s)) = (ndk.set_data_position, start) {
@@ -398,7 +397,6 @@ extern "C" fn tsl_on_transact(
             let _ra = p_component(&ndk, in_parcel);
             if let Some((pkg, comp)) = actl {
                 if !pkg.is_empty() && !comp.is_empty() {
-                    crate::act_dbg(&format!("0xc parse pkg={} comp={}", pkg, comp));
                     /* uid(i32 LE) + pkg\0 + comp\0 (SOCK_DGRAM 原子) */
                     let mut msg = Vec::with_capacity(8 + pkg.len() + comp.len());
                     msg.extend_from_slice(&euid.to_le_bytes());
@@ -412,11 +410,7 @@ extern "C" fn tsl_on_transact(
                             libc::send(fd, msg.as_ptr() as *const libc::c_void, msg.len(), libc::MSG_DONTWAIT)
                         };
                     }
-                } else {
-                    crate::act_dbg("0xc parse 空组件");
                 }
-            } else {
-                crate::act_dbg("0xc parse 失败 (组件 None)");
             }
             STATUS_OK
         }

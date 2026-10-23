@@ -456,7 +456,7 @@ impl AppState {
                 es.bpf.srv_enable(false);
                 // 断开把探针摘除 (srv_remove); 重置激活记录 → 下次前台回调重新下发
                 self.srv_enable_cur = false;
-                crate::process_observer::set_act_fg_uid(-1);
+                crate::process_observer::sync_act_rule_uids(std::collections::HashSet::new());
             }
             crate::web::KPM_ARMED.store(arm, std::sync::atomic::Ordering::Relaxed);
         }
@@ -583,16 +583,16 @@ impl AppState {
             );
         }
         apply_config(cpu_changed, self.cfg.as_deref(), &self.pkg_uid);
-        /* 配置可能改了 activity 规则: 重算前台规则 uid (0xc 过滤依据) */
-        let fg_act = match self.uid_map.get(&self.last_fg_uid) {
-            Some(e) if self
-                .cfg
-                .as_ref()
-                .is_some_and(|c| c.app_refresh_activity.contains_key(&e.pkg)) =>
-                self.last_fg_uid,
-            _ => -1,
-        };
-        crate::process_observer::set_act_fg_uid(fg_act);
+        /* 同步"有 activity 规则的应用 uid"集合 (0xc 回调早期过滤; 与 uid_map 同批构建) */
+        let mut act_uids = std::collections::HashSet::new();
+        if let Some(cfg) = self.cfg.as_ref() {
+            for (uid, e) in self.uid_map.iter() {
+                if cfg.app_refresh_activity.contains_key(&e.pkg) {
+                    act_uids.insert(*uid);
+                }
+            }
+        }
+        crate::process_observer::sync_act_rule_uids(act_uids);
     }
 
     /// packages.list 变化 (安装/卸载/替换) → 整表重建 cpu uid 表 + 刷新已安装应用缓存。
@@ -658,27 +658,10 @@ pub fn rfr_hit_list() -> Vec<(i32, String)> {
 /// RFR_MON 登记重试去重: cgroup 晚于 task event 时在跑重试的 uid 集合 (同 uid 只一个重试线程)
 static RFR_RETRYING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<i32>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-/// 0xc 通道 50ms 防抖 (同 (pkg,comp) 去重)
+/// 0xc 通道 100ms 防抖 (同 (pkg,comp) 去重)
 static ACTL_DB: std::sync::LazyLock<std::sync::Mutex<Option<(std::time::Instant, String, String)>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
-/// activity 链路调试日志 (临时诊断: 0xc → ACTL → refresh 全链)
-pub fn act_dbg(msg: &str) {
-    use std::io::Write;
-    if let Ok(md) = std::fs::metadata("/data/local/tmp/appopt_act_dbg.txt") {
-        if md.len() > 1024 * 1024 {
-            return;
-        }
-    }
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/data/local/tmp/appopt_act_dbg.txt")
-    {
-        let _ = f.write_all(msg.as_bytes());
-        let _ = f.write_all(b"\n");
-    }
-}
 /// RFR_MON 登记重试参数 (只需主 pid: 10×200ms = 2s, 与 CPU 收集窗口一致)
 const RFR_MON_RETRY_MS: u64 = 200;
 const RFR_MON_RETRY_TIMES: u32 = 10;
@@ -1088,19 +1071,6 @@ fn main() {
                         };
                         if n == 4 {
                             state.last_fg_uid = uid;   /* 前台 uid (原 on_fg 维护; 现 task event) */
-                            /* 0xc 过滤: 当前前台若是规则应用 → uid, 否则 -1 */
-                            let fg_act = match state.uid_map.get(&uid) {
-                                Some(e)
-                                    if state
-                                        .cfg
-                                        .as_ref()
-                                        .is_some_and(|c| c.app_refresh_activity.contains_key(&e.pkg)) =>
-                                {
-                                    uid
-                                }
-                                _ => -1,
-                            };
-                            crate::process_observer::set_act_fg_uid(fg_act);
                             // activity 检测由 ITaskStackListener.onTaskDescriptionChanged(0xc)
                             // 直连驱动 (EV_ACTL), 不再涉及内核开关
                             // ---- CPU: 冷启动 (表无该 uid) → 收集窗口; 热 → 跳过 ----
@@ -1241,22 +1211,25 @@ fn main() {
                                         if p1 > 0 {
                                             let comp =
                                                 String::from_utf8_lossy(&rest2[..p1]).into_owned();
-                                            /* 50ms 防抖: 同 (pkg,comp) 去重, 换页面立即放行;
-                                             * 规则判定已由回调内 uid 集合 + apply_activity 兜底,
-                                             * 这里不再查 cfg */
+                                            /* 前台归属: 只处理"当前前台 uid 的包" (last_fg_uid 由
+                                             * EV_TASK 维护; 后台规则应用的 0xc 不应用, 防误切前台刷新率) */
+                                            let fg_pkg = state
+                                                .uid_map
+                                                .get(&state.last_fg_uid)
+                                                .map(|e| e.pkg.as_str());
+                                            if fg_pkg != Some(pkg.as_str()) {
+                                                continue;
+                                            }
+                                            /* 100ms 防抖: 同 (pkg,comp) 去重, 换页面立即放行 */
                                             let mut db = ACTL_DB.lock().unwrap();
                                             let now = std::time::Instant::now();
                                             let dup = db
                                                 .as_ref()
                                                 .is_some_and(|(t, p, c)| {
-                                                    now.duration_since(*t).as_millis() < 50
+                                                    now.duration_since(*t).as_millis() < 100
                                                         && *p == pkg
                                                         && *c == comp
                                                 });
-                                            crate::act_dbg(&format!(
-                                                "ACTL pkg={} comp={} dup={}",
-                                                pkg, comp, dup
-                                            ));
                                             if !dup {
                                                 *db = Some((now, pkg.clone(), comp.clone()));
                                                 drop(db);
