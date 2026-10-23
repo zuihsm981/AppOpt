@@ -47,8 +47,10 @@ struct BinderNdk {
     write_binder: FnWriteBinder,
     write_int32: FnWriteI32,
     read_i32: FnReadI32,
-    data_position: FnGetDataPos,
-    set_data_position: FnSetDataPos,
+    /* getTasks 回复手动 string16 解析的游标辅助 (可选; 失败仅影响 get_top_activity,
+     * 绝不拖垮 ndk() 核心 —— ITaskStackListener / SF_BINDER 不依赖这两个符号) */
+    data_position: Option<FnGetDataPos>,
+    set_data_position: Option<FnSetDataPos>,
     join_thread_pool: FnJoinThreadPool,
     start_thread_pool: FnStartThreadPool,
     associate_class: FnAssociateClass,
@@ -76,7 +78,7 @@ fn ndk() -> Option<&'static BinderNdk> {
         let p_write_binder = sym("AParcel_writeStrongBinder");
         let p_write_i32 = sym("AParcel_writeInt32");
         let p_read_i32 = sym("AParcel_readInt32");
-        let p_get_data_pos = sym("AParcel_dataPosition");
+        let p_get_data_pos = sym("AParcel_getDataPosition");
         let p_set_data_pos = sym("AParcel_setDataPosition");
         let p_join = sym("ABinderProcess_joinThreadPool");
         let p_start = sym("ABinderProcess_startThreadPool");
@@ -85,9 +87,19 @@ fn ndk() -> Option<&'static BinderNdk> {
             || p_prepare_tx.is_null() || p_transact.is_null() || p_parcel_delete.is_null()
             || p_write_binder.is_null() || p_write_i32.is_null()
             || p_read_i32.is_null()
-            || p_get_data_pos.is_null() || p_set_data_pos.is_null()
             || p_join.is_null() || p_start.is_null() || p_associate.is_null()
         { return None; }
+        /* 游标辅助为可选: dlsym 失败 → getTasks 解析不可用, 不影响核心 binder 功能 */
+        let data_position = if p_get_data_pos.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute::<*mut c_void, FnGetDataPos>(p_get_data_pos))
+        };
+        let set_data_position = if p_set_data_pos.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute::<*mut c_void, FnSetDataPos>(p_set_data_pos))
+        };
         
         Some(BinderNdk {
             get_service: std::mem::transmute(p_get_service),
@@ -99,8 +111,8 @@ fn ndk() -> Option<&'static BinderNdk> {
             write_binder: std::mem::transmute(p_write_binder),
             write_int32: std::mem::transmute(p_write_i32),
             read_i32: std::mem::transmute(p_read_i32),
-            data_position: std::mem::transmute(p_get_data_pos),
-            set_data_position: std::mem::transmute(p_set_data_pos),
+            data_position,
+            set_data_position,
             join_thread_pool: std::mem::transmute(p_join),
             start_thread_pool: std::mem::transmute(p_start),
             associate_class: std::mem::transmute(p_associate),
@@ -360,7 +372,10 @@ fn p_i32(ndk: &BinderNdk, p: *mut c_void) -> Option<i32> {
 /// 上内部间接调用会跳到非执行区崩溃)。宽容解析: 结果乱/None 时只是本次查询失败。
 #[inline]
 fn p_str(ndk: &BinderNdk, p: *mut c_void) -> Option<String> {
-    let start = unsafe { (ndk.data_position)(p) };
+    let Some(dp) = ndk.data_position else {
+        return None;
+    };
+    let start = unsafe { dp(p) };
     if start < 0 {
         return None;
     }
@@ -382,14 +397,19 @@ fn p_str(ndk: &BinderNdk, p: *mut c_void) -> Option<String> {
     }
     let s = String::from_utf16_lossy(&units);
     // 游标精确对齐字段尾 (start + 4 + n*2), 校正奇数字数时多读的 2 字节
-    unsafe {
-        let _ = (ndk.set_data_position)(p, start + 4 + n * 2);
+    if let Some(sp) = ndk.set_data_position {
+        unsafe {
+            let _ = sp(p, start + 4 + n * 2);
+        }
     }
     Some(s)
 }
 
 fn p_hex_dump(ndk: &BinderNdk, p: *mut c_void, max_words: usize) -> String {
-    let start = unsafe { (ndk.data_position)(p) };
+    let Some(dp) = ndk.data_position else {
+        return String::new();
+    };
+    let start = unsafe { dp(p) };
     if start < 0 {
         return String::new();
     }
@@ -405,8 +425,10 @@ fn p_hex_dump(ndk: &BinderNdk, p: *mut c_void, max_words: usize) -> String {
             b[0], b[1], b[2], b[3]
         ));
     }
-    unsafe {
-        let _ = (ndk.set_data_position)(p, start);
+    if let Some(sp) = ndk.set_data_position {
+        unsafe {
+            let _ = sp(p, start);
+        }
     }
     out
 }
@@ -518,8 +540,10 @@ pub fn get_top_activity() -> Option<(String, String)> {
         let mut exc = 0i32;
         let _ = unsafe { (ndk.read_i32)(out_parcel, &mut exc) };
         // 诊断: 回复头原始 hex (从 0 位置, 前 96 个 int32) 核对布局用
-        unsafe {
-            let _ = (ndk.set_data_position)(out_parcel, 0);
+        if let Some(sp) = ndk.set_data_position {
+            unsafe {
+                let _ = sp(out_parcel, 0);
+            }
         }
         let head = p_hex_dump(&ndk, out_parcel, 96);
         crate::act_dbg(&format!("getTasks status={} exc={} head={}", status, exc, head));
