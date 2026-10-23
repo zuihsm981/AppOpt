@@ -422,19 +422,6 @@ impl AppState {
         }
     }
 
-    /// 同步"有 activity 规则的应用 uid"集合 (0xc 回调早期过滤用)
-    fn sync_act_rule_uids(&self) {
-        let mut uids = std::collections::HashSet::new();
-        if let Some(cfg) = self.cfg.as_ref() {
-            for (uid, e) in self.uid_map.iter() {
-                if cfg.app_refresh_activity.contains_key(&e.pkg) {
-                    uids.insert(*uid);
-                }
-            }
-        }
-        crate::process_observer::sync_act_rule_uids(uids);
-    }
-
     /// 配置重载 (EV_INOTIFY / EV_CONFIG 共用): 重载配置 → 应用到当前模式 →
     /// 仅"规则应用集合"变更时重建 uid 表 (调整数值不重建)
     /// KPM 武装/解除 (拦截页连接/断开): start=武装全功能, stop=解除;
@@ -469,6 +456,7 @@ impl AppState {
                 es.bpf.srv_enable(false);
                 // 断开把探针摘除 (srv_remove); 重置激活记录 → 下次前台回调重新下发
                 self.srv_enable_cur = false;
+                crate::process_observer::set_act_fg_uid(-1);
             }
             crate::web::KPM_ARMED.store(arm, std::sync::atomic::Ordering::Relaxed);
         }
@@ -595,7 +583,16 @@ impl AppState {
             );
         }
         apply_config(cpu_changed, self.cfg.as_deref(), &self.pkg_uid);
-        self.sync_act_rule_uids();
+        /* 配置可能改了 activity 规则: 重算前台规则 uid (0xc 过滤依据) */
+        let fg_act = match self.uid_map.get(&self.last_fg_uid) {
+            Some(e) if self
+                .cfg
+                .as_ref()
+                .is_some_and(|c| c.app_refresh_activity.contains_key(&e.pkg)) =>
+                self.last_fg_uid,
+            _ => -1,
+        };
+        crate::process_observer::set_act_fg_uid(fg_act);
     }
 
     /// packages.list 变化 (安装/卸载/替换) → 整表重建 cpu uid 表 + 刷新已安装应用缓存。
@@ -1073,6 +1070,19 @@ fn main() {
                         };
                         if n == 4 {
                             state.last_fg_uid = uid;   /* 前台 uid (原 on_fg 维护; 现 task event) */
+                            /* 0xc 过滤: 当前前台若是规则应用 → uid, 否则 -1 */
+                            let fg_act = match state.uid_map.get(&uid) {
+                                Some(e)
+                                    if state
+                                        .cfg
+                                        .as_ref()
+                                        .is_some_and(|c| c.app_refresh_activity.contains_key(&e.pkg)) =>
+                                {
+                                    uid
+                                }
+                                _ => -1,
+                            };
+                            crate::process_observer::set_act_fg_uid(fg_act);
                             // activity 检测由 ITaskStackListener.onTaskDescriptionChanged(0xc)
                             // 直连驱动 (EV_ACTL), 不再涉及内核开关
                             // ---- CPU: 冷启动 (表无该 uid) → 收集窗口; 热 → 跳过 ----

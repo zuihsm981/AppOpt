@@ -143,14 +143,13 @@ static TSL_CLASS: OnceLock<SendClass> = OnceLock::new();
 static TASK_SEND_FD: AtomicI32 = AtomicI32::new(-1);
 /// onTaskDescriptionChanged(0xc) 事件通道写端 (uid+pkg+comp → 主线程)
 static ACTL_SEND_FD: AtomicI32 = AtomicI32::new(-1);
-/// 有 activity 规则的应用 uid 集合: 0xc 回调早期过滤 (先于 Intent/Component 解析与投递),
-/// 由 main 在 reload/连接时同步; 空集合 = 无规则应用 → 0xc 全忽略
-static ACT_RULE_UIDS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<i32>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+/// 当前前台"有 activity 规则的应用" uid (main 在 EV_TASK 时写; -1 = 无规则应用前台)。
+/// 0xc 回调用它做单一值比较过滤 (比 uid 集合哈希更省, 且后台规则应用事件也被滤掉)
+static ACT_FG_UID: AtomicI32 = AtomicI32::new(-1);
 
-/// 同步"有 activity 规则的应用 uid"集合 (0xc 早期过滤用)
-pub fn sync_act_rule_uids(uids: std::collections::HashSet<i32>) {
-    *ACT_RULE_UIDS.lock().unwrap() = uids;
+/// 设置当前前台规则应用 uid (main EV_TASK / reload / 断开时写)
+pub fn set_act_fg_uid(uid: i32) {
+    ACT_FG_UID.store(uid, Ordering::Release);
 }
 
 /// 设置 0xc 事件通道写端 (main 创建 socketpair 后注入)
@@ -367,8 +366,8 @@ extern "C" fn tsl_on_transact(
                 }
             };
             let Some(euid) = euid else { return STATUS_OK };
-            if euid <= 0 || !ACT_RULE_UIDS.lock().unwrap().contains(&euid) {
-                return STATUS_OK;   /* 非规则应用: 零解析零投递 */
+            if euid <= 0 || euid != ACT_FG_UID.load(Ordering::Acquire) {
+                return STATUS_OK;   /* 非前台规则应用: 零解析零投递 */
             }
             /* 命中规则应用: 复位从头完整解析 (flag/id/userId/taskId 已在跳读时跳过) */
             if let (Some(sp), Some(s)) = (ndk.set_data_position, start) {
