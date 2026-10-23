@@ -51,6 +51,7 @@ struct BinderNdk {
      * 绝不拖垮 ndk() 核心 —— ITaskStackListener / SF_BINDER 不依赖这两个符号) */
     data_position: Option<FnGetDataPos>,
     set_data_position: Option<FnSetDataPos>,
+    data_size: Option<FnGetDataPos>,
     join_thread_pool: FnJoinThreadPool,
     start_thread_pool: FnStartThreadPool,
     associate_class: FnAssociateClass,
@@ -80,6 +81,7 @@ fn ndk() -> Option<&'static BinderNdk> {
         let p_read_i32 = sym("AParcel_readInt32");
         let p_get_data_pos = sym("AParcel_getDataPosition");
         let p_set_data_pos = sym("AParcel_setDataPosition");
+        let p_get_data_size = sym("AParcel_getDataSize");
         let p_join = sym("ABinderProcess_joinThreadPool");
         let p_start = sym("ABinderProcess_startThreadPool");
         let p_associate = sym("AIBinder_associateClass");
@@ -100,7 +102,12 @@ fn ndk() -> Option<&'static BinderNdk> {
         } else {
             Some(std::mem::transmute::<*mut c_void, FnSetDataPos>(p_set_data_pos))
         };
-        
+        let data_size = if p_get_data_size.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute::<*mut c_void, FnGetDataPos>(p_get_data_size))
+        };
+
         Some(BinderNdk {
             get_service: std::mem::transmute(p_get_service),
             class_define: std::mem::transmute(p_class_define),
@@ -113,6 +120,7 @@ fn ndk() -> Option<&'static BinderNdk> {
             read_i32: std::mem::transmute(p_read_i32),
             data_position,
             set_data_position,
+            data_size,
             join_thread_pool: std::mem::transmute(p_join),
             start_thread_pool: std::mem::transmute(p_start),
             associate_class: std::mem::transmute(p_associate),
@@ -366,43 +374,185 @@ fn p_i32(ndk: &BinderNdk, p: *mut c_void) -> Option<i32> {
     unsafe { (ndk.read_i32)(p, &mut v) == 0 }.then_some(v)
 }
 
-/// 读 parcel 字符串 (utf8, parcel 内指针; null → None)
-/// 读 parcel 字符串 (Java writeString → string16: int32 单元数(含结尾 NUL) + UTF-16LE; -1=null)。
-/// 纯 read_int32 + dataPosition 实现, 不调用 AParcel_readString (该符号在部分 ROM
-/// 上内部间接调用会跳到非执行区崩溃)。宽容解析: 结果乱/None 时只是本次查询失败。
-#[inline]
-fn p_str(ndk: &BinderNdk, p: *mut c_void) -> Option<String> {
-    let Some(dp) = ndk.data_position else {
-        return None;
-    };
-    let start = unsafe { dp(p) };
+/// 读 parcel 字符串 (utf8=false → string16; utf8=true → string8)。
+/// Android 16: Intent 的 action/type/identifier/package/categories 用 writeString8 (字节数)，
+/// ComponentName 仍用 writeString (UTF-16 单元数)。两种都是 int32 长度 + 数据 + 补齐到 4 字节，
+/// 长度 -1 = null。纯 read_int32 + dataPosition 实现 (不调用 AParcel_readString — 该符号在
+/// 部分 ROM 内部间接调用会跳到非执行区崩溃)。
+fn p_strx(ndk: &BinderNdk, p: *mut c_void, utf8: bool) -> Option<String> {
+    let start = unsafe { (ndk.data_position?)(p) };
     if start < 0 {
         return None;
     }
-    let n = p_i32(ndk, p)?; // UTF-16 单元数 (含结尾 '\0'); -1 = null
-    if n <= 0 || n > 4096 {
+    let n = p_i32(ndk, p)?;            // -1 = null
+    if n < 0 {
+        return Some(String::new());
+    }
+    let n = n as usize;
+    let width = if utf8 { n + 1 } else { 2 * n + 2 };   // 含结尾 NUL
+    if width > 65536 {
         return None;
     }
-    // 数据区 n*2 字节; 每 4 字节 (一个 int32) 含两个 UTF-16 单元 (LE: 低16=首单元)
-    let words = (n as usize + 1) / 2;
-    let mut units: Vec<u16> = Vec::with_capacity(n as usize);
+    let words = (width + 3) / 4;
+    let mut raw: Vec<u8> = Vec::with_capacity(words * 4);
     for _ in 0..words {
-        let w = p_i32(ndk, p)? as u32;
-        units.push((w & 0xffff) as u16);
-        units.push(((w >> 16) & 0xffff) as u16);
+        raw.extend_from_slice(&(p_i32(ndk, p)? as u32).to_le_bytes());
     }
-    units.truncate(n as usize);
-    if units.last() == Some(&0) {
-        units.pop(); // 去掉结尾 NUL 单元
-    }
-    let s = String::from_utf16_lossy(&units);
-    // 游标精确对齐字段尾 (start + 4 + n*2), 校正奇数字数时多读的 2 字节
+    let s = if utf8 {
+        String::from_utf8_lossy(&raw[..n]).into_owned()
+    } else {
+        let units: Vec<u16> = (0..n)
+            .map(|i| u16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]))
+            .collect();
+        String::from_utf16_lossy(&units)
+    };
+    let end = start + 4 + (((width as i32) + 3) & !3);
     if let Some(sp) = ndk.set_data_position {
         unsafe {
-            let _ = sp(p, start + 4 + n * 2);
+            let _ = sp(p, end);
         }
     }
     Some(s)
+}
+
+#[inline]
+fn p_str8(ndk: &BinderNdk, p: *mut c_void) -> Option<String> {
+    p_strx(ndk, p, true)
+}
+
+#[inline]
+fn p_str16(ndk: &BinderNdk, p: *mut c_void) -> Option<String> {
+    p_strx(ndk, p, false)
+}
+
+/// ComponentName.writeToParcel: null → 单个 int32 -1; 否则两个 string16 (pkg, cls)
+fn p_component(ndk: &BinderNdk, p: *mut c_void) -> Option<(String, String)> {
+    let start = unsafe { (ndk.data_position?)(p) };
+    if start < 0 || p_i32(ndk, p)? < 0 {
+        return None;
+    }
+    if let Some(sp) = ndk.set_data_position {
+        unsafe {
+            let _ = sp(p, start);
+        }
+    }
+    let pkg = p_str16(ndk, p)?;
+    let cls = p_str16(ndk, p)?;
+    if pkg.is_empty() || cls.is_empty() {
+        return None;
+    }
+    Some((pkg, cls))
+}
+
+/// 宽容跳过 Intent (lineage-23.2 Intent.writeToParcel 字段序; 读错无害 — 只影响本次结果)
+fn p_skip_intent(ndk: &BinderNdk, p: *mut c_void) {
+    let _ = p_str8(ndk, p);            // mAction
+    if let Some(t) = p_i32(ndk, p) {   // mData: Uri (0=null, 其余 TYPE_ID + string8)
+        if t != 0 {
+            let _ = p_str8(ndk, p);
+        }
+    }
+    let _ = p_str8(ndk, p);            // mType
+    let _ = p_str8(ndk, p);            // mIdentifier
+    let _ = p_i32(ndk, p);             // mFlags
+    let _ = p_i32(ndk, p);             // mExtendedFlags
+    let _ = p_str8(ndk, p);            // mPackage
+    let _ = p_component(ndk, p);       // mComponent
+    if p_i32(ndk, p) == Some(1) {      // mSourceBounds (Rect: 4 个 int32)
+        for _ in 0..4 {
+            let _ = p_i32(ndk, p);
+        }
+    }
+    if let Some(n) = p_i32(ndk, p) {   // mCategories
+        for _ in 0..n.max(0) {
+            let _ = p_str8(ndk, p);
+        }
+    }
+    let _ = p_i32(ndk, p);             // mSelector (null)
+    let _ = p_i32(ndk, p);             // mClipData (null)
+    let _ = p_i32(ndk, p);             // mContentUserHint
+    let pos = ndk.data_position.map(|dp| unsafe { dp(p) });
+    if let Some(l) = p_i32(ndk, p) {   // mExtras (writeBundle: <=0 → 只占 4 字节)
+        if l > 0 {
+            if let (Some(sp), Some(pos)) = (ndk.set_data_position, pos) {
+                unsafe {
+                    let _ = sp(p, pos + 12 + l);   // 长度 + magic + 数据 + hasIntent
+                }
+            }
+        }
+    }
+    let _ = p_i32(ndk, p);             // mOriginalIntent (null; 非 null 罕见 → 后续读乱即失败)
+    if p_i32(ndk, p) == Some(1) {      // mCreatorTokenInfo (preventIntentRedirect)
+        let _ = p_i32(ndk, p);         // strong binder
+        if let Some(n) = p_i32(ndk, p) {
+            for _ in 0..n.max(0) {
+                let _ = p_i32(ndk, p);     // key.mType
+                let _ = p_str8(ndk, p);    // key.mKey
+                let _ = p_i32(ndk, p);     // key.mIndex
+            }
+        }
+    }
+}
+
+/// 名字字段合法 (包名/类名形态), 用于扫描校验
+fn p_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 200
+        && s.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'.' || c == b'_' || c == b'$')
+}
+
+/// 兜底: baseIntent 布局意外 (extras/selector 等任意数据) 时, 按 4 字节步进扫描
+/// 连续两个同包 ComponentName (= baseActivity, topActivity), 取第二个
+fn p_scan_component(ndk: &BinderNdk, p: *mut c_void, from: i32, size: i32) -> Option<(String, String)> {
+    let sp = ndk.set_data_position?;
+    let mut pos = from & !3;
+    while pos + 16 <= size {
+        unsafe {
+            let _ = sp(p, pos);
+        }
+        if let Some(a) = p_component(ndk, p) {
+            if let Some(b) = p_component(ndk, p) {
+                if a.0 == b.0 && p_ident(&a.0) && p_ident(&b.1) && b.1.contains('.') {
+                    return Some(b);
+                }
+            }
+        }
+        pos += 4;
+    }
+    None
+}
+
+/// 解析回复中第一个 RunningTaskInfo 的 topActivity (ComponentName → pkg, cls)
+fn p_parse_top(ndk: &BinderNdk, p: *mut c_void) -> Option<(String, String)> {
+    // readTypedObject 元素 null 标志 (1=有对象)
+    let f = p_i32(ndk, p);
+    if f != Some(1) {
+        crate::act_dbg(&format!("p_parse_top: elem flag={:?}", f));
+        return None;
+    }
+    let id = p_i32(ndk, p);            // RunningTaskInfo.id
+    let mut t5 = [None; 5];
+    for t in t5.iter_mut() {
+        *t = p_i32(ndk, p);            // userId/taskId/effectiveUid/displayId/isRunning
+    }
+    let bi = p_i32(ndk, p);            // baseIntent 标志 (1=有)
+    if bi == Some(1) {
+        p_skip_intent(ndk, p);
+    }
+    // 4 连 ComponentName: baseActivity / topActivity / origActivity / realActivity
+    let ba = p_component(ndk, p);
+    let ta = p_component(ndk, p);
+    let oa = p_component(ndk, p);
+    let ra = p_component(ndk, p);
+    let num = p_i32(ndk, p);           // numActivities
+    let last = p_i32(ndk, p);          // lastActiveTime (long)
+    let last_hi = p_i32(ndk, p);
+    crate::act_dbg(&format!(
+        "p_parse_top f={:?} id={:?} t5={:?} bi={:?} ba={:?} ta={:?} oa={:?} ra={:?} num={:?} last={:?}:{:?}",
+        f, id, t5, bi, ba, ta, oa, ra, num, last_hi, last
+    ));
+    ta.or(ra).or(oa).or(ba)
 }
 
 fn p_hex_dump(ndk: &BinderNdk, p: *mut c_void, max_words: usize) -> String {
@@ -431,72 +581,6 @@ fn p_hex_dump(ndk: &BinderNdk, p: *mut c_void, max_words: usize) -> String {
         }
     }
     out
-}
-
-/// 宽容跳过 Intent (AOSP Intent.writeToParcel 字段序; 读错无害 — 只影响本次结果)
-fn p_skip_intent(ndk: &BinderNdk, p: *mut c_void) {
-    let _ = p_str(ndk, p);            // mAction
-    if let Some(d) = p_i32(ndk, p) {  // mData 标志 (1=有)
-        if d != 0 {
-            let _ = p_str(ndk, p);   // scheme
-            let _ = p_str(ndk, p);   // ssp
-            let _ = p_str(ndk, p);   // fragment
-            if let Some(au) = p_i32(ndk, p) {
-                if au != 0 {
-                    let _ = p_str(ndk, p);
-                    let _ = p_str(ndk, p);
-                    let _ = p_str(ndk, p);
-                }
-            }
-        }
-    }
-    let _ = p_str(ndk, p);            // mType
-    let _ = p_str(ndk, p);            // mIdentifier
-    let _ = p_str(ndk, p);            // mPackage
-    if let Some(c) = p_i32(ndk, p) {  // mComponent 标志
-        if c != 0 {
-            let _ = p_str(ndk, p);
-            let _ = p_str(ndk, p);
-        }
-    }
-}
-
-/// 解析回复中第一个 RunningTaskInfo 的 topActivity (ComponentName → pkg, cls)
-fn p_parse_top(ndk: &BinderNdk, p: *mut c_void) -> Option<(String, String)> {
-    // readTypedObject 元素 null 标志 (1=有对象)
-    let f = p_i32(ndk, p);
-    if f != Some(1) {
-        crate::act_dbg(&format!("p_parse_top: elem flag={:?}", f));
-        return None;
-    }
-    let id = p_i32(ndk, p);            // RunningTaskInfo.id
-    let mut t5 = [None; 5];
-    for t in t5.iter_mut() {
-        *t = p_i32(ndk, p);            // userId/taskId/effectiveUid/displayId/isRunning
-    }
-    let bi = p_i32(ndk, p);            // baseIntent 标志 (1=有)
-    if bi == Some(1) {
-        p_skip_intent(ndk, p);
-    }
-    let ba = p_i32(ndk, p);            // baseActivity 标志
-    if ba == Some(1) {
-        let _ = p_str(ndk, p);
-        let _ = p_str(ndk, p);
-    }
-    let ta = p_i32(ndk, p);            // topActivity 标志
-    crate::act_dbg(&format!(
-        "p_parse_top f={:?} id={:?} t5={:?} bi={:?} ba={:?} ta={:?}",
-        f, id, t5, bi, ba, ta
-    ));
-    if ta != Some(1) {
-        return None;
-    }
-    let pkg = p_str(ndk, p)?;
-    let cls = p_str(ndk, p)?;
-    if pkg.is_empty() || cls.is_empty() {
-        return None;
-    }
-    Some((pkg, cls))
 }
 
 /// 当前前台 task 的 topActivity 完整类名 (binder 直连 activity_task getTasks=0x19)
@@ -548,9 +632,25 @@ pub fn get_top_activity() -> Option<(String, String)> {
         let head = p_hex_dump(&ndk, out_parcel, 96);
         crate::act_dbg(&format!("getTasks status={} exc={} head={}", status, exc, head));
         if exc == 0 {
+            // 回复体: [0]=exception/status, [1]=列表长度, [2]=元素非 null 标志 ...
+            if let Some(sp) = ndk.set_data_position {
+                unsafe {
+                    let _ = sp(out_parcel, 4);
+                }
+            }
+            let start = ndk.data_position.map(|dp| unsafe { dp(out_parcel) }).unwrap_or(-1);
+            let size = ndk.data_size.map(|ds| unsafe { ds(out_parcel) }).unwrap_or(0);
             if let Some(n) = p_i32(&ndk, out_parcel) {
                 if n > 0 {
-                    r = p_parse_top(&ndk, out_parcel);
+                    r = p_parse_top(&ndk, out_parcel).or_else(|| {
+                        if start < 0 {
+                            return None;
+                        }
+                        let bound = if size > start { size } else { start + 65536 };
+                        p_scan_component(&ndk, out_parcel, start, bound)
+                    });
+                } else {
+                    crate::act_dbg(&format!("getTasks 列表长度={}", n));
                 }
             }
         }
