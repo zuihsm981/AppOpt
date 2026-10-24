@@ -304,9 +304,9 @@ fn resolve_apply(state: &mut RefreshState, uid: i32, pkg: &str, comp: Option<&st
         }
     }
 
-    /* ② 该 uid 有缓存且包有 activity 规则 → 保持上次的刷新率
-     * (包级事件/配置热更/切回应用 都不得覆盖 activity 恒值) */
-    if state.app_activity.contains_key(pkg) {
+    /* ② 只有"没有 activity 信息"的事件 (FgPkg / 配置热更) 才用缓存保持上次刷新率;
+     * 明确带着 activity 但没命中时必须走 ③ 回落包级 (否则返回无规则页面不回 90) */
+    if comp.is_none() && state.app_activity.contains_key(pkg) {
         if let Some(&mode) = state.act_last.get(&uid) {
             state.effective.timeout = timeout_for_pkg(state);
             state.effective.active = mode;
