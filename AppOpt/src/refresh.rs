@@ -171,11 +171,10 @@ struct RefreshState {
     app_configs: HashMap<String, AppRefreshConfig>,
     /// activity 级恒值映射: pkg -> (activity完整类名 -> 刷新率模式码); 命中即恒值无回落
     app_activity: HashMap<String, HashMap<String, i32>>,
-    /// act 规则缓存 (合并原 cur_act 与 mode 缓存): uid → (pkg, activity, 刷新率模式码)。
-    /// 语义: "该 uid 上一次已应用的 activity 与刷新率"。
+    /// act 规则缓存: uid → 该 uid 上一次已应用的刷新率模式码 (无 activity 记录)。
     ///  · act 命中 → 写入; 该 uid 回落包级 → 删除; 应用退出 → 删除
-    ///  · 包级 apply / 回到前台时, 同 uid+pkg 命中 → 保持 activity 恒值 (不被覆盖)
-    act_last: std::collections::HashMap<i32, (String, String, i32)>,
+    ///  · 包级事件/配置热更/回到前台: 同 uid 有缓存且包有 activity 规则 → 保持该值
+    act_last: std::collections::HashMap<i32, i32>,
     /// 当前前台 uid (与 current_package 配对; 配置热更时用于恢复 activity 恒值)
     current_uid: i32,
     /// 当前生效配置 (全局默认, 或被应用级配置覆盖)
@@ -298,22 +297,24 @@ fn resolve_apply(state: &mut RefreshState, uid: i32, pkg: &str, comp: Option<&st
                 state.effective.timeout = timeout_for_pkg(state);
                 state.effective.active = v;
                 state.effective.idle = v;
-                state.act_last.insert(uid, (pkg.to_string(), c.to_string(), v));
+                state.act_last.insert(uid, v);
                 finish_apply(state);
                 return;
             }
         }
     }
 
-    /* ② 【测试已移除: act_last 保持恒值】
-     * 原逻辑: 该 uid 上次 activity 同包 → 保持恒值 (防包级事件/配置热更覆盖)
-     * 恢复时把下面这段放回此处:
-     *   if state.app_activity.contains_key(pkg) {
-     *       if let Some((cpkg, _cc, mode)) = state.act_last.get(&uid) {
-     *           if cpkg == pkg { ...按 mode 应用 + finish_apply; return }
-     *       }
-     *   }
-     */
+    /* ② 该 uid 有缓存且包有 activity 规则 → 保持上次的刷新率
+     * (包级事件/配置热更/切回应用 都不得覆盖 activity 恒值) */
+    if state.app_activity.contains_key(pkg) {
+        if let Some(&mode) = state.act_last.get(&uid) {
+            state.effective.timeout = timeout_for_pkg(state);
+            state.effective.active = mode;
+            state.effective.idle = mode;
+            finish_apply(state);
+            return;
+        }
+    }
 
     /* ③ 回落包级/全局 */
     if let Some(c) = comp {
