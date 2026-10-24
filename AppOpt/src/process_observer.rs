@@ -153,6 +153,9 @@ static ACT_RULE_UIDS: std::sync::LazyLock<std::sync::Mutex<std::collections::Has
 pub fn sync_act_rule_uids(uids: std::collections::HashSet<i32>) {
     *ACT_RULE_UIDS.lock().unwrap() = uids;
 }
+/// 回调侧 100ms 同 uid 合并: 重复事件 (同一应用连发) 跳过完整解析/投递
+static ACTL_COALESCE: std::sync::LazyLock<std::sync::Mutex<Option<(std::time::Instant, i32)>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
 /// 设置 0xc 事件通道写端 (main 创建 socketpair 后注入)
 pub fn set_actl_fd(fd: i32) {
@@ -373,6 +376,17 @@ extern "C" fn tsl_on_transact(
             if euid <= 0 || !ACT_RULE_UIDS.lock().unwrap().contains(&euid) {
                 return STATUS_OK;   /* 非规则应用: 零解析零投递 */
             }
+            /* 100ms 同 uid 合并: 重复事件直接返回, 不解析不投递 */
+            {
+                let now = std::time::Instant::now();
+                let mut cc = ACTL_COALESCE.lock().unwrap();
+                if let Some((t, u)) = cc.as_ref() {
+                    if now.duration_since(*t).as_millis() < 100 && *u == euid {
+                        return STATUS_OK;
+                    }
+                }
+                *cc = Some((now, euid));
+            }
             /* 命中规则应用: 复位从头完整解析 (flag/id/userId/taskId 已在跳读时跳过) */
             if let (Some(sp), Some(s)) = (ndk.set_data_position, start) {
                 unsafe {
@@ -397,18 +411,26 @@ extern "C" fn tsl_on_transact(
             let _ra = p_component(&ndk, in_parcel);
             if let Some((pkg, comp)) = actl {
                 if !pkg.is_empty() && !comp.is_empty() {
-                    /* uid(i32 LE) + pkg\0 + comp\0 (SOCK_DGRAM 原子) */
-                    let mut msg = Vec::with_capacity(8 + pkg.len() + comp.len());
-                    msg.extend_from_slice(&euid.to_le_bytes());
-                    msg.extend_from_slice(pkg.as_bytes());
-                    msg.push(0);
-                    msg.extend_from_slice(comp.as_bytes());
-                    msg.push(0);
-                    let fd = ACTL_SEND_FD.load(Ordering::Acquire);
-                    if fd >= 0 {
-                        let _ = unsafe {
-                            libc::send(fd, msg.as_ptr() as *const libc::c_void, msg.len(), libc::MSG_DONTWAIT)
-                        };
+                    /* uid(i32 LE) + pkg\0 + comp\0 (SOCK_DGRAM 原子); 栈缓冲免分配 */
+                    let mut msg = [0u8; 512];
+                    let total = 4 + pkg.len() + 1 + comp.len() + 1;
+                    if total <= msg.len() {
+                        msg[..4].copy_from_slice(&euid.to_le_bytes());
+                        let mut off = 4;
+                        msg[off..off + pkg.len()].copy_from_slice(pkg.as_bytes());
+                        off += pkg.len();
+                        msg[off] = 0;
+                        off += 1;
+                        msg[off..off + comp.len()].copy_from_slice(comp.as_bytes());
+                        off += comp.len();
+                        msg[off] = 0;
+                        off += 1;
+                        let fd = ACTL_SEND_FD.load(Ordering::Acquire);
+                        if fd >= 0 {
+                            let _ = unsafe {
+                                libc::send(fd, msg.as_ptr() as *const libc::c_void, off, libc::MSG_DONTWAIT)
+                            };
+                        }
                     }
                 }
             }

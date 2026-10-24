@@ -631,8 +631,8 @@ impl AppState {
     }
 
     /// 刷新率应用规则: 主线程命中后下发包名给刷新率线程
-    fn refresh_apply(&mut self, pkg: String) {
-        crate::refresh::refresh_send_fg_pkg(pkg);
+    fn refresh_apply(&mut self, uid: i32, pkg: String) {
+        crate::refresh::refresh_send_fg_pkg(uid, pkg);
     }
 
 }
@@ -1052,6 +1052,8 @@ fn main() {
                             // 刷新率规则应用退出: pid → uid 反查 → 清命中表 (回落已由 task event 驱动)
                             if let Some(rf_uid) = RFR_PID_UID.lock().unwrap().remove(&pid) {
                                 RFR_MON.lock().unwrap().remove(&rf_uid);
+                                /* 规则应用退出: 清理该 uid 的 act 刷新率缓存 */
+                                crate::refresh::refresh_act_cache_clear(rf_uid);
                             }                        }
                     }
                 }
@@ -1184,7 +1186,7 @@ fn main() {
                                 Some(e) if e.rfr => e.pkg.clone(),
                                 _ => crate::config::DEFAULT_REFRESH_PACKAGE.to_string(),
                             };
-                            state.refresh_apply(rfr_pkg);
+                            state.refresh_apply(uid, rfr_pkg);
                         }
                     }
                 }
@@ -1201,7 +1203,7 @@ fn main() {
                             )
                         };
                         if n >= 6 {
-                            let _uid = i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                            let uid = i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
                             let rest = &buf[4..n as usize];
                             if let Some(p0) = rest.iter().position(|&b| b == 0) {
                                 if p0 > 0 {
@@ -1233,7 +1235,7 @@ fn main() {
                                             if !dup {
                                                 *db = Some((now, pkg.clone(), comp.clone()));
                                                 drop(db);
-                                                crate::refresh::refresh_send_fg_act(pkg, comp);
+                                                crate::refresh::refresh_send_fg_act(uid, pkg, comp);
                                             }
                                         }
                                     }

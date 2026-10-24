@@ -133,11 +133,13 @@ pub struct RefreshStatus {
 
 enum RefreshEvent {
     Input,
-    /// 主线程判定前台 uid 命中刷新率表后, 下发包名应用刷新率
-    FgPkg(String),
-    /// activity 级刷新率事件 (KPM START_ACTIVITY 检测): 包名 + activity 完整类名,
+    /// 主线程判定前台 uid 命中刷新率表后, 下发 (uid, 包名) 应用刷新率
+    FgPkg(i32, String),
+    /// activity 级刷新率事件 (0xc): (uid, 包名, activity 完整类名);
     /// 命中恒值映射 → 该界面恒用对应刷新率 (无回落); 未命中 → 包级默认
-    Act(String, String),
+    Act(i32, String, String),
+    /// 规则应用退出: 清理该 uid 的 act 刷新率缓存
+    ActCacheClear(i32),
     /// 挂机黑屏挂起/恢复: true=停止空闲回落定时器 (刷新率保持 active,
     /// 单击恢复时无刷新率切换, 避免面板切换绿屏/瞬亮); false=重启定时器
     HangSuspend(bool),
@@ -169,9 +171,13 @@ struct RefreshState {
     app_configs: HashMap<String, AppRefreshConfig>,
     /// activity 级恒值映射: pkg -> (activity完整类名 -> 刷新率模式码); 命中即恒值无回落
     app_activity: HashMap<String, HashMap<String, i32>>,
-    /// 当前前台 activity (pkg, comp): 包级事件 (EV_TASK → FgPkg) 之后仍能保住 activity 命中,
-    /// 否则包级 apply 会把 activity 恒值覆盖回包默认值 (activity 规则表现为"完全无效")
-    cur_act: Option<(String, String)>,
+    /// act 规则缓存 (合并原 cur_act 与 mode 缓存): uid → (pkg, activity, 刷新率模式码)。
+    /// 语义: "该 uid 上一次已应用的 activity 与刷新率"。
+    ///  · act 命中 → 写入; 该 uid 回落包级 → 删除; 应用退出 → 删除
+    ///  · 包级 apply / 回到前台时, 同 uid+pkg 命中 → 保持 activity 恒值 (不被覆盖)
+    act_last: std::collections::HashMap<i32, (String, String, i32)>,
+    /// 当前前台 uid (与 current_package 配对; 配置热更时用于恢复 activity 恒值)
+    current_uid: i32,
     /// 当前生效配置 (全局默认, 或被应用级配置覆盖)
     effective: RateConfig,
     current_applied_mode: i32,
@@ -241,7 +247,8 @@ fn set_refresh_rate(state: &mut RefreshState, mode: i32) {
     state.current_applied_mode = mode;
 }
 
-fn apply_app_config(state: &mut RefreshState, pkg: &str) {
+/// 包级/全局取值 (纯计算, 不含 activity 概念)
+fn apply_pkg_rates(state: &mut RefreshState, pkg: &str) {
     // com.android.launcher3 是默认桌面, 始终绑定全局刷新率配置;
     // 即使配置文件中残留同名刷新率行，也不能把桌面切到应用级覆盖值。
     if pkg != crate::config::DEFAULT_REFRESH_PACKAGE {
@@ -249,81 +256,94 @@ fn apply_app_config(state: &mut RefreshState, pkg: &str) {
             state.effective.timeout = cfg.timeout;
             state.effective.active = cfg.active_mode;
             state.effective.idle = cfg.idle_mode;
-        } else {
-            state.effective.timeout = state.global.timeout;
-            state.effective.active = state.global.active;
-            state.effective.idle = state.global.idle;
-        }
-    } else {
-        state.effective.timeout = state.global.timeout;
-        state.effective.active = state.global.active;
-        state.effective.idle = state.global.idle;
-    }
-    // activity 覆盖: 已知当前 activity 且命中 → 恒值 (包级事件不得把它覆盖回包默认值)
-    if let Some((apkg, acomp)) = state.cur_act.clone() {
-        if apkg == pkg {
-            if let Some(v) = state
-                .app_activity
-                .get(pkg)
-                .and_then(|m| m.get(&acomp))
-                .copied()
-            {
-                state.effective.active = v;
-                state.effective.idle = v;
-            }
-        } else {
-            state.cur_act = None;   /* 切到别的包: 旧 activity 失效 */
+            return;
         }
     }
-    state.timer_enabled = state.effective.idle != state.effective.active;
-    // 同步触摸监听开关 (与 load_global_config 一致): 应用级配置切换后保持状态同步
-    crate::event_probe::set_enabled(state.timer_enabled);
+    state.effective.timeout = state.global.timeout;
+    state.effective.active = state.global.active;
+    state.effective.idle = state.global.idle;
 }
 
-/// activity 级刷新率应用 (KPM 事件驱动): 按完整类名精确匹配。
-/// 命中恒值映射 → 该界面恒用对应刷新率 (active==idle, 无空闲回落, timer 关);
-/// 未命中 → 包级默认档位 (回落语义保留); 无包级配置/桌面 → 全局。
-fn apply_activity(state: &mut RefreshState, pkg: &str, comp: &str) {
+/// 落地: 按 effective 计算 timer/触摸开关并切档
+fn finish_apply(state: &mut RefreshState) {
+    state.timer_enabled = state.effective.idle != state.effective.active;
+    // 同步触摸监听开关 (与 load_global_config 一致)
+    crate::event_probe::set_enabled(state.timer_enabled);
+    set_refresh_rate(state, state.effective.active);
+    reset_timer(state, true);
+}
+
+/// 刷新率解析与应用 (唯一入口)
+/// 优先级:
+///   ① comp 命中 activity 规则        → 该 activity 恒值 (写 act_last)
+///   ② 该 uid 上次 activity 同包       → 保持该恒值 (包级事件/配置热更不得覆盖)
+///   ③ 包级配置 / 全局                → 回落 (明确给了 comp 且未命中 → 清该 uid 缓存)
+fn resolve_apply(state: &mut RefreshState, uid: i32, pkg: &str, comp: Option<&str>) {
+    if pkg.is_empty() {
+        return;
+    }
+    state.current_uid = uid;
+    state.current_package = pkg.to_string();
+    let timeout_for_pkg = |st: &RefreshState| -> i32 {
+        st.app_configs
+            .get(pkg)
+            .map(|c| c.timeout)
+            .unwrap_or(st.global.timeout)
+    };
+
+    /* ① 明确的 activity 命中 → 恒值 */
+    if let Some(c) = comp {
+        if !c.is_empty() {
+            if let Some(v) = state.app_activity.get(pkg).and_then(|m| m.get(c)).copied() {
+                state.effective.timeout = timeout_for_pkg(state);
+                state.effective.active = v;
+                state.effective.idle = v;
+                state.act_last.insert(uid, (pkg.to_string(), c.to_string(), v));
+                finish_apply(state);
+                return;
+            }
+        }
+    }
+
+    /* ② 【测试已移除: act_last 保持恒值】
+     * 原逻辑: 该 uid 上次 activity 同包 → 保持恒值 (防包级事件/配置热更覆盖)
+     * 恢复时把下面这段放回此处:
+     *   if state.app_activity.contains_key(pkg) {
+     *       if let Some((cpkg, _cc, mode)) = state.act_last.get(&uid) {
+     *           if cpkg == pkg { ...按 mode 应用 + finish_apply; return }
+     *       }
+     *   }
+     */
+
+    /* ③ 回落包级/全局 */
+    if let Some(c) = comp {
+        if !c.is_empty() {
+            state.act_last.remove(&uid);   /* activity 未命中 → 清该 uid 缓存 */
+        }
+    }
+    apply_pkg_rates(state, pkg);
+    finish_apply(state);
+}
+
+/// 前台包变化 (EV_TASK → FgPkg): 无 activity 信息, 走解析器 (可命中 uid 缓存)
+fn try_apply_fg_pkg(state: &mut RefreshState, uid: i32, pkg: &str) -> bool {
+    if pkg.is_empty() {
+        return false;
+    }
+    resolve_apply(state, uid, pkg, None);
+    true
+}
+
+/// activity 事件 (0xc): 带 activity 类名走解析器
+fn apply_activity(state: &mut RefreshState, uid: i32, pkg: &str, comp: &str) {
     if pkg.is_empty() || comp.is_empty() {
         return;
     }
     // 无 activity 块的包: 包级刷新率已由 task event 应用, activity 事件不干预
-    // (也不重置空闲回落计时); 判定用本线程 app_activity 表 (与 apply 逻辑同源)
     if !state.app_activity.contains_key(pkg) {
         return;
     }
-    state.cur_act = Some((pkg.to_string(), comp.to_string()));
-    state.current_package = pkg.to_string();
-    if pkg == crate::config::DEFAULT_REFRESH_PACKAGE {
-        state.effective.timeout = state.global.timeout;
-        state.effective.active = state.global.active;
-        state.effective.idle = state.global.idle;
-    } else if let Some(cfg) = state.app_configs.get(pkg) {
-        if let Some(v) = state
-            .app_activity
-            .get(pkg)
-            .and_then(|m| m.get(comp))
-            .copied()
-        {
-            // activity 命中: 恒值 (active==idle, 无回落)
-            state.effective.timeout = cfg.timeout;
-            state.effective.active = v;
-            state.effective.idle = v;
-        } else {
-            // 未命中: 包级默认 (回落语义保留)
-            state.effective.timeout = cfg.timeout;
-            state.effective.active = cfg.active_mode;
-            state.effective.idle = cfg.idle_mode;
-        }
-    } else {
-        state.effective.timeout = state.global.timeout;
-        state.effective.active = state.global.active;
-        state.effective.idle = state.global.idle;
-    }
-    state.timer_enabled = state.effective.idle != state.effective.active;
-    crate::event_probe::set_enabled(state.timer_enabled);
-    set_refresh_rate(state, state.effective.active);
-    reset_timer(state, true);
+    resolve_apply(state, uid, pkg, Some(comp));
 }
 
 fn timerfd_set(fd: i32, seconds: i32) {
@@ -378,19 +398,6 @@ fn switch_to_idle(state: &mut RefreshState) {
     state.last_reset_time = None;
 }
 
-/// 刷新率应用: 仅 launcher 或已配置应用会到达此处 (主线程 rfr uid 表已过滤,
-/// 不存在"无配置 → 无配置"场景)。launcher(视为无配置) → 全局配置; 已配置 → 专属配置。
-fn try_apply_fg_pkg(state: &mut RefreshState, pkg: &str) -> bool {
-    if pkg.is_empty() {
-        return false;
-    }
-    state.current_package = pkg.to_string();
-    apply_app_config(state, pkg);
-    set_refresh_rate(state, state.effective.active);
-    reset_timer(state, true);
-    true
-}
-
 /// input 事件触发：用户活动
 /// 1 秒节流 + 计时器停止时切回活跃刷新率并重启计时器
 fn handle_input(state: &mut RefreshState) {
@@ -417,12 +424,10 @@ fn check_config(state: &mut RefreshState) {
     if REFRESH_FORCE_RELOAD.swap(false, Ordering::AcqRel) {
         load_global_config(state);
         load_app_configs(state);
+        /* 配置热更: 用解析器按当前 (uid, 包) 重新决定 (act_last 命中则保持 activity 恒值) */
         let current_pkg = state.current_package.clone();
-        apply_app_config(state, &current_pkg);
-        set_refresh_rate(state, state.effective.active);
-        if state.last_reset_time.is_some() {
-            reset_timer(state, true);
-        }
+        let cur_uid = state.current_uid;
+        resolve_apply(state, cur_uid, &current_pkg, None);
     }
 }
 
@@ -487,7 +492,7 @@ pub fn refresh_init(display_modes: std::thread::JoinHandle<Vec<(u32, u32, u32, f
         },
         app_configs: HashMap::new(),
         app_activity: HashMap::new(),
-        cur_act: None,
+        act_last: std::collections::HashMap::new(),
         effective: RateConfig {
             active: crate::config::REFRESH_MODE_120,
             idle: crate::config::REFRESH_MODE_60,
@@ -501,6 +506,7 @@ pub fn refresh_init(display_modes: std::thread::JoinHandle<Vec<(u32, u32, u32, f
         timer_enabled: true,
         last_reset_time: None,
         current_package: String::new(),
+        current_uid: -1,
         last_input_time: None,
         timer_fd,
     };
@@ -556,11 +562,14 @@ pub fn refresh_init(display_modes: std::thread::JoinHandle<Vec<(u32, u32, u32, f
                         while let Ok(event) = rx.try_recv() {
                             match event {
                                 RefreshEvent::Input => handle_input(&mut state),
-                                RefreshEvent::FgPkg(pkg) => {
-                                    try_apply_fg_pkg(&mut state, &pkg);
+                                RefreshEvent::FgPkg(uid, pkg) => {
+                                    try_apply_fg_pkg(&mut state, uid, &pkg);
                                 }
-                                RefreshEvent::Act(pkg, comp) => {
-                                    apply_activity(&mut state, &pkg, &comp);
+                                RefreshEvent::Act(uid, pkg, comp) => {
+                                    apply_activity(&mut state, uid, &pkg, &comp);
+                                }
+                                RefreshEvent::ActCacheClear(uid) => {
+                                    state.act_last.remove(&uid);
                                 }
                                 RefreshEvent::HangSuspend(on) => {
                                     if on {
@@ -600,20 +609,29 @@ pub fn refresh_init(display_modes: std::thread::JoinHandle<Vec<(u32, u32, u32, f
 }
 
 /// 主线程命中刷新率 uid 表后, 下发前台包名 (三线程: 主 → 刷新率线程)。
-pub fn refresh_send_fg_pkg(pkg: String) {
+pub fn refresh_send_fg_pkg(uid: i32, pkg: String) {
     let guard = crate::lock_ignore_poison(&REFRESH_TX);
     if let Some(tx) = guard.as_ref() {
-        let _ = tx.send(RefreshEvent::FgPkg(pkg));
+        let _ = tx.send(RefreshEvent::FgPkg(uid, pkg));
         wake();
     }
 }
 
 /// KPM activity 事件: 按完整类名精确匹配 activity 恒值映射并应用刷新率
 /// (命中 → 恒值无回落; 未命中 → 包级默认)。主线程 EV_ACT 调用。
-pub fn refresh_send_fg_act(pkg: String, comp: String) {
+/// 规则应用退出: 清理该 uid 的 act 刷新率缓存
+pub fn refresh_act_cache_clear(uid: i32) {
     let guard = crate::lock_ignore_poison(&REFRESH_TX);
     if let Some(tx) = guard.as_ref() {
-        let _ = tx.send(RefreshEvent::Act(pkg, comp));
+        let _ = tx.send(RefreshEvent::ActCacheClear(uid));
+        wake();
+    }
+}
+
+pub fn refresh_send_fg_act(uid: i32, pkg: String, comp: String) {
+    let guard = crate::lock_ignore_poison(&REFRESH_TX);
+    if let Some(tx) = guard.as_ref() {
+        let _ = tx.send(RefreshEvent::Act(uid, pkg, comp));
         wake();
     }
 }
