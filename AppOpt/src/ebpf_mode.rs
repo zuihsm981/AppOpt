@@ -364,6 +364,7 @@ impl KpmHandle {
         self.cmd("srv_clear");
     }
 
+
     /// 设置第 idx 组等长替换规则 (from→to, 字符数一致); L1 校验后下发
     pub(crate) fn srv_rule(&self, idx: usize, from: &str, to: &str) -> Result<(), String> {
         validate_srv_rule(idx, from, to)?;
@@ -387,11 +388,11 @@ impl KpmHandle {
     /// 解除武装 (stop: 摘除全部业务探针 + 恢复 vendor_file_contexts 读取)
     pub(crate) fn disarm(&self) {
         self.cmd("stop");
-        self.vfc_disable();        // vfc off: 重定向/内容替换失效 (hook 常驻, 回调跳过)
+        self.vfc_disable();        // vfc off: 摘除全部 vfc 业务钩子 (按需挂载)
         self.prop_file_apply(false);   // prop 恢复原属性 (tmpfs 反向替换)
     }
 
-    /// 激活 vfc (enabled=1 + 首次常驻挂载); 规则已由 vfc_sync 下发
+    /// 激活 vfc (enabled=1 + 挂载, off 时已全摘; 规则已由 vfc_sync 下发)
     pub(crate) fn vfc_apply(&self) {
         self.cmd("vfc off");   // 清 file* 表与应用侧残留
         self.cmd("vfc on");
@@ -568,6 +569,22 @@ pub fn ebpf_init(drive_mode: String) -> Option<EbpfState> {
 /// 事件派发 (input: 刷新率活动检测; 退出清理统一由用户态 pidfd 负责,
 /// 内核 EXIT 事件不再消费; CPU/刷新率主体由 binder 三线程驱动)
 
+
+/// 通知内核"该 uid 亲和性已固定 (或撤销固定)": 内核 sched_setaffinity 钩子
+/// 对集合内 uid 的进程返回 -EPERM (阻止应用自行改亲和)。
+/// 模块未加载/未武装时 kpm_ctl0 失败静默 (不影响用户态已做的固定)。
+/// 切换内核对该 uid 的亲和固定 (内核按自身记录翻转: 无→拦截, 有→放行)。
+/// 内核 sched_setaffinity 钩子对集合内 uid 的进程返回 -EPERM, 阻止应用自行改亲和。
+/// 模块未加载/未武装时 kpm_ctl0 失败静默 (不影响用户态已做的固定)。
+pub(crate) fn pin_uid(uid: i32) {
+    if uid <= 0 {
+        return;
+    }
+    let cmd = format!("cpu_pin {uid}");
+    let key = kpm_key();
+    let c = cstr(&cmd);
+    let _ = kpm_ctl0(&key, &c, &mut []);
+}
 
 /// 提前 mmap 并保持目标 property tmpfs 文件映射 (连接/首次使用时建立,
 /// 前台切换只做内存替换)。MAP_SHARED 改动即写回 page cache → 全进程共享映射可见。

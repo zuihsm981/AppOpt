@@ -89,7 +89,7 @@ fn ndk() -> Option<&'static BinderNdk> {
             || p_read_i32.is_null()
             || p_join.is_null() || p_start.is_null() || p_associate.is_null()
         { return None; }
-        /* 游标辅助为可选: dlsym 失败 → getTasks 解析不可用, 不影响核心 binder 功能 */
+        /* 游标辅助为可选: 缺失仅影响 0xc/TSL 的事件解析, 不影响核心 binder 功能 */
         let data_position = if p_get_data_pos.is_null() {
             None
         } else {
@@ -586,9 +586,9 @@ pub fn set_refresh_rate_binder(mode: i32) -> bool {
     ok
 }
 
-/* ================= activity 查询: binder 直连 getTasks(0x19) 拿 topActivity =================
- * 内核 token 命中 START_ACTIVITY → eventfd 信号 → 本函数查权威 topActivity (完整类名)。
- * 用户态解析: 读错/失败只返回 None (不应用), 无崩溃风险 (与内核 copy 崩区分)。
+/* ================= activity 事件解析 (ITaskStackListener onTaskDescriptionChanged) =================
+ * 0xc 回调 (tsl_on_transact) 解析 RunningTaskInfo 拿 topActivity → socket → 主循环 EV_ACTL;
+ * 读错/失败只跳过该条事件, 无崩溃风险。
  */
 
 

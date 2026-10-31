@@ -30,9 +30,6 @@ fn cpuset_leaf() -> String {
 
 /// web 是否启用 (--no-web 时 false)
 pub static WEB_ENABLED: AtomicBool = AtomicBool::new(false);
-/// activity 事件唤醒 eventfd 写端 (main 创建后注入内核 act_evt <fd>; KPM 内核
-/// token 命中 START_ACTIVITY → 限频 signal → 主循环 EV_ACT)
-
 /// uclamp (sched_setattr util clamp) 是否可用: /proc/sys/kernel/sched_util_clamp_max 存在
 /// 表示内核支持 uclamp; 启动时检查一次, webui 据此决定是否显示 uclamp 配置 UI。
 pub static UCLAMP_SUPPORTED: AtomicBool = AtomicBool::new(false);
@@ -1336,15 +1333,12 @@ pub fn refresh_pkg_cache() {
             let mut it = line.split_whitespace();
             let Some(pkg) = it.next() else { continue };
             let Some(uid) = it.next().and_then(|s| s.parse::<i32>().ok()) else { continue };
-            if uid <= 0 || uid >= 100000 {
-                continue;   /* 仅当前用户 (与 cpu/waylay uid 表一致) */
-            }
-            let _flag = it.next();
-            /* 第 4 列 data 目录: 非 0 用户应用为 null → 过滤 (仅主用户应用) */
-            let Some(data_dir) = it.next() else { continue };
-            if data_dir == "null" || !data_dir.starts_with("/data/user/0/") {
+            if uid <= 0 {
                 continue;
             }
+            let _flag = it.next();
+            let _data_dir = it.next();   /* 忽略 dataPath: 非 0 用户应用 (null/路径不同) 也保留,
+                                          * 交由前端按 uid≥100000 分组显示, 规则照常可运行 */
             /* 应用类别: 条目末尾标记 @system=系统应用, @null=用户应用 */
             let system = line.trim_end().ends_with("@system");
             /* 应用名: 用户应用从 /data/app 的 base.apk 用 aapt2 取 label (系统应用不在 /data/app) */

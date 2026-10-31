@@ -618,8 +618,8 @@ pub fn refresh_send_fg_pkg(uid: i32, pkg: String) {
     }
 }
 
-/// KPM activity 事件: 按完整类名精确匹配 activity 恒值映射并应用刷新率
-/// (命中 → 恒值无回落; 未命中 → 包级默认)。主线程 EV_ACT 调用。
+/// activity 事件 (0xc → EV_ACTL): 按完整类名精确匹配 activity 恒值映射并应用刷新率
+/// (命中 → 恒值无回落; 未命中 → 包级默认)。
 /// 规则应用退出: 清理该 uid 的 act 刷新率缓存
 pub fn refresh_act_cache_clear(uid: i32) {
     let guard = crate::lock_ignore_poison(&REFRESH_TX);

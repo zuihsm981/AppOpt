@@ -12,10 +12,10 @@
 //!   - 应用: 该 uid 全部进程的全部线程 (/proc/<pid>/task) → thread_affinity →
 //!     applied_set + affinity_set。
 //!   - 清理: APPLIED 条目由进程退出清理 (pidfd 事件 → EvictUid → 按 uid 摘除,
-//!     防 tid 复用被 kprobe 误抓/错误覆盖新进程亲和性)。
-//!   - 内核只保留: applied 表 (ctl0) + sched_setaffinity kprobe 强制;
-//!     input 检测已统一用户态 eventX (内核 input kprobe 不再依赖)。
-//!     进程事件探针对本模块无意义。
+//!     防 tid 复用错误覆盖新进程亲和性)。
+//!   - 内核只保留: sched_setaffinity 钩子 + cpu_pin <> 开关 (防止被固定的应用自行
+//!     改亲和, 冷应用下发 toggle 拦截 / 主进程退出 toggle 放行)。
+//!     input 检测与进程事件探测已统一用户态 (内核 input/EXIT 探针不再依赖)。
 //!
 //! 为什么按 uid + cgroup: zygote spawn 子进程 (pkg:child, 不同 tgid) 与主进程共享
 //! uid; /sys/fs/cgroup/apps/uid_<uid>/ 目录按 uid 归属全部进程 (主+子), 直接读 pid_*
@@ -69,11 +69,35 @@ pub fn cpu_known_has(uid: i32) -> bool {
     uid > 0 && crate::rw_read_ignore_poison(&CPU_KNOWN).contains_key(&uid)
 }
 
+/// CPU 链路调试日志 (临时: 写 /data/local/tmp/appopt_cpu_dbg.txt, ≤1MB)
+pub fn cpu_dbg(msg: &str) {
+    use std::io::Write;
+    if let Ok(md) = std::fs::metadata("/data/local/tmp/appopt_cpu_dbg.txt") {
+        if md.len() > 1024 * 1024 {
+            return;
+        }
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/data/local/tmp/appopt_cpu_dbg.txt")
+    {
+        let _ = f.write_all(msg.as_bytes());
+        let _ = f.write_all(b"\n");
+    }
+}
+
 /// 按 uid 从 cgroup apps 目录取全部 pid (task event 驱动: web 命中显示/退出监听,
 /// CPU worker 也复用)。失败 (布局不存在/未运行) 返回 None。
 pub fn cgroup_pids(uid: i32) -> Option<Vec<i32>> {
     let dir_path = format!("/sys/fs/cgroup/apps/uid_{uid}");
-    let rd = std::fs::read_dir(&dir_path).ok()?;
+    let rd = match std::fs::read_dir(&dir_path) {
+        Ok(rd) => rd,
+        Err(e) => {
+            cpu_dbg(&format!("cgroup_pids uid={} 目录失败 {:?} err={}", uid, dir_path, e));
+            return None;
+        }
+    };
     let mut pids: Vec<i32> = Vec::new();
     for ent in rd.flatten() {
         let name = ent.file_name().to_string_lossy().into_owned();
@@ -83,6 +107,7 @@ pub fn cgroup_pids(uid: i32) -> Option<Vec<i32>> {
             pids.push(p);
         }
     }
+    cpu_dbg(&format!("cgroup_pids uid={} n={} {:?}", uid, pids.len(), pids));
     Some(pids)
 }
 /// 按主 pid 反查 uid (退出事件路径用: 反查后发 EvictUid, 身份清理统一由
@@ -161,6 +186,7 @@ impl CpuAffinity {
 
     /// 应用退出清理: Cgroup 主 pid 目录消失 / 显式 EvictUid 消息共用
     fn evict_uid(&mut self, uid: i32) {
+        // 内核放行由主线程 pidfd 退出事件直接 toggle (evict_uid 不再处理)
         crate::rw_write_ignore_poison(&CPU_KNOWN).remove(&uid);
         // 同时摘除该 uid 的收集窗口排期 (进程已退出, 不再重扫重新登记)
         self.pending.retain(|(_, u, _, _, _)| *u != uid);
@@ -198,13 +224,21 @@ impl CpuAffinity {
     pub fn apply_all(&mut self, cfg: &AppConfig, pkg_uids: HashMap<String, i32>) -> usize {
         let mut applied = 0usize;
         for (pkg, uid) in &pkg_uids {
-            let Some(pids) = Self::cgroup_apps_pids(*uid) else { continue };
+            let Some(pids) = Self::cgroup_apps_pids(*uid) else {
+                cpu_dbg(&format!("ApplyAll uid={} pkg={} cgroup 取 pid 失败", uid, pkg));
+                continue;
+            };
             if pids.is_empty() {
+                cpu_dbg(&format!("ApplyAll uid={} pkg={} 未运行(pid 空)", uid, pkg));
                 continue; // 未运行
             }
             self.apply_tids(&pids, pkg, cfg);
             // 记录 uid→pkg 清理索引 (managed 按包名索引, 退出 evict_uid 需反查)
             self.uid_pkg.insert(*uid, pkg.clone());
+            /* 冷应用才下发固定 (已有固定/热重放不重发, 对应退出时再 toggle 放行) */
+            if !crate::cpu_affinity::cpu_known_has(*uid) {
+                crate::ebpf_mode::pin_uid(*uid);
+            }
             applied += 1;
         }
         // 初始化 (初始全量应用) 完成后: 整树时间戳同步一次 (仅首次)
@@ -220,6 +254,13 @@ impl CpuAffinity {
     /// 对给定进程集合的全部线程套用规则并应用 (解析 → 亲和 → uclamp 三段)
     fn apply_tids(&mut self, pids: &[i32], pkg: &str, cfg: &AppConfig) {
         let (aff, uclamps) = self.resolve_threads(pids, pkg, cfg);
+        cpu_dbg(&format!(
+            "apply_tids pkg={} pids={} aff={} uclamp={}",
+            pkg,
+            pids.len(),
+            aff.len(),
+            uclamps.len()
+        ));
         self.apply_affinity_batch(aff.clone(), cfg);
         self.apply_uclamp_batch(uclamps);
         /* 应用级 + 线程规则同一遍回读校验 (tok 一次遍历得出; 应用 ok 从 tok 派生) */
@@ -423,6 +464,12 @@ impl CpuAffinity {
                 // 未登记 (冷) → 进入 ~2000ms 收集窗口 (cgroup pid_* 晚于事件生成 +
                 // 子进程 fork 更晚, 扫到 pid 不提前停, 窗口结束用完整并集一次应用)。
                 let cached = crate::rw_read_ignore_poison(&CPU_KNOWN).get(&uid).cloned();
+                cpu_dbg(&format!(
+                    "ApplyPkgByUid uid={} pkg={} cached={:?}",
+                    uid,
+                    pkg,
+                    cached.as_ref().map(|(m, p)| (*m, p.len()))
+                ));
                 if let Some((_, pids)) = cached {
                     if !pids.is_empty() {
                         self.apply_pkg_uid(uid, pkg, pids);
@@ -435,6 +482,7 @@ impl CpuAffinity {
                 // 重置 2000ms; watch 已幂等, 但避免窗口结束重复 apply 两遍)
                 self.pending.retain(|(_, u, _, _, _)| *u != uid);
                 let pids = Self::cgroup_apps_pids(uid).unwrap_or_default();
+                cpu_dbg(&format!("冷启动窗口 uid={} pkg={} 首扫 pids={}", uid, pkg, pids.len()));
                 self.pending.push((
                     std::time::Instant::now()
                         + std::time::Duration::from_millis(CGROUP_RETRY_MS),
@@ -474,7 +522,9 @@ impl CpuAffinity {
     /// + 登记 + 退出监听 + 立即发布命中统计。
     fn apply_pkg_uid(&mut self, uid: i32, pkg: String, pids: Vec<i32>) {
         let Some(cfg) = crate::config::current_cfg() else { return };
+        cpu_dbg(&format!("apply_pkg_uid uid={} pkg={} pids={:?}", uid, pkg, pids));
         self.apply_tids(&pids, &pkg, &cfg);
+        crate::ebpf_mode::pin_uid(uid);   /* 冷应用首次应用: 下发固定 (退出时 toggle 放行) */
         // 登记身份: 主 pid = cgroup 下最小 pid (主进程最先 fork)
         let main = *pids.iter().min().unwrap_or(&0);
         crate::rw_write_ignore_poison(&CPU_KNOWN).insert(uid, (main, pids));
@@ -492,6 +542,14 @@ impl CpuAffinity {
     /// 用完整并集应用一次 (仍空 → 清身份, 下次前台事件重新冷启动)。
     fn retry_apply(&mut self, uid: i32, pkg: String, tries: u32, mut seen: Vec<i32>) {
         let pids = Self::cgroup_apps_pids(uid).unwrap_or_default();
+        cpu_dbg(&format!(
+            "retry_apply uid={} pkg={} tries={} 现扫={} 并集={}",
+            uid,
+            pkg,
+            tries,
+            pids.len(),
+            seen.len()
+        ));
         for p in &pids {
             if !seen.contains(p) {
                 seen.push(*p);
@@ -524,7 +582,8 @@ pub fn start() {
     }
     // 用户态与 KPM 模式统一启动 CPU worker: 身份记录/进程枚举/亲和性施加全部经
     // ApplyPkgByUid (前台 task event 驱动) / ApplyAll 消息驱动; 亲和完全由用户态
-    // apply_affinity::affinity_set 施加 (内核 KPM 只做 service list 替换, 不参与亲和)。
+    // apply_affinity::affinity_set 施加 (内核还有 sched_setaffinity 钩子防应用自行改亲和,
+    // 由 CPU 线程在应用成功后下发 cpu_pin toggle)。
     let (tx, rx) = mpsc::channel::<CpuMsg>();
     let _ = CPU_FG_TX.set(Mutex::new(tx));
     let cpu = CpuAffinity::new();

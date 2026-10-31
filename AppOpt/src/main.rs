@@ -68,7 +68,7 @@ fn build_uid_tables(cfg: &AppConfig) -> (HashMap<i32, UidEntry>, HashMap<String,
     }
     let mut fwd: HashMap<i32, UidEntry> = HashMap::new();
     let mut rev: HashMap<String, i32> = HashMap::new();
-    /* 与 pkg_to_uid_map 共用 packages.list 读取 (当前用户 uid<100000) */
+    /* 与 pkg_to_uid_map 共用 packages.list 读取 (含非 0 用户应用) */
     for (pkg, uid) in pkg_to_uid_map() {
         let cpu = cpu_pkgs.contains(pkg.as_str());
         let rfr = pkg == crate::config::DEFAULT_REFRESH_PACKAGE
@@ -78,6 +78,13 @@ fn build_uid_tables(cfg: &AppConfig) -> (HashMap<i32, UidEntry>, HashMap<String,
             rev.entry(pkg.clone()).or_insert(uid);
         }
     }
+    crate::cpu_affinity::cpu_dbg(&format!(
+        "build_uid_tables 规则包={} rfr包={} uid表={} cpu包={}",
+        cpu_pkgs.len(),
+        cfg.app_refresh_configs.len(),
+        fwd.len(),
+        fwd.values().filter(|e| e.cpu).count()
+    ));
     (fwd, rev)
 }
 
@@ -102,9 +109,7 @@ pub(crate) fn pkg_to_uid_map() -> HashMap<String, i32> {
             let mut it = line.split_whitespace();
             let (Some(pkg), Some(uid_s)) = (it.next(), it.next()) else { continue };
             if let Ok(uid) = uid_s.parse::<i32>() {
-                if uid > 0 && uid < 100000 {   /* 当前用户 (Android 多用户 uid 偏移, 与 cpu 一致) */
-                    m.insert(pkg.to_string(), uid);
-                }
+                m.insert(pkg.to_string(), uid);   /* 含非 0 用户应用 (uid ≥ 100000) */
             }
         }
     }
@@ -1045,6 +1050,8 @@ fn main() {
                             // 清身份 + 通知 CPU worker 清该 uid managed → 发布统计
                             // CPU 身份清理 (EvictUid → evict_uid 移除条目)
                             if let Some(uid) = crate::cpu_affinity::cpu_known_pid_to_uid(pid) {
+                                /* 主进程退出 → toggle 内核放行该 uid 的亲和固定 */
+                                crate::ebpf_mode::pin_uid(uid);
                                 if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
                                     let _ = tx.send(crate::cpu_affinity::CpuMsg::EvictUid(uid));
                                 }
@@ -1076,6 +1083,11 @@ fn main() {
                             // activity 检测由 ITaskStackListener.onTaskDescriptionChanged(0xc)
                             // 直连驱动 (EV_ACTL), 不再涉及内核开关
                             // ---- CPU: 冷启动 (表无该 uid) → 收集窗口; 热 → 跳过 ----
+                            crate::cpu_affinity::cpu_dbg(&format!(
+                                "EV_TASK uid={} 表项={:?}",
+                                uid,
+                                state.uid_map.get(&uid).map(|e| (e.pkg.clone(), e.cpu, e.rfr))
+                            ));
                             if let Some(e) = state.uid_map.get(&uid) {
                                 if e.cpu && !crate::cpu_affinity::cpu_known_has(uid) {
                                     if let Some(tx) = crate::cpu_affinity::cpu_fg_tx() {
